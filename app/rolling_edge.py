@@ -4,9 +4,9 @@ from typing import Any, Sequence
 
 @dataclass(frozen=True)
 class RollingEdgeConfig:
-    lookback_days: int = 90
-    min_samples: int = 20
-    min_win_rate: float = 0.5556
+    lookback_days: int = 60
+    min_samples: int = 5
+    min_win_rate: float = 0.62
     min_ev: float = 0.5
 
 

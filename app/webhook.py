@@ -68,11 +68,14 @@ class WebhookSignalProxy:
             self.last_sent_at_ms = int(time.time() * 1000)
 
     def status(self) -> dict:
+        last_payload = dict(self.last_payload) if self.last_payload else None
+        if last_payload and "importToken" in last_payload:
+            last_payload["importToken"] = "***"
         return {
             "enabled": self.enabled,
             "url": self.url,
             "last_error": self.last_error,
-            "last_payload": self.last_payload,
+            "last_payload": last_payload,
             "last_sent_at_ms": self.last_sent_at_ms,
         }
 

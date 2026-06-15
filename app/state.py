@@ -170,6 +170,9 @@ class MonitorState:
         self.risk_pause = gate.risk_pause
         if not gate.open_allowed:
             return gate.code
+        if signal.direction == "SHORT":
+            self.risk_pause = "SHORT观察模式：仅记录信号，不开模拟订单，不推送Webhook"
+            return "SHORT_OBSERVE_ONLY"
         if self.enable_rolling_edge_guard and self.rolling_edge["status"] == "DEGRADED":
             self.risk_pause = (
                 f"滚动优势衰退 {self.rolling_edge['key']} "

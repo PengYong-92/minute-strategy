@@ -1,7 +1,9 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 from app.models import Signal, SimulatedOrder
@@ -300,10 +302,18 @@ class SQLiteMonitorStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _init_schema(self) -> None:
         with self._connect() as connection:

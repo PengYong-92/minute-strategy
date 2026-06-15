@@ -18,9 +18,9 @@ class RollingEdgeTest(unittest.TestCase):
     def test_default_guard_config_uses_backtested_parameters(self):
         config = RollingEdgeConfig()
 
-        self.assertEqual(config.lookback_days, 90)
-        self.assertEqual(config.min_samples, 20)
-        self.assertEqual(config.min_win_rate, 0.5556)
+        self.assertEqual(config.lookback_days, 60)
+        self.assertEqual(config.min_samples, 5)
+        self.assertEqual(config.min_win_rate, 0.62)
         self.assertEqual(config.min_ev, 0.5)
 
     def test_setup_key_includes_timeframe_segment_and_setup_name(self):

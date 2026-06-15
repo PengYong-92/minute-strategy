@@ -1,6 +1,6 @@
 # 当前策略说明
 
-更新时间：2026-05-27  
+更新时间：2026-06-15
 代码范围：`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`
 
 ## 1. 策略目标与运行周期
@@ -14,6 +14,7 @@
 - 只在信号满足方向、时段、边际、风控、订单间隔条件时模拟开单。
 - 开单后通过 webhook 推送方向、周期和本单金额。
 - 对所有开单记录入场快照，便于后续分析亏损订单和优化策略。
+- SHORT 当前作为观察信号记录审计，不创建模拟订单、不推送 webhook、不参与滚单。
 
 当前实盘开单周期：
 
@@ -890,6 +891,7 @@ session_allowed == True
 edge >= session_edge_min
 edge < max_trade_edge
 signal.actionable == True
+direction != SHORT
 无未结订单
 距离上一单 >= 10分钟
 非重复 signal_key
@@ -916,6 +918,7 @@ and abs(score) >= threshold
 | `COOLDOWN` | 距离上一单不足 10分钟 |
 | `DUPLICATE_SIGNAL` | 同一信号已开过 |
 | `RISK_PAUSED` | 同日同分段连续亏损达到 3 单 |
+| `SHORT_OBSERVE_ONLY` | SHORT 观察模式，只记录信号和决策，不开单 |
 | `ROLLING_EDGE_BLOCKED` | 滚动守卫判定该 setup 衰退 |
 | `OPENED` | 成功开单 |
 
@@ -937,9 +940,9 @@ and abs(score) >= threshold
 默认配置：
 
 ```text
-lookback_days = 90
-min_samples = 20
-min_win_rate = 0.5556
+lookback_days = 60
+min_samples = 5
+min_win_rate = 0.62
 min_ev = 0.5
 ```
 
@@ -1177,15 +1180,17 @@ win_return = 18
 enable_stake_progression = False
 stake_progression_max_orders = 3
 enable_rolling_edge_guard = False
-rolling_edge_lookback_days = 90
-rolling_edge_min_samples = 20
-rolling_edge_min_win_rate = 0.5556
+rolling_edge_lookback_days = 60
+rolling_edge_min_samples = 5
+rolling_edge_min_win_rate = 0.62
 rolling_edge_min_ev = 0.5
+short_observe_only = True
 ```
 
 注意：
 
 - 普通 `BacktestConfig` 默认不开滚单和滚动守卫。
+- 普通 `BacktestConfig` 默认与实盘一致：SHORT 只观察，不进入订单统计。
 - 研究脚本中会显式开启滚动守卫和三单叠加。
 - 回测结算逻辑与实盘模拟一致。
 - 若到期价等于入场价，视为 LOSS。
@@ -1208,13 +1213,13 @@ rolling_edge_min_ev = 0.5
 
 ## 21. 当前策略特征总结
 
-当前策略的主要开单来源是 10分钟 LONG，尤其是“放量急跌反抽”。SHORT 逻辑存在，但被严格限制在少数分时段，并要求 MACD、RSI、BOLL、多周期偏向和下影承接共同确认。
+当前策略的主要开单来源是 10分钟 LONG，尤其是“放量急跌反抽”。SHORT 逻辑存在，但当前只作为观察信号，不实际开空；系统仍保留严格的 MACD、RSI、BOLL、多周期偏向和下影承接确认，用于后续积累短空样本。
 
 当前策略不是“看到下跌就追空”，而是：
 
 - 非高位放量急跌更倾向按反抽做多。
-- 高位放量下跌才考虑做空。
-- 平量下跌只有在短空确认充分时才考虑做空。
+- 高位放量下跌才考虑生成 SHORT 观察信号。
+- 平量下跌只有在短空确认充分时才生成 SHORT 观察信号。
 - 低位放量上涨、低位承接、高位滞涨、量增价升等形态只观察不开单。
 
 最终是否开单由以下层级共同决定：
@@ -1228,7 +1233,21 @@ K线窗口
  -> Fear & Greed / regime 调整
  -> 最小 edge 和过热上限
  -> 订单状态 / 冷却 / 重复信号
+ -> SHORT观察拦截
  -> 同日连续亏损风控
  -> 滚动守卫
  -> 模拟开单 + webhook + 入场快照
 ```
+
+## 22. 2026-06-15 策略节点记录
+
+本节点用于后续重新分析修改后的新增样本：
+
+- 数据基线：生产接口截至 `2026-06-15 21:10:47` 共有 `72` 单，胜率 `52.78%`，累计 `-50.08U`。
+- 上次发布后新增样本：`7` 单，`4W/3L`，累计 `+18.32U`。
+- 其中新增亏损主要集中在 `LONG WD-18` 与 `LONG WD-12`；用本节点滚动守卫参数复盘时，这两单在开单前已有同 key 衰退迹象。
+- 本节点修改滚动守卫默认值为 `60天 / 至少5样本 / 胜率>=62% / EV>0.5U`。
+- 本节点将 SHORT 改为观察模式：保留信号审计与页面决策，返回 `SHORT_OBSERVE_ONLY`，但不创建订单、不推送 webhook、不消耗滚单状态。
+- webhook 状态接口会对 `importToken` 做脱敏展示，内部 payload 不变。
+
+后续分析口径：只把部署本节点后的订单作为“修改后样本”，与本节点之前的生产样本分开统计。

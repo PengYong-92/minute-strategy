@@ -23,10 +23,39 @@ class BacktestTest(unittest.TestCase):
     def test_default_backtest_guard_config_uses_backtested_parameters(self):
         config = BacktestConfig()
 
-        self.assertEqual(config.rolling_edge_lookback_days, 90)
-        self.assertEqual(config.rolling_edge_min_samples, 20)
-        self.assertEqual(config.rolling_edge_min_win_rate, 0.5556)
+        self.assertEqual(config.rolling_edge_lookback_days, 60)
+        self.assertEqual(config.rolling_edge_min_samples, 5)
+        self.assertEqual(config.rolling_edge_min_win_rate, 0.62)
         self.assertEqual(config.rolling_edge_min_ev, 0.5)
+        self.assertTrue(config.short_observe_only)
+
+    def test_run_backtest_observes_short_without_opening_order_by_default(self):
+        klines = [kline(i, 100 - i) for i in range(80)]
+
+        def signal_provider(history):
+            if len(history) == 40:
+                return Signal(
+                    direction="SHORT",
+                    timeframe_minutes=10,
+                    level="S",
+                    reason="synthetic short",
+                    price=history[-1].close,
+                    open_time=history[-1].open_time,
+                    score=-82,
+                    threshold=70,
+                    threshold_segment="WD-02",
+                    session_allowed=True,
+                    session_sample_size=20,
+                    session_win_rate=0.7,
+                    session_ev=2.0,
+                )
+            return Signal("WAIT", 10, "B", "wait", history[-1].close, history[-1].open_time)
+
+        result = run_backtest(klines, BacktestConfig(warmup_minutes=40), signal_provider=signal_provider)
+
+        self.assertEqual(result["stats"]["total_orders"], 0)
+        self.assertEqual(result["rejected_signals"]["short_observe_only"], 1)
+        self.assertEqual(result["by_direction"], {})
 
     def test_load_klines_from_zip_parses_binance_csv_rows(self):
         row = "1710000000000,100.0,101.0,99.0,100.5,12.3,1710000059999,0,0,0,0,0\n"

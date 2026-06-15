@@ -89,6 +89,7 @@ class MonitorStateTest(unittest.TestCase):
             klines = actionable_rebound_klines()
             state = MonitorState(symbol="BTCUSDT", storage_path=db_path)
             state.update_from_klines(klines)
+            state.wait_for_storage_writes()
 
             restored = MonitorState(symbol="BTCUSDT", storage_path=db_path)
             snapshot = restored.snapshot()
@@ -224,6 +225,30 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(webhook.calls[0][3], state.snapshot()["orders"][0]["reason"])
         self.assertEqual(webhook.calls[0][4], state.snapshot()["orders"][0]["stake"])
         self.assertTrue(state.snapshot()["webhook"]["enabled"])
+
+    def test_short_signal_is_observed_without_opening_order_or_webhook(self):
+        webhook = RecordingWebhook()
+        state = MonitorState(symbol="BTCUSDT", webhook=webhook)
+        signal = Signal(
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="A",
+            reason="量平价跌：MACD/RSI确认弱势延续",
+            price=100.0,
+            open_time=4_200_000,
+            score=-90.0,
+            threshold=70.0,
+            threshold_segment="WD-02",
+            session_allowed=True,
+        )
+
+        decision = state._maybe_open_order(signal, kline(70, 100.0, 100))
+        snapshot = state.snapshot()
+
+        self.assertEqual(decision, "SHORT_OBSERVE_ONLY")
+        self.assertEqual(snapshot["stats"]["total_orders"], 0)
+        self.assertEqual(webhook.calls, [])
+        self.assertIn("SHORT观察模式", snapshot["risk_pause"])
 
     def test_state_uses_configured_stake_terms_for_orders_and_webhook(self):
         klines = actionable_rebound_klines()

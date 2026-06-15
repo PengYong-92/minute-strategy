@@ -24,10 +24,11 @@ class BacktestConfig:
     enable_stake_progression: bool = False
     stake_progression_max_orders: int = 3
     enable_rolling_edge_guard: bool = False
-    rolling_edge_lookback_days: int = 90
-    rolling_edge_min_samples: int = 20
-    rolling_edge_min_win_rate: float = 0.5556
+    rolling_edge_lookback_days: int = 60
+    rolling_edge_min_samples: int = 5
+    rolling_edge_min_win_rate: float = 0.62
     rolling_edge_min_ev: float = 0.5
+    short_observe_only: bool = True
 
 
 def load_klines_from_zip(zip_path: str | Path) -> list[Kline]:
@@ -89,6 +90,10 @@ def run_backtest(
         if last_order_time is not None:
             if current.close_time - last_order_time < config.min_order_gap_minutes * 60_000:
                 continue
+
+        if config.short_observe_only and signal.direction == "SHORT":
+            rejected_signals["short_observe_only"] = rejected_signals.get("short_observe_only", 0) + 1
+            continue
 
         if config.enable_rolling_edge_guard and _rolling_edge_degraded(orders, signal, current, config):
             rejected_signals["rolling_edge_degraded"] = rejected_signals.get("rolling_edge_degraded", 0) + 1

@@ -75,6 +75,17 @@ class WebhookSignalProxyTest(unittest.TestCase):
         self.assertEqual(calls[0]["symbol"], "BTCUSDT")
         self.assertEqual(calls[0]["message"], opening_reason)
 
+    def test_status_redacts_import_token_from_last_payload(self):
+        def transport(url, body, timeout):
+            return None
+
+        proxy = WebhookSignalProxy(import_token="secret-token", transport=transport)
+
+        proxy.send_signal("BTCUSDT", signal("LONG", 10), "策略触发", amount=10.0)
+
+        self.assertEqual(proxy.last_payload["importToken"], "secret-token")
+        self.assertEqual(proxy.status()["last_payload"]["importToken"], "***")
+
 
 if __name__ == "__main__":
     unittest.main()
