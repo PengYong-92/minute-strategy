@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>事件合约量价预警监控</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <header>
+      <div class="header-copy">
+        <h1>事件合约量价预警监控</h1>
+        <p>币安现货 1分钟K线 · 仅10分钟事件合约 · LONG守卫 + WD-02/WD-23 SHORT扩展 · 滚动守卫 + 三单叠加</p>
+        <div class="strategy-badges" aria-label="当前策略">
+          <span>10分钟开单</span>
+          <span>LONG守卫</span>
+          <span>WD-02/WD-23 SHORT扩展</span>
+          <span>三单叠加</span>
+        </div>
+      </div>
+      <form id="symbol-form">
+        <input id="symbol-input" placeholder="BTCUSDT" autocomplete="off">
+        <button type="submit">切换币种</button>
+      </form>
+    </header>
+
+    <main class="layout">
+      <section class="cards summary-cards">
+        <article class="card primary-card">
+          <span>交易对</span>
+          <strong id="symbol">-</strong>
+        </article>
+        <article class="card primary-card">
+          <span>当前点位</span>
+          <strong id="price">-</strong>
+        </article>
+        <article class="card primary-card">
+          <span>总盈亏</span>
+          <strong id="balance">-</strong>
+        </article>
+        <article class="card primary-card">
+          <span>胜率</span>
+          <strong id="win-rate">-</strong>
+        </article>
+        <article class="card primary-card">
+          <span>总下单</span>
+          <strong id="total-orders">-</strong>
+        </article>
+        <article class="card primary-card">
+          <span>更新时间</span>
+          <strong id="updated-at">-</strong>
+        </article>
+      </section>
+
+      <section class="cards status-cards">
+        <article class="card highlight-card">
+          <span>恐惧贪婪</span>
+          <strong id="fear-greed">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>开单决策</span>
+          <strong id="order-decision">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>分数 / 阈值</span>
+          <strong id="score-threshold">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>时段画像</span>
+          <strong id="session-profile">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>SHORT扩展</span>
+          <strong id="short-extension-status">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>预热数据</span>
+          <strong id="warmup-status">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>行情状态</span>
+          <strong id="regime">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>风控暂停</span>
+          <strong id="risk-pause">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>滚动优势</span>
+          <strong id="rolling-edge-status">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>Webhook</span>
+          <strong id="webhook-status">-</strong>
+        </article>
+      </section>
+
+      <section class="panel analysis-panel">
+        <div class="panel-head">
+          <h2>最新K线分析</h2>
+          <span id="last-error"></span>
+        </div>
+        <div id="selected-signal" class="selected-signal"></div>
+      </section>
+
+      <section class="panel orders-panel">
+        <div class="panel-head orders-head">
+          <h2>模拟订单</h2>
+          <span id="orders-page-info">-</span>
+        </div>
+        <div id="order-filters" class="order-filters">
+          <label>
+            方向
+            <select id="direction-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            等级
+            <select id="level-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            时段
+            <select id="segment-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            胜负
+            <select id="result-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            每页
+            <select id="page-size-filter">
+              <option value="10">10条</option>
+              <option value="20" selected>20条</option>
+              <option value="30">30条</option>
+              <option value="50">50条</option>
+              <option value="100">100条</option>
+            </select>
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>方向</th>
+                <th>周期</th>
+                <th>等级</th>
+                <th>时段</th>
+                <th>时段胜率/EV</th>
+                <th>金额</th>
+                <th>入场点位</th>
+                <th>入场时间</th>
+                <th>到期点位</th>
+                <th>出场时间</th>
+                <th>状态</th>
+                <th>胜负</th>
+                <th>盈亏</th>
+                <th>原因</th>
+              </tr>
+            </thead>
+            <tbody id="orders"></tbody>
+          </table>
+        </div>
+        <div id="pagination" class="pagination">
+          <button id="prev-page" type="button">上一页</button>
+          <span id="page-status">-</span>
+          <button id="next-page" type="button">下一页</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
