@@ -43,6 +43,14 @@ LONG_REBOUND_MAX_BOLLINGER_POSITION = 0.35
 LONG_REBOUND_MAX_VOLUME_RATIO = 4.0
 LONG_REBOUND_MAX_MTF_10M_BIAS = 1.0
 NORMAL_DOWN_SHORT_EXTENSION_MIN_EDGE = 8.0
+EXTREME_DROP_RECLAIM_MIN_DROP_PCT = 0.012
+EXTREME_DROP_RECLAIM_MIN_VOLUME_RATIO = 1.5
+EXTREME_DROP_RECLAIM_MAX_RSI = 30.0
+EXTREME_DROP_RECLAIM_MAX_BOLLINGER_POSITION = 0.1
+FAILED_BREAKOUT_OBSERVATION_SEGMENTS = {
+    "failed_high_120m_short_observe": set(),
+    "failed_low_120m_long_observe": set(),
+}
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,28 @@ def choose_trade_signal(klines: Sequence[Kline], fear_greed: FearGreedContext | 
         analyze_volume_price(klines, timeframe_minutes=10, fear_greed=fear_greed),
     ]
     return choose_best_candidate(candidates)
+
+
+def analyze_observation_signals(
+    klines: Sequence[Kline],
+    timeframe_minutes: int = 10,
+    fear_greed: FearGreedContext | None = None,
+) -> list[Signal]:
+    """Generate research-only 10m candidates without changing live order decisions."""
+    primary = analyze_volume_price(klines, timeframe_minutes=timeframe_minutes, fear_greed=fear_greed)
+    if not klines or timeframe_minutes not in LIVE_TRADE_TIMEFRAMES:
+        return []
+
+    latest = klines[-1]
+    recent = list(klines[-timeframe_minutes:])
+    history = list(klines[:-timeframe_minutes]) or list(klines[:-1])
+    candidates: list[Signal] = []
+
+    failed_breakout = _failed_breakout_observation(primary, history, recent, latest)
+    if failed_breakout:
+        candidates.append(failed_breakout)
+
+    return _dedupe_observation_signals(candidates)
 
 
 def choose_best_candidate(candidates: Sequence[Signal]) -> Signal:
@@ -247,6 +277,16 @@ def analyze_volume_price(
         volume_ratio,
         mtf_10m_bias,
     )
+    strategy_family, strategy_tag, observe_direction, observe_only = _strategy_identity(
+        raw_direction,
+        reason,
+        price_change_pct,
+        volume_ratio,
+        technical.rsi,
+        technical.bollinger_position,
+        has_lower_reclaim,
+        has_upper_rejection,
+    )
     actionable = (
         raw_direction in {"LONG", "SHORT"}
         and session_allowed
@@ -321,7 +361,24 @@ def analyze_volume_price(
         session_ev,
         session_edge_min,
         regime,
-        _risk_flags(regime, regime_adjustment, final_reason),
+        _risk_flags(
+            regime,
+            regime_adjustment,
+            final_reason,
+            raw_direction=raw_direction,
+            threshold_segment=threshold_segment,
+            level=level,
+            price_position=price_position,
+            price_change_pct=price_change_pct,
+            rsi=technical.rsi,
+            mtf_10m_bias=mtf_10m_bias,
+            mtf_30m_bias=mtf_30m_bias,
+        ),
+        strategy_family,
+        strategy_tag,
+        observe_direction,
+        observe_only,
+        _profile_key(strategy_family, observe_direction or final_direction or raw_direction, threshold_segment),
     )
 
 
@@ -618,6 +675,192 @@ def _long_rebound_guard_reason(
     return "急跌反抽过滤：" + "，".join(failures) + "，不开单"
 
 
+def _drop_reclaim_mirror_short_observation(signal: Signal) -> Signal | None:
+    if signal.timeframe_minutes != 10:
+        return None
+    if "放量急跌反抽" not in signal.reason:
+        return None
+    if signal.price_position < 0.35:
+        return None
+    if signal.close_strength >= 0.35:
+        return None
+    if signal.rsi < 38.0 and signal.bollinger_position < 0.10:
+        return None
+
+    edge = max(0.0, abs(signal.score) - signal.threshold)
+    score = round(-(58.0 + min(edge, 24.0) + max(signal.rsi - 38.0, 0.0) * 0.35), 4)
+    threshold = 58.0
+    return _signal(
+        "WAIT",
+        10,
+        _level(abs(score), threshold),
+        (
+            "急跌反抽镜像SHORT观察：中位急跌收弱且未充分过冷，"
+            "用于验证亏损LONG形态是否可转为空单观察"
+        ),
+        signal.price,
+        signal.open_time,
+        signal.volume_ratio,
+        signal.price_position,
+        signal.price_change_pct,
+        score,
+        threshold,
+        signal.volume_threshold,
+        signal.move_threshold_pct,
+        signal.close_strength,
+        signal.analysis_window_minutes,
+        signal.threshold_window_minutes,
+        signal.threshold_segment,
+        signal.mtf_10m_bias,
+        signal.mtf_30m_bias,
+        signal.macd_histogram,
+        signal.macd_histogram_delta,
+        signal.rsi,
+        signal.bollinger_position,
+        signal.bollinger_width,
+        signal.indicator_profile_segment,
+        signal.indicator_profile_sample_size,
+        signal.rsi_lower_threshold,
+        signal.rsi_upper_threshold,
+        signal.bollinger_lower_threshold,
+        signal.bollinger_upper_threshold,
+        signal.macd_histogram_threshold,
+        signal.macd_delta_threshold,
+        signal.fear_greed_value,
+        signal.fear_greed_classification,
+        signal.fear_greed_trend,
+        signal.fear_greed_average_30d,
+        signal.fear_greed_adjustment,
+        False,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        signal.regime,
+        f"{signal.risk_flags},DROP_RECLAIM_MIRROR_SHORT_OBSERVE".strip(","),
+        "short_observe",
+        "drop_reclaim_mirror_short_observe",
+        "SHORT",
+        True,
+        _profile_key("short_observe", "SHORT", signal.threshold_segment),
+    )
+
+
+def _failed_breakout_observation(
+    primary: Signal,
+    history: Sequence[Kline],
+    recent: Sequence[Kline],
+    latest: Kline,
+) -> Signal | None:
+    if primary.timeframe_minutes != 10 or len(history) < 120 or not recent:
+        return None
+
+    lookback = history[-120:]
+    prior_high = max(item.high for item in lookback)
+    prior_low = min(item.low for item in lookback)
+    candle_strength = _candle_close_strength(latest)
+    recent_high = max(item.high for item in recent)
+    recent_low = min(item.low for item in recent)
+    score_abs = 0.0
+    direction = ""
+    reason = ""
+    family = ""
+    tag = ""
+
+    if (
+        recent_high > prior_high
+        and latest.close <= prior_high
+        and candle_strength <= 0.45
+        and primary.bollinger_position >= 0.50
+        and primary.macd_histogram < 0.0
+    ):
+        score_abs = 58.0 + min((recent_high / prior_high - 1.0) * 10_000, 28.0) if prior_high else 58.0
+        direction = "SHORT"
+        reason = "冲高失败SHORT观察：10分钟窗口突破120分钟高点后收回，BOLL>=0.5且MACD柱<0"
+        family = "failed_breakout"
+        tag = "failed_high_120m_short_observe"
+    elif (
+        recent_low < prior_low
+        and latest.close >= prior_low
+        and candle_strength >= 0.55
+        and primary.bollinger_position <= 0.35
+        and primary.close_strength <= 0.35
+    ):
+        score_abs = 58.0 + min((1.0 - recent_low / prior_low) * 10_000, 28.0) if prior_low else 58.0
+        direction = "LONG"
+        reason = "破低收回LONG观察：10分钟窗口跌破120分钟低点后收回，BOLL<=0.35且10m收盘偏弱"
+        family = "failed_breakout"
+        tag = "failed_low_120m_long_observe"
+    else:
+        return None
+
+    if primary.threshold_segment not in FAILED_BREAKOUT_OBSERVATION_SEGMENTS.get(tag, set()):
+        return None
+
+    score = -round(score_abs, 4) if direction == "SHORT" else round(score_abs, 4)
+    threshold = 58.0
+    return _signal(
+        "WAIT",
+        10,
+        _level(abs(score), threshold),
+        reason,
+        primary.price,
+        primary.open_time,
+        primary.volume_ratio,
+        primary.price_position,
+        primary.price_change_pct,
+        score,
+        threshold,
+        primary.volume_threshold,
+        primary.move_threshold_pct,
+        primary.close_strength,
+        primary.analysis_window_minutes,
+        primary.threshold_window_minutes,
+        primary.threshold_segment,
+        primary.mtf_10m_bias,
+        primary.mtf_30m_bias,
+        primary.macd_histogram,
+        primary.macd_histogram_delta,
+        primary.rsi,
+        primary.bollinger_position,
+        primary.bollinger_width,
+        primary.indicator_profile_segment,
+        primary.indicator_profile_sample_size,
+        primary.rsi_lower_threshold,
+        primary.rsi_upper_threshold,
+        primary.bollinger_lower_threshold,
+        primary.bollinger_upper_threshold,
+        primary.macd_histogram_threshold,
+        primary.macd_delta_threshold,
+        primary.fear_greed_value,
+        primary.fear_greed_classification,
+        primary.fear_greed_trend,
+        primary.fear_greed_average_30d,
+        primary.fear_greed_adjustment,
+        False,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        primary.regime,
+        f"{primary.risk_flags},FAILED_BREAKOUT_OBSERVE".strip(","),
+        family,
+        tag,
+        direction,
+        True,
+        _profile_key(family, direction, primary.threshold_segment),
+    )
+
+
+def _dedupe_observation_signals(signals: Sequence[Signal]) -> list[Signal]:
+    by_tag: dict[str, Signal] = {}
+    for signal in signals:
+        if signal.observe_direction not in {"LONG", "SHORT"}:
+            continue
+        by_tag.setdefault(signal.strategy_tag, signal)
+    return list(by_tag.values())
+
+
 def _volume_context(
     history: Sequence[Kline], recent: Sequence[Kline], window_size: int, threshold_segment: str
 ) -> tuple[float, float, float, float]:
@@ -752,7 +995,20 @@ def _regime_threshold_adjustment(
     return round(_clamp(adjustment, 0.0, 6.0), 1)
 
 
-def _risk_flags(regime: str, regime_adjustment: float, reason: str = "") -> str:
+def _risk_flags(
+    regime: str,
+    regime_adjustment: float,
+    reason: str = "",
+    *,
+    raw_direction: str = "",
+    threshold_segment: str = "",
+    level: str = "",
+    price_position: float = 0.5,
+    price_change_pct: float = 0.0,
+    rsi: float = 50.0,
+    mtf_10m_bias: float = 0.0,
+    mtf_30m_bias: float = 0.0,
+) -> str:
     flags = [regime]
     if regime_adjustment > 0:
         flags.append(f"regime_threshold+{regime_adjustment:.1f}")
@@ -766,7 +1022,110 @@ def _risk_flags(regime: str, regime_adjustment: float, reason: str = "") -> str:
         flags.append("REBOUND_LONG_GUARD")
     if "量平价跌SHORT扩展" in reason:
         flags.append("NORMAL_DOWN_SHORT_EXTENSION")
+    if "极端急跌反抽" in reason:
+        flags.append("EXTREME_DROP_RECLAIM")
+    flags.extend(
+        _sample_hint_flags(
+            raw_direction=raw_direction,
+            reason=reason,
+            threshold_segment=threshold_segment,
+            level=level,
+            price_position=price_position,
+            price_change_pct=price_change_pct,
+            rsi=rsi,
+            mtf_10m_bias=mtf_10m_bias,
+            mtf_30m_bias=mtf_30m_bias,
+        )
+    )
     return ",".join(flags)
+
+
+def _sample_hint_flags(
+    *,
+    raw_direction: str,
+    reason: str,
+    threshold_segment: str,
+    level: str,
+    price_position: float,
+    price_change_pct: float,
+    rsi: float,
+    mtf_10m_bias: float,
+    mtf_30m_bias: float,
+) -> list[str]:
+    if raw_direction != "LONG" or "放量急跌反抽" not in reason:
+        return []
+
+    flags = []
+    if level == "A":
+        flags.append("SAMPLE_WEAK_LEVEL_A_REBOUND")
+    if threshold_segment in {"WD-00", "WD-18", "WD-22"}:
+        flags.append(f"SAMPLE_WEAK_SEGMENT_{threshold_segment}")
+    if 0.35 <= price_position < 0.65:
+        flags.append("SAMPLE_WEAK_MID_POSITION_REBOUND")
+    if -0.002 <= price_change_pct < -0.001:
+        flags.append("SAMPLE_WEAK_SHALLOW_DROP_REBOUND")
+    if rsi >= 45.0:
+        flags.append("SAMPLE_WEAK_HIGH_RSI_REBOUND")
+    if mtf_10m_bias >= 0.0 and mtf_30m_bias >= 0.0:
+        flags.append("SAMPLE_WEAK_DUAL_UP_BIAS_REBOUND")
+    return flags
+
+
+def _strategy_identity(
+    raw_direction: str,
+    reason: str,
+    price_change_pct: float,
+    volume_ratio: float,
+    rsi: float,
+    bollinger_position: float,
+    has_lower_reclaim: bool,
+    has_upper_rejection: bool,
+) -> tuple[str, str, str, bool]:
+    if "放量急跌反抽" in reason:
+        if _is_extreme_drop_reclaim(price_change_pct, volume_ratio, rsi, bollinger_position, has_lower_reclaim):
+            return "drop_reclaim", "drop_reclaim_extreme_10m_120bps_v1.5_rsi30_boll0.1", "LONG", False
+        return "reversal", "drop_reclaim_live_guarded", "LONG", False
+    if "量平价跌SHORT扩展" in reason:
+        return "short_extension", "normal_down_short_extension_observe", "SHORT", True
+    if "趋势候选顺势SHORT" in reason:
+        return "short_observe", "broad_rebound_short_observe", "SHORT", True
+    if "高位放量下跌" in reason:
+        return "short_observe", "high_volume_drop_short_observe", "SHORT", True
+    if "高位放量滞涨" in reason:
+        return "rise_reject", "high_stall_observe", "SHORT", True
+    if "低位放量承接" in reason:
+        return "failed_low", "low_volume_reclaim_observe", "LONG", True
+    if "低位放量上涨" in reason:
+        return "low_rise_observe", "low_volume_rise_observe", "LONG", True
+    if "量增价升" in reason:
+        return "momentum_observe", "high_volume_rise_observe", "LONG", True
+    if "量平价跌" in reason:
+        return "short_observe", "normal_down_short_observe", "SHORT", True
+    if raw_direction == "SHORT" or has_upper_rejection:
+        return "short_observe", "generic_short_observe", "SHORT", True
+    if raw_direction == "LONG" or has_lower_reclaim:
+        return "long_observe", "generic_long_observe", "LONG", raw_direction != "LONG"
+    return "unknown", "unknown", raw_direction if raw_direction in {"LONG", "SHORT"} else "", False
+
+
+def _is_extreme_drop_reclaim(
+    price_change_pct: float,
+    volume_ratio: float,
+    rsi: float,
+    bollinger_position: float,
+    has_lower_reclaim: bool,
+) -> bool:
+    return (
+        price_change_pct <= -EXTREME_DROP_RECLAIM_MIN_DROP_PCT
+        and volume_ratio >= EXTREME_DROP_RECLAIM_MIN_VOLUME_RATIO
+        and has_lower_reclaim
+        and (rsi <= EXTREME_DROP_RECLAIM_MAX_RSI or bollinger_position <= EXTREME_DROP_RECLAIM_MAX_BOLLINGER_POSITION)
+    )
+
+
+def _profile_key(strategy_family: str, direction: str, threshold_segment: str) -> str:
+    clean_direction = direction if direction in {"LONG", "SHORT"} else "WAIT"
+    return f"{strategy_family}|{clean_direction}|{threshold_segment}"
 
 
 def _session_adjusted_threshold(
@@ -957,6 +1316,11 @@ def _signal(
     session_edge_min: float = 0.0,
     regime: str = "UNKNOWN",
     risk_flags: str = "",
+    strategy_family: str = "unknown",
+    strategy_tag: str = "unknown",
+    observe_direction: str = "",
+    observe_only: bool = False,
+    profile_key: str = "",
 ) -> Signal:
     return Signal(
         direction=direction,
@@ -1003,6 +1367,11 @@ def _signal(
         session_edge_min=round(session_edge_min, 1),
         regime=regime,
         risk_flags=risk_flags,
+        strategy_family=strategy_family,
+        strategy_tag=strategy_tag,
+        observe_direction=observe_direction,
+        observe_only=observe_only,
+        profile_key=profile_key,
     )
 
 

@@ -37,7 +37,7 @@ Build settled `ObservationSignal` rows that prove:
 - grouping includes strategy tag and direction;
 - overlapping rows are deduplicated per profile;
 - rows outside `[lookback_start, lookback_end)` are excluded;
-- minimum sample, 60% win rate, and 0.8U EV gates are enforced;
+- minimum sample, 60% win rate, and non-negative EV gates are enforced;
 - selected profiles are sorted by win rate, EV, sample count, then key and capped at four.
 
 - [ ] **Step 5: Implement `build_daily_selection`**
@@ -46,7 +46,7 @@ Return a serializable snapshot with version, status, schedule, config, all candi
 
 - [ ] **Step 6: Add hysteresis tests and implementation**
 
-An active profile below 56% or EV at/below zero increments `degraded_runs`; retain it once and remove it after the second consecutive degraded evaluation. A profile between exit and entry thresholds remains active without incrementing degradation.
+An active profile below 60% or EV at/below zero exits at that daily evaluation. All qualifying profiles are selected; there is no fixed count cap.
 
 - [ ] **Step 7: Run focused tests GREEN**
 
@@ -135,7 +135,7 @@ Expected: all tests pass.
 
 - [ ] **Step 1: Write failing parser and packaging tests**
 
-Require Chinese help text and environment/CLI options for enable switch, 7-day lookback, 30 samples, 60% entry win rate, 0.8U entry EV, 56% exit win rate, two degraded runs, four active profiles, 07:50 evaluation, and 08:00 activation.
+Require Chinese help text and environment/CLI options for enable switch, 7-day lookback, 20 samples, 60% entry win rate, 0U entry EV, 60% exit win rate, immediate degraded exit, unlimited active profiles, 07:50 evaluation, and 08:00 activation.
 
 - [ ] **Step 2: Implement arguments and pass config into state**
 

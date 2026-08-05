@@ -10,12 +10,14 @@
     <header>
       <div class="header-copy">
         <h1>事件合约量价预警监控</h1>
-        <p>币安现货 1分钟K线 · 仅10分钟事件合约 · LONG守卫 + WD-02/WD-23 SHORT扩展 · 滚动守卫 + 三单叠加</p>
+        <p id="strategy-summary">币安现货 1分钟K线 · 仅10分钟事件合约 · 每日画像选策</p>
         <div class="strategy-badges" aria-label="当前策略">
           <span>10分钟开单</span>
-          <span>LONG守卫</span>
-          <span>WD-02/WD-23 SHORT扩展</span>
-          <span>三单叠加</span>
+          <span id="daily-profile-schedule-badge">每日画像评估</span>
+          <span>LONG/SHORT动态选策</span>
+          <span>极端急跌反抽标签</span>
+          <span id="stake-progression-badge">两单叠加</span>
+          <span id="result-sequence-guard-badge">结算序列守卫</span>
         </div>
       </div>
       <form id="symbol-form">
@@ -74,6 +76,30 @@
           <strong id="short-extension-status">-</strong>
         </article>
         <article class="card highlight-card">
+          <span>策略标签</span>
+          <strong id="strategy-profile">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>观察画像</span>
+          <strong id="observation-profile">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>每日选策</span>
+          <strong id="daily-profile-status">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>订单弱点</span>
+          <strong id="order-profile">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>当前弱点</span>
+          <strong id="current-risk-profile">-</strong>
+        </article>
+        <article class="card highlight-card">
+          <span>画像守卫</span>
+          <strong id="profile-guard-shadow">-</strong>
+        </article>
+        <article class="card highlight-card">
           <span>预热数据</span>
           <strong id="warmup-status">-</strong>
         </article>
@@ -90,9 +116,21 @@
           <strong id="rolling-edge-status">-</strong>
         </article>
         <article class="card highlight-card">
+          <span>结算序列守卫</span>
+          <strong id="result-sequence-guard-status">-</strong>
+        </article>
+        <article class="card highlight-card">
           <span>Webhook</span>
           <strong id="webhook-status">-</strong>
         </article>
+      </section>
+
+      <section class="panel daily-profile-panel">
+        <div class="panel-head">
+          <h2>今日启用画像</h2>
+          <span id="daily-profile-window">-</span>
+        </div>
+        <div id="daily-profile-list" class="daily-profile-list"></div>
       </section>
 
       <section class="panel analysis-panel">
@@ -153,6 +191,7 @@
                 <th>周期</th>
                 <th>等级</th>
                 <th>时段</th>
+                <th>策略</th>
                 <th>时段胜率/EV</th>
                 <th>金额</th>
                 <th>入场点位</th>
@@ -172,6 +211,139 @@
           <button id="prev-page" type="button">上一页</button>
           <span id="page-status">-</span>
           <button id="next-page" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section class="panel order-profile-panel">
+        <div class="panel-head orders-head">
+          <h2>订单弱点画像</h2>
+          <span id="order-profile-info">-</span>
+        </div>
+        <div id="current-risk-hits" class="risk-hit-list"></div>
+        <div id="profile-guard-summary" class="profile-guard-summary"></div>
+        <div id="profile-guard-shadow-summary" class="profile-guard-summary"></div>
+        <div id="profile-guard-policy-summary" class="profile-guard-summary"></div>
+        <div id="profile-guard-compare-summary" class="profile-guard-summary"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>风险画像</th>
+                <th>订单</th>
+                <th>胜率</th>
+                <th>EV</th>
+                <th>盈亏</th>
+              </tr>
+            </thead>
+            <tbody id="order-profile-summary"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel observation-summary-panel">
+        <div class="panel-head orders-head">
+          <h2>观察画像统计</h2>
+          <span id="observation-summary-info">-</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>策略族</th>
+                <th>策略标签</th>
+                <th>方向</th>
+                <th>周期</th>
+                <th>时段</th>
+                <th>信号</th>
+                <th>结算</th>
+                <th>胜率</th>
+                <th>EV</th>
+                <th>盈亏</th>
+                <th>结论</th>
+                <th>每日选择</th>
+                <th>置信度</th>
+                <th>最近信号</th>
+              </tr>
+            </thead>
+            <tbody id="observation-summary"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel observations-panel">
+        <div class="panel-head orders-head">
+          <h2>观察信号</h2>
+          <span id="observations-page-info">-</span>
+        </div>
+        <div id="observation-filters" class="order-filters observation-filters">
+          <label>
+            方向
+            <select id="obs-direction-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            策略族
+            <select id="obs-family-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            策略标签
+            <select id="obs-tag-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            时段
+            <select id="obs-segment-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            胜负
+            <select id="obs-result-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            每页
+            <select id="obs-page-size-filter">
+              <option value="10">10条</option>
+              <option value="20" selected>20条</option>
+              <option value="30">30条</option>
+              <option value="50">50条</option>
+              <option value="100">100条</option>
+            </select>
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>方向</th>
+                <th>策略族</th>
+                <th>策略标签</th>
+                <th>周期</th>
+                <th>时段</th>
+                <th>边际</th>
+                <th>入场点位</th>
+                <th>入场时间</th>
+                <th>到期点位</th>
+                <th>出场时间</th>
+                <th>状态</th>
+                <th>胜负</th>
+                <th>盈亏</th>
+                <th>原因</th>
+              </tr>
+            </thead>
+            <tbody id="observations"></tbody>
+          </table>
+        </div>
+        <div id="observation-pagination" class="pagination">
+          <button id="obs-prev-page" type="button">上一页</button>
+          <span id="obs-page-status">-</span>
+          <button id="obs-next-page" type="button">下一页</button>
         </div>
       </section>
     </main>

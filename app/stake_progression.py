@@ -193,6 +193,33 @@ class TwoStageStakeProgression:
         self._active_second_order_ids.add(normalized_order_id)
         return self._second_terms(credit.source_order_id), credit
 
+    def rollback_assignment(
+        self,
+        order_id: int,
+    ) -> StakeProgressionCredit | None:
+        normalized_order_id = self._positive_order_id(order_id)
+        if normalized_order_id not in self._active_second_order_ids:
+            return None
+
+        credit = next(
+            (
+                item
+                for item in self.credits
+                if item.version == TWO_STAGE_VERSION
+                and item.status == "CONSUMED"
+                and item.consumed_order_id == normalized_order_id
+            ),
+            None,
+        )
+        if credit is None:
+            return None
+
+        self._active_second_order_ids.remove(normalized_order_id)
+        credit.status = "PENDING"
+        credit.consumed_order_id = None
+        credit.consumed_at = None
+        return credit
+
     def settle(
         self,
         order_id: int,
@@ -394,8 +421,6 @@ class TwoStageStakeProgression:
                 )
             restored_ids = set()
 
-        if restored_ids is not None and len(restored_ids) > self.max_active:
-            raise ValueError("active second-stage orders must not exceed max_active")
         if restored_ids:
             consumed_order_ids = {
                 credit.consumed_order_id

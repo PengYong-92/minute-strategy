@@ -1,24 +1,47 @@
 import threading
 import time
+from bisect import bisect_left
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
-from app.models import FearGreedContext, Kline, Signal
+from app.daily_profile_selector import (
+    DailyProfileSelectorConfig,
+    build_daily_selection,
+    profile_key as daily_profile_key,
+    selection_window,
+)
+from app.models import FearGreedContext, Kline, ObservationSignal, Signal
 from app.order_policy import OrderPolicy
+from app.order_profile import profile_guard_shadow, summarize_order_samples_with_guard
+from app.result_sequence_guard import (
+    ResultSequenceGuardConfig,
+    ResultSequenceGuardDecision,
+    evaluate_result_sequence_guard,
+)
 from app.rolling_edge import RollingEdgeConfig, RollingEdgeSnapshot, rolling_edge_snapshot, should_degrade
-from app.simulator import AccountSimulator
-from app.storage import SQLiteMonitorStore, page_order_list
-from app.strategy import LIVE_TRADE_TIMEFRAMES, analyze_volume_price, choose_trade_signal
+from app.simulator import AccountSimulator, SettlementEvent
+from app.stake_progression import TWO_STAGE_VERSION
+from app.storage import SQLiteMonitorStore, page_observation_list, page_order_list, summarize_observations
+from app.strategy import (
+    LIVE_TRADE_TIMEFRAMES,
+    analyze_observation_signals,
+    analyze_volume_price,
+    choose_trade_signal,
+    max_trade_edge_for,
+)
+
+
+DAY_MS = 86_400_000
 
 
 class MonitorState:
     def __init__(
         self,
         symbol: str,
-        max_open_orders: int = 1,
-        min_order_gap_ms: int = 10 * 60_000,
+        max_open_orders: int = 5,
+        min_order_gap_ms: int = 2 * 60_000,
         fear_greed_provider=None,
         max_klines: int = 140_000,
         storage_path: str | Path | None = None,
@@ -26,47 +49,96 @@ class MonitorState:
         webhook=None,
         rolling_edge_config: RollingEdgeConfig | None = None,
         enable_rolling_edge_guard: bool = True,
+        result_sequence_guard_config: ResultSequenceGuardConfig | None = None,
         stake: float = 10.0,
         win_return: float = 18.0,
         enable_stake_progression: bool = True,
-        stake_progression_max_orders: int = 3,
+        stake_progression_max_orders: int = 2,
+        stake_progression_base_only_segments: Sequence[str] | None = None,
+        stake_progression_max_active: int = 1,
+        enable_profile_guard: bool = False,
+        profile_guard_min_history: int = 15,
+        profile_guard_min_group_size: int = 2,
+        enable_observation_profile_promotion: bool = True,
+        observation_profile_lookback_days: int = 7,
+        observation_profile_min_samples: int = 12,
+        observation_profile_min_win_rate: float = 0.72,
+        observation_profile_min_ev: float = 4.0,
+        observation_profile_min_edge: float = 10.0,
+        live_short_segments: Sequence[str] | None = ("WD-02", "WD-23"),
+        enable_daily_profile_selector: bool = False,
+        daily_profile_selector_config: DailyProfileSelectorConfig | None = None,
+        now_ms=None,
     ):
         self.symbol = symbol.upper()
-        self.order_policy = OrderPolicy(max_open_orders=max_open_orders, min_order_gap_ms=min_order_gap_ms)
+        self.order_policy = OrderPolicy(
+            max_open_orders=max(1, int(max_open_orders)),
+            min_order_gap_ms=max(0, int(min_order_gap_ms)),
+        )
         self.max_klines = max_klines
         self.storage = storage or (SQLiteMonitorStore(storage_path) if storage_path else None)
         self.webhook = webhook
         self.rolling_edge_config = rolling_edge_config or RollingEdgeConfig()
         self.enable_rolling_edge_guard = enable_rolling_edge_guard
+        self.result_sequence_guard_config = (
+            result_sequence_guard_config or ResultSequenceGuardConfig()
+        ).normalized()
         self.stake = stake
         self.win_return = win_return
         self.enable_stake_progression = enable_stake_progression
-        self.stake_progression_max_orders = stake_progression_max_orders
-        self.webhook_error: str | None = None
-        restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
-        self.simulator = AccountSimulator(
-            stake=self.stake,
-            win_return=self.win_return,
-            orders=restored_orders,
-            enable_stake_progression=self.enable_stake_progression,
-            stake_progression_max_orders=self.stake_progression_max_orders,
+        self.stake_progression_max_orders = 2
+        self.stake_progression_max_active = max(1, int(stake_progression_max_active))
+        self._ignored_stake_progression_max_orders = stake_progression_max_orders
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self.stake_progression_base_only_segments = tuple(
+            item.strip().upper()
+            for item in (stake_progression_base_only_segments or [])
+            if str(item).strip()
         )
+        self.enable_profile_guard = enable_profile_guard
+        self.profile_guard_min_history = max(1, int(profile_guard_min_history))
+        self.profile_guard_min_group_size = max(1, int(profile_guard_min_group_size))
+        self.enable_observation_profile_promotion = enable_observation_profile_promotion
+        self.observation_profile_lookback_days = max(1, int(observation_profile_lookback_days))
+        self.observation_profile_min_samples = max(1, int(observation_profile_min_samples))
+        self.observation_profile_min_win_rate = min(1.0, max(0.0, float(observation_profile_min_win_rate)))
+        self.observation_profile_min_ev = float(observation_profile_min_ev)
+        self.observation_profile_min_edge = max(0.0, float(observation_profile_min_edge))
+        self.live_short_segments = {
+            str(item).strip().upper()
+            for item in (live_short_segments or [])
+            if str(item).strip()
+        }
+        self.enable_daily_profile_selector = bool(enable_daily_profile_selector)
+        self.daily_profile_selector_config = (
+            daily_profile_selector_config or DailyProfileSelectorConfig()
+        ).normalized()
+        self.webhook_error: str | None = None
+        self.stake_progression_recovery_warning = ""
+        self._storage_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor-storage")
+        self._storage_futures: list[Future] = []
+        restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
+        restored_observations = self._load_restored_observations()
+        self.simulator = self._build_simulator(self.symbol, restored_orders)
+        self._pending_settlement_events: list[tuple[str, SettlementEvent]] = []
         self.fear_greed_provider = fear_greed_provider
         self.fear_greed = None
         self.warmup: dict | None = None
         self.risk_pause: str = ""
         self.klines: list[Kline] = []
         self.signals: list[Signal] = []
+        self.observations: list[ObservationSignal] = list(reversed(restored_observations))
+        self.daily_profile_selection = self._load_latest_daily_profile_selection()
+        self.active_daily_profile_selection: dict | None = None
         self.selected_signal: Signal | None = None
         self.order_decision = "WAIT"
         self.rolling_edge: dict = self._empty_rolling_edge()
+        self.result_sequence_guard: dict = self._empty_result_sequence_guard()
         self.last_error: str | None = None
         self.updated_at_ms = 0
         self._opened_signal_keys: set[tuple[int, int, str]] = set()
         self._last_order_opened_at: int | None = None
-        self._lock = threading.Lock()
-        self._storage_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor-storage")
-        self._storage_futures: list[Future] = []
+        self._lock = threading.RLock()
 
     def update_from_klines(self, klines: Sequence[Kline]) -> None:
         if not klines:
@@ -82,24 +154,48 @@ class MonitorState:
             analyze_volume_price(merged_klines, timeframe_minutes=minutes, fear_greed=fear_greed)
             for minutes in LIVE_TRADE_TIMEFRAMES
         ]
+        observation_signals = [
+            signal
+            for minutes in LIVE_TRADE_TIMEFRAMES
+            for signal in analyze_observation_signals(merged_klines, timeframe_minutes=minutes, fear_greed=fear_greed)
+        ]
         selected_signal = choose_trade_signal(merged_klines, fear_greed=fear_greed)
 
         with self._lock:
             self.fear_greed = fear_greed
             self.klines = merged_klines
             self.signals = new_signals
-            self.selected_signal = selected_signal
             self.updated_at_ms = int(time.time() * 1000)
             self.last_error = None
-            settled_orders = self.simulator.settle_expired_orders(latest.close_time, latest.close)
+            if self.storage and not self._flush_pending_settlement_events():
+                return
+            settlement_events = self.simulator.settle_expired_order_events_from_klines(merged_klines)
             if self.storage:
-                for order in settled_orders:
-                    self._save_order(order)
-                    self._update_order_entry_snapshot_settlement(order)
+                self._pending_settlement_events.extend(
+                    (self.symbol, event) for event in settlement_events
+                )
+                if not self._flush_pending_settlement_events():
+                    return
+            settled_observations = self._settle_observations(latest.close_time, latest.close, merged_klines)
+            if self.storage:
+                for observation in settled_observations:
+                    self._save_observation(observation)
 
-            self.order_decision = self._maybe_open_order(selected_signal, latest)
+            self._refresh_daily_profile_selection(latest.close_time)
+            selected_signal, daily_profile_required = self._select_daily_profile_signal(
+                selected_signal,
+                observation_signals,
+                latest.close_time,
+            )
+            self.selected_signal = selected_signal
+            self.order_decision = self._maybe_open_order(
+                selected_signal,
+                latest,
+                daily_profile_required=daily_profile_required,
+            )
+            self._record_observation_candidates(observation_signals, latest)
             if self.storage:
-                self._save_signal(selected_signal, self.order_decision, self.updated_at_ms)
+                self._save_signal(self.selected_signal or selected_signal, self.order_decision, self.updated_at_ms)
 
     def seed_klines(self, klines: Sequence[Kline], warmup_report: dict | None = None) -> None:
         with self._lock:
@@ -128,26 +224,81 @@ class MonitorState:
         with self._lock:
             self.symbol = symbol.upper()
             restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
-            self.simulator = AccountSimulator(
-                stake=self.stake,
-                win_return=self.win_return,
-                orders=restored_orders,
-                enable_stake_progression=self.enable_stake_progression,
-                stake_progression_max_orders=self.stake_progression_max_orders,
-            )
+            restored_observations = self._load_restored_observations()
+            self.simulator = self._build_simulator(self.symbol, restored_orders)
             self.fear_greed = None
             self.warmup = None
             self.risk_pause = ""
             self.webhook_error = None
             self.klines = []
             self.signals = []
+            self.observations = list(reversed(restored_observations))
+            self.daily_profile_selection = self._load_latest_daily_profile_selection()
+            self.active_daily_profile_selection = None
             self.selected_signal = None
             self.order_decision = "WAIT"
             self.rolling_edge = self._empty_rolling_edge()
+            self.result_sequence_guard = self._empty_result_sequence_guard()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self._opened_signal_keys.clear()
             self._last_order_opened_at = None
+
+    def _build_simulator(self, symbol: str, restored_orders) -> AccountSimulator:
+        activated_at = 0
+        credits = []
+        prepare = getattr(self.storage, "prepare_stake_progression", None) if self.storage else None
+        load_credits = (
+            getattr(self.storage, "load_stake_progression_credits", None)
+            if self.storage
+            else None
+        )
+        if prepare is not None and load_credits is not None:
+            activated_at = prepare(
+                symbol,
+                TWO_STAGE_VERSION,
+                self.enable_stake_progression,
+                self._now_ms(),
+            )
+            credits = load_credits(symbol, TWO_STAGE_VERSION)
+
+        pending_ids = {
+            credit.credit_id for credit in credits if credit.status == "PENDING"
+        }
+        active_second_order_ids = {
+            order.id
+            for order in restored_orders
+            if order.status == "OPEN"
+            and order.stake_progression_step == 2
+            and order.stake_progression_version == TWO_STAGE_VERSION
+        }
+        simulator = AccountSimulator(
+            stake=self.stake,
+            win_return=self.win_return,
+            orders=restored_orders,
+            enable_stake_progression=self.enable_stake_progression,
+            stake_progression_max_orders=2,
+            stake_progression_base_only_segments=self.stake_progression_base_only_segments,
+            stake_progression_max_active=self.stake_progression_max_active,
+            max_open_orders=self.order_policy.max_open_orders,
+            stake_progression_activated_at=activated_at,
+            stake_progression_credits=credits,
+            active_second_order_ids=active_second_order_ids,
+        )
+        cancelled = [
+            credit
+            for credit in simulator.stake_progression.credits
+            if credit.credit_id in pending_ids and credit.status == "CANCELLED"
+        ]
+        self.stake_progression_recovery_warning = ""
+        if cancelled:
+            reason = "滚单已禁用" if not self.enable_stake_progression else "并发上限缩小"
+            self.stake_progression_recovery_warning = (
+                f"恢复时取消 {len(cancelled)} 个待用资格：{reason}"
+            )
+            for credit in cancelled:
+                self.storage.save_stake_progression_credit(symbol, replace(credit))
+        return simulator
 
     def _merge_klines(self, existing: Sequence[Kline], incoming: Sequence[Kline]) -> list[Kline]:
         merged = {item.open_time: item for item in existing}
@@ -158,8 +309,34 @@ class MonitorState:
             return ordered[-self.max_klines :]
         return ordered
 
-    def _maybe_open_order(self, signal: Signal, latest: Kline) -> str:
+    def _maybe_open_order(
+        self,
+        signal: Signal,
+        latest: Kline,
+        *,
+        daily_profile_required: bool = False,
+    ) -> str:
+        with self._lock:
+            return self._maybe_open_order_locked(
+                signal,
+                latest,
+                daily_profile_required=daily_profile_required,
+            )
+
+    def _maybe_open_order_locked(
+        self,
+        signal: Signal,
+        latest: Kline,
+        *,
+        daily_profile_required: bool = False,
+    ) -> str:
         self.rolling_edge = self._rolling_edge_status(signal, latest)
+        should_observe = self._should_record_observation(signal)
+        if daily_profile_required and not signal.daily_profile_selected:
+            if should_observe:
+                self._record_observation(signal, latest, "DAILY_PROFILE_NOT_SELECTED")
+            self.risk_pause = "当前信号未进入今日启用画像，仅记录观察"
+            return "DAILY_PROFILE_NOT_SELECTED"
         gate = self.order_policy.evaluate(
             signal,
             latest,
@@ -168,28 +345,471 @@ class MonitorState:
             self._opened_signal_keys,
         )
         self.risk_pause = gate.risk_pause
+        promoted_signal = None
+        if not self.enable_daily_profile_selector:
+            promoted_signal = self._observation_profile_promoted_signal(signal, latest, gate.code)
+        if promoted_signal is not None:
+            signal = promoted_signal
+            self.selected_signal = signal
+            self.rolling_edge = self._rolling_edge_status(signal, latest)
+            gate = self.order_policy.evaluate(
+                signal,
+                latest,
+                self.simulator.orders,
+                self._last_order_opened_at,
+                self._opened_signal_keys,
+            )
+            self.risk_pause = gate.risk_pause
         if not gate.open_allowed:
+            if should_observe:
+                self._record_observation(signal, latest, gate.code)
             return gate.code
-        if signal.direction == "SHORT":
+        if (
+            signal.direction == "SHORT"
+            and not signal.daily_profile_selected
+            and signal.threshold_segment.upper() not in self.live_short_segments
+        ):
+            self._record_observation(signal, latest, "SHORT_OBSERVE_ONLY")
             self.risk_pause = "SHORT观察模式：仅记录信号，不开模拟订单，不推送Webhook"
             return "SHORT_OBSERVE_ONLY"
+        if signal.direction == "SHORT" and signal.observe_only:
+            signal = replace(
+                signal,
+                observe_only=False,
+                reason=f"{signal.reason}；{signal.threshold_segment} SHORT小口放行",
+            )
+            self.selected_signal = signal
+        sequence_decision = evaluate_result_sequence_guard(
+            self.simulator.orders,
+            current_time=latest.close_time,
+            direction=signal.direction,
+            config=self.result_sequence_guard_config,
+        )
+        self.result_sequence_guard = self._result_sequence_guard_to_dict(sequence_decision)
+        if sequence_decision.blocked:
+            if should_observe:
+                self._record_observation(signal, latest, "RESULT_SEQUENCE_GUARD_BLOCKED")
+            self.risk_pause = sequence_decision.reason
+            return "RESULT_SEQUENCE_GUARD_BLOCKED"
         if self.enable_rolling_edge_guard and self.rolling_edge["status"] == "DEGRADED":
+            if should_observe:
+                self._record_observation(signal, latest, "ROLLING_EDGE_BLOCKED")
             self.risk_pause = (
                 f"滚动优势衰退 {self.rolling_edge['key']} "
                 f"样本 {self.rolling_edge['sample_size']} 胜率 {self.rolling_edge['win_rate']:.2%} "
                 f"EV {self.rolling_edge['ev']:.2f}，暂停开单"
             )
             return "ROLLING_EDGE_BLOCKED"
+        profile_guard = self._profile_guard_shadow(signal)
+        if self.enable_profile_guard and profile_guard["status"] == "WOULD_BLOCK":
+            if should_observe:
+                self._record_observation(signal, latest, "PROFILE_GUARD_BLOCKED")
+            self.risk_pause = (
+                "画像守卫命中 "
+                f"{'/'.join(profile_guard['hit_keys'])}，"
+                f"H{profile_guard['min_history']}/G{profile_guard['min_group_size']}，暂停开单"
+            )
+            return "PROFILE_GUARD_BLOCKED"
 
-        order = self.simulator.open_order(signal, entry_price=latest.close, opened_at=latest.close_time)
+        order, consumed_credit = self.simulator.open_order_with_credit(
+            signal,
+            entry_price=latest.close,
+            opened_at=latest.close_time,
+        )
         if self.storage:
-            self._save_order(order)
+            try:
+                self.storage.save_open_order_with_credit(
+                    replace(order),
+                    self.symbol,
+                    replace(consumed_credit) if consumed_credit is not None else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - 原子写失败必须回滚内存开单。
+                self.simulator.rollback_open_order(order.id)
+                self._set_storage_error("开单持久化失败", exc)
+                return "STORAGE_ERROR"
+        if should_observe:
+            self._record_observation(signal, latest, "OPENED")
+        if self.storage:
             self._save_order_entry_snapshot(order, signal, latest)
         self._send_webhook(signal, order)
         if gate.signal_key:
             self._opened_signal_keys.add(gate.signal_key)
         self._last_order_opened_at = latest.close_time
         return gate.code
+
+    def _flush_pending_settlement_events(self) -> bool:
+        while self._pending_settlement_events:
+            symbol, event = self._pending_settlement_events[0]
+            try:
+                self.storage.save_settled_order_with_credit(
+                    replace(event.order),
+                    symbol,
+                    replace(event.progression_credit)
+                    if event.progression_credit is not None
+                    else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - 保留事件供下次更新幂等重试。
+                self._set_storage_error("结算持久化失败", exc)
+                return False
+            self._pending_settlement_events.pop(0)
+            self._update_order_entry_snapshot_settlement(event.order, symbol=symbol)
+        return True
+
+    def _set_storage_error(self, operation: str, error: Exception) -> None:
+        self.last_error = f"{operation}: {error}"
+        self.risk_pause = "存储写入失败，暂停开单"
+        self.order_decision = "STORAGE_ERROR"
+
+    def _refresh_daily_profile_selection(self, current_time: int) -> None:
+        if not self.enable_daily_profile_selector:
+            return
+        config = self.daily_profile_selector_config
+        target = selection_window(
+            current_time,
+            lookback_days=config.lookback_days,
+            evaluation_hour=config.evaluation_hour,
+            evaluation_minute=config.evaluation_minute,
+            activation_hour=config.activation_hour,
+            activation_minute=config.activation_minute,
+        )
+        latest = self.daily_profile_selection
+        if latest is None or int(latest.get("effective_from", -1)) != target["effective_from"]:
+            previous = latest or self._load_latest_daily_profile_selection()
+            try:
+                next_snapshot = build_daily_selection(
+                    self.observations,
+                    current_time,
+                    config=config,
+                    previous_snapshot=previous,
+                )
+                saver = getattr(self.storage, "save_daily_profile_selection", None) if self.storage else None
+                if saver is not None:
+                    saver(self.symbol, next_snapshot)
+            except Exception as exc:  # noqa: BLE001 - 评估失败必须沿用上次有效画像。
+                next_snapshot = self._daily_profile_fallback(previous, target, current_time, str(exc))
+            self.daily_profile_selection = next_snapshot
+            latest = next_snapshot
+
+        if self._selection_is_effective(latest, current_time):
+            self.active_daily_profile_selection = latest
+            return
+        if self._selection_is_effective(self.active_daily_profile_selection, current_time):
+            return
+        loader = getattr(self.storage, "load_daily_profile_selection", None) if self.storage else None
+        active = loader(self.symbol, current_time) if loader is not None else None
+        self.active_daily_profile_selection = active
+
+    def _select_daily_profile_signal(
+        self,
+        primary_signal: Signal,
+        observation_candidates: Sequence[Signal],
+        current_time: int,
+    ) -> tuple[Signal, bool]:
+        if not self.enable_daily_profile_selector:
+            return primary_signal, False
+        snapshot = self.active_daily_profile_selection
+        if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
+            return primary_signal, False
+
+        signals = [primary_signal, *observation_candidates]
+        for selected_profile in snapshot.get("selected_profiles", []):
+            selected_key = str(selected_profile.get("key", ""))
+            for signal in signals:
+                direction = (signal.observe_direction or signal.direction).upper()
+                if direction not in {"LONG", "SHORT"}:
+                    continue
+                key = daily_profile_key(
+                    signal.timeframe_minutes,
+                    signal.strategy_family,
+                    signal.strategy_tag,
+                    direction,
+                    signal.threshold_segment,
+                )
+                if key != selected_key:
+                    continue
+                return (
+                    replace(
+                        signal,
+                        direction=direction,
+                        reason=(
+                            f"{signal.reason}；每日画像启用 {snapshot.get('version', '')} "
+                            f"N{selected_profile.get('sample_size', 0)} "
+                            f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
+                            f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
+                        ),
+                        session_allowed=True,
+                        session_sample_size=int(selected_profile.get("sample_size", 0)),
+                        session_win_rate=float(selected_profile.get("win_rate", 0.0)),
+                        session_ev=float(selected_profile.get("ev", 0.0)),
+                        observe_only=False,
+                        profile_key=key,
+                        daily_profile_selected=True,
+                        daily_profile_version=str(snapshot.get("version", "")),
+                    ),
+                    True,
+                )
+        return primary_signal, True
+
+    def _load_latest_daily_profile_selection(self) -> dict | None:
+        if not self.storage:
+            return None
+        loader = getattr(self.storage, "load_latest_daily_profile_selection", None)
+        return loader(self.symbol) if loader is not None else None
+
+    @staticmethod
+    def _selection_is_effective(snapshot: dict | None, current_time: int) -> bool:
+        if not snapshot:
+            return False
+        return (
+            snapshot.get("status") in {"READY", "FALLBACK"}
+            and int(snapshot.get("effective_from", 0)) <= current_time
+            and int(snapshot.get("effective_until", 0)) > current_time
+        )
+
+    @staticmethod
+    def _daily_profile_fallback(
+        previous: dict | None,
+        target: dict,
+        evaluated_at: int,
+        error: str,
+    ) -> dict:
+        if not previous:
+            return {
+                "version": "DPS-FAILED",
+                "status": "FAILED",
+                "evaluated_at": evaluated_at,
+                **target,
+                "selected_profiles": [],
+                "selected_count": 0,
+                "reason": f"每日画像评估失败，沿用静态基准：{error}",
+                "error": error,
+            }
+        fallback = dict(previous)
+        fallback.update(
+            {
+                "version": f"{previous.get('version', 'DPS')}-FALLBACK",
+                "status": "FALLBACK",
+                "evaluated_at": evaluated_at,
+                **target,
+                "reason": f"每日画像评估失败，沿用上一版本：{error}",
+                "error": error,
+            }
+        )
+        return fallback
+
+    def _observation_profile_promoted_signal(
+        self,
+        signal: Signal,
+        latest: Kline,
+        gate_code: str,
+    ) -> Signal | None:
+        if not self.enable_observation_profile_promotion or gate_code != "SESSION_BLOCKED":
+            return None
+        direction = (signal.observe_direction or signal.direction).upper()
+        if direction not in {"LONG", "SHORT"}:
+            return None
+        if direction == "SHORT" and signal.threshold_segment.upper() not in self.live_short_segments:
+            return None
+
+        edge = abs(signal.score) - signal.threshold
+        if edge < self.observation_profile_min_edge:
+            return None
+        if edge >= max_trade_edge_for(signal.timeframe_minutes, signal.threshold_segment, direction):
+            return None
+
+        profile = self._observation_profile(signal, direction, latest.close_time)
+        if (
+            profile["sample_size"] < self.observation_profile_min_samples
+            or profile["win_rate"] < self.observation_profile_min_win_rate
+            or profile["ev"] < self.observation_profile_min_ev
+        ):
+            return None
+
+        profile_key = f"{signal.strategy_family}|{direction}|{signal.threshold_segment}"
+        return replace(
+            signal,
+            direction=direction,
+            reason=(
+                f"{signal.reason}；观察画像放行 "
+                f"{profile_key} N{profile['sample_size']} "
+                f"胜率{profile['win_rate']:.2%} EV{profile['ev']:.2f}U"
+            ),
+            session_allowed=True,
+            session_sample_size=profile["sample_size"],
+            session_win_rate=profile["win_rate"],
+            session_ev=profile["ev"],
+            session_edge_min=self.observation_profile_min_edge,
+            observe_only=False,
+            profile_key=profile_key,
+        )
+
+    def _observation_profile(self, signal: Signal, direction: str, current_time: int) -> dict:
+        cutoff = current_time - self.observation_profile_lookback_days * DAY_MS
+        matching = [
+            item
+            for item in self.observations
+            if item.status == "SETTLED"
+            and item.result in {"WIN", "LOSS"}
+            and item.settled_at is not None
+            and item.settled_at <= current_time
+            and item.opened_at >= cutoff
+            and item.timeframe_minutes == signal.timeframe_minutes
+            and item.strategy_family == signal.strategy_family
+            and item.direction == direction
+            and item.threshold_segment == signal.threshold_segment
+        ]
+        samples = []
+        next_independent_at = 0
+        for item in sorted(matching, key=lambda row: (row.opened_at, row.observation_key)):
+            if item.opened_at < next_independent_at:
+                continue
+            samples.append(item)
+            next_independent_at = item.expires_at
+        wins = sum(1 for item in samples if item.result == "WIN")
+        pnl = sum(float(item.pnl) for item in samples)
+        sample_size = len(samples)
+        return {
+            "sample_size": sample_size,
+            "wins": wins,
+            "losses": sample_size - wins,
+            "win_rate": wins / sample_size if sample_size else 0.0,
+            "pnl": round(pnl, 4),
+            "ev": round(pnl / sample_size, 4) if sample_size else 0.0,
+        }
+
+    def _should_record_observation(self, signal: Signal) -> bool:
+        if signal.observe_only or signal.observe_direction:
+            return True
+        return signal.direction == "SHORT"
+
+    def _record_observation(self, signal: Signal, latest: Kline, decision: str) -> None:
+        direction = signal.observe_direction or signal.direction
+        if direction not in {"LONG", "SHORT"}:
+            return
+        key = self._observation_key(signal, direction)
+        existing = next((item for item in self.observations if item.observation_key == key), None)
+        if existing is not None:
+            if decision and existing.source_decision != decision:
+                existing.source_decision = decision
+                if self.storage:
+                    self._save_observation(existing)
+            return
+        overlapping = next(
+            (
+                item
+                for item in self.observations
+                if item.status == "OPEN"
+                and item.timeframe_minutes == signal.timeframe_minutes
+                and item.strategy_family == signal.strategy_family
+                and item.direction == direction
+                and item.threshold_segment == signal.threshold_segment
+                and latest.close_time < item.expires_at
+            ),
+            None,
+        )
+        if overlapping is not None:
+            return
+        observation = ObservationSignal(
+            observation_key=key,
+            strategy_family=signal.strategy_family,
+            strategy_tag=signal.strategy_tag,
+            direction=direction,
+            timeframe_minutes=signal.timeframe_minutes,
+            level=signal.level,
+            reason=signal.reason,
+            entry_price=latest.close,
+            opened_at=latest.close_time,
+            expires_at=latest.close_time + signal.timeframe_minutes * 60_000,
+            threshold_segment=signal.threshold_segment,
+            score=signal.score,
+            threshold=signal.threshold,
+            edge=round(abs(signal.score) - signal.threshold, 4),
+            regime=signal.regime,
+            source_decision=decision,
+            observe_only=True,
+        )
+        self.observations.append(observation)
+        if self.storage:
+            self._save_observation(observation)
+
+    def _record_observation_candidates(self, signals: Sequence[Signal], latest: Kline) -> None:
+        for signal in signals:
+            if self._has_open_research_observation(signal, latest):
+                continue
+            self._record_observation(signal, latest, "RESEARCH_OBSERVE")
+
+    def _has_open_research_observation(self, signal: Signal, latest: Kline) -> bool:
+        direction = signal.observe_direction or signal.direction
+        if direction not in {"LONG", "SHORT"}:
+            return False
+        for observation in self.observations:
+            if observation.status != "OPEN":
+                continue
+            if observation.strategy_tag != signal.strategy_tag or observation.direction != direction:
+                continue
+            if latest.close_time < observation.expires_at:
+                return True
+        return False
+
+    def _settle_observations(
+        self,
+        current_time: int,
+        current_price: float,
+        klines: Sequence[Kline] | None = None,
+    ) -> list[ObservationSignal]:
+        ordered_klines = sorted(klines or [], key=lambda item: item.close_time)
+        close_times = [item.close_time for item in ordered_klines]
+        settled = []
+        for observation in self.observations:
+            if observation.status != "OPEN" or current_time < observation.expires_at:
+                continue
+            settled_at = current_time
+            exit_price = current_price
+            if ordered_klines:
+                index = bisect_left(close_times, observation.expires_at)
+                if index >= len(ordered_klines):
+                    continue
+                exit_kline = ordered_klines[index]
+                if exit_kline.close_time != observation.expires_at:
+                    continue
+                settled_at = exit_kline.close_time
+                exit_price = exit_kline.close
+            elif current_time != observation.expires_at:
+                continue
+            won = self._is_observation_win(observation.direction, observation.entry_price, exit_price)
+            observation.status = "SETTLED"
+            observation.result = "WIN" if won else "LOSS"
+            observation.exit_price = exit_price
+            observation.settled_at = settled_at
+            observation.pnl = 8.0 if won else -10.0
+            settled.append(observation)
+        return settled
+
+    def _load_restored_observations(self) -> list[ObservationSignal]:
+        if not self.storage:
+            return []
+        profile_loader = getattr(self.storage, "load_observations_for_profile", None)
+        if profile_loader is not None:
+            return profile_loader(
+                self.symbol,
+                lookback_days=max(
+                    self.observation_profile_lookback_days,
+                    self.daily_profile_selector_config.lookback_days,
+                ),
+            )
+        return self.storage.load_observations(self.symbol)
+
+    @staticmethod
+    def _is_observation_win(direction: str, entry_price: float, current_price: float) -> bool:
+        if direction == "LONG":
+            return current_price > entry_price
+        if direction == "SHORT":
+            return current_price < entry_price
+        return False
+
+    @staticmethod
+    def _observation_key(signal: Signal, direction: str) -> str:
+        return f"{signal.open_time}|{signal.timeframe_minutes}|{direction}|{signal.strategy_tag}"
 
     def _rolling_edge_status(self, signal: Signal, latest: Kline) -> dict:
         current_item = {
@@ -198,7 +818,22 @@ class MonitorState:
             "threshold_segment": signal.threshold_segment,
             "reason": signal.reason,
         }
-        snapshot = rolling_edge_snapshot(self.simulator.orders, current_item, self.rolling_edge_config)
+        edge_orders = self.simulator.orders
+        if self.enable_stake_progression:
+            edge_orders = [
+                {
+                    **order.to_dict(),
+                    "pnl": (
+                        round(self.simulator.win_return - self.simulator.stake, 4)
+                        if order.result == "WIN"
+                        else round(-self.simulator.stake, 4)
+                        if order.result == "LOSS"
+                        else order.pnl
+                    ),
+                }
+                for order in self.simulator.orders
+            ]
+        snapshot = rolling_edge_snapshot(edge_orders, current_item, self.rolling_edge_config)
         degraded = should_degrade(snapshot, self.rolling_edge_config)
         return self._rolling_edge_to_dict(snapshot, degraded, self.enable_rolling_edge_guard)
 
@@ -218,23 +853,84 @@ class MonitorState:
 
     def _save_order(self, order) -> None:
         order_snapshot = replace(order)
-        self._submit_storage_write(lambda: self.storage.save_order(order_snapshot, self.symbol))
+        symbol = self.symbol
+        self._submit_storage_write(
+            lambda order=order_snapshot, symbol=symbol: self.storage.save_order(order, symbol)
+        )
+
+    def _save_stake_progression_credit(self, credit, *, symbol: str | None = None) -> None:
+        credit_snapshot = replace(credit)
+        captured_symbol = (symbol or self.symbol).upper()
+        self._submit_storage_write(
+            lambda credit=credit_snapshot, symbol=captured_symbol: (
+                self.storage.save_stake_progression_credit(symbol, credit)
+            )
+        )
+
+    def _save_settled_order_with_credit(self, order, credit) -> None:
+        order_snapshot = replace(order)
+        credit_snapshot = replace(credit) if credit is not None else None
+        symbol = self.symbol
+        self._submit_storage_write(
+            lambda order=order_snapshot, symbol=symbol, credit=credit_snapshot: (
+                self.storage.save_settled_order_with_credit(order, symbol, credit)
+            )
+        )
+
+    def _save_open_order_with_credit(self, order, credit) -> None:
+        order_snapshot = replace(order)
+        credit_snapshot = replace(credit) if credit is not None else None
+        symbol = self.symbol
+        self._submit_storage_write(
+            lambda order=order_snapshot, symbol=symbol, credit=credit_snapshot: (
+                self.storage.save_open_order_with_credit(order, symbol, credit)
+            )
+        )
 
     def _save_signal(self, signal: Signal, decision: str, created_at_ms: int) -> None:
-        self._submit_storage_write(lambda: self.storage.save_signal(self.symbol, signal, decision, created_at_ms))
+        symbol = self.symbol
+        self._submit_storage_write(
+            lambda signal=signal, symbol=symbol, decision=decision, created_at_ms=created_at_ms: (
+                self.storage.save_signal(symbol, signal, decision, created_at_ms)
+            )
+        )
+
+    def _save_observation(self, observation: ObservationSignal) -> None:
+        observation_snapshot = replace(observation)
+        symbol = self.symbol
+        self._submit_storage_write(
+            lambda observation=observation_snapshot, symbol=symbol: (
+                self.storage.save_observation(observation, symbol)
+            )
+        )
 
     def _save_order_entry_snapshot(self, order, signal: Signal, latest: Kline) -> None:
         order_snapshot = replace(order)
+        symbol = self.symbol
+        profile_guard = self._profile_guard_shadow(signal)
+        profile_guard_default = self._profile_guard_default_shadow(signal)
+        progression = self._stake_progression_status()
         entry_snapshot = {
             "signal": signal.to_dict(),
             "rolling_edge": dict(self.rolling_edge),
+            "result_sequence_guard": dict(self.result_sequence_guard),
+            "profile_guard_shadow": profile_guard,
+            "profile_guard_default_shadow": profile_guard_default,
+            "profile_guard_selection_policy": profile_guard.get("selection_policy") or {},
+            "profile_guard_config": self._profile_guard_config(),
+            "observation_profile_promotion": self._observation_profile_promotion_config(),
+            "daily_profile_selection": self._daily_profile_selector_status(),
             "latest_kline": latest.to_dict(),
             "fear_greed": self.fear_greed.to_dict() if self.fear_greed else None,
+            "stake_progression": progression,
+            "stake_progression_source_order_id": order_snapshot.stake_progression_source_order_id,
+            "stake_progression_version": order_snapshot.stake_progression_version,
             "stake_config": {
                 "stake": self.stake,
                 "win_return": self.win_return,
                 "stake_progression_enabled": self.enable_stake_progression,
-                "stake_progression_max_orders": self.stake_progression_max_orders,
+                "stake_progression_max_orders": 2,
+                "stake_progression_max_active": progression["max_active"],
             },
             "order_policy": {
                 "max_open_orders": self.order_policy.max_open_orders,
@@ -242,14 +938,102 @@ class MonitorState:
             },
         }
         self._submit_storage_write(
-            lambda: self.storage.save_order_entry_snapshot(order_snapshot, self.symbol, entry_snapshot)
+            lambda order=order_snapshot, symbol=symbol, snapshot=entry_snapshot: (
+                self.storage.save_order_entry_snapshot(order, symbol, snapshot)
+            )
         )
 
-    def _update_order_entry_snapshot_settlement(self, order) -> None:
-        order_snapshot = replace(order)
-        self._submit_storage_write(
-            lambda: self.storage.update_order_entry_snapshot_settlement(order_snapshot, self.symbol)
+    def _profile_guard_shadow(self, signal: Signal) -> dict:
+        return profile_guard_shadow(
+            signal,
+            self._profile_guard_shadow_source(),
+            use_recommended=True,
         )
+
+    def _profile_guard_default_shadow(self, signal: Signal) -> dict:
+        return profile_guard_shadow(
+            signal,
+            self._profile_guard_shadow_source(),
+            use_recommended=False,
+        )
+
+    def _profile_guard_shadow_source(self) -> dict | None:
+        if not self.storage or not hasattr(self.storage, "order_profile_summary"):
+            return None
+        try:
+            return self.storage.order_profile_summary(
+                self.symbol,
+                profile_guard_min_history=self.profile_guard_min_history,
+                profile_guard_min_group_size=self.profile_guard_min_group_size,
+            )
+        except Exception:  # noqa: BLE001 - 画像守卫仅用于复盘，不能影响开单保存。
+            return None
+
+    def _profile_guard_config(self) -> dict:
+        return {
+            "enabled": self.enable_profile_guard,
+            "observe_only": not self.enable_profile_guard,
+            "min_history": self.profile_guard_min_history,
+            "min_group_size": self.profile_guard_min_group_size,
+        }
+
+    def _observation_profile_promotion_config(self) -> dict:
+        return {
+            "enabled": self.enable_observation_profile_promotion,
+            "lookback_days": self.observation_profile_lookback_days,
+            "min_samples": self.observation_profile_min_samples,
+            "min_win_rate": self.observation_profile_min_win_rate,
+            "min_ev": self.observation_profile_min_ev,
+            "min_edge": self.observation_profile_min_edge,
+            "live_short_segments": sorted(self.live_short_segments),
+        }
+
+    def _daily_profile_selector_status(self) -> dict:
+        latest = self.daily_profile_selection or {}
+        active = self.active_daily_profile_selection or {}
+        latest_is_active = bool(
+            latest
+            and active
+            and latest.get("version") == active.get("version")
+            and latest.get("effective_from") == active.get("effective_from")
+        )
+        return {
+            "enabled": self.enable_daily_profile_selector,
+            "status": latest.get("status", "DISABLED" if not self.enable_daily_profile_selector else "PENDING"),
+            "version": active.get("version") or latest.get("version", ""),
+            "evaluated_at": latest.get("evaluated_at"),
+            "lookback_start": latest.get("lookback_start"),
+            "lookback_end": latest.get("lookback_end"),
+            "effective_from": active.get("effective_from") or latest.get("effective_from"),
+            "effective_until": active.get("effective_until") or latest.get("effective_until"),
+            "selected_profiles": list(active.get("selected_profiles", [])),
+            "selected_count": len(active.get("selected_profiles", [])),
+            "pending_profiles": list(latest.get("selected_profiles", [])) if not latest_is_active else [],
+            "reason": latest.get("reason", ""),
+            "error": latest.get("error"),
+            "config": {
+                **self.daily_profile_selector_config.__dict__,
+            },
+        }
+
+    def _update_order_entry_snapshot_settlement(
+        self,
+        order,
+        *,
+        symbol: str | None = None,
+    ) -> None:
+        order_snapshot = replace(order)
+        captured_symbol = (symbol or self.symbol).upper()
+        self._submit_storage_write(
+            lambda order=order_snapshot, symbol=captured_symbol: (
+                self.storage.update_order_entry_snapshot_settlement(order, symbol)
+            )
+        )
+
+    def _stake_progression_status(self) -> dict:
+        status = self.simulator.stake_progression.status()
+        status["recovery_warning"] = self.stake_progression_recovery_warning
+        return status
 
     def _submit_storage_write(self, func) -> None:
         if not self.storage:
@@ -273,6 +1057,41 @@ class MonitorState:
             "win_rate": 0.0,
             "pnl": 0.0,
             "ev": 0.0,
+        }
+
+    def _empty_result_sequence_guard(self) -> dict:
+        config = self.result_sequence_guard_config
+        return {
+            "enabled": config.enabled,
+            "status": "NORMAL" if config.enabled else "DISABLED",
+            "scope": config.scope,
+            "loss_streak": config.loss_streak,
+            "cooldown_minutes": config.cooldown_minutes,
+            "direction": "",
+            "consecutive_losses": 0,
+            "last_settled_at": 0,
+            "pause_until": 0,
+            "paused_directions": [],
+            "reason": "",
+        }
+
+    def _result_sequence_guard_to_dict(
+        self,
+        decision: ResultSequenceGuardDecision,
+    ) -> dict:
+        config = self.result_sequence_guard_config
+        return {
+            "enabled": config.enabled,
+            "status": "PAUSED" if decision.blocked else "NORMAL" if config.enabled else "DISABLED",
+            "scope": config.scope,
+            "loss_streak": config.loss_streak,
+            "cooldown_minutes": config.cooldown_minutes,
+            "direction": decision.direction,
+            "consecutive_losses": decision.consecutive_losses,
+            "last_settled_at": decision.last_settled_at,
+            "pause_until": decision.pause_until,
+            "paused_directions": [decision.direction] if decision.blocked else [],
+            "reason": decision.reason,
         }
 
     def _send_webhook(self, signal: Signal, order=None) -> None:
@@ -299,6 +1118,15 @@ class MonitorState:
                 "warmup": self.warmup,
                 "risk_pause": self.risk_pause,
                 "rolling_edge": self.rolling_edge,
+                "result_sequence_guard": self.result_sequence_guard,
+                "profile_guard": self._profile_guard_config(),
+                "observation_profile_promotion": self._observation_profile_promotion_config(),
+                "daily_profile_selection": self._daily_profile_selector_status(),
+                "stake_progression": self._stake_progression_status(),
+                "order_policy": {
+                    "max_open_orders": self.order_policy.max_open_orders,
+                    "min_order_gap_ms": self.order_policy.min_order_gap_ms,
+                },
                 "webhook": self.webhook.status() if self.webhook else {"enabled": False, "last_error": None},
                 "webhook_error": self.webhook_error,
                 "signals": [signal.to_dict() for signal in self.signals],
@@ -306,6 +1134,7 @@ class MonitorState:
                 "order_decision": self.order_decision,
                 "stats": self.simulator.stats(),
                 "orders": [order.to_dict() for order in orders],
+                "observations": [observation.to_dict() for observation in reversed(self.observations[-50:])],
                 "kline_count": len(self.klines),
             }
 
@@ -339,4 +1168,123 @@ class MonitorState:
             level=level,
             segment=segment,
             result=result,
+        )
+
+    def page_observations(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        direction: str = "",
+        family: str = "",
+        tag: str = "",
+        segment: str = "",
+        result: str = "",
+    ) -> dict:
+        if self.storage:
+            return self.storage.page_observations(
+                self.symbol,
+                page=page,
+                page_size=page_size,
+                direction=direction,
+                family=family,
+                tag=tag,
+                segment=segment,
+                result=result,
+            )
+        with self._lock:
+            observations = list(self.observations)
+        return page_observation_list(
+            observations,
+            page=page,
+            page_size=page_size,
+            direction=direction,
+            family=family,
+            tag=tag,
+            segment=segment,
+            result=result,
+        )
+
+    def observation_summary(self) -> dict:
+        if self.storage:
+            summary = self.storage.observation_summary(self.symbol)
+        else:
+            with self._lock:
+                observations = list(self.observations)
+            summary = summarize_observations(observations)
+        summary["promotion_config"] = self._observation_profile_promotion_config()
+        latest = self.daily_profile_selection or {}
+        active_keys = {
+            item.get("key")
+            for item in (self.active_daily_profile_selection or {}).get("selected_profiles", [])
+        }
+        candidates = {item.get("key"): item for item in latest.get("candidates", [])}
+        for group in summary.get("groups", []):
+            key = daily_profile_key(
+                group.get("timeframe_minutes", 0),
+                group.get("strategy_family", "unknown"),
+                group.get("strategy_tag", "unknown"),
+                group.get("direction", ""),
+                group.get("threshold_segment", "GLOBAL"),
+            )
+            candidate = candidates.get(key, {})
+            group["daily_profile_key"] = key
+            group["selection_state"] = "ACTIVE" if key in active_keys else candidate.get(
+                "selection_state",
+                "NOT_EVALUATED",
+            )
+            group["selection_reason"] = (
+                "今日主程序已启用"
+                if key in active_keys
+                else candidate.get("selection_reason", "尚未进入每日评估窗口")
+            )
+        summary["daily_profile_selection"] = self._daily_profile_selector_status()
+        return summary
+
+    def order_profile_summary(self) -> dict:
+        if self.storage:
+            return self.storage.order_profile_summary(
+                self.symbol,
+                profile_guard_min_history=self.profile_guard_min_history,
+                profile_guard_min_group_size=self.profile_guard_min_group_size,
+            )
+        with self._lock:
+            orders = list(self.simulator.orders)
+        samples = [
+            {
+                "order_id": order.id,
+                "direction": order.direction,
+                "timeframe_minutes": order.timeframe_minutes,
+                "threshold_segment": order.threshold_segment,
+                "result": order.result,
+                "pnl": order.pnl,
+                "stake": order.stake,
+                "stake_progression_step": order.stake_progression_step,
+                "opened_at": order.opened_at,
+                "settled_at": order.settled_at,
+                "level": order.level,
+                "reason": order.reason,
+                "reason_setup": order.reason.split("：", 1)[0].split(";", 1)[0].strip() or "UNKNOWN",
+                "score": order.score,
+                "threshold": order.threshold,
+                "edge": round(abs(order.score) - order.threshold, 4),
+                "volume_ratio": 0.0,
+                "volume_threshold": 0.0,
+                "price_change_pct": 0.0,
+                "price_position": 0.0,
+                "rsi": 0.0,
+                "bollinger_position": 0.0,
+                "mtf_10m_bias": 0.0,
+                "mtf_30m_bias": 0.0,
+                "regime": order.regime,
+                "risk_flags": "",
+                "fear_greed_trend": "",
+            }
+            for order in orders
+            if order.status == "SETTLED"
+        ]
+        return summarize_order_samples_with_guard(
+            samples,
+            profile_guard_min_history=self.profile_guard_min_history,
+            profile_guard_min_group_size=self.profile_guard_min_group_size,
         )

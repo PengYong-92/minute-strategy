@@ -1,7 +1,17 @@
 import unittest
 
 from app.models import FearGreedContext, Kline, Signal
-from app.strategy import _session_edge, analyze_volume_price, choose_trade_signal, choose_best_candidate, max_trade_edge_for
+from app.strategy import (
+    _failed_breakout_observation,
+    _is_extreme_drop_reclaim,
+    _risk_flags,
+    _session_edge,
+    analyze_observation_signals,
+    analyze_volume_price,
+    choose_best_candidate,
+    choose_trade_signal,
+    max_trade_edge_for,
+)
 
 
 def kline(idx, close, volume, open_price=None, high=None, low=None):
@@ -241,6 +251,50 @@ class StrategyTest(unittest.TestCase):
         self.assertGreater(signal.mtf_10m_bias, 0.0)
         self.assertGreater(signal.mtf_30m_bias, 0.0)
 
+    def test_observation_signals_do_not_include_unproven_drop_reclaim_mirror_short(self):
+        klines = fear_falling_mid_drop_klines(drop_total=1.0)
+        primary = analyze_volume_price(
+            klines,
+            timeframe_minutes=10,
+            fear_greed=FearGreedContext(value=28, classification="Fear", average_30d=37.0, trend="falling"),
+        )
+        observations = analyze_observation_signals(
+            klines,
+            timeframe_minutes=10,
+            fear_greed=FearGreedContext(value=28, classification="Fear", average_30d=37.0, trend="falling"),
+        )
+
+        self.assertEqual(primary.direction, "WAIT")
+        self.assertIn("极端过热", primary.reason)
+        self.assertFalse(any(item.strategy_tag == "drop_reclaim_mirror_short_observe" for item in observations))
+
+    def test_failed_breakout_observation_stays_disabled_after_walk_forward_review(self):
+        history = [kline(820 + i, 100.0, 100, high=105.0, low=95.0) for i in range(120)]
+        recent = [
+            kline(940 + i, 100.0, 100, open_price=100.0, high=104.0, low=99.0)
+            for i in range(9)
+        ]
+        latest = kline(949, 104.8, 100, open_price=105.2, high=106.0, low=104.5)
+        recent.append(latest)
+        primary = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="A",
+            reason="观察",
+            price=latest.close,
+            open_time=latest.open_time,
+            threshold_segment="WD-12",
+            score=0.0,
+            threshold=0.0,
+            bollinger_position=0.55,
+            macd_histogram=-1.0,
+            close_strength=0.2,
+        )
+
+        observation = _failed_breakout_observation(primary, history, recent, latest)
+
+        self.assertIsNone(observation)
+
     def test_extreme_fear_raises_short_threshold(self):
         klines = []
         for offset in range(260):
@@ -372,8 +426,62 @@ class StrategyTest(unittest.TestCase):
 
         self.assertEqual(signal.direction, "LONG")
         self.assertIn("放量急跌反抽", signal.reason)
+        self.assertIn(signal.strategy_family, {"reversal", "drop_reclaim"})
+        self.assertTrue(signal.strategy_tag.startswith("drop_reclaim"))
+        self.assertEqual(signal.observe_direction, "LONG")
         self.assertGreaterEqual(signal.price_position, 0.0)
         self.assertLessEqual(signal.price_position, 1.0)
+
+    def test_extreme_drop_reclaim_identity_uses_brainstorm_replay_thresholds(self):
+        self.assertTrue(
+            _is_extreme_drop_reclaim(
+                price_change_pct=-0.012,
+                volume_ratio=1.5,
+                rsi=30.0,
+                bollinger_position=0.5,
+                has_lower_reclaim=True,
+            )
+        )
+        self.assertTrue(
+            _is_extreme_drop_reclaim(
+                price_change_pct=-0.012,
+                volume_ratio=1.5,
+                rsi=45.0,
+                bollinger_position=0.1,
+                has_lower_reclaim=True,
+            )
+        )
+        self.assertFalse(
+            _is_extreme_drop_reclaim(
+                price_change_pct=-0.011,
+                volume_ratio=1.5,
+                rsi=30.0,
+                bollinger_position=0.1,
+                has_lower_reclaim=True,
+            )
+        )
+
+    def test_database_sample_hint_flags_are_observability_only(self):
+        flags = _risk_flags(
+            "FEAR_FALLING",
+            0.0,
+            "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多",
+            raw_direction="LONG",
+            threshold_segment="WD-18",
+            level="A",
+            price_position=0.45,
+            price_change_pct=-0.0015,
+            rsi=46.0,
+            mtf_10m_bias=0.1,
+            mtf_30m_bias=0.2,
+        )
+
+        self.assertIn("SAMPLE_WEAK_LEVEL_A_REBOUND", flags)
+        self.assertIn("SAMPLE_WEAK_SEGMENT_WD-18", flags)
+        self.assertIn("SAMPLE_WEAK_MID_POSITION_REBOUND", flags)
+        self.assertIn("SAMPLE_WEAK_SHALLOW_DROP_REBOUND", flags)
+        self.assertIn("SAMPLE_WEAK_HIGH_RSI_REBOUND", flags)
+        self.assertIn("SAMPLE_WEAK_DUAL_UP_BIAS_REBOUND", flags)
 
     def test_rebound_long_guard_blocks_recently_bad_live_pattern(self):
         from app import strategy

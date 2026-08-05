@@ -245,10 +245,10 @@ def decide_current_state(
     ordered = sorted((item for item in klines if item.close_time <= current_time), key=lambda item: item.close_time)
     if not ordered or ordered[-1].close_time != current_time:
         return _wait_decision("LATEST_KLINE_MISSING")
-    features = _state_features(ordered, len(ordered) - 1, resolved)
+    features = state_features_at_index(ordered, len(ordered) - 1, config=resolved)
     if features is None:
         return _wait_decision("INSUFFICIENT_KLINES")
-    key = _state_key(features, resolved.key_mode)
+    key = features["state_key"]
     selected = selected_states.get(key)
     if selected is None:
         return {**_wait_decision("STATE_NOT_SELECTED"), "state_key": key, "features": features}
@@ -263,6 +263,76 @@ def decide_current_state(
         "wilson95_lower": float(selected.get("wilson95_lower", 0.0)),
         "ev": float(selected.get("ev", 0.0)),
     }
+
+
+def state_features_at_index(
+    ordered_klines: Sequence[Kline],
+    index: int,
+    *,
+    config: MarketSequenceConfig | None = None,
+) -> dict | None:
+    resolved = (config or MarketSequenceConfig()).normalized()
+    if index < 0 or index >= len(ordered_klines):
+        return None
+    features = _state_features(ordered_klines, index, resolved)
+    if features is None:
+        return None
+    return {**features, "state_key": _state_key(features, resolved.key_mode)}
+
+
+def build_state_feature_series(
+    ordered_klines: Sequence[Kline],
+    *,
+    config: MarketSequenceConfig | None = None,
+) -> list[dict | None]:
+    resolved = (config or MarketSequenceConfig()).normalized()
+    count = len(ordered_klines)
+    prefix_volume = [0.0]
+    for item in ordered_klines:
+        prefix_volume.append(prefix_volume[-1] + item.volume)
+
+    moves: list[str | None] = [None] * count
+    run_lengths = [0] * count
+    for index in range(resolved.horizon_minutes, count):
+        move = _move(
+            ordered_klines[index - resolved.horizon_minutes].close,
+            ordered_klines[index].close,
+        )
+        if move == "FLAT":
+            move = "DOWN"
+        moves[index] = move
+        previous = index - resolved.run_step_minutes
+        if previous >= resolved.horizon_minutes and moves[previous] == move:
+            run_lengths[index] = run_lengths[previous] + 1
+        else:
+            run_lengths[index] = 1
+
+    series: list[dict | None] = [None] * count
+    for index in range(max(resolved.horizon_minutes, 14), count):
+        recent_start = max(0, index - resolved.horizon_minutes + 1)
+        recent_volume = prefix_volume[index + 1] - prefix_volume[recent_start]
+        prior_volumes = []
+        cursor = index - resolved.horizon_minutes
+        for _ in range(24):
+            start = cursor - resolved.horizon_minutes + 1
+            if start < 0:
+                break
+            prior_volumes.append(prefix_volume[cursor + 1] - prefix_volume[start])
+            cursor -= resolved.horizon_minutes
+        baseline_volume = median(prior_volumes) if prior_volumes else recent_volume
+        volume_ratio = recent_volume / baseline_volume if baseline_volume > 0 else 1.0
+        rsi = _rsi(ordered_klines, index)
+        features = {
+            "move": moves[index],
+            "run_length": run_lengths[index],
+            "run_bucket": run_bucket(run_lengths[index]),
+            "volume_ratio": round(volume_ratio, 6),
+            "volume_bucket": "LOW" if volume_ratio < 0.8 else "HIGH" if volume_ratio > 1.3 else "NORMAL",
+            "rsi": round(rsi, 4),
+            "rsi_bucket": "LOW" if rsi < 35.0 else "HIGH" if rsi > 70.0 else "NORMAL",
+        }
+        series[index] = {**features, "state_key": _state_key(features, resolved.key_mode)}
+    return series
 
 
 def _state_features(

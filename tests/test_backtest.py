@@ -3,8 +3,9 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from app.backtest import BacktestConfig, load_klines_from_zip, load_klines_from_zips, run_backtest
+from app.backtest import BacktestConfig, _risk_stats, load_klines_from_zip, load_klines_from_zips, main, run_backtest
 from app.models import Kline, Signal
+from app.stake_progression import TWO_STAGE_VERSION
 
 
 def kline(idx, close):
@@ -27,6 +28,8 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(config.rolling_edge_min_samples, 5)
         self.assertEqual(config.rolling_edge_min_win_rate, 0.62)
         self.assertEqual(config.rolling_edge_min_ev, 0.5)
+        self.assertEqual(config.stake_progression_max_orders, 2)
+        self.assertEqual(config.stake_progression_max_active, 1)
         self.assertTrue(config.short_observe_only)
 
     def test_run_backtest_observes_short_without_opening_order_by_default(self):
@@ -119,7 +122,7 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(result["risk"]["max_drawdown"], 0.0)
         self.assertIn("1970-01", result["by_month"])
 
-    def test_run_backtest_compounds_stake_after_wins_up_to_three_orders(self):
+    def test_run_backtest_uses_strict_two_stage_progression(self):
         klines = [kline(i, 100 + i) for i in range(12)]
         signal_points = {2, 4, 6, 8}
 
@@ -150,11 +153,12 @@ class BacktestTest(unittest.TestCase):
             signal_provider=signal_provider,
         )
 
-        self.assertEqual([order["stake"] for order in result["orders"]], [10.0, 18.0, 32.4, 10.0])
-        self.assertEqual([order["win_return"] for order in result["orders"]], [18.0, 32.4, 58.32, 18.0])
-        self.assertEqual([order["stake_progression_step"] for order in result["orders"]], [1, 2, 3, 1])
-        self.assertEqual([order["pnl"] for order in result["orders"]], [8.0, 14.4, 25.92, 8.0])
-        self.assertEqual(result["stats"]["balance"], 56.32)
+        self.assertEqual([order["stake"] for order in result["orders"]], [10.0, 18.0, 10.0, 18.0])
+        self.assertEqual([order["win_return"] for order in result["orders"]], [18.0, 32.4, 18.0, 32.4])
+        self.assertEqual([order["stake_progression_step"] for order in result["orders"]], [1, 2, 1, 2])
+        self.assertEqual([order["pnl"] for order in result["orders"]], [8.0, 14.4, 8.0, 14.4])
+        self.assertEqual(result["stats"]["balance"], 44.8)
+        self.assertTrue(all(order["stake_progression_version"] == TWO_STAGE_VERSION for order in result["orders"]))
 
     def test_run_backtest_compounded_stake_resets_after_loss(self):
         klines = [
@@ -193,10 +197,175 @@ class BacktestTest(unittest.TestCase):
             signal_provider=signal_provider,
         )
 
-        self.assertEqual([order["stake"] for order in result["orders"]], [10.0, 18.0, 32.4, 10.0])
+        self.assertEqual([order["stake"] for order in result["orders"]], [10.0, 18.0, 10.0, 10.0])
         self.assertEqual([order["result"] for order in result["orders"]], ["WIN", "WIN", "LOSS", "WIN"])
-        self.assertEqual([order["pnl"] for order in result["orders"]], [8.0, 14.4, -32.4, 8.0])
-        self.assertEqual(result["stats"]["balance"], -2.0)
+        self.assertEqual([order["pnl"] for order in result["orders"]], [8.0, 14.4, -10.0, 8.0])
+        self.assertEqual(result["stats"]["balance"], 20.4)
+
+    def test_run_backtest_settles_all_due_orders_before_same_millisecond_entry(self):
+        klines = [kline(i, 100 + i) for i in range(12)]
+        signal_points = {2, 3, 5, 7}
+
+        def signal_provider(history):
+            if len(history) in signal_points:
+                return Signal(
+                    direction="LONG",
+                    timeframe_minutes=3,
+                    level="A",
+                    reason="synthetic",
+                    price=history[-1].close,
+                    open_time=history[-1].open_time,
+                    score=80,
+                    threshold=70,
+                    threshold_segment="WD-12",
+                    session_allowed=True,
+                )
+            return Signal("WAIT", 3, "B", "wait", history[-1].close, history[-1].open_time)
+
+        result = run_backtest(
+            klines,
+            BacktestConfig(
+                warmup_minutes=2,
+                max_open_orders=5,
+                min_order_gap_minutes=0,
+                enable_stake_progression=True,
+                stake_progression_max_active=1,
+            ),
+            signal_provider=signal_provider,
+        )
+
+        orders = result["orders"]
+        self.assertEqual([order["stake"] for order in orders], [10.0, 10.0, 18.0, 10.0])
+        self.assertEqual([order["stake_progression_step"] for order in orders], [1, 1, 2, 1])
+        self.assertEqual(orders[2]["entry_time"], orders[0]["exit_time"])
+        self.assertEqual(orders[2]["stake_progression_source_order_id"], orders[0]["id"])
+        self.assertTrue(all(order["stake_progression_version"] == TWO_STAGE_VERSION for order in orders))
+
+    def test_run_backtest_keeps_fixed_stake_when_progression_is_disabled(self):
+        klines = [kline(i, 100 + i) for i in range(10)]
+
+        def signal_provider(history):
+            if len(history) in {2, 4, 6}:
+                return Signal(
+                    direction="LONG",
+                    timeframe_minutes=1,
+                    level="A",
+                    reason="synthetic",
+                    price=history[-1].close,
+                    open_time=history[-1].open_time,
+                    score=80,
+                    threshold=70,
+                    session_allowed=True,
+                )
+            return Signal("WAIT", 1, "B", "wait", history[-1].close, history[-1].open_time)
+
+        result = run_backtest(
+            klines,
+            BacktestConfig(
+                warmup_minutes=2,
+                min_order_gap_minutes=0,
+                enable_stake_progression=False,
+                stake_progression_max_orders=99,
+            ),
+            signal_provider=signal_provider,
+        )
+
+        self.assertEqual([order["stake"] for order in result["orders"]], [10.0, 10.0, 10.0])
+        self.assertEqual([order["stake_progression_step"] for order in result["orders"]], [1, 1, 1])
+        self.assertEqual([order["stake_progression_version"] for order in result["orders"]], ["", "", ""])
+
+    def test_run_backtest_rejects_invalid_stake_terms_even_when_progression_is_disabled(self):
+        klines = [kline(i, 100 + i) for i in range(4)]
+
+        for config in (
+            BacktestConfig(stake=-10.0),
+            BacktestConfig(stake=float("inf")),
+            BacktestConfig(stake=10.0, win_return=10.0),
+            BacktestConfig(stake=10.0, win_return=float("nan")),
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                run_backtest(klines, config)
+
+    def test_custom_payout_reports_matching_break_even_rate(self):
+        klines = [kline(i, 100 + i) for i in range(5)]
+
+        def signal_provider(history):
+            if len(history) == 2:
+                return Signal(
+                    direction="LONG", timeframe_minutes=1, level="A", reason="synthetic",
+                    price=history[-1].close, open_time=history[-1].open_time,
+                    score=80, threshold=70, session_allowed=True,
+                )
+            return Signal("WAIT", 1, "B", "wait", history[-1].close, history[-1].open_time)
+
+        result = run_backtest(
+            klines,
+            BacktestConfig(warmup_minutes=2, stake=20.0, win_return=30.0),
+            signal_provider=signal_provider,
+        )
+
+        self.assertEqual(result["stats"]["break_even_win_rate"], 0.6667)
+
+    def test_risk_stats_use_settlement_order_for_overlapping_orders(self):
+        orders = [
+            {"id": 1, "result": "LOSS", "pnl": -10.0, "exit_time": 300},
+            {"id": 2, "result": "LOSS", "pnl": -10.0, "exit_time": 100},
+            {"id": 3, "result": "WIN", "pnl": 8.0, "exit_time": 200},
+        ]
+
+        risk = _risk_stats(orders)
+
+        self.assertEqual(risk["max_drawdown"], -12.0)
+        self.assertEqual(risk["max_loss_streak"], 1)
+
+    def test_backtest_cli_rejects_extra_arguments(self):
+        self.assertEqual(main(["input.zip", "report.json", "unexpected"]), 2)
+
+    def test_stake_progression_does_not_change_rolling_edge_order_selection(self):
+        klines = [kline(i, 100 + i) for i in range(10)]
+
+        def signal_provider(history):
+            if len(history) in {2, 4, 6}:
+                return Signal(
+                    direction="LONG",
+                    timeframe_minutes=1,
+                    level="A",
+                    reason="same setup",
+                    price=history[-1].close,
+                    open_time=history[-1].open_time,
+                    score=80,
+                    threshold=70,
+                    threshold_segment="WD-12",
+                    session_allowed=True,
+                )
+            return Signal("WAIT", 1, "B", "wait", history[-1].close, history[-1].open_time)
+
+        common = {
+            "warmup_minutes": 2,
+            "min_order_gap_minutes": 0,
+            "enable_rolling_edge_guard": True,
+            "rolling_edge_min_samples": 2,
+            "rolling_edge_min_win_rate": 0.0,
+            "rolling_edge_min_ev": 9.0,
+        }
+        fixed = run_backtest(
+            klines,
+            BacktestConfig(**common, enable_stake_progression=False),
+            signal_provider=signal_provider,
+        )
+        progressed = run_backtest(
+            klines,
+            BacktestConfig(**common, enable_stake_progression=True),
+            signal_provider=signal_provider,
+        )
+
+        fields = ("id", "direction", "entry_time", "expires_at", "result")
+        self.assertEqual(
+            [tuple(order[field] for field in fields) for order in progressed["orders"]],
+            [tuple(order[field] for field in fields) for order in fixed["orders"]],
+        )
+        self.assertEqual(fixed["stats"]["total_orders"], 2)
+        self.assertEqual(progressed["stats"]["total_orders"], 2)
 
     def test_load_klines_from_zips_deduplicates_and_sorts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -4,10 +4,12 @@ from app.market_sequence import (
     MarketSequenceConfig,
     SequenceTrainingRow,
     build_daily_snapshot,
+    build_state_feature_series,
     build_snapshot_from_rows,
     build_training_rows,
     decide_current_state,
     run_bucket,
+    state_features_at_index,
 )
 from app.models import Kline
 
@@ -129,6 +131,35 @@ class MarketSequenceTest(unittest.TestCase):
         self.assertTrue(opened["selected"])
         self.assertEqual(unaligned["direction"], "WAIT")
         self.assertEqual(unaligned["reason"], "ENTRY_NOT_ALIGNED")
+
+    def test_sorted_index_feature_api_matches_current_decision_state(self):
+        closes = [100.0 + index for index in range(30)]
+        klines = [minute_kline(index, close) for index, close in enumerate(closes)]
+        config = MarketSequenceConfig(key_mode="move_run_volume_rsi")
+
+        feature = state_features_at_index(klines, len(klines) - 1, config=config)
+        decision = decide_current_state(
+            klines,
+            {},
+            current_time=klines[-1].close_time,
+            config=config,
+        )
+
+        self.assertEqual(feature["state_key"], decision["state_key"])
+        self.assertEqual(feature["move"], "UP")
+
+    def test_batch_feature_series_matches_index_calculation(self):
+        klines = [
+            minute_kline(index, 100.0 + ((index % 9) - 4) * 0.3 + index * 0.02, 80.0 + index % 17)
+            for index in range(320)
+        ]
+        config = MarketSequenceConfig(key_mode="move_run_volume_rsi")
+
+        series = build_state_feature_series(klines, config=config)
+
+        for index in (20, 40, 100, 319):
+            expected = state_features_at_index(klines, index, config=config)
+            self.assertEqual(series[index], expected)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from app.models import Kline, Signal, SimulatedOrder
 from app.order_policy import OrderPolicy
@@ -33,6 +34,51 @@ def signal(direction="LONG", score=82.0, threshold=70.0, segment="WD-12"):
 
 
 class OrderPolicyTest(unittest.TestCase):
+    def test_default_policy_allows_fifth_open_order_and_blocks_sixth(self):
+        policy = OrderPolicy()
+        latest = kline(20)
+        open_orders = [
+            SimulatedOrder(
+                id=idx + 1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="open",
+                entry_price=100.0,
+                opened_at=latest.close_time - (idx + 2) * 120_000,
+                expires_at=latest.close_time + 600_000,
+                threshold_segment="WD-12",
+            )
+            for idx in range(4)
+        ]
+
+        fifth = policy.evaluate(
+            signal(),
+            latest,
+            open_orders,
+            latest.close_time - 120_000,
+            set(),
+        )
+        sixth = policy.evaluate(
+            signal(),
+            latest,
+            [*open_orders, replace(open_orders[-1], id=5)],
+            latest.close_time - 120_000,
+            set(),
+        )
+
+        self.assertTrue(fifth.open_allowed)
+        self.assertEqual(sixth.code, "HOLD_OPEN_ORDER")
+
+    def test_default_policy_keeps_two_minute_entry_gap(self):
+        policy = OrderPolicy()
+        latest = kline(20)
+
+        gate = policy.evaluate(signal(), latest, [], latest.close_time - 60_000, set())
+
+        self.assertFalse(gate.open_allowed)
+        self.assertEqual(gate.code, "COOLDOWN")
+
     def test_allows_actionable_signal_without_open_orders(self):
         policy = OrderPolicy(max_open_orders=1, min_order_gap_ms=600_000)
 

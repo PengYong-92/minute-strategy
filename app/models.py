@@ -75,10 +75,19 @@ class Signal:
     session_edge_min: float = 0.0
     regime: str = "UNKNOWN"
     risk_flags: str = ""
+    strategy_family: str = "unknown"
+    strategy_tag: str = "unknown"
+    observe_direction: str = ""
+    observe_only: bool = False
+    profile_key: str = ""
+    daily_profile_selected: bool = False
+    daily_profile_version: str = ""
 
     @property
     def actionable(self) -> bool:
-        return self.direction in {"LONG", "SHORT"} and abs(self.score) >= self.threshold
+        return self.direction in {"LONG", "SHORT"} and (
+            self.daily_profile_selected or abs(self.score) >= self.threshold
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -103,9 +112,45 @@ class SimulatedOrder:
     session_ev: float = 0.0
     session_edge_min: float = 0.0
     regime: str = "UNKNOWN"
+    strategy_family: str = "unknown"
+    strategy_tag: str = "unknown"
+    profile_key: str = ""
+    daily_profile_selected: bool = False
+    daily_profile_version: str = ""
     stake: float = 10.0
     win_return: float = 18.0
     stake_progression_step: int = 1
+    status: str = "OPEN"
+    result: Optional[str] = None
+    exit_price: Optional[float] = None
+    settled_at: Optional[int] = None
+    pnl: float = 0.0
+    stake_progression_source_order_id: Optional[int] = None
+    stake_progression_version: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ObservationSignal:
+    observation_key: str
+    strategy_family: str
+    strategy_tag: str
+    direction: str
+    timeframe_minutes: int
+    level: str
+    reason: str
+    entry_price: float
+    opened_at: int
+    expires_at: int
+    threshold_segment: str = "GLOBAL"
+    score: float = 0.0
+    threshold: float = 0.0
+    edge: float = 0.0
+    regime: str = "UNKNOWN"
+    source_decision: str = ""
+    observe_only: bool = True
     status: str = "OPEN"
     result: Optional[str] = None
     exit_price: Optional[float] = None

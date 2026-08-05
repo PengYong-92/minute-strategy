@@ -26,6 +26,18 @@ class RollingEdgeTest(unittest.TestCase):
     def test_setup_key_includes_timeframe_segment_and_setup_name(self):
         self.assertEqual(setup_key(order(1, "WIN", 8.0)), "10|WD-12|放量急跌反抽")
 
+    def test_setup_key_keeps_reason_based_guard_for_backward_compatibility(self):
+        item = order(1, "WIN", 8.0)
+        item.update(
+            {
+                "profile_key": "drop_reclaim|LONG|WD-12",
+                "strategy_family": "drop_reclaim",
+                "strategy_tag": "drop_reclaim_extreme_10m_120bps_v1.5_rsi30_boll0.1",
+            }
+        )
+
+        self.assertEqual(setup_key(item), "10|WD-12|放量急跌反抽")
+
     def test_snapshot_uses_only_prior_orders_in_lookback_window(self):
         config = RollingEdgeConfig(lookback_days=1, min_samples=2, min_win_rate=0.5556, min_ev=0.0)
         current = order(100, "WIN", 8.0)

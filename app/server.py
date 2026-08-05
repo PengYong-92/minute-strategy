@@ -9,8 +9,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from app.binance_client import BinanceKlineClient
+from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.fear_greed import FearGreedProvider
 from app.history import WarmupConfig, WarmupReport, warmup_history
+from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import MonitorState
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
 
@@ -18,6 +20,8 @@ from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignal
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 STATIC_DIR = ROOT / "static"
+DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS = ""
+DEFAULT_LIVE_SHORT_SEGMENTS = "WD-02,WD-23"
 
 
 def start_polling(state: MonitorState, client: BinanceKlineClient, poll_seconds: int, limit: int) -> threading.Thread:
@@ -54,6 +58,26 @@ def make_handler(state: MonitorState, warmup_loader=None):
                         result=_query_text(query, "result"),
                     )
                 )
+                return
+            if parsed.path == "/api/observations":
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    state.page_observations(
+                        page=_query_int(query, "page", 1),
+                        page_size=_query_int(query, "page_size", 20),
+                        direction=_query_text(query, "direction"),
+                        family=_query_text(query, "family"),
+                        tag=_query_text(query, "tag"),
+                        segment=_query_text(query, "segment"),
+                        result=_query_text(query, "result"),
+                    )
+                )
+                return
+            if parsed.path == "/api/observation-summary":
+                self._send_json(state.observation_summary())
+                return
+            if parsed.path == "/api/order-profile":
+                self._send_json(state.order_profile_summary())
                 return
             if parsed.path == "/api/config":
                 query = parse_qs(parsed.query)
@@ -144,7 +168,7 @@ def apply_warmup(
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
-    if value is None:
+    if value is None or value.strip() == "":
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -154,6 +178,24 @@ def _env_float(name: str, default: float | None) -> float | None:
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip().upper() for item in value.split(",") if item.strip()]
+
+
+def _clock_value(value: str) -> tuple[int, int]:
+    try:
+        hour_text, minute_text = str(value).split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("时间必须使用 HH:MM 格式") from exc
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise argparse.ArgumentTypeError("时间必须在 00:00 到 23:59 之间")
+    return hour, minute
 
 
 def main() -> None:
@@ -213,6 +255,18 @@ def main() -> None:
     )
     parser.add_argument("--stake", type=float, default=float(os.getenv("STAKE", "10")), help="基础下单金额，默认: 10")
     parser.add_argument(
+        "--max-open-orders",
+        type=int,
+        default=int(os.getenv("MAX_OPEN_ORDERS", "5")),
+        help="最多同时持有的未结订单数，默认: 5",
+    )
+    parser.add_argument(
+        "--min-order-gap-minutes",
+        type=float,
+        default=float(os.getenv("MIN_ORDER_GAP_MINUTES", "2")),
+        help="两次开单最小间隔分钟数，默认: 2",
+    )
+    parser.add_argument(
         "--win-return",
         type=float,
         default=_env_float("WIN_RETURN", None),
@@ -221,8 +275,22 @@ def main() -> None:
     parser.add_argument(
         "--stake-progression-max-orders",
         type=int,
-        default=int(os.getenv("STAKE_PROGRESSION_MAX_ORDERS", "3")),
-        help="最大连续滚单次数，默认: 3",
+        default=os.getenv("STAKE_PROGRESSION_MAX_ORDERS", "2"),
+        help="兼容参数；两阶段固定为 2 级，默认: 2",
+    )
+    parser.add_argument(
+        "--stake-progression-max-active",
+        type=int,
+        default=os.getenv("STAKE_PROGRESSION_MAX_ACTIVE", "1"),
+        help="最多并行第二级订单数，默认: 1",
+    )
+    parser.add_argument(
+        "--stake-progression-base-only-segments",
+        default=os.getenv("STAKE_PROGRESSION_BASE_ONLY_SEGMENTS", DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS),
+        help=(
+            "兼容参数；仅使用基础金额、不继承第二级金额的时段，逗号分隔；"
+            "默认空，生产默认所有已入选时段均可参与"
+        ),
     )
     parser.add_argument(
         "--no-current-month-daily",
@@ -247,7 +315,163 @@ def main() -> None:
         "--no-stake-progression",
         action="store_true",
         default=not _env_bool("STAKE_PROGRESSION", True),
-        help="关闭赢单返还滚单",
+        help="关闭两阶段金额叠加",
+    )
+    parser.add_argument(
+        "--no-rolling-edge-guard",
+        action="store_true",
+        default=not _env_bool("ROLLING_EDGE_GUARD", True),
+        help="关闭滚动优势守卫，仅保留状态观察",
+    )
+    parser.add_argument(
+        "--no-result-sequence-guard",
+        action="store_true",
+        default=not _env_bool("RESULT_SEQUENCE_GUARD", True),
+        help="关闭结算序列冷却守卫",
+    )
+    parser.add_argument(
+        "--result-sequence-loss-streak",
+        type=int,
+        default=int(os.getenv("RESULT_SEQUENCE_LOSS_STREAK", "3")),
+        help="同方向连续已结算亏损触发笔数，默认: 3",
+    )
+    parser.add_argument(
+        "--result-sequence-cooldown-minutes",
+        type=int,
+        default=int(os.getenv("RESULT_SEQUENCE_COOLDOWN_MINUTES", "20")),
+        help="结算序列守卫触发后的冷却分钟数，默认: 20",
+    )
+    parser.add_argument(
+        "--result-sequence-scope",
+        type=str.upper,
+        choices=("GLOBAL", "DIRECTION"),
+        default=os.getenv("RESULT_SEQUENCE_SCOPE", "DIRECTION").upper(),
+        help="结算序列统计范围：GLOBAL 全局，DIRECTION 同方向；默认: DIRECTION",
+    )
+    parser.add_argument(
+        "--profile-guard",
+        action="store_true",
+        default=_env_bool("PROFILE_GUARD", False),
+        help="开启画像守卫正式拦截，默认仅影子观察",
+    )
+    parser.add_argument(
+        "--profile-guard-min-history",
+        type=int,
+        default=int(os.getenv("PROFILE_GUARD_MIN_HISTORY", "15")),
+        help="画像守卫启用前需要的历史订单数量，默认: 15",
+    )
+    parser.add_argument(
+        "--profile-guard-min-group-size",
+        type=int,
+        default=int(os.getenv("PROFILE_GUARD_MIN_GROUP_SIZE", "2")),
+        help="画像守卫单个弱点最小历史样本数，默认: 2",
+    )
+    parser.add_argument(
+        "--no-observation-profile-promotion",
+        action="store_true",
+        default=not _env_bool("OBSERVATION_PROFILE_PROMOTION", True),
+        help="关闭已结算观察画像对静态时段拦截的动态放行",
+    )
+    parser.add_argument(
+        "--observation-profile-lookback-days",
+        type=int,
+        default=int(os.getenv("OBSERVATION_PROFILE_LOOKBACK_DAYS", "7")),
+        help="观察画像滚动统计天数，默认: 7",
+    )
+    parser.add_argument(
+        "--observation-profile-min-samples",
+        type=int,
+        default=int(os.getenv("OBSERVATION_PROFILE_MIN_SAMPLES", "12")),
+        help="观察画像允许开单的最小独立已结算样本数，默认: 12",
+    )
+    parser.add_argument(
+        "--observation-profile-min-win-rate",
+        type=float,
+        default=float(os.getenv("OBSERVATION_PROFILE_MIN_WIN_RATE", "0.72")),
+        help="观察画像允许开单的最低胜率，默认: 0.72",
+    )
+    parser.add_argument(
+        "--observation-profile-min-ev",
+        type=float,
+        default=float(os.getenv("OBSERVATION_PROFILE_MIN_EV", "4")),
+        help="观察画像允许开单的最低单笔期望收益，默认: 4U",
+    )
+    parser.add_argument(
+        "--observation-profile-min-edge",
+        type=float,
+        default=float(os.getenv("OBSERVATION_PROFILE_MIN_EDGE", "10")),
+        help="观察画像动态放行要求的最低评分边际，默认: 10",
+    )
+    parser.add_argument(
+        "--live-short-segments",
+        default=os.getenv("LIVE_SHORT_SEGMENTS", DEFAULT_LIVE_SHORT_SEGMENTS),
+        help=f"允许实际开 SHORT 的时段，逗号分隔；默认: {DEFAULT_LIVE_SHORT_SEGMENTS}",
+    )
+    parser.add_argument(
+        "--no-daily-profile-selector",
+        action="store_true",
+        default=not _env_bool("DAILY_PROFILE_SELECTOR", True),
+        help="关闭每日观察画像策略选择器，回退到静态主策略",
+    )
+    parser.add_argument(
+        "--daily-profile-lookback-days",
+        type=int,
+        default=int(os.getenv("DAILY_PROFILE_LOOKBACK_DAYS", "7")),
+        help="每日画像统计回看天数，默认: 7",
+    )
+    parser.add_argument(
+        "--daily-profile-min-samples",
+        type=int,
+        default=int(os.getenv("DAILY_PROFILE_MIN_SAMPLES", "20")),
+        help="新画像入选所需最小独立样本数，默认: 20",
+    )
+    parser.add_argument(
+        "--daily-profile-min-win-rate",
+        type=float,
+        default=float(os.getenv("DAILY_PROFILE_MIN_WIN_RATE", "0.60")),
+        help="新画像入选最低胜率，默认: 0.60",
+    )
+    parser.add_argument(
+        "--daily-profile-min-ev",
+        type=float,
+        default=float(os.getenv("DAILY_PROFILE_MIN_EV", "0")),
+        help="新画像入选最低单笔期望收益，默认: 0U",
+    )
+    parser.add_argument(
+        "--daily-profile-exit-win-rate",
+        type=float,
+        default=float(os.getenv("DAILY_PROFILE_EXIT_WIN_RATE", "0.60")),
+        help="已启用画像退化胜率线，默认: 0.60",
+    )
+    parser.add_argument(
+        "--daily-profile-exit-ev",
+        type=float,
+        default=float(os.getenv("DAILY_PROFILE_EXIT_EV", "0")),
+        help="已启用画像退化EV线，默认: 0U",
+    )
+    parser.add_argument(
+        "--daily-profile-degraded-runs",
+        type=int,
+        default=int(os.getenv("DAILY_PROFILE_DEGRADED_RUNS", "1")),
+        help="画像连续退化多少次后退出，默认: 1",
+    )
+    parser.add_argument(
+        "--daily-profile-max-active",
+        type=int,
+        default=int(os.getenv("DAILY_PROFILE_MAX_ACTIVE", "0")),
+        help="每天最多启用画像数量，0 表示不限制，默认: 0",
+    )
+    parser.add_argument(
+        "--daily-profile-evaluation-time",
+        type=_clock_value,
+        default=os.getenv("DAILY_PROFILE_EVALUATION_TIME", "07:50"),
+        help="每天北京时间画像评估时间，格式 HH:MM，默认: 07:50",
+    )
+    parser.add_argument(
+        "--daily-profile-activation-time",
+        type=_clock_value,
+        default=os.getenv("DAILY_PROFILE_ACTIVATION_TIME", "08:00"),
+        help="每天北京时间画像生效时间，格式 HH:MM，默认: 08:00",
     )
     args = parser.parse_args()
     win_return = args.win_return if args.win_return is not None else round(args.stake * 1.8, 4)
@@ -262,13 +486,49 @@ def main() -> None:
 
     state = MonitorState(
         symbol=args.symbol,
+        max_open_orders=args.max_open_orders,
+        min_order_gap_ms=round(args.min_order_gap_minutes * 60_000),
         fear_greed_provider=FearGreedProvider(),
         storage_path=None if args.no_persistence else args.db_path,
         webhook=webhook,
         stake=args.stake,
         win_return=win_return,
+        enable_rolling_edge_guard=not args.no_rolling_edge_guard,
+        result_sequence_guard_config=ResultSequenceGuardConfig(
+            enabled=not args.no_result_sequence_guard,
+            loss_streak=args.result_sequence_loss_streak,
+            cooldown_minutes=args.result_sequence_cooldown_minutes,
+            scope=args.result_sequence_scope,
+        ),
         enable_stake_progression=not args.no_stake_progression,
         stake_progression_max_orders=args.stake_progression_max_orders,
+        stake_progression_max_active=args.stake_progression_max_active,
+        stake_progression_base_only_segments=_split_csv(args.stake_progression_base_only_segments),
+        enable_profile_guard=args.profile_guard,
+        profile_guard_min_history=args.profile_guard_min_history,
+        profile_guard_min_group_size=args.profile_guard_min_group_size,
+        enable_observation_profile_promotion=not args.no_observation_profile_promotion,
+        observation_profile_lookback_days=args.observation_profile_lookback_days,
+        observation_profile_min_samples=args.observation_profile_min_samples,
+        observation_profile_min_win_rate=args.observation_profile_min_win_rate,
+        observation_profile_min_ev=args.observation_profile_min_ev,
+        observation_profile_min_edge=args.observation_profile_min_edge,
+        live_short_segments=_split_csv(args.live_short_segments),
+        enable_daily_profile_selector=not args.no_daily_profile_selector,
+        daily_profile_selector_config=DailyProfileSelectorConfig(
+            lookback_days=args.daily_profile_lookback_days,
+            min_samples=args.daily_profile_min_samples,
+            min_win_rate=args.daily_profile_min_win_rate,
+            min_ev=args.daily_profile_min_ev,
+            exit_win_rate=args.daily_profile_exit_win_rate,
+            exit_ev=args.daily_profile_exit_ev,
+            degraded_runs_to_exit=args.daily_profile_degraded_runs,
+            max_active_profiles=args.daily_profile_max_active,
+            evaluation_hour=args.daily_profile_evaluation_time[0],
+            evaluation_minute=args.daily_profile_evaluation_time[1],
+            activation_hour=args.daily_profile_activation_time[0],
+            activation_minute=args.daily_profile_activation_time[1],
+        ),
     )
     data_dir = Path(args.data_dir)
     include_current_month_daily = not args.no_current_month_daily

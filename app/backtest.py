@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import sys
 import time
 import zipfile
@@ -10,6 +11,7 @@ from typing import Callable, Sequence
 
 from app.models import Kline, Signal
 from app.rolling_edge import RollingEdgeConfig, rolling_edge_snapshot, should_degrade
+from app.stake_progression import TWO_STAGE_VERSION, TwoStageStakeProgression
 from app.strategy import choose_trade_signal
 
 
@@ -22,7 +24,8 @@ class BacktestConfig:
     stake: float = 10.0
     win_return: float = 18.0
     enable_stake_progression: bool = False
-    stake_progression_max_orders: int = 3
+    stake_progression_max_orders: int = 2
+    stake_progression_max_active: int = 1
     enable_rolling_edge_guard: bool = False
     rolling_edge_lookback_days: int = 60
     rolling_edge_min_samples: int = 5
@@ -57,27 +60,48 @@ def run_backtest(
     signal_provider: Callable[[Sequence[Kline]], Signal] = choose_trade_signal,
 ) -> dict:
     config = config or BacktestConfig()
+    _validate_stake_config(config)
     started = time.perf_counter()
     orders: list[dict] = []
     open_orders: list[dict] = []
     rejected_signals: dict[str, int] = {}
     last_order_time: int | None = None
     balance = 0.0
-    next_stake = config.stake
-    stake_progression_step = 1
+    progression = (
+        TwoStageStakeProgression(
+            enabled=True,
+            base_stake=config.stake,
+            base_win_return=config.win_return,
+            max_active=config.stake_progression_max_active,
+            max_open_orders=config.max_open_orders,
+            activated_at=0,
+        )
+        if config.enable_stake_progression
+        else None
+    )
 
     for index in range(max(config.warmup_minutes, 1), len(klines)):
         current = klines[index - 1]
 
-        for order in list(open_orders):
+        due_orders = []
+        for order in open_orders:
             if current.close_time < order["expires_at"]:
                 continue
             exit_kline = _first_kline_at_or_after(klines, order["expires_at"], start=index - 1)
             if exit_kline is None:
                 continue
+            due_orders.append((order, exit_kline))
+        for order, exit_kline in sorted(due_orders, key=_settlement_sort_key):
             _settle_order(order, exit_kline, config)
             balance = round(balance + order["pnl"], 4)
-            next_stake, stake_progression_step = _next_stake_after_settlement(order, config)
+            if progression is not None:
+                progression.settle(
+                    order["id"],
+                    order["entry_time"],
+                    order["stake_progression_step"],
+                    order["result"],
+                    order["exit_time"],
+                )
             open_orders.remove(order)
 
         history_start = max(0, index - config.strategy_history_limit)
@@ -103,10 +127,22 @@ def run_backtest(
         if expires_at > klines[-1].close_time:
             continue
 
-        stake = round(next_stake, 4)
-        win_return = _win_return_for_stake(stake, config)
+        order_id = len(orders) + 1
+        if progression is None:
+            stake = round(config.stake, 4)
+            win_return = round(config.win_return, 4)
+            progression_step = 1
+            progression_source_order_id = None
+            progression_version = ""
+        else:
+            terms, _credit = progression.assign(order_id, current.close_time)
+            stake = terms.stake
+            win_return = terms.win_return
+            progression_step = terms.step
+            progression_source_order_id = terms.source_order_id
+            progression_version = TWO_STAGE_VERSION
         order = {
-            "id": len(orders) + 1,
+            "id": order_id,
             "direction": signal.direction,
             "timeframe_minutes": signal.timeframe_minutes,
             "level": signal.level,
@@ -122,7 +158,9 @@ def run_backtest(
             "regime": signal.regime,
             "stake": stake,
             "win_return": win_return,
-            "stake_progression_step": stake_progression_step,
+            "stake_progression_step": progression_step,
+            "stake_progression_source_order_id": progression_source_order_id,
+            "stake_progression_version": progression_version,
             "entry_price": current.close,
             "entry_time": current.close_time,
             "expires_at": expires_at,
@@ -135,13 +173,23 @@ def run_backtest(
         open_orders.append(order)
         last_order_time = current.close_time
 
-    for order in list(open_orders):
+    remaining_due_orders = []
+    for order in open_orders:
         exit_kline = _first_kline_at_or_after(klines, order["expires_at"], start=0)
         if exit_kline is None:
             continue
+        remaining_due_orders.append((order, exit_kline))
+    for order, exit_kline in sorted(remaining_due_orders, key=_settlement_sort_key):
         _settle_order(order, exit_kline, config)
         balance = round(balance + order["pnl"], 4)
-        next_stake, stake_progression_step = _next_stake_after_settlement(order, config)
+        if progression is not None:
+            progression.settle(
+                order["id"],
+                order["entry_time"],
+                order["stake_progression_step"],
+                order["result"],
+                order["exit_time"],
+            )
         open_orders.remove(order)
 
     return {
@@ -207,24 +255,18 @@ def _settle_order(order: dict, exit_kline: Kline, config: BacktestConfig) -> Non
     order["pnl"] = round(win_return - stake, 4) if won else round(-stake, 4)
 
 
-def _win_return_for_stake(stake: float, config: BacktestConfig) -> float:
-    if not config.enable_stake_progression:
-        return round(config.win_return, 4)
-    if config.stake <= 0:
-        return round(config.win_return, 4)
-    return round(stake * (config.win_return / config.stake), 4)
+def _settlement_sort_key(item: tuple[dict, Kline]) -> tuple[int, int]:
+    order, exit_kline = item
+    return exit_kline.close_time, int(order["id"])
 
 
-def _next_stake_after_settlement(order: dict, config: BacktestConfig) -> tuple[float, int]:
-    if not config.enable_stake_progression:
-        return config.stake, 1
-    max_orders = max(1, int(config.stake_progression_max_orders))
-    if order.get("result") != "WIN":
-        return config.stake, 1
-    current_step = int(order.get("stake_progression_step", 1) or 1)
-    if current_step >= max_orders:
-        return config.stake, 1
-    return float(order.get("win_return", config.win_return)), current_step + 1
+def _validate_stake_config(config: BacktestConfig) -> None:
+    stake = float(config.stake)
+    win_return = float(config.win_return)
+    if not math.isfinite(stake) or stake <= 0:
+        raise ValueError("stake must be finite and > 0")
+    if not math.isfinite(win_return) or win_return <= stake:
+        raise ValueError("win_return must be finite and > stake")
 
 
 def _stats(orders: Sequence[dict], balance: float) -> dict:
@@ -232,6 +274,7 @@ def _stats(orders: Sequence[dict], balance: float) -> dict:
     wins = [order for order in settled if order["result"] == "WIN"]
     losses = [order for order in settled if order["result"] == "LOSS"]
     total_staked = round(sum(float(order.get("stake", 0.0)) for order in settled), 4)
+    total_win_return = sum(float(order.get("win_return", 0.0)) for order in settled)
     return {
         "total_orders": len(settled),
         "wins": len(wins),
@@ -241,7 +284,7 @@ def _stats(orders: Sequence[dict], balance: float) -> dict:
         "avg_pnl": round(balance / len(settled), 4) if settled else 0.0,
         "total_staked": total_staked,
         "roi": round(balance / total_staked, 4) if total_staked else 0.0,
-        "break_even_win_rate": 0.5556,
+        "break_even_win_rate": round(total_staked / total_win_return, 4) if total_win_return else 0.0,
     }
 
 
@@ -253,7 +296,13 @@ def _risk_stats(orders: Sequence[dict]) -> dict:
     max_loss_streak = 0
     win_streak = 0
     max_win_streak = 0
-    for order in orders:
+    for order in sorted(
+        orders,
+        key=lambda item: (
+            item.get("exit_time") if item.get("exit_time") is not None else float("inf"),
+            int(item.get("id", 0)),
+        ),
+    ):
         if not order["result"]:
             continue
         equity = round(equity + order["pnl"], 4)
@@ -335,13 +384,26 @@ def _rolling_edge_degraded(
         "threshold_segment": signal.threshold_segment,
         "reason": signal.reason,
     }
-    snapshot = rolling_edge_snapshot(orders, current_item, edge_config)
+    edge_orders = orders
+    if config.enable_stake_progression:
+        edge_orders = [
+            {
+                **order,
+                "pnl": (
+                    round(config.win_return - config.stake, 4)
+                    if order.get("result") == "WIN"
+                    else round(-config.stake, 4)
+                ),
+            }
+            for order in orders
+        ]
+    snapshot = rolling_edge_snapshot(edge_orders, current_item, edge_config)
     return should_degrade(snapshot, edge_config)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv:
+    if not 1 <= len(argv) <= 2:
         print("usage: python3 -m app.backtest PATH_TO_BINANCE_ZIP [REPORT_JSON]", file=sys.stderr)
         return 2
     klines = load_klines_from_zip(argv[0])

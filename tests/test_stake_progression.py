@@ -248,6 +248,41 @@ class TwoStageStakeProgressionTest(unittest.TestCase):
         self.assertEqual(ledger.status()["pending_credits"], 1)
         self.assertEqual(ledger.status()["active_second_stage"], 1)
 
+    def test_restore_keeps_active_orders_when_the_limit_is_reduced(self):
+        credits = [
+            StakeProgressionCredit(
+                source_order_id=1,
+                created_at=601_000,
+                status="CONSUMED",
+                consumed_order_id=20,
+                consumed_at=602_000,
+            ),
+            StakeProgressionCredit(
+                source_order_id=2,
+                created_at=603_000,
+                status="CONSUMED",
+                consumed_order_id=21,
+                consumed_at=604_000,
+            ),
+            StakeProgressionCredit(source_order_id=3, created_at=605_000),
+        ]
+
+        ledger = self.ledger(
+            max_active=1,
+            credits=credits,
+            active_second_order_ids=[20, 21],
+        )
+
+        self.assertEqual(ledger.active_second_order_ids, frozenset({20, 21}))
+        self.assertEqual(credits[2].status, "CANCELLED")
+        self.assertEqual(ledger.status()["pending_credits"], 0)
+        self.assertEqual(ledger.status()["active_second_stage"], 2)
+
+        ledger.settle(20, 602_000, 2, "WIN", 1_202_000)
+        self.assertEqual(ledger.status()["active_second_stage"], 1)
+        blocked = ledger.settle(4, 606_000, 1, "WIN", 1_206_000)
+        self.assertEqual(blocked.status, "CANCELLED")
+
     def test_reconcile_restores_active_ids_and_releases_matching_order(self):
         consumed = StakeProgressionCredit(
             source_order_id=1,
@@ -348,6 +383,50 @@ class TwoStageStakeProgressionTest(unittest.TestCase):
 
         self.assertEqual(ledger.active_second_order_ids, frozenset({20}))
         self.assertEqual(ledger.status()["active_second_stage"], 1)
+
+    def test_rollback_assignment_restores_current_active_credit_to_pending(self):
+        ledger = self.ledger()
+        pending = self.win_first_stage(ledger)
+        _, consumed = ledger.assign(20, 602_000)
+
+        rolled_back = ledger.rollback_assignment(20)
+
+        self.assertIs(rolled_back, consumed)
+        self.assertIs(rolled_back, pending)
+        self.assertEqual(rolled_back.status, "PENDING")
+        self.assertIsNone(rolled_back.consumed_order_id)
+        self.assertIsNone(rolled_back.consumed_at)
+        self.assertEqual(ledger.active_second_order_ids, frozenset())
+
+    def test_rollback_assignment_ignores_historical_and_unknown_order_ids(self):
+        historical = StakeProgressionCredit(
+            source_order_id=1,
+            created_at=601_000,
+            status="CONSUMED",
+            consumed_order_id=10,
+            consumed_at=602_000,
+        )
+        current = StakeProgressionCredit(
+            source_order_id=2,
+            created_at=603_000,
+            status="CONSUMED",
+            consumed_order_id=20,
+            consumed_at=604_000,
+        )
+        ledger = self.ledger(
+            max_active=2,
+            credits=[historical, current],
+            active_second_order_ids=[20],
+        )
+
+        historical_result = ledger.rollback_assignment(10)
+        unknown_result = ledger.rollback_assignment(999)
+
+        self.assertIsNone(historical_result)
+        self.assertIsNone(unknown_result)
+        self.assertEqual(historical.status, "CONSUMED")
+        self.assertEqual(current.status, "CONSUMED")
+        self.assertEqual(ledger.active_second_order_ids, frozenset({20}))
 
     def test_assign_rejects_negative_consumed_time_without_mutating_credit(self):
         ledger = self.ledger()

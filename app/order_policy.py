@@ -15,8 +15,8 @@ class OrderGate:
 
 @dataclass(frozen=True)
 class OrderPolicy:
-    max_open_orders: int = 1
-    min_order_gap_ms: int = 10 * 60_000
+    max_open_orders: int = 5
+    min_order_gap_ms: int = 2 * 60_000
 
     def evaluate(
         self,
