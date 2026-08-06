@@ -88,6 +88,11 @@ def analyze_wave(
 
     current_time = wave_bars[-1].close_time
     if raw_state not in {"UP_LEG", "DOWN_LEG"}:
+        confirmed_at = (
+            previous.confirmed_at
+            if previous is not None and previous.state == raw_state
+            else current_time
+        )
         return WaveSnapshot(
             state=raw_state,
             raw_state=raw_state,
@@ -97,7 +102,7 @@ def analyze_wave(
             atr_strength=atr_strength,
             range_position=range_position,
             confirmations=0,
-            confirmed_at=current_time,
+            confirmed_at=confirmed_at,
             allowed_directions=_allowed_directions(raw_state),
         )
 

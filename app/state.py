@@ -32,6 +32,11 @@ from app.strategy import (
     max_trade_edge_for,
 )
 from app.wave_state import WaveSnapshot, analyze_wave
+from app.wave_batch_guard import (
+    WaveBatchGuardConfig,
+    WaveBatchGuardDecision,
+    evaluate_wave_batch_guard,
+)
 
 
 DAY_MS = 86_400_000
@@ -70,6 +75,7 @@ class MonitorState:
         enable_daily_profile_selector: bool = False,
         daily_profile_selector_config: DailyProfileSelectorConfig | None = None,
         enable_wave_guard: bool = True,
+        wave_batch_guard_config: WaveBatchGuardConfig | None = None,
         now_ms=None,
     ):
         self.symbol = symbol.upper()
@@ -113,6 +119,9 @@ class MonitorState:
         }
         self.enable_daily_profile_selector = bool(enable_daily_profile_selector)
         self.enable_wave_guard = bool(enable_wave_guard)
+        self.wave_batch_guard_config = (
+            wave_batch_guard_config or WaveBatchGuardConfig()
+        ).normalized()
         self.daily_profile_selector_config = (
             daily_profile_selector_config or DailyProfileSelectorConfig()
         ).normalized()
@@ -138,6 +147,7 @@ class MonitorState:
         self.order_decision = "WAIT"
         self.rolling_edge: dict = self._empty_rolling_edge()
         self.result_sequence_guard: dict = self._empty_result_sequence_guard()
+        self.wave_batch_guard: dict = self._empty_wave_batch_guard()
         self.last_error: str | None = None
         self.updated_at_ms = 0
         self._opened_signal_keys: set[tuple[int, int, str]] = set()
@@ -255,6 +265,7 @@ class MonitorState:
             self.order_decision = "WAIT"
             self.rolling_edge = self._empty_rolling_edge()
             self.result_sequence_guard = self._empty_result_sequence_guard()
+            self.wave_batch_guard = self._empty_wave_batch_guard()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self._opened_signal_keys.clear()
@@ -399,6 +410,21 @@ class MonitorState:
                 observe_only=False,
                 reason=f"{signal.reason}；{signal.threshold_segment} SHORT小口放行",
             )
+            self.selected_signal = signal
+        batch_decision = evaluate_wave_batch_guard(
+            self.simulator.orders,
+            current_time=latest.close_time,
+            current_batch_id=signal.wave_batch_id,
+            config=self.wave_batch_guard_config,
+        )
+        self.wave_batch_guard = self._wave_batch_guard_to_dict(batch_decision)
+        if batch_decision.blocked:
+            if should_observe:
+                self._record_observation(signal, latest, batch_decision.code)
+            self.risk_pause = batch_decision.reason
+            return batch_decision.code
+        if batch_decision.mode == "RECOVERY":
+            signal = replace(signal, wave_guard_mode="RECOVERY")
             self.selected_signal = signal
         sequence_decision = evaluate_result_sequence_guard(
             self.simulator.orders,
@@ -986,6 +1012,7 @@ class MonitorState:
             "signal": signal.to_dict(),
             "rolling_edge": dict(self.rolling_edge),
             "result_sequence_guard": dict(self.result_sequence_guard),
+            "wave_batch_guard": dict(self.wave_batch_guard),
             "profile_guard_shadow": profile_guard,
             "profile_guard_default_shadow": profile_guard_default,
             "profile_guard_selection_policy": profile_guard.get("selection_policy") or {},
@@ -1147,6 +1174,45 @@ class MonitorState:
             "reason": "",
         }
 
+    def _empty_wave_batch_guard(self) -> dict:
+        config = self.wave_batch_guard_config
+        return {
+            "enabled": config.enabled,
+            "code": "WAVE_BATCH_GUARD_PENDING",
+            "mode": "PENDING" if config.enabled else "DISABLED",
+            "blocked": False,
+            "allow_progression": True,
+            "current_batch_id": "",
+            "batch_orders": 0,
+            "batch_wins": 0,
+            "batch_losses": 0,
+            "failed_batches": 0,
+            "pause_until": 0,
+            "reason": "",
+            "config": {
+                "batch_size": config.batch_size,
+                "failed_batches_for_cooldown": config.failed_batches_for_cooldown,
+                "failed_batch_window_ms": config.failed_batch_window_ms,
+                "cooldown_ms": config.cooldown_ms,
+            },
+        }
+
+    def _wave_batch_guard_to_dict(self, decision: WaveBatchGuardDecision) -> dict:
+        return {
+            **self._empty_wave_batch_guard(),
+            "code": decision.code,
+            "mode": decision.mode,
+            "blocked": decision.blocked,
+            "allow_progression": decision.allow_progression,
+            "current_batch_id": decision.current_batch_id,
+            "batch_orders": decision.batch_orders,
+            "batch_wins": decision.batch_wins,
+            "batch_losses": decision.batch_losses,
+            "failed_batches": decision.failed_batches,
+            "pause_until": decision.pause_until,
+            "reason": decision.reason,
+        }
+
     def _result_sequence_guard_to_dict(
         self,
         decision: ResultSequenceGuardDecision,
@@ -1204,6 +1270,7 @@ class MonitorState:
                     "allowed_directions": list(self.wave_state.allowed_directions),
                 },
                 "result_sequence_guard": self.result_sequence_guard,
+                "wave_batch_guard": self.wave_batch_guard,
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),

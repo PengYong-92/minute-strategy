@@ -15,6 +15,7 @@ from app.state import MonitorState
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
 from app.wave_state import WaveSnapshot
+from app.wave_batch_guard import WaveBatchGuardConfig
 
 
 def kline(idx, close, volume, open_price=None, high=None, low=None):
@@ -267,6 +268,101 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_wave_batch_guard_stops_refill_after_first_loss(self):
+        state = MonitorState(symbol="BTCUSDT")
+        state.simulator.orders.append(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="first loss",
+                entry_price=100.0,
+                opened_at=0,
+                expires_at=600_000,
+                status="SETTLED",
+                result="LOSS",
+                settled_at=600_000,
+                pnl=-10.0,
+                wave_batch_id="wave-a",
+            )
+        )
+        signal = Signal(
+            "LONG",
+            10,
+            "A",
+            "same wave",
+            100.0,
+            700_000,
+            score=84.0,
+            threshold=79.0,
+            session_allowed=True,
+            wave_batch_id="wave-a",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(640_000, 100.0, 100.0, 100.0, 100.0, 1.0, 700_000),
+        )
+
+        self.assertEqual(decision, "WAVE_BATCH_LOSS_LOCKED")
+        self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "BATCH_LOCKED")
+        self.assertEqual(len(state.simulator.orders), 1)
+
+    def test_wave_batch_guard_marks_first_post_cooldown_order_as_recovery(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
+        for order_id, batch_id, opened_minute, segment in (
+            (1, "wave-a", 0, "WD-01"),
+            (2, "wave-a", 2, "WD-02"),
+            (3, "wave-b", 30, "WD-03"),
+            (4, "wave-b", 32, "WD-04"),
+        ):
+            state.simulator.orders.append(
+                SimulatedOrder(
+                    id=order_id,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="failed batch",
+                    entry_price=100.0,
+                    opened_at=opened_minute * 60_000,
+                    expires_at=(opened_minute + 10) * 60_000,
+                    threshold_segment=segment,
+                    status="SETTLED",
+                    result="LOSS",
+                    settled_at=(opened_minute + 10) * 60_000,
+                    pnl=-10.0,
+                    wave_batch_id=batch_id,
+                )
+            )
+        current_time = 103 * 60_000
+        signal = Signal(
+            "LONG",
+            10,
+            "A",
+            "recovery candidate",
+            100.0,
+            current_time,
+            score=84.0,
+            threshold=79.0,
+            threshold_segment="WD-05",
+            session_allowed=True,
+            wave_batch_id="wave-c",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(current_time - 60_000, 100.0, 100.0, 100.0, 100.0, 1.0, current_time),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.simulator.orders[-1].wave_guard_mode, "RECOVERY")
+        self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "RECOVERY")
+
     def test_wave_guard_blocks_short_in_up_leg_and_keeps_long(self):
         state = MonitorState(symbol="BTCUSDT")
         wave = WaveSnapshot(
