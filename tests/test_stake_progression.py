@@ -75,6 +75,23 @@ class TwoStageStakeProgressionTest(unittest.TestCase):
         self.assertIsNone(consumed)
         self.assertEqual((terms.stake, terms.win_return, terms.step), (10.0, 18.0, 1))
 
+    def test_recovery_win_does_not_create_progression_credit(self):
+        ledger = self.ledger()
+
+        created = ledger.settle(
+            1,
+            order_opened_at=1_000,
+            step=1,
+            result="WIN",
+            settled_at=601_000,
+            allow_credit=False,
+        )
+        terms, consumed = ledger.assign(2, 602_000)
+
+        self.assertIsNone(created)
+        self.assertIsNone(consumed)
+        self.assertEqual((terms.stake, terms.win_return, terms.step), (10.0, 18.0, 1))
+
     def test_second_stage_win_ends_chain_and_returns_to_10u(self):
         ledger = self.ledger()
         self.win_first_stage(ledger)

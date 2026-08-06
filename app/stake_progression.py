@@ -227,6 +227,7 @@ class TwoStageStakeProgression:
         step: int,
         result: str,
         settled_at: int,
+        allow_credit: bool = True,
     ) -> StakeProgressionCredit | None:
         normalized_step = self._validate_step(step)
         normalized_result = self._validate_result(result)
@@ -255,6 +256,12 @@ class TwoStageStakeProgression:
             ),
             None,
         )
+        if not allow_credit:
+            self._processed_first_stage_order_ids.add(normalized_order_id)
+            if existing is not None and existing.status == "PENDING":
+                existing.status = "CANCELLED"
+                return existing
+            return None
         if existing is not None:
             return existing
         if normalized_order_id in self._processed_first_stage_order_ids:

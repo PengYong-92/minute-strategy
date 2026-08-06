@@ -117,6 +117,22 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored[0].result, "WIN")
         self.assertEqual(restored[0].pnl, 8.0)
 
+    def test_persists_and_restores_wave_batch_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            saved = progression_order(1)
+            saved.wave_state = "DOWN_LEG"
+            saved.wave_raw_state = "DOWN_LEG"
+            saved.wave_batch_id = "123|DOWN_LEG|SHORT|WD-05|DPS-1"
+            saved.wave_guard_mode = "RECOVERY"
+
+            store.save_order(saved, "BTCUSDT")
+            restored = store.load_orders("BTCUSDT")[0]
+
+        self.assertEqual(restored.wave_state, "DOWN_LEG")
+        self.assertEqual(restored.wave_batch_id, saved.wave_batch_id)
+        self.assertEqual(restored.wave_guard_mode, "RECOVERY")
+
     def test_persists_signal_audit_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -491,6 +507,9 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             legacy_order = progression_order(1).to_dict()
             legacy_order.pop("stake_progression_source_order_id")
             legacy_order.pop("stake_progression_version")
+            for key in list(legacy_order):
+                if key.startswith("wave_"):
+                    legacy_order.pop(key)
             with sqlite3.connect(db_path) as connection:
                 connection.execute(
                     """
@@ -545,6 +564,9 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertIn("stake_progression_credits", tables)
         self.assertEqual(restored[0].stake_progression_source_order_id, None)
         self.assertEqual(restored[0].stake_progression_version, "")
+        self.assertEqual(restored[0].wave_state, "UNKNOWN")
+        self.assertEqual(restored[0].wave_batch_id, "")
+        self.assertEqual(restored[0].wave_guard_mode, "NORMAL")
 
     def test_round_trips_all_credit_states_in_stable_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -133,6 +133,52 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(order.wave_batch_id, selected.wave_batch_id)
         self.assertEqual(order.wave_guard_mode, "NORMAL")
 
+    def test_recovery_order_does_not_consume_pending_credit(self):
+        simulator = AccountSimulator(enable_stake_progression=True, stake_progression_activated_at=0)
+        first = simulator.open_order(signal(timeframe_minutes=1), 100.0, 0)
+        simulator.settle_expired_orders(60_000, 101.0)
+        self.assertEqual(simulator.stake_progression.credits[0].status, "PENDING")
+        recovery_signal = Signal(
+            "LONG",
+            1,
+            "A",
+            "recovery",
+            101.0,
+            60_000,
+            wave_guard_mode="RECOVERY",
+        )
+
+        recovery, consumed = simulator.open_order_with_credit(
+            recovery_signal,
+            101.0,
+            60_000,
+            allow_progression=False,
+        )
+
+        self.assertEqual(first.stake, 10.0)
+        self.assertEqual(recovery.stake, 10.0)
+        self.assertEqual(recovery.stake_progression_step, 1)
+        self.assertIsNone(consumed)
+        self.assertEqual(simulator.stake_progression.credits[0].status, "PENDING")
+
+    def test_recovery_win_does_not_generate_pending_credit(self):
+        simulator = AccountSimulator(enable_stake_progression=True, stake_progression_activated_at=0)
+        recovery_signal = Signal(
+            "LONG", 1, "A", "recovery", 100.0, 0, wave_guard_mode="RECOVERY"
+        )
+        simulator.open_order_with_credit(
+            recovery_signal,
+            100.0,
+            0,
+            allow_progression=False,
+        )
+
+        events = simulator.settle_expired_order_events(60_000, 101.0)
+
+        self.assertEqual(events[0].order.result, "WIN")
+        self.assertIsNone(events[0].progression_credit)
+        self.assertEqual(simulator.stake_progression.credits, [])
+
     def test_long_order_wins_when_expiry_price_is_higher(self):
         simulator = AccountSimulator()
         order = simulator.open_order(signal("LONG"), entry_price=100.0, opened_at=0)

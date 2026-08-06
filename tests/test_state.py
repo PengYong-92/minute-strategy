@@ -309,6 +309,57 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "BATCH_LOCKED")
         self.assertEqual(len(state.simulator.orders), 1)
 
+    def test_wave_batch_lock_cancels_and_persists_pending_progression_credit(self):
+        storage = RecordingStorage()
+        state = MonitorState(symbol="BTCUSDT", storage=storage, now_ms=lambda: 0)
+        first = state.simulator.open_order(
+            Signal("LONG", 1, "A", "first", 100.0, 0, wave_batch_id="source-wave"),
+            100.0,
+            0,
+        )
+        state.simulator.settle_expired_orders(60_000, 101.0)
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "PENDING")
+        state.simulator.orders.append(
+            SimulatedOrder(
+                id=2,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="loss",
+                entry_price=100.0,
+                opened_at=100_000,
+                expires_at=700_000,
+                status="SETTLED",
+                result="LOSS",
+                settled_at=700_000,
+                pnl=-10.0,
+                wave_batch_id="lock-wave",
+            )
+        )
+        signal = Signal(
+            "LONG",
+            10,
+            "A",
+            "same wave",
+            100.0,
+            800_000,
+            score=84.0,
+            threshold=79.0,
+            session_allowed=True,
+            wave_batch_id="lock-wave",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(740_000, 100.0, 100.0, 100.0, 100.0, 1.0, 800_000),
+        )
+        state.wait_for_storage_writes()
+
+        self.assertEqual(first.result, "WIN")
+        self.assertEqual(decision, "WAVE_BATCH_LOSS_LOCKED")
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "CANCELLED")
+        self.assertEqual(storage.credit_saves[-1][1]["status"], "CANCELLED")
+
     def test_wave_batch_guard_marks_first_post_cooldown_order_as_recovery(self):
         state = MonitorState(
             symbol="BTCUSDT",

@@ -418,6 +418,8 @@ class MonitorState:
             config=self.wave_batch_guard_config,
         )
         self.wave_batch_guard = self._wave_batch_guard_to_dict(batch_decision)
+        if batch_decision.blocked or batch_decision.mode == "RECOVERY":
+            self._cancel_pending_progression_credits()
         if batch_decision.blocked:
             if should_observe:
                 self._record_observation(signal, latest, batch_decision.code)
@@ -462,6 +464,7 @@ class MonitorState:
             signal,
             entry_price=latest.close,
             opened_at=latest.close_time,
+            allow_progression=batch_decision.allow_progression,
         )
         if self.storage:
             try:
@@ -964,6 +967,13 @@ class MonitorState:
                 self.storage.save_stake_progression_credit(symbol, credit)
             )
         )
+
+    def _cancel_pending_progression_credits(self) -> None:
+        cancelled = self.simulator.stake_progression.cancel_pending()
+        if not self.storage:
+            return
+        for credit in cancelled:
+            self._save_stake_progression_credit(credit)
 
     def _save_settled_order_with_credit(self, order, credit) -> None:
         order_snapshot = replace(order)

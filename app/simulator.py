@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from app.models import Kline, Signal, SimulatedOrder
 from app.stake_progression import (
     TWO_STAGE_VERSION,
+    OrderTerms,
     StakeProgressionCredit,
     TwoStageStakeProgression,
 )
@@ -90,6 +91,8 @@ class AccountSimulator:
         signal: Signal,
         entry_price: float,
         opened_at: int,
+        *,
+        allow_progression: bool = True,
     ) -> tuple[SimulatedOrder, StakeProgressionCredit | None]:
         normalized_opened_at = int(opened_at)
         if normalized_opened_at < 0:
@@ -129,10 +132,19 @@ class AccountSimulator:
             "wave_batch_id": signal.wave_batch_id,
             "wave_guard_mode": signal.wave_guard_mode,
         }
-        terms, credit = self.stake_progression.assign(
-            self._next_id,
-            normalized_opened_at,
-        )
+        if allow_progression:
+            terms, credit = self.stake_progression.assign(
+                self._next_id,
+                normalized_opened_at,
+            )
+        else:
+            terms = OrderTerms(
+                stake=self.stake,
+                win_return=self.win_return,
+                step=1,
+                source_order_id=None,
+            )
+            credit = None
         try:
             order = SimulatedOrder(
                 id=self._next_id,
@@ -146,7 +158,8 @@ class AccountSimulator:
                 ),
             )
         except Exception:
-            self.stake_progression.rollback_assignment(self._next_id)
+            if allow_progression:
+                self.stake_progression.rollback_assignment(self._next_id)
             raise
         self._next_id += 1
         self.orders.append(order)
@@ -236,6 +249,7 @@ class AccountSimulator:
             order.stake_progression_step,
             result,
             settled_at,
+            allow_credit=order.wave_guard_mode != "RECOVERY",
         )
 
         order.status = "SETTLED"
