@@ -14,7 +14,7 @@ from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
-from app.wave_state import WaveSnapshot
+from app.wave_state import WaveSnapshot, analyze_wave
 from app.wave_batch_guard import WaveBatchGuardConfig
 
 
@@ -125,12 +125,29 @@ class RecordingStorage:
         self.write_gate = None
         self.order_profile = None
         self.daily_profile_selections = []
+        self.wave_runtime = {}
 
     def load_orders(self, symbol):
         return [replace(order) for order in self.persisted_orders.get(symbol.upper(), {}).values()]
 
     def load_observations(self, symbol):
         return []
+
+    def load_wave_runtime(self, symbol):
+        runtime = self.wave_runtime.get(symbol.upper())
+        if runtime is None:
+            return None
+        return {
+            "evaluated_at": runtime["evaluated_at"],
+            "snapshot": runtime["snapshot"],
+        }
+
+    def save_wave_runtime(self, symbol, snapshot, evaluated_at):
+        self._maybe_fail("save_wave_runtime")
+        self.wave_runtime[symbol.upper()] = {
+            "evaluated_at": evaluated_at,
+            "snapshot": snapshot,
+        }
 
     def save_order(self, order, symbol):
         self._wait_for_write_gate()
@@ -171,6 +188,16 @@ class RecordingStorage:
         credit_snapshot = replace(credit)
         self.credit_saves.append((symbol, credit_snapshot.to_dict()))
         self._persist_credit(credit_snapshot, symbol)
+
+    def cancel_stake_progression_credits(self, symbol, credits):
+        self._maybe_fail("cancel_stake_progression_credits")
+        snapshots = [replace(credit) for credit in credits]
+        self.atomic_calls.append(
+            ("cancel", symbol, [credit.to_dict() for credit in snapshots])
+        )
+        for credit in snapshots:
+            self.credit_saves.append((symbol, credit.to_dict()))
+            self._persist_credit(credit, symbol)
 
     def save_settled_order_with_credit(self, order, symbol, credit):
         self._maybe_fail("save_settled_order_with_credit")
@@ -414,6 +441,209 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.simulator.orders[-1].wave_guard_mode, "RECOVERY")
         self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "RECOVERY")
 
+    def test_wave_global_cooldown_refreshes_and_cancels_credit_while_signal_waits(self):
+        state = MonitorState(symbol="BTCUSDT")
+        for order_id, batch_id, opened_minute in (
+            (1, "wave-a", 0),
+            (2, "wave-a", 2),
+            (3, "wave-b", 30),
+            (4, "wave-b", 32),
+        ):
+            state.simulator.orders.append(
+                SimulatedOrder(
+                    id=order_id,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="失败波段",
+                    entry_price=100.0,
+                    opened_at=opened_minute * 60_000,
+                    expires_at=(opened_minute + 10) * 60_000,
+                    status="SETTLED",
+                    result="LOSS",
+                    settled_at=(opened_minute + 10) * 60_000,
+                    pnl=-10.0,
+                    wave_batch_id=batch_id,
+                )
+            )
+        state.simulator.stake_progression.credits.append(
+            StakeProgressionCredit(source_order_id=99, created_at=0)
+        )
+        current_time = 50 * 60_000
+        signal = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="实时信号不足",
+            price=100.0,
+            open_time=current_time - 60_000,
+            score=0.0,
+            threshold=80.0,
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(current_time - 60_000, 100.0, 100.0, 100.0, 100.0, 1.0, current_time),
+        )
+
+        self.assertEqual(decision, "BELOW_THRESHOLD")
+        self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "COOLDOWN")
+        self.assertEqual(state.simulator.stake_progression.credits[-1].status, "CANCELLED")
+
+    def test_new_wave_cancels_old_credit_before_opening_base_order(self):
+        state = MonitorState(symbol="BTCUSDT")
+        state.simulator.orders.append(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="旧波段盈利",
+                entry_price=100.0,
+                opened_at=0,
+                expires_at=600_000,
+                status="SETTLED",
+                result="WIN",
+                settled_at=600_000,
+                pnl=8.0,
+                wave_state="RANGE_LOW",
+                wave_confirmed_at=60_000,
+                wave_batch_id="60000|RANGE_LOW|LONG|WD-00|STATIC",
+            )
+        )
+        state.simulator.stake_progression.credits.append(
+            StakeProgressionCredit(source_order_id=1, created_at=600_000)
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="新波段首单",
+            price=101.0,
+            open_time=900_000,
+            score=84.0,
+            threshold=79.0,
+            session_allowed=True,
+            wave_state="UP_LEG",
+            wave_raw_state="UP_LEG",
+            wave_window=8,
+            wave_confirmations=2,
+            wave_confirmed_at=900_000,
+            wave_batch_id="900000|UP_LEG|LONG|WD-00|STATIC",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(840_000, 101.0, 101.0, 101.0, 101.0, 1.0, 900_000),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "CANCELLED")
+        self.assertEqual(state.simulator.orders[-1].stake, 10.0)
+        self.assertEqual(state.simulator.orders[-1].stake_progression_step, 1)
+
+    def test_turn_state_cancels_credit_before_any_new_signal(self):
+        state = MonitorState(symbol="BTCUSDT")
+        state.simulator.orders.append(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="旧上涨波段盈利",
+                entry_price=100.0,
+                opened_at=0,
+                expires_at=600_000,
+                status="SETTLED",
+                result="WIN",
+                settled_at=600_000,
+                pnl=8.0,
+                wave_state="UP_LEG",
+                wave_confirmed_at=60_000,
+                wave_batch_id="60000|UP_LEG|LONG|WD-00|STATIC",
+            )
+        )
+        state.simulator.stake_progression.credits.append(
+            StakeProgressionCredit(source_order_id=1, created_at=600_000)
+        )
+        signal = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="转折确认中",
+            price=99.0,
+            open_time=900_000,
+            score=0.0,
+            threshold=79.0,
+            wave_state="TURN_DOWN",
+            wave_raw_state="DOWN_LEG",
+            wave_window=8,
+            wave_confirmations=1,
+            wave_confirmed_at=900_000,
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(840_000, 99.0, 99.0, 99.0, 99.0, 1.0, 900_000),
+        )
+
+        self.assertEqual(decision, "BELOW_THRESHOLD")
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "CANCELLED")
+
+    def test_credit_cancellation_failure_keeps_memory_pending_and_blocks_order(self):
+        storage = RecordingStorage()
+        source = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="旧波段盈利",
+            entry_price=100.0,
+            opened_at=0,
+            expires_at=600_000,
+            status="SETTLED",
+            result="WIN",
+            settled_at=600_000,
+            pnl=8.0,
+            wave_state="RANGE_LOW",
+            wave_confirmed_at=60_000,
+            wave_batch_id="60000|RANGE_LOW|LONG|WD-00|STATIC",
+        )
+        storage._persist_order(source, "BTCUSDT")
+        storage._persist_credit(
+            StakeProgressionCredit(source_order_id=1, created_at=600_000),
+            "BTCUSDT",
+        )
+        state = MonitorState(symbol="BTCUSDT", storage=storage, now_ms=lambda: 0)
+        storage.fail_once("cancel_stake_progression_credits")
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="新波段首单",
+            price=101.0,
+            open_time=900_000,
+            score=84.0,
+            threshold=79.0,
+            session_allowed=True,
+            wave_state="UP_LEG",
+            wave_raw_state="UP_LEG",
+            wave_window=8,
+            wave_confirmations=2,
+            wave_confirmed_at=900_000,
+            wave_batch_id="900000|UP_LEG|LONG|WD-00|STATIC",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(840_000, 101.0, 101.0, 101.0, 101.0, 1.0, 900_000),
+        )
+
+        self.assertEqual(decision, "STORAGE_ERROR")
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "PENDING")
+        self.assertEqual(len(state.simulator.orders), 1)
+        self.assertIn("资格取消持久化失败", state.last_error)
+
     def test_wave_guard_blocks_short_in_up_leg_and_keeps_long(self):
         state = MonitorState(symbol="BTCUSDT")
         wave = WaveSnapshot(
@@ -446,10 +676,474 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(blocked.direction, "WAIT")
         self.assertEqual(blocked.observe_direction, "SHORT")
         self.assertEqual(blocked.wave_guard_mode, "DIRECTION_BLOCKED")
+        self.assertEqual(blocked.wave_guard_status, "DIRECTION_BLOCKED")
+        self.assertIn("不允许 SHORT", blocked.wave_guard_reason)
         self.assertIn("波段方向冲突", blocked.reason)
         self.assertEqual(allowed.direction, "LONG")
         self.assertEqual(allowed.wave_guard_mode, "NORMAL")
         self.assertTrue(allowed.wave_batch_id)
+
+    def test_seed_rebuilds_wave_anchor_and_preserves_loss_lock_after_restart(self):
+        closes = [100.0] * 12 + [100.2, 100.5, 100.9, 101.3, 101.8, 102.3, 102.9, 103.5, 104.1]
+        history = []
+        for index, close in enumerate(closes):
+            previous_close = closes[index - 1] if index else close
+            history.append(
+                Kline(
+                    open_time=index * 60_000,
+                    open=previous_close,
+                    high=max(previous_close, close) + 0.2,
+                    low=min(previous_close, close) - 0.2,
+                    close=close,
+                    volume=100.0,
+                    close_time=(index + 1) * 60_000,
+                )
+            )
+        uninterrupted = analyze_wave(())
+        for end in range(15, len(history) + 1):
+            uninterrupted = analyze_wave(history[:end], previous=uninterrupted)
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="同一上涨波段",
+            price=closes[-1],
+            open_time=history[-1].open_time,
+            score=84.0,
+            threshold=79.0,
+            session_allowed=True,
+            threshold_segment="WD-00",
+        )
+        before_restart = MonitorState(symbol="BTCUSDT")
+        before_restart.wave_state = uninterrupted
+        original = before_restart._attach_wave_metadata(signal, uninterrupted)
+
+        restarted = MonitorState(symbol="BTCUSDT")
+        restarted.seed_klines(history)
+        restored = restarted._attach_wave_metadata(signal, restarted.wave_state)
+        restarted.simulator.orders.append(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="重启前首亏",
+                entry_price=103.5,
+                opened_at=history[-2].close_time,
+                expires_at=history[-2].close_time + 600_000,
+                status="SETTLED",
+                result="LOSS",
+                settled_at=history[-1].close_time,
+                pnl=-10.0,
+                wave_batch_id=original.wave_batch_id,
+            )
+        )
+
+        decision = restarted._maybe_open_order(restored, history[-1])
+
+        self.assertEqual(restarted.wave_state.confirmed_at, uninterrupted.confirmed_at)
+        self.assertEqual(restored.wave_batch_id, original.wave_batch_id)
+        self.assertEqual(decision, "WAVE_BATCH_LOSS_LOCKED")
+
+    def test_restart_preserves_wave_anchor_when_warmup_omits_long_wave_start(self):
+        history = []
+        for index in range(400):
+            open_price = 100.0 + index * 0.2
+            close_price = open_price + 0.2
+            history.append(
+                Kline(
+                    open_time=index * 60_000,
+                    open=open_price,
+                    high=close_price + 0.1,
+                    low=open_price - 0.1,
+                    close=close_price,
+                    volume=100.0,
+                    close_time=(index + 1) * 60_000,
+                )
+            )
+        storage = RecordingStorage()
+        running = MonitorState(symbol="BTCUSDT", storage=storage)
+        running.seed_klines(history)
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="超长上涨波段",
+            price=history[-1].close,
+            open_time=history[-1].open_time,
+            score=84.0,
+            threshold=79.0,
+            session_allowed=True,
+            threshold_segment="WD-00",
+        )
+        original = running._attach_wave_metadata(signal, running.wave_state)
+        loss = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="重启前首亏",
+            entry_price=history[-2].close,
+            opened_at=history[-2].close_time,
+            expires_at=history[-2].close_time + 600_000,
+            status="SETTLED",
+            result="LOSS",
+            settled_at=history[-1].close_time,
+            pnl=-10.0,
+            wave_batch_id=original.wave_batch_id,
+        )
+        storage.save_order(loss, "BTCUSDT")
+
+        restarted = MonitorState(symbol="BTCUSDT", storage=storage)
+        restarted.seed_klines(history[-300:])
+        restored = restarted._attach_wave_metadata(signal, restarted.wave_state)
+
+        decision = restarted._maybe_open_order(restored, history[-1])
+
+        self.assertEqual(restarted.wave_state.confirmed_at, running.wave_state.confirmed_at)
+        self.assertEqual(restored.wave_batch_id, original.wave_batch_id)
+        self.assertEqual(decision, "WAVE_BATCH_LOSS_LOCKED")
+
+    def test_first_upgrade_inherits_persisted_order_anchor_without_wave_runtime(self):
+        history = []
+        for index in range(400):
+            open_price = 100.0 + index * 0.2
+            close_price = open_price + 0.2
+            history.append(
+                Kline(
+                    open_time=index * 60_000,
+                    open=open_price,
+                    high=close_price + 0.1,
+                    low=open_price - 0.1,
+                    close=close_price,
+                    volume=100.0,
+                    close_time=(index + 1) * 60_000,
+                )
+            )
+        uninterrupted = analyze_wave(())
+        for end in range(15, len(history) + 1):
+            uninterrupted = analyze_wave(history[:end], previous=uninterrupted)
+        original_batch_id = (
+            f"{uninterrupted.confirmed_at}|UP_LEG|LONG|WD-00|STATIC"
+        )
+        storage = RecordingStorage()
+        storage.save_order(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="升级前首亏",
+                entry_price=history[-2].close,
+                opened_at=history[-2].close_time,
+                expires_at=history[-2].close_time + 600_000,
+                status="SETTLED",
+                result="LOSS",
+                settled_at=history[-1].close_time,
+                pnl=-10.0,
+                threshold_segment="WD-00",
+                wave_state="UP_LEG",
+                wave_raw_state="UP_LEG",
+                wave_confirmed_at=uninterrupted.confirmed_at,
+                wave_batch_id=original_batch_id,
+            ),
+            "BTCUSDT",
+        )
+        restarted = MonitorState(symbol="BTCUSDT", storage=storage)
+        restarted.seed_klines([])
+        restarted.seed_klines(history[-14:])
+        restarted.seed_klines(history[-15:])
+        restarted.seed_klines(history[-300:])
+        restored = restarted._attach_wave_metadata(
+            Signal(
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="升级后同一上涨波段",
+                price=history[-1].close,
+                open_time=history[-1].open_time,
+                score=84.0,
+                threshold=79.0,
+                session_allowed=True,
+                threshold_segment="WD-00",
+            ),
+            restarted.wave_state,
+        )
+
+        decision = restarted._maybe_open_order(restored, history[-1])
+
+        self.assertEqual(restarted.wave_state.confirmed_at, uninterrupted.confirmed_at)
+        self.assertEqual(restored.wave_batch_id, original_batch_id)
+        self.assertEqual(decision, "WAVE_BATCH_LOSS_LOCKED")
+
+    def test_kline_gap_starts_new_wave_and_cancels_old_progression_credit(self):
+        old_wave = WaveSnapshot(
+            state="UP_LEG",
+            raw_state="UP_LEG",
+            window=8,
+            efficiency=0.9,
+            direction_ratio=0.85,
+            atr_strength=1.7,
+            range_position=0.92,
+            confirmations=2,
+            confirmed_at=960_000,
+            allowed_directions=("LONG",),
+        )
+        old_batch_id = "960000|UP_LEG|LONG|WD-00|STATIC"
+        source = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="缺口前赢单",
+            entry_price=100.0,
+            opened_at=23_400_000,
+            expires_at=24_000_000,
+            status="SETTLED",
+            result="WIN",
+            settled_at=24_000_000,
+            pnl=8.0,
+            threshold_segment="WD-00",
+            wave_state="UP_LEG",
+            wave_raw_state="UP_LEG",
+            wave_confirmed_at=old_wave.confirmed_at,
+            wave_batch_id=old_batch_id,
+        )
+        storage = RecordingStorage()
+        storage.save_order(source, "BTCUSDT")
+        storage.save_wave_runtime("BTCUSDT", old_wave, evaluated_at=24_000_000)
+        storage.progression_runtime["BTCUSDT"] = (TWO_STAGE_VERSION, 0, True)
+        storage.save_stake_progression_credit(
+            "BTCUSDT",
+            StakeProgressionCredit(source_order_id=1, created_at=24_000_000),
+        )
+        history = []
+        for index in range(300):
+            open_time = 48_000_000 + index * 60_000
+            open_price = 200.0 + index * 0.2
+            close_price = open_price + 0.2
+            history.append(
+                Kline(
+                    open_time=open_time,
+                    open=open_price,
+                    high=close_price + 0.1,
+                    low=open_price - 0.1,
+                    close=close_price,
+                    volume=100.0,
+                    close_time=open_time + 60_000,
+                )
+            )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            now_ms=lambda: history[-1].close_time,
+        )
+        state.seed_klines(history)
+        signal = state._attach_wave_metadata(
+            Signal(
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="缺口后上涨波段",
+                price=history[-1].close,
+                open_time=history[-1].open_time,
+                score=84.0,
+                threshold=79.0,
+                session_allowed=True,
+                threshold_segment="WD-00",
+            ),
+            state.wave_state,
+        )
+
+        decision = state._maybe_open_order(signal, history[-1])
+
+        self.assertEqual(decision, "OPENED")
+        self.assertNotEqual(signal.wave_confirmed_at, old_wave.confirmed_at)
+        self.assertNotEqual(signal.wave_batch_id, old_batch_id)
+        self.assertEqual(state.simulator.orders[-1].stake, 10.0)
+        self.assertEqual(state.simulator.orders[-1].stake_progression_step, 1)
+        self.assertEqual(
+            storage.persisted_credits[("BTCUSDT", TWO_STAGE_VERSION, 1)].status,
+            "CANCELLED",
+        )
+
+    def test_first_upgrade_cancels_pending_credit_before_runtime_snapshot(self):
+        history = []
+        for index in range(400):
+            open_price = 100.0 + index * 0.2
+            close_price = open_price + 0.2
+            history.append(
+                Kline(
+                    open_time=index * 60_000,
+                    open=open_price,
+                    high=close_price + 0.1,
+                    low=open_price - 0.1,
+                    close=close_price,
+                    volume=100.0,
+                    close_time=(index + 1) * 60_000,
+                )
+            )
+        old_wave = analyze_wave(())
+        for end in range(15, len(history) + 1):
+            old_wave = analyze_wave(history[:end], previous=old_wave)
+        old_batch_id = f"{old_wave.confirmed_at}|UP_LEG|LONG|WD-00|STATIC"
+        source = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="升级前赢单",
+            entry_price=history[-2].close,
+            opened_at=history[-2].open_time,
+            expires_at=history[-1].close_time,
+            status="SETTLED",
+            result="WIN",
+            settled_at=history[-1].close_time,
+            pnl=8.0,
+            threshold_segment="WD-00",
+            wave_state="UP_LEG",
+            wave_raw_state="UP_LEG",
+            wave_confirmed_at=old_wave.confirmed_at,
+            wave_batch_id=old_batch_id,
+        )
+        storage = RecordingStorage()
+        storage.save_order(source, "BTCUSDT")
+        storage.progression_runtime["BTCUSDT"] = (TWO_STAGE_VERSION, 0, True)
+        storage.save_stake_progression_credit(
+            "BTCUSDT",
+            StakeProgressionCredit(
+                source_order_id=source.id,
+                created_at=source.settled_at,
+            ),
+        )
+
+        first_boot = MonitorState(symbol="BTCUSDT", storage=storage)
+        first_boot.seed_klines(history[-300:])
+        second_boot = MonitorState(symbol="BTCUSDT", storage=storage)
+        second_boot.seed_klines(history[-300:])
+        signal = second_boot._attach_wave_metadata(
+            Signal(
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="二次重启后同一波段",
+                price=history[-1].close,
+                open_time=history[-1].open_time,
+                score=84.0,
+                threshold=79.0,
+                session_allowed=True,
+                threshold_segment="WD-00",
+            ),
+            second_boot.wave_state,
+        )
+
+        decision = second_boot._maybe_open_order(signal, history[-1])
+
+        self.assertEqual(
+            storage.persisted_credits[("BTCUSDT", TWO_STAGE_VERSION, source.id)].status,
+            "CANCELLED",
+        )
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(len(second_boot.simulator.orders), 2)
+        self.assertEqual(second_boot.simulator.orders[-1].stake, 10.0)
+        self.assertEqual(second_boot.simulator.orders[-1].stake_progression_step, 1)
+
+    def test_newer_wave_snapshot_is_not_overwritten_by_older_warmup(self):
+        history = []
+        for index in range(400):
+            open_price = 100.0 + index * 0.2
+            close_price = open_price + 0.2
+            history.append(
+                Kline(
+                    open_time=index * 60_000,
+                    open=open_price,
+                    high=close_price + 0.1,
+                    low=open_price - 0.1,
+                    close=close_price,
+                    volume=100.0,
+                    close_time=(index + 1) * 60_000,
+                )
+            )
+        saved_wave = analyze_wave(())
+        for end in range(15, len(history) + 1):
+            saved_wave = analyze_wave(history[:end], previous=saved_wave)
+        batch_id = f"{saved_wave.confirmed_at}|UP_LEG|LONG|WD-00|STATIC"
+        storage = RecordingStorage()
+        storage.save_wave_runtime(
+            "BTCUSDT",
+            saved_wave,
+            evaluated_at=history[-1].close_time,
+        )
+        storage.save_order(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="快照时刻首亏",
+                entry_price=history[-1].close,
+                opened_at=history[-1].open_time,
+                expires_at=history[-1].close_time + 600_000,
+                status="SETTLED",
+                result="LOSS",
+                settled_at=history[-1].close_time,
+                pnl=-10.0,
+                threshold_segment="WD-00",
+                wave_state="UP_LEG",
+                wave_raw_state="UP_LEG",
+                wave_confirmed_at=saved_wave.confirmed_at,
+                wave_batch_id=batch_id,
+            ),
+            "BTCUSDT",
+        )
+        state = MonitorState(symbol="BTCUSDT", storage=storage)
+
+        state.seed_klines(history[-301:-1])
+        state.seed_klines([history[-1]])
+        restored = state._attach_wave_metadata(
+            Signal(
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="实时数据追平快照",
+                price=history[-1].close,
+                open_time=history[-1].open_time,
+                score=84.0,
+                threshold=79.0,
+                session_allowed=True,
+                threshold_segment="WD-00",
+            ),
+            state.wave_state,
+        )
+
+        decision = state._maybe_open_order(restored, history[-1])
+
+        self.assertEqual(state.wave_state.confirmed_at, saved_wave.confirmed_at)
+        self.assertEqual(restored.wave_batch_id, batch_id)
+        self.assertEqual(decision, "WAVE_BATCH_LOSS_LOCKED")
+
+    def test_wave_runtime_persistence_failure_pauses_order_opening(self):
+        storage = RecordingStorage()
+        storage.fail_once("save_wave_runtime")
+        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        history = [
+            Kline(
+                open_time=index * 60_000,
+                open=100.0 + index,
+                high=101.2 + index,
+                low=99.8 + index,
+                close=101.0 + index,
+                volume=100.0,
+                close_time=(index + 1) * 60_000,
+            )
+            for index in range(16)
+        ]
+
+        state.seed_klines(history)
+
+        self.assertEqual(state.order_decision, "STORAGE_ERROR")
+        self.assertEqual(state.risk_pause, "存储写入失败，暂停开单")
+        self.assertIn("波段运行态持久化失败", state.last_error)
 
     def test_wave_guard_blocks_turn_and_range_middle(self):
         state = MonitorState(symbol="BTCUSDT")
@@ -521,6 +1215,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertFalse(selected.daily_profile_selected)
         self.assertEqual(decision, "WAVE_DIRECTION_BLOCKED")
         self.assertEqual(state.simulator.orders, [])
+        self.assertEqual(state.observations[-1].wave_guard_status, "DIRECTION_BLOCKED")
+        self.assertIn("不允许 SHORT", state.observations[-1].wave_guard_reason)
 
     def test_default_order_policy_supports_two_open_orders_two_minutes_apart(self):
         state = MonitorState(symbol="BTCUSDT")
@@ -531,6 +1227,8 @@ class MonitorStateTest(unittest.TestCase):
             state.snapshot()["order_policy"],
             {"max_open_orders": 2, "min_order_gap_ms": 2 * 60_000},
         )
+        self.assertFalse(state.snapshot()["result_sequence_guard"]["enabled"])
+        self.assertTrue(state.snapshot()["wave_batch_guard"]["enabled"])
 
     def test_daily_profile_status_does_not_repeat_reloaded_active_snapshot_as_pending(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
@@ -632,11 +1330,11 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [], now)
         decision = state._maybe_open_order(selected, latest, daily_profile_required=required)
 
-        self.assertTrue(required)
+        self.assertFalse(required)
         self.assertFalse(selected.daily_profile_selected)
         self.assertEqual(selected.direction, "WAIT")
         self.assertEqual(selected.score, 0.0)
-        self.assertNotEqual(decision, "OPENED")
+        self.assertEqual(decision, "BELOW_THRESHOLD")
         self.assertEqual(state.simulator.orders, [])
 
     def test_daily_selected_profile_verifies_actionable_same_direction_signal(self):
@@ -691,17 +1389,19 @@ class MonitorStateTest(unittest.TestCase):
             "selected_profiles": [{"key": "10|short_observe|other|SHORT|WD-02"}],
         }
         primary = Signal(
-            direction="WAIT",
+            direction="SHORT",
             timeframe_minutes=10,
-            level="B",
-            reason="观察",
+            level="A",
+            reason="实时SHORT已过线",
             price=100.0,
             open_time=now - 60_000,
+            score=-84.0,
+            threshold=79.0,
             threshold_segment="WD-01",
             strategy_family="short_observe",
             strategy_tag="generic_short_observe",
             observe_direction="SHORT",
-            observe_only=True,
+            observe_only=False,
         )
         latest = Kline(now - 60_000, 100.0, 100.0, 100.0, 100.0, 1.0, now)
 
@@ -748,7 +1448,7 @@ class MonitorStateTest(unittest.TestCase):
 
         selected, required = state._select_daily_profile_signal(primary, [candidate], now)
 
-        self.assertTrue(required)
+        self.assertFalse(required)
         self.assertEqual(selected.direction, "WAIT")
         self.assertNotEqual(selected.strategy_tag, "low_volume_reclaim_observe")
         self.assertFalse(selected.daily_profile_selected)
@@ -1094,7 +1794,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "OPENED")
         self.assertEqual(state.simulator.orders[-1].direction, "SHORT")
 
-    def test_session_blocked_signal_opens_after_recent_observation_profile_proves_edge(self):
+    def test_legacy_observation_profile_cannot_promote_wait_signal(self):
         state = MonitorState(
             symbol="BTCUSDT",
             observation_profile_min_samples=8,
@@ -1130,17 +1830,10 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         decision = state._maybe_open_order(signal, latest)
-        order = state.simulator.orders[-1]
+        self.assertEqual(decision, "SESSION_BLOCKED")
+        self.assertEqual(state.simulator.orders, [])
 
-        self.assertEqual(decision, "OPENED")
-        self.assertEqual(order.direction, "LONG")
-        self.assertEqual(order.session_sample_size, 8)
-        self.assertAlmostEqual(order.session_win_rate, 0.875)
-        self.assertAlmostEqual(order.session_ev, 5.75)
-        self.assertEqual(order.session_edge_min, 8.0)
-        self.assertIn("观察画像放行", order.reason)
-
-    def test_default_observation_profile_thresholds_can_promote_twelve_independent_samples(self):
+    def test_default_legacy_observation_profile_cannot_promote_wait_signal(self):
         state = MonitorState(symbol="BTCUSDT")
         latest = kline(20_000, 100.0, 100)
         profile_start = latest.close_time - 6 * 86_400_000
@@ -1171,11 +1864,10 @@ class MonitorStateTest(unittest.TestCase):
 
         decision = state._maybe_open_order(signal, latest)
 
-        self.assertEqual(decision, "OPENED")
-        self.assertEqual(state.simulator.orders[-1].session_sample_size, 12)
-        self.assertAlmostEqual(state.simulator.orders[-1].session_ev, 5.0)
+        self.assertEqual(decision, "SESSION_BLOCKED")
+        self.assertEqual(state.simulator.orders, [])
 
-    def test_observation_profile_promotion_respects_configured_open_order_limit(self):
+    def test_legacy_observation_profile_does_not_bypass_wait_with_open_order(self):
         state = MonitorState(symbol="BTCUSDT", max_open_orders=1)
         latest = kline(20_000, 100.0, 100)
         profile_start = latest.close_time - 6 * 86_400_000
@@ -1215,7 +1907,7 @@ class MonitorStateTest(unittest.TestCase):
 
         decision = state._maybe_open_order(signal, latest)
 
-        self.assertEqual(decision, "HOLD_OPEN_ORDER")
+        self.assertEqual(decision, "SESSION_BLOCKED")
         self.assertEqual(len(state.simulator.orders), 1)
 
     def test_session_blocked_signal_ignores_observations_older_than_lookback(self):
@@ -1248,7 +1940,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "SESSION_BLOCKED")
         self.assertEqual(state.snapshot()["stats"]["total_orders"], 0)
 
-    def test_observation_profile_promotion_still_respects_rolling_edge_guard(self):
+    def test_wait_signal_is_rejected_before_rolling_edge_guard(self):
         state = MonitorState(
             symbol="BTCUSDT",
             rolling_edge_config=RollingEdgeConfig(min_samples=3),
@@ -1302,7 +1994,7 @@ class MonitorStateTest(unittest.TestCase):
 
         decision = state._maybe_open_order(signal, latest)
 
-        self.assertEqual(decision, "ROLLING_EDGE_BLOCKED")
+        self.assertEqual(decision, "SESSION_BLOCKED")
         self.assertEqual(len(state.simulator.orders), 3)
         self.assertEqual(state.snapshot()["rolling_edge"]["status"], "DEGRADED")
 
@@ -2035,9 +2727,9 @@ class MonitorStateTest(unittest.TestCase):
             StakeProgressionCredit(source_order_id=2, created_at=300),
             "BTCUSDT",
         )
-        storage.fail_once("save_stake_progression_credit")
+        storage.fail_once("cancel_stake_progression_credits")
 
-        with self.assertRaisesRegex(OSError, "save_stake_progression_credit failed"):
+        with self.assertRaisesRegex(OSError, "cancel_stake_progression_credits failed"):
             MonitorState(
                 symbol="BTCUSDT", storage=storage, stake_progression_max_active=1,
                 now_ms=lambda: 1_000,

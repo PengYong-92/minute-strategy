@@ -124,6 +124,8 @@ class SimulatorTest(unittest.TestCase):
             wave_confirmed_at=120_000,
             wave_batch_id="120000|UP_LEG|LONG|WD-00|STATIC",
             wave_guard_mode="NORMAL",
+            wave_guard_status="WAVE_BATCH_NORMAL",
+            wave_guard_reason="当前波段批次允许开单",
         )
 
         order = AccountSimulator().open_order(selected, entry_price=100.0, opened_at=180_000)
@@ -132,6 +134,8 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(order.wave_window, 8)
         self.assertEqual(order.wave_batch_id, selected.wave_batch_id)
         self.assertEqual(order.wave_guard_mode, "NORMAL")
+        self.assertEqual(order.wave_guard_status, "WAVE_BATCH_NORMAL")
+        self.assertEqual(order.wave_guard_reason, "当前波段批次允许开单")
 
     def test_recovery_order_does_not_consume_pending_credit(self):
         simulator = AccountSimulator(enable_stake_progression=True, stake_progression_activated_at=0)

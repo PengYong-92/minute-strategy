@@ -70,6 +70,8 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "wave_raw_state": signal.get("wave_raw_state") or "UNKNOWN",
         "wave_batch_id": signal.get("wave_batch_id") or "",
         "wave_guard_mode": signal.get("wave_guard_mode") or wave_batch_guard.get("mode") or "NORMAL",
+        "wave_guard_status": signal.get("wave_guard_status") or "UNKNOWN",
+        "wave_guard_reason": signal.get("wave_guard_reason") or "",
         "fear_greed_value": fear_greed.get("value"),
         "fear_greed_trend": fear_greed.get("trend") or "",
         "profile_guard_shadow_status": guard_shadow.get("status", ""),
@@ -172,6 +174,8 @@ def sample_from_signal(signal: Signal) -> dict[str, Any]:
         "wave_raw_state": signal.wave_raw_state,
         "wave_batch_id": signal.wave_batch_id,
         "wave_guard_mode": signal.wave_guard_mode,
+        "wave_guard_status": signal.wave_guard_status,
+        "wave_guard_reason": signal.wave_guard_reason,
         "fear_greed_value": signal.fear_greed_value,
         "fear_greed_trend": signal.fear_greed_trend,
     }

@@ -326,8 +326,8 @@ def main() -> None:
     parser.add_argument(
         "--no-result-sequence-guard",
         action="store_true",
-        default=not _env_bool("RESULT_SEQUENCE_GUARD", True),
-        help="关闭结算序列冷却守卫",
+        default=not _env_bool("RESULT_SEQUENCE_GUARD", False),
+        help="关闭旧结算序列冷却守卫；生产默认关闭，由波段批次守卫替代",
     )
     parser.add_argument(
         "--result-sequence-loss-streak",

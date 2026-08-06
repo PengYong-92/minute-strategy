@@ -1,7 +1,7 @@
 # 当前策略说明
 
-更新时间：2026-08-05
-代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
+更新时间：2026-08-06
+代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
 
 ## 1. 策略目标与运行周期
 
@@ -15,6 +15,8 @@
 - 开单后通过 webhook 推送方向、周期和本单金额。
 - 对所有开单记录入场快照，便于后续分析亏损订单和优化策略。
 - LONG/SHORT 候选均持续记录观察结果，主程序每天从最近7天观察画像中选出当日启用策略。
+- 使用单一1分钟波段守卫校验方向；每日画像只验证已达到实时阈值的同方向信号，不生成方向。
+- 默认总未结订单上限为2；同一波段首亏后不补位，连续失败批次触发全局冷却。
 
 当前实盘开单周期：
 
@@ -58,6 +60,7 @@ bash scripts/run.sh
 | `--no-persistence` | 关闭参数 | 关闭 SQLite 持久化 |
 | `--no-webhook` | 关闭参数 | 关闭 webhook 推送 |
 | `--no-daily-profile-selector` | 关闭参数 | 关闭每日观察画像选策，回退静态主策略 |
+| `--no-result-sequence-guard` | 默认关闭 | 旧按方向连亏守卫兼容开关；生产由波段批次守卫替代 |
 | `--daily-profile-lookback-days` | `7` | 每日画像统计窗口 |
 | `--daily-profile-min-samples` | `20` | 新画像入选最小独立样本 |
 | `--daily-profile-min-win-rate` | `0.60` | 新画像入选最低胜率，低于该值不入选 |
@@ -905,11 +908,13 @@ session_allowed == True
 edge >= session_edge_min
 edge < max_trade_edge
 signal.actionable == True
-direction != SHORT
-未结订单数 < 5
+1分钟波段允许该方向
+每日画像启用时，匹配同方向完整画像
+未结订单数 < 2
 距离上一单 >= 2分钟
 非重复 signal_key
 未触发同日同分段连续亏损暂停
+未触发波段批次锁定或全局冷却
 未触发滚动守卫 DEGRADED
 ```
 
@@ -928,11 +933,16 @@ and abs(score) >= threshold
 | `EDGE_TOO_SMALL` | 分数过阈但边际不足，或尚未达到过热上限 |
 | `SESSION_BLOCKED` | 当前时段没有对应 session edge |
 | `OVERHEATED` | edge 超过过热上限 |
-| `HOLD_OPEN_ORDER` | 未结订单已达到5单 |
+| `WAVE_DIRECTION_BLOCKED` | 1分钟波段不允许当前实时方向 |
+| `DAILY_PROFILE_NOT_SELECTED` | 实时信号未进入今日启用画像 |
+| `HOLD_OPEN_ORDER` | 未结订单已达到2单 |
 | `COOLDOWN` | 距离上一单不足2分钟 |
 | `DUPLICATE_SIGNAL` | 同一信号已开过 |
 | `RISK_PAUSED` | 同日同分段连续亏损达到 3 单 |
-| `SHORT_OBSERVE_ONLY` | 非实单白名单时段的 SHORT 观察模式，只记录信号和决策，不开单 |
+| `SHORT_OBSERVE_ONLY` | 静态兼容模式下非实单时段的 SHORT，只记录观察 |
+| `WAVE_BATCH_LOSS_LOCKED` | 当前波段批次已有亏损，不再补单 |
+| `WAVE_BATCH_FULL` | 当前波段批次已达到2单 |
+| `WAVE_GLOBAL_COOLDOWN` | 两个全亏批次或恢复单亏损触发全局冷却 |
 | `ROLLING_EDGE_BLOCKED` | 滚动守卫判定该 setup 衰退 |
 | `OPENED` | 成功开单 |
 
@@ -1237,9 +1247,9 @@ short_observe_only = True
 
 ## 21. 当前策略特征总结
 
-当前策略只做10分钟事件合约。LONG 与 SHORT 都先作为观察候选记录，是否进入主程序由每天生成的完整画像快照决定；当前不再使用固定的 SHORT 时段白名单，也不因方向跳过持仓、冷却、连续亏损、滚动优势和画像守卫。
+当前策略只做10分钟事件合约。原量价和技术指标先生成实时 LONG、SHORT 或 WAIT，1分钟波段校验方向，每日完整画像再验证同方向策略和时段；任何画像都不能生成方向或提升 WAIT。每日画像生效时不使用固定 SHORT 时段白名单，静态兼容模式仍保留 `WD-02/WD-23` 小口。
 
-当前生产资金管理严格使用 `10U -> 18U -> 重置10U` 两阶段；第一级赢后才产生一次第二级资格，不存在第三级，最多并行第二级订单数默认是 1，且所有已入选时段默认均可参与。
+当前生产资金管理严格使用 `10U -> 18U -> 重置10U` 两阶段；第一级赢后才产生一次第二级资格，不存在第三级，最多并行第二级订单数默认是1，且所有已入选时段默认均可参与。总未结订单上限为2；批次锁定、全局冷却和恢复单不消费或生成18U资格。
 
 当前策略不是“看到下跌就追空”，而是：
 
@@ -1258,10 +1268,13 @@ K线窗口
  -> 分时段 session edge
  -> Fear & Greed / regime 调整
  -> 最小 edge 和过热上限
+ -> 1分钟波段方向否决
+ -> 每日画像同方向验证
  -> 订单状态 / 冷却 / 重复信号
- -> SHORT观察拦截
+ -> 波段批次 / 全局恢复守卫
  -> 同日连续亏损风控
  -> 滚动守卫
+ -> 10U/18U金额分配
  -> 模拟开单 + webhook + 入场快照
 ```
 
@@ -1662,6 +1675,8 @@ bash scripts/run.sh \
 
 本节点替代第28节的“单条信号动态放行”。观察画像现在负责选择主程序当天采用的策略，而不是只在 `SESSION_BLOCKED` 后临时放行某条信号。
 
+> 历史说明：本节后续关于画像可替代评分或指标资格的描述是2026-07-30节点行为。2026-08-06起以第32节权限边界为准，画像不能提升WAIT、不能改写方向、不能绕过实时评分阈值。
+
 完整画像键：
 
 ```text
@@ -1683,11 +1698,11 @@ EV >= 0U
 
 服务从数据库恢复观察画像时会额外加载 1 天缓冲数据，随后仍由每日选择器按北京时间 07:50 截止点精确截取近 7 天。该缓冲用于保证服务在任意时刻重启后重算结果一致，不会扩大实际统计窗口。
 
-每轮K线分析会把主信号和研究观察候选与当天快照逐一精确匹配。匹配成功的观察信号获得显式 `daily_profile_selected` 执行资格，原始 `score`、`threshold`、MACD、RSI、BOLL等数据保持不变。对于 `generic_*_observe`，技术指标不再是硬门槛，但原始方向、量价结构、策略标签和时段必须与画像完全一致。
+每轮K线分析只把已成立的主实时信号与当天快照精确匹配。研究观察候选仅入库统计，不参与实际选择。匹配成功只能增加 `daily_profile_selected` 元数据，原始方向、`score`、`threshold`、MACD、RSI和BOLL条件必须已经成立。
 
-每日画像只替代静态时段、动态评分阈值和技术指标资格，不绕过以下通用控制：
+每日画像只验证同方向实时信号，不替代动态评分阈值和技术指标资格，也不绕过以下通用控制：
 
-1. 最大持仓和10分钟冷却。
+1. 最大持仓和2分钟最小开单间隔。
 2. 重复信号和同日同画像三连亏暂停。
 3. 滚动优势守卫与订单弱点画像守卫。
 4. 基础金额与严格两阶段金额叠加规则；第二级并行上限默认是1，所有已入选时段默认均可参与。
@@ -1782,3 +1797,130 @@ bash scripts/run.sh \
 ```
 
 设置 `--no-result-sequence-guard` 可关闭。严格回放报告为 `reports/result-sequence-guard-server-20260805.json`，两年否决报告为 `reports/market-sequence-two-year-20260805.json`；`reports/` 默认不提交仓库。
+
+> 当前状态：本节是历史对照。2026-08-06起生产默认关闭按方向结算序列守卫，改用第32节的波段批次规律守卫。兼容代码仍可通过 `RESULT_SEQUENCE_GUARD=1` 显式启用。
+
+## 32. 2026-08-06 1分钟波段方向与批次守卫
+
+### 32.1 当前决策顺序
+
+当前生产流水线固定为：
+
+1. 只使用已闭合1分钟K线计算当前波段。
+2. 原有10分钟量价、MACD、RSI和BOLL逻辑生成实时 `LONG`、`SHORT` 或 `WAIT`。
+3. 1分钟波段守卫只校验该实时方向；冲突时改为 `WAIT`，但保留原方向用于影子观察。
+4. 每日画像只匹配主实时信号的相同方向、策略族、策略标签和时段。
+5. 执行评分边际、时段、并发、2分钟间隔、重复信号、波段批次、滚动优势和画像守卫。
+6. 所有检查通过后才分配10U或已有的18U资格，并保存订单、入场快照和Webhook。
+
+后置模块都不能把 `WAIT` 改成 `LONG/SHORT`，也不能互换方向。`Signal.actionable` 只在方向为 `LONG/SHORT` 且 `abs(score) >= threshold` 时成立；`daily_profile_selected` 不再绕过评分。
+
+### 32.2 1分钟波段计算
+
+主窗口固定为最近8根已闭合1分钟K线，ATR窗口为最近14根1分钟K线。本节点不使用30分钟、4小时或日线趋势投票，也不使用会事后重画的ZigZag。
+
+计算量：
+
+```text
+net = close[-1] - close[0]
+path = sum(abs(close[i] - close[i-1]))
+efficiency = abs(net) / path
+direction_ratio = 与net同方向的分钟变化数 / 7
+atr_strength = abs(net) / ATR14
+range_position = (close[-1] - min(low)) / (max(high) - min(low))
+```
+
+趋势成立条件：
+
+```text
+efficiency >= 0.35
+direction_ratio >= 0.60
+atr_strength >= 0.50
+```
+
+状态和方向许可：
+
+| 状态 | 判断 | 允许方向 |
+|---|---|---|
+| `UP_LEG` | 趋势条件成立且净变化向上，连续两根闭合分钟确认 | `LONG` |
+| `DOWN_LEG` | 趋势条件成立且净变化向下，连续两根闭合分钟确认 | `SHORT` |
+| `TURN_UP` | 上涨候选仅确认一次 | 无，等待 |
+| `TURN_DOWN` | 下跌候选仅确认一次 | 无，等待 |
+| `RANGE_HIGH` | 无明确趋势且区间位置不低于0.70 | `SHORT`均值回归候选 |
+| `RANGE_LOW` | 无明确趋势且区间位置不高于0.30 | `LONG`均值回归候选 |
+| `RANGE_MID` | 无明确趋势且位于区间中部 | 无，等待 |
+
+波段守卫只做否决，不主动生成信号或反向开仓。即使波段允许方向，实时量能、评分和指标未成立仍然不开单。
+
+### 32.3 每日画像权限
+
+每日画像键保持：
+
+```text
+timeframe_minutes | strategy_family | strategy_tag | direction | threshold_segment
+```
+
+画像职责仅为：
+
+- 验证已经成立的同方向实时信号；
+- 对样本数、胜率或EV不达标的画像执行否决；
+- 填充画像版本、样本数、胜率和EV元数据。
+
+`observe_direction` 和研究观察候选只用于统计。原始信号为 `WAIT` 时保持 `WAIT`；原始LONG不能匹配SHORT画像，原始SHORT也不能匹配LONG画像。波段细分结果会存储并按组报告，但当前不加入每日画像键，避免样本被过度拆散。
+
+关闭每日画像选择器后，旧观察画像兼容路径也遵守相同权限边界：只能验证已达到实时阈值的原方向，不读取 `observe_direction` 生成订单。`WAIT` 的最终决策保持为实时信号不足或原静态时段拦截。
+
+### 32.4 并发与波段批次
+
+生产默认总未结订单上限为2，基础单和18U第二级订单共同占用上限。两次开单最小间隔仍为2分钟。
+
+波段批次ID：
+
+```text
+波段确认时间 | 波段状态 | 方向 | WD/WE时段 | 每日画像版本
+```
+
+同一波段状态未改变时确认时间保持不变，因此属于同一批次。规则：
+
+- 当前批次无亏损且不足2单：可继续按通用门槛开单。
+- 当前批次出现第一笔已结算亏损：立即锁定，不补位。
+- 一赢一亏：旧波段继续锁定，等待新的已确认波段。
+- 两笔全亏：记为失败批次，只允许新波段恢复。
+- 60分钟内出现两个全亏批次：进入60分钟全局冷却。
+- 冷却结束：只允许一笔恢复单；恢复单未结算前不允许其他订单。
+- 恢复单盈利：解除全局恢复状态；恢复单亏损：重新冷却60分钟。
+
+守卫每次都从订单中的批次、状态、结果和时间重建，不依赖仅存在内存中的计数。旧订单没有批次ID时不会被错误归为同一批次。
+
+每根已闭合1分钟K线都会把波段状态、最后评估时间和 `confirmed_at` 同步写入SQLite `wave_runtime`。启动时先恢复同一交易对的版本化快照，再只对快照之后的预热K线按时间顺序增量重放。快照后的K线必须严格按1分钟连续；出现缺口时无法证明波段连续性，系统会只用缺口后的连续尾段建立新波段身份，旧18U资格不得跨缺口消费。
+
+首次升级、版本变化或快照损坏导致没有有效快照时，系统从现有预热K线完整重建，并从持久化订单保守继承同状态的最近旧锚点，优先保持首亏锁定；空预热、不足15根得到 `UNKNOWN`，或恰好进入 `TURN_UP/TURN_DOWN` 的单根确认态时，都不会写入首个快照，也不会结束首次升级保护。由于此时无法证明资格连续性，所有旧 `PENDING` 18U资格必须在获得稳定波段后于预热阶段原子取消成功，才允许写入新快照。取消失败时保持无快照状态并暂停开单，下一次启动仍会重试。这样即使连续重启或同一波段持续超过默认300根预热K线，也不能绕过首亏锁定或消费升级前资格。
+
+如果数据库快照比本次历史预热的最后一根K线更新，系统保留较新的快照和评估时间，不用旧历史反向重建或覆盖；实时数据追平后再恢复增量计算。运行态写入失败时返回 `STORAGE_ERROR` 并暂停开单。
+
+### 32.5 两阶段金额叠加
+
+正常状态保留严格两阶段：
+
+```text
+10U一级订单盈利 -> 产生一个18U资格
+18U二级订单结算 -> 资格结束，回到10U
+```
+
+转折、新波段、画像版本切换、批次锁定或全局冷却时，旧波段所有尚未消费的 `PENDING` 资格变为 `CANCELLED`。取消操作先在SQLite单个事务中提交，成功后才修改内存；事务失败则保留内存 `PENDING`、返回 `STORAGE_ERROR` 并暂停开单，防止重启后资格复活。恢复单固定10U，即使数据库中存在待用资格也不消费；恢复单盈利也不生成18U资格。只有恢复到正常新波段后，新的10U赢单才能产生资格。
+
+### 32.6 保存与页面
+
+`Signal`、`SimulatedOrder`、`ObservationSignal` 和订单入口快照保存：
+
+- `wave_state`、`wave_raw_state`、`wave_window`；
+- `wave_efficiency`、`wave_direction_ratio`、`wave_atr_strength`；
+- `wave_confirmations`、`wave_confirmed_at`；
+- `wave_batch_id`、`wave_guard_mode`；
+- `wave_guard_status`、`wave_guard_reason`。
+
+旧JSON载荷缺少这些字段时使用 `UNKNOWN`、空批次和 `NORMAL` 默认值。`/api/state` 输出 `wave_state` 与 `wave_batch_guard`；页面显示当前波段、允许方向、确认次数、批次订单胜负、冷却截止和恢复模式。数据库分析按波段状态和守卫模式分组，但不直接把这些小样本分组用于生产选策。
+
+### 32.7 本节点验证边界
+
+本节点按要求不执行历史回放或回测。参数采用已确认设计值，只运行纯函数、状态、模拟器、SQLite、API和页面单元测试。后续实际样本积累后，应分别统计 `WAVE_DIRECTION_BLOCKED`、`WAVE_BATCH_LOSS_LOCKED`、`WAVE_GLOBAL_COOLDOWN`、恢复单和正常订单，不能用被否决信号的事后结果反向污染生产守卫。

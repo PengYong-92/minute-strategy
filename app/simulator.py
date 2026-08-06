@@ -131,6 +131,8 @@ class AccountSimulator:
             "wave_confirmed_at": signal.wave_confirmed_at,
             "wave_batch_id": signal.wave_batch_id,
             "wave_guard_mode": signal.wave_guard_mode,
+            "wave_guard_status": signal.wave_guard_status,
+            "wave_guard_reason": signal.wave_guard_reason,
         }
         if allow_progression:
             terms, credit = self.stake_progression.assign(

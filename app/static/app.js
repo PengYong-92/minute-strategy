@@ -440,7 +440,8 @@ const selectedSignalFields = [
   ["1m波段", (s) => s.wave_state || "UNKNOWN"],
   ["波段确认", (s) => `${s.wave_confirmations || 0} / ${num(s.wave_efficiency).toFixed(3)}`],
   ["波段批次", (s) => s.wave_batch_id || DASH],
-  ["波段守卫", (s) => s.wave_guard_mode || "NORMAL"],
+  ["波段守卫", (s) => `${s.wave_guard_status || "UNKNOWN"} · ${s.wave_guard_mode || "NORMAL"}`],
+  ["守卫原因", (s) => s.wave_guard_reason || DASH],
 ];
 
 const signalFields = [
@@ -530,7 +531,7 @@ function renderOrders(orders) {
       <td>${escapeHtml(order.timeframe_minutes)}分钟</td>
       <td>${escapeHtml(order.level)}</td>
       <td>${escapeHtml(order.threshold_segment || DASH)}</td>
-      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span></td>
+      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_status || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span></td>
       <td>${fmtPct(order.session_win_rate)} / ${fmtMoney(order.session_ev)}</td>
       <td>${fmtMoney(order.stake)}</td>
       <td>${fmtPrice(order.entry_price)}</td>

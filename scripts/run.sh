@@ -23,7 +23,7 @@ MAX_OPEN_ORDERS="${MAX_OPEN_ORDERS:-2}"
 MIN_ORDER_GAP_MINUTES="${MIN_ORDER_GAP_MINUTES:-2}"
 STAKE_PROGRESSION="${STAKE_PROGRESSION:-1}"
 ROLLING_EDGE_GUARD="${ROLLING_EDGE_GUARD:-1}"
-RESULT_SEQUENCE_GUARD="${RESULT_SEQUENCE_GUARD:-1}"
+RESULT_SEQUENCE_GUARD="${RESULT_SEQUENCE_GUARD:-0}"
 RESULT_SEQUENCE_LOSS_STREAK="${RESULT_SEQUENCE_LOSS_STREAK:-3}"
 RESULT_SEQUENCE_COOLDOWN_MINUTES="${RESULT_SEQUENCE_COOLDOWN_MINUTES:-20}"
 RESULT_SEQUENCE_SCOPE="${RESULT_SEQUENCE_SCOPE:-DIRECTION}"
@@ -85,7 +85,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --no-rolling-edge-guard
                          关闭滚动优势守卫，仅保留状态观察
   --no-result-sequence-guard
-                         关闭结算序列冷却守卫
+                         关闭旧结算序列冷却守卫，生产默认已关闭
   --result-sequence-loss-streak N
                          同方向连续已结算亏损触发笔数，默认: 3
   --result-sequence-cooldown-minutes N

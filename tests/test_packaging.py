@@ -36,6 +36,8 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("wave-batch-guard-status", index_html)
         self.assertIn("fmtWaveState", app_js)
         self.assertIn("fmtWaveBatchGuard", app_js)
+        self.assertIn("wave_guard_status", app_js)
+        self.assertIn("wave_guard_reason", app_js)
         self.assertIn("daily-profile-list", index_html)
         self.assertIn(".layout > *", styles_css)
         self.assertIn("max-width: 100%", styles_css)
@@ -352,6 +354,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
             env = os.environ.copy()
             for name in (
                 "MAX_OPEN_ORDERS",
+                "RESULT_SEQUENCE_GUARD",
                 "STAKE_PROGRESSION",
                 "STAKE_PROGRESSION_MAX_ORDERS",
                 "STAKE_PROGRESSION_MAX_ACTIVE",
@@ -396,6 +399,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
 
         self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
         self.assertNotIn("--no-stake-progression", default_args)
+        self.assertIn("--no-result-sequence-guard", default_args)
         self.assertEqual(default_args[default_args.index("--max-open-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-active") + 1], "1")

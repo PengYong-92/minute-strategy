@@ -3,12 +3,13 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
+from app.wave_state import WAVE_RUNTIME_VERSION, WaveSnapshot
 
 
 ORDER_PAGE_SIZES = (10, 20, 30, 50, 100)
@@ -353,6 +354,78 @@ class SQLiteMonitorStore:
         with self._connect() as connection:
             self._upsert_order(connection, order, symbol)
 
+    def save_wave_runtime(
+        self,
+        symbol: str,
+        snapshot: WaveSnapshot,
+        evaluated_at: int,
+    ) -> None:
+        payload = {
+            "state": snapshot.state,
+            "raw_state": snapshot.raw_state,
+            "window": snapshot.window,
+            "efficiency": snapshot.efficiency,
+            "direction_ratio": snapshot.direction_ratio,
+            "atr_strength": snapshot.atr_strength,
+            "range_position": snapshot.range_position,
+            "confirmations": snapshot.confirmations,
+            "confirmed_at": snapshot.confirmed_at,
+            "allowed_directions": list(snapshot.allowed_directions),
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                insert into wave_runtime(symbol, version, evaluated_at, payload)
+                values (?, ?, ?, ?)
+                on conflict(symbol) do update set
+                    version=excluded.version,
+                    evaluated_at=excluded.evaluated_at,
+                    payload=excluded.payload,
+                    updated_at_ms=strftime('%s','now') * 1000
+                """,
+                (
+                    symbol.upper(),
+                    WAVE_RUNTIME_VERSION,
+                    int(evaluated_at),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+
+    def load_wave_runtime(self, symbol: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select version, evaluated_at, payload
+                from wave_runtime
+                where symbol = ?
+                """,
+                (symbol.upper(),),
+            ).fetchone()
+        if row is None or row["version"] != WAVE_RUNTIME_VERSION:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+            snapshot = WaveSnapshot(
+                state=str(payload["state"]),
+                raw_state=str(payload["raw_state"]),
+                window=int(payload["window"]),
+                efficiency=float(payload["efficiency"]),
+                direction_ratio=float(payload["direction_ratio"]),
+                atr_strength=float(payload["atr_strength"]),
+                range_position=float(payload["range_position"]),
+                confirmations=int(payload["confirmations"]),
+                confirmed_at=int(payload["confirmed_at"]),
+                allowed_directions=tuple(
+                    str(item) for item in payload["allowed_directions"]
+                ),
+            )
+            evaluated_at = int(row["evaluated_at"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if evaluated_at <= 0:
+            return None
+        return {"evaluated_at": evaluated_at, "snapshot": snapshot}
+
     def _upsert_order(
         self,
         connection: sqlite3.Connection,
@@ -442,6 +515,59 @@ class SQLiteMonitorStore:
     ) -> None:
         with self._connect() as connection:
             self._upsert_progression_credit(connection, symbol, credit)
+
+    def cancel_stake_progression_credits(
+        self,
+        symbol: str,
+        credits: Sequence[StakeProgressionCredit],
+    ) -> None:
+        normalized_symbol = symbol.upper()
+        snapshots = list(credits)
+        if not snapshots:
+            return
+        if any(credit.status != "CANCELLED" for credit in snapshots):
+            raise ValueError("cancelled credit snapshots are required")
+        keys = {(credit.version, credit.source_order_id) for credit in snapshots}
+        if len(keys) != len(snapshots):
+            raise ValueError("duplicate progression credit cancellation")
+
+        with self._connect() as connection:
+            for credit in snapshots:
+                persisted = connection.execute(
+                    """
+                    select credit_id, status
+                    from stake_progression_credits
+                    where symbol = ? and version = ? and source_order_id = ?
+                    """,
+                    (normalized_symbol, credit.version, credit.source_order_id),
+                ).fetchone()
+                if persisted is None:
+                    raise ValueError("progression credit to cancel does not exist")
+                if persisted["credit_id"] != credit.credit_id:
+                    raise ValueError("progression credit id conflicts with persisted state")
+                if persisted["status"] == "CANCELLED":
+                    continue
+                if persisted["status"] != "PENDING":
+                    raise ValueError("only pending progression credits can be cancelled")
+                cursor = connection.execute(
+                    """
+                    update stake_progression_credits
+                    set status = 'CANCELLED',
+                        consumed_order_id = null,
+                        consumed_at = null,
+                        updated_at_ms = strftime('%s','now') * 1000
+                    where symbol = ? and version = ? and source_order_id = ?
+                      and credit_id = ? and status = 'PENDING'
+                    """,
+                    (
+                        normalized_symbol,
+                        credit.version,
+                        credit.source_order_id,
+                        credit.credit_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("progression credit cancellation lost a concurrent update")
 
     def load_stake_progression_credits(
         self,
@@ -1032,6 +1158,17 @@ class SQLiteMonitorStore:
                     version text not null,
                     activated_at integer not null,
                     enabled integer not null check(enabled in (0, 1)),
+                    updated_at_ms integer not null default (strftime('%s','now') * 1000)
+                )
+                """
+            )
+            connection.execute(
+                """
+                create table if not exists wave_runtime (
+                    symbol text primary key,
+                    version text not null,
+                    evaluated_at integer not null,
+                    payload text not null,
                     updated_at_ms integer not null default (strftime('%s','now') * 1000)
                 )
                 """

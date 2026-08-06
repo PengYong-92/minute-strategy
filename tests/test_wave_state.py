@@ -1,7 +1,7 @@
 import unittest
 
 from app.models import Kline
-from app.wave_state import WaveSnapshot, analyze_wave
+from app.wave_state import WaveSnapshot, analyze_wave, rebuild_wave
 
 
 def bars(closes: list[float], *, start: int = 0, wick: float = 0.2) -> list[Kline]:
@@ -106,6 +106,18 @@ class WaveStateTest(unittest.TestCase):
         after = analyze_wave(history)
 
         self.assertEqual(before, after)
+
+    def test_rebuild_matches_incremental_wave_anchor_after_restart(self):
+        history = bars([100.0] * 12 + [100.2, 100.5, 100.9, 101.3, 101.8, 102.3, 102.9, 103.5, 104.1])
+        incremental = analyze_wave(())
+        for end in range(15, len(history) + 1):
+            incremental = analyze_wave(history[:end], previous=incremental)
+
+        rebuilt = rebuild_wave(history)
+
+        self.assertEqual(rebuilt, incremental)
+        self.assertEqual(rebuilt.state, "UP_LEG")
+        self.assertEqual(rebuilt.confirmed_at, incremental.confirmed_at)
 
 
 if __name__ == "__main__":

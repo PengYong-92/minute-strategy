@@ -31,7 +31,7 @@ from app.strategy import (
     choose_trade_signal,
     max_trade_edge_for,
 )
-from app.wave_state import WaveSnapshot, analyze_wave
+from app.wave_state import WaveSnapshot, advance_wave, analyze_wave
 from app.wave_batch_guard import (
     WaveBatchGuardConfig,
     WaveBatchGuardDecision,
@@ -89,7 +89,7 @@ class MonitorState:
         self.rolling_edge_config = rolling_edge_config or RollingEdgeConfig()
         self.enable_rolling_edge_guard = enable_rolling_edge_guard
         self.result_sequence_guard_config = (
-            result_sequence_guard_config or ResultSequenceGuardConfig()
+            result_sequence_guard_config or ResultSequenceGuardConfig(enabled=False)
         ).normalized()
         self.stake = stake
         self.win_return = win_return
@@ -138,7 +138,24 @@ class MonitorState:
         self.warmup: dict | None = None
         self.risk_pause: str = ""
         self.klines: list[Kline] = []
-        self.wave_state = analyze_wave(())
+        restored_wave_runtime = self._load_wave_runtime()
+        self.wave_state = (
+            restored_wave_runtime["snapshot"]
+            if restored_wave_runtime is not None
+            else analyze_wave(())
+        )
+        self._wave_evaluated_at = (
+            int(restored_wave_runtime["evaluated_at"])
+            if restored_wave_runtime is not None
+            else 0
+        )
+        self._wave_runtime_bootstrap_required = (
+            self.storage is not None and restored_wave_runtime is None
+        )
+        self._wave_bootstrap_cancel_pending = bool(
+            self._wave_runtime_bootstrap_required
+            and self.simulator.stake_progression.pending_credits()
+        )
         self.signals: list[Signal] = []
         self.observations: list[ObservationSignal] = list(reversed(restored_observations))
         self.daily_profile_selection = self._load_latest_daily_profile_selection()
@@ -161,10 +178,27 @@ class MonitorState:
         with self._lock:
             existing = list(self.klines)
             previous_wave = self.wave_state
+            previous_wave_evaluated_at = self._wave_evaluated_at
+            if (
+                self._wave_runtime_bootstrap_required
+                and previous_wave.state in {"UNKNOWN", "TURN_UP", "TURN_DOWN"}
+            ):
+                previous_wave = None
+                previous_wave_evaluated_at = 0
 
         merged_klines = self._merge_klines(existing, klines)
         latest = merged_klines[-1]
-        wave_state = analyze_wave(merged_klines, previous=previous_wave)
+        wave_state, wave_evaluated_at = advance_wave(
+            merged_klines,
+            previous=previous_wave,
+            evaluated_at=previous_wave_evaluated_at,
+        )
+        bootstrap_ready = (
+            wave_state.state not in {"UNKNOWN", "TURN_UP", "TURN_DOWN"}
+            and wave_evaluated_at > 0
+        )
+        if self._wave_runtime_bootstrap_required and bootstrap_ready:
+            wave_state = self._bootstrap_wave_anchor(wave_state, wave_evaluated_at)
         fear_greed = self._fear_greed_context()
         new_signals = [
             analyze_volume_price(merged_klines, timeframe_minutes=minutes, fear_greed=fear_greed)
@@ -181,8 +215,26 @@ class MonitorState:
             self.fear_greed = fear_greed
             self.klines = merged_klines
             self.wave_state = wave_state
+            self._wave_evaluated_at = wave_evaluated_at
             self.updated_at_ms = int(time.time() * 1000)
             self.last_error = None
+            if (
+                self._wave_runtime_bootstrap_required
+                and bootstrap_ready
+                and self._wave_bootstrap_cancel_pending
+            ):
+                if not self._cancel_pending_progression_credits():
+                    return
+                self._wave_bootstrap_cancel_pending = False
+            if self.storage and (
+                not self._wave_runtime_bootstrap_required or bootstrap_ready
+            ):
+                if not self._persist_wave_runtime(
+                    wave_state,
+                    wave_evaluated_at,
+                ):
+                    return
+                self._wave_runtime_bootstrap_required = False
             if self.storage and not self._flush_pending_settlement_events():
                 return
             settlement_events = self.simulator.settle_expired_order_events_from_klines(merged_klines)
@@ -225,8 +277,47 @@ class MonitorState:
     def seed_klines(self, klines: Sequence[Kline], warmup_report: dict | None = None) -> None:
         with self._lock:
             self.klines = self._merge_klines(self.klines, klines)
+            previous_wave = self.wave_state
+            previous_wave_evaluated_at = self._wave_evaluated_at
+            if (
+                self._wave_runtime_bootstrap_required
+                and previous_wave.state in {"UNKNOWN", "TURN_UP", "TURN_DOWN"}
+            ):
+                previous_wave = None
+                previous_wave_evaluated_at = 0
+            self.wave_state, self._wave_evaluated_at = advance_wave(
+                self.klines,
+                previous=previous_wave,
+                evaluated_at=previous_wave_evaluated_at,
+            )
+            bootstrap_ready = (
+                self.wave_state.state not in {"UNKNOWN", "TURN_UP", "TURN_DOWN"}
+                and self._wave_evaluated_at > 0
+            )
+            if self._wave_runtime_bootstrap_required and bootstrap_ready:
+                self.wave_state = self._bootstrap_wave_anchor(
+                    self.wave_state,
+                    self._wave_evaluated_at,
+                )
             self.warmup = warmup_report
             self.updated_at_ms = int(time.time() * 1000)
+            if (
+                self._wave_runtime_bootstrap_required
+                and bootstrap_ready
+                and self._wave_bootstrap_cancel_pending
+            ):
+                if not self._cancel_pending_progression_credits():
+                    return
+                self._wave_bootstrap_cancel_pending = False
+            if self.storage and (
+                not self._wave_runtime_bootstrap_required or bootstrap_ready
+            ):
+                persisted = self._persist_wave_runtime(
+                    self.wave_state,
+                    self._wave_evaluated_at,
+                )
+                if persisted:
+                    self._wave_runtime_bootstrap_required = False
 
     def record_error(self, message: str) -> None:
         with self._lock:
@@ -256,7 +347,24 @@ class MonitorState:
             self.risk_pause = ""
             self.webhook_error = None
             self.klines = []
-            self.wave_state = analyze_wave(())
+            restored_wave_runtime = self._load_wave_runtime()
+            self.wave_state = (
+                restored_wave_runtime["snapshot"]
+                if restored_wave_runtime is not None
+                else analyze_wave(())
+            )
+            self._wave_evaluated_at = (
+                int(restored_wave_runtime["evaluated_at"])
+                if restored_wave_runtime is not None
+                else 0
+            )
+            self._wave_runtime_bootstrap_required = (
+                self.storage is not None and restored_wave_runtime is None
+            )
+            self._wave_bootstrap_cancel_pending = bool(
+                self._wave_runtime_bootstrap_required
+                and self.simulator.stake_progression.pending_credits()
+            )
             self.signals = []
             self.observations = list(reversed(restored_observations))
             self.daily_profile_selection = self._load_latest_daily_profile_selection()
@@ -323,8 +431,10 @@ class MonitorState:
             self.stake_progression_recovery_warning = (
                 f"恢复时取消 {len(cancelled)} 个待用资格：{reason}"
             )
-            for credit in cancelled:
-                self.storage.save_stake_progression_credit(symbol, replace(credit))
+            self.storage.cancel_stake_progression_credits(
+                symbol,
+                [replace(credit) for credit in cancelled],
+            )
         return simulator
 
     def _merge_klines(self, existing: Sequence[Kline], incoming: Sequence[Kline]) -> list[Kline]:
@@ -359,6 +469,22 @@ class MonitorState:
     ) -> str:
         self.rolling_edge = self._rolling_edge_status(signal, latest)
         should_observe = self._should_record_observation(signal)
+        batch_decision = evaluate_wave_batch_guard(
+            self.simulator.orders,
+            current_time=latest.close_time,
+            current_batch_id=signal.wave_batch_id,
+            config=self.wave_batch_guard_config,
+        )
+        self.wave_batch_guard = self._wave_batch_guard_to_dict(batch_decision)
+        if batch_decision.blocked or batch_decision.mode == "RECOVERY":
+            if not self._cancel_pending_progression_credits():
+                return "STORAGE_ERROR"
+            self._wave_bootstrap_cancel_pending = False
+        else:
+            stale_source_ids = self._stale_progression_credit_source_ids(signal)
+            if stale_source_ids and not self._cancel_pending_progression_credits(stale_source_ids):
+                return "STORAGE_ERROR"
+            self._wave_bootstrap_cancel_pending = False
         if signal.wave_guard_mode == "DIRECTION_BLOCKED":
             if should_observe:
                 self._record_observation(signal, latest, "WAVE_DIRECTION_BLOCKED")
@@ -411,15 +537,12 @@ class MonitorState:
                 reason=f"{signal.reason}；{signal.threshold_segment} SHORT小口放行",
             )
             self.selected_signal = signal
-        batch_decision = evaluate_wave_batch_guard(
-            self.simulator.orders,
-            current_time=latest.close_time,
-            current_batch_id=signal.wave_batch_id,
-            config=self.wave_batch_guard_config,
+        signal = replace(
+            signal,
+            wave_guard_status=batch_decision.code,
+            wave_guard_reason=batch_decision.reason,
         )
-        self.wave_batch_guard = self._wave_batch_guard_to_dict(batch_decision)
-        if batch_decision.blocked or batch_decision.mode == "RECOVERY":
-            self._cancel_pending_progression_credits()
+        self.selected_signal = signal
         if batch_decision.blocked:
             if should_observe:
                 self._record_observation(signal, latest, batch_decision.code)
@@ -490,19 +613,35 @@ class MonitorState:
     def _apply_wave_guard(self, signal: Signal, wave: WaveSnapshot) -> Signal:
         guarded = self._attach_wave_metadata(signal, wave)
         if not self.enable_wave_guard:
-            return replace(guarded, wave_guard_mode="DISABLED")
+            return replace(
+                guarded,
+                wave_guard_mode="DISABLED",
+                wave_guard_status="DISABLED",
+                wave_guard_reason="1分钟波段方向守卫已关闭",
+            )
         direction = signal.direction.upper()
         if direction not in {"LONG", "SHORT"}:
-            return guarded
+            return replace(
+                guarded,
+                wave_guard_status="SIGNAL_WAIT",
+                wave_guard_reason="实时量价和指标信号尚未成立",
+            )
         if direction in wave.allowed_directions:
-            return guarded
+            return replace(
+                guarded,
+                wave_guard_status="DIRECTION_ALLOWED",
+                wave_guard_reason=f"1分钟波段 {wave.state} 允许 {direction}",
+            )
+        block_reason = f"1分钟波段方向冲突：{wave.state} 不允许 {direction}，等待"
         return replace(
             guarded,
             direction="WAIT",
             observe_direction=signal.observe_direction or direction,
             observe_only=True,
             wave_guard_mode="DIRECTION_BLOCKED",
-            reason=f"{signal.reason}；1分钟波段方向冲突：{wave.state} 不允许 {direction}，等待",
+            wave_guard_status="DIRECTION_BLOCKED",
+            wave_guard_reason=block_reason,
+            reason=f"{signal.reason}；{block_reason}",
         )
 
     def _attach_wave_metadata(self, signal: Signal, wave: WaveSnapshot) -> Signal:
@@ -528,6 +667,8 @@ class MonitorState:
             wave_confirmed_at=wave.confirmed_at,
             wave_batch_id=batch_id,
             wave_guard_mode="NORMAL",
+            wave_guard_status="PENDING",
+            wave_guard_reason="等待波段方向与批次守卫判断",
         )
 
     def _flush_pending_settlement_events(self) -> bool:
@@ -605,7 +746,7 @@ class MonitorState:
             return primary_signal, False
 
         if not primary_signal.actionable:
-            return primary_signal, True
+            return primary_signal, False
 
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
@@ -696,7 +837,9 @@ class MonitorState:
     ) -> Signal | None:
         if not self.enable_observation_profile_promotion or gate_code != "SESSION_BLOCKED":
             return None
-        direction = (signal.observe_direction or signal.direction).upper()
+        if not signal.actionable:
+            return None
+        direction = signal.direction.upper()
         if direction not in {"LONG", "SHORT"}:
             return None
         if direction == "SHORT" and signal.threshold_segment.upper() not in self.live_short_segments:
@@ -828,6 +971,8 @@ class MonitorState:
             wave_confirmed_at=signal.wave_confirmed_at,
             wave_batch_id=signal.wave_batch_id,
             wave_guard_mode=signal.wave_guard_mode,
+            wave_guard_status=signal.wave_guard_status,
+            wave_guard_reason=signal.wave_guard_reason,
         )
         self.observations.append(observation)
         if self.storage:
@@ -900,6 +1045,55 @@ class MonitorState:
             )
         return self.storage.load_observations(self.symbol)
 
+    def _load_wave_runtime(self) -> dict | None:
+        loader = getattr(self.storage, "load_wave_runtime", None) if self.storage else None
+        if loader is None:
+            return None
+        runtime = loader(self.symbol)
+        if not runtime or not isinstance(runtime.get("snapshot"), WaveSnapshot):
+            return None
+        if int(runtime.get("evaluated_at", 0)) <= 0:
+            return None
+        return runtime
+
+    def _bootstrap_wave_anchor(
+        self,
+        snapshot: WaveSnapshot,
+        evaluated_at: int,
+    ) -> WaveSnapshot:
+        if snapshot.state not in {"UP_LEG", "DOWN_LEG", "RANGE_HIGH", "RANGE_LOW"}:
+            return snapshot
+        candidates = []
+        for order in self.simulator.orders:
+            if order.wave_guard_mode == "RECOVERY" or order.wave_state != snapshot.state:
+                continue
+            anchor = int(order.wave_confirmed_at or 0)
+            if anchor <= 0 and order.wave_batch_id:
+                try:
+                    anchor = int(order.wave_batch_id.split("|", 1)[0])
+                except ValueError:
+                    anchor = 0
+            if 0 < anchor <= evaluated_at:
+                candidates.append((order.opened_at, order.id, anchor))
+        if not candidates:
+            return snapshot
+        return replace(snapshot, confirmed_at=max(candidates)[2])
+
+    def _persist_wave_runtime(
+        self,
+        snapshot: WaveSnapshot,
+        evaluated_at: int,
+    ) -> bool:
+        saver = getattr(self.storage, "save_wave_runtime", None) if self.storage else None
+        if saver is None:
+            return True
+        try:
+            saver(self.symbol, snapshot, evaluated_at)
+        except Exception as exc:  # noqa: BLE001 - 波段锚点失败时禁止继续开单。
+            self._set_storage_error("波段运行态持久化失败", exc)
+            return False
+        return True
+
     @staticmethod
     def _is_observation_win(direction: str, entry_price: float, current_price: float) -> bool:
         if direction == "LONG":
@@ -959,21 +1153,64 @@ class MonitorState:
             lambda order=order_snapshot, symbol=symbol: self.storage.save_order(order, symbol)
         )
 
-    def _save_stake_progression_credit(self, credit, *, symbol: str | None = None) -> None:
-        credit_snapshot = replace(credit)
-        captured_symbol = (symbol or self.symbol).upper()
-        self._submit_storage_write(
-            lambda credit=credit_snapshot, symbol=captured_symbol: (
-                self.storage.save_stake_progression_credit(symbol, credit)
-            )
-        )
+    def _cancel_pending_progression_credits(
+        self,
+        source_order_ids: Sequence[int] | set[int] | None = None,
+    ) -> bool:
+        pending = self.simulator.stake_progression.pending_credits(source_order_ids)
+        if not pending:
+            return True
+        cancelled_snapshots = [replace(credit, status="CANCELLED") for credit in pending]
+        if self.storage:
+            canceler = getattr(self.storage, "cancel_stake_progression_credits", None)
+            if canceler is None:
+                self._set_storage_error(
+                    "资格取消持久化失败",
+                    RuntimeError("storage does not support atomic credit cancellation"),
+                )
+                return False
+            try:
+                canceler(self.symbol, cancelled_snapshots)
+            except Exception as exc:  # noqa: BLE001 - 未持久化前不得修改内存资格。
+                self._set_storage_error("资格取消持久化失败", exc)
+                return False
+        self.simulator.stake_progression.cancel_pending(source_order_ids)
+        return True
 
-    def _cancel_pending_progression_credits(self) -> None:
-        cancelled = self.simulator.stake_progression.cancel_pending()
-        if not self.storage:
-            return
-        for credit in cancelled:
-            self._save_stake_progression_credit(credit)
+    def _stale_progression_credit_source_ids(self, signal: Signal) -> set[int]:
+        pending = self.simulator.stake_progression.pending_credits()
+        if not pending:
+            return set()
+        if self._wave_bootstrap_cancel_pending:
+            return {credit.source_order_id for credit in pending}
+        if not self.enable_wave_guard or signal.wave_window <= 0:
+            return set()
+        if signal.wave_state not in {"UP_LEG", "DOWN_LEG", "RANGE_HIGH", "RANGE_LOW"}:
+            return {credit.source_order_id for credit in pending}
+        if signal.wave_confirmed_at <= 0:
+            return {credit.source_order_id for credit in pending}
+
+        current_profile = str(
+            (self.active_daily_profile_selection or {}).get("version", "") or "STATIC"
+        )
+        orders_by_id = {order.id: order for order in self.simulator.orders}
+        stale = set()
+        for credit in pending:
+            source = orders_by_id.get(credit.source_order_id)
+            if source is None:
+                stale.add(credit.source_order_id)
+                continue
+            source_profile = source.daily_profile_version
+            if not source_profile and "|" in source.wave_batch_id:
+                source_profile = source.wave_batch_id.rsplit("|", 1)[-1]
+            source_profile = source_profile or "STATIC"
+            if (
+                source.wave_state != signal.wave_state
+                or source.wave_confirmed_at != signal.wave_confirmed_at
+                or source_profile != current_profile
+            ):
+                stale.add(credit.source_order_id)
+        return stale
 
     def _save_settled_order_with_credit(self, order, credit) -> None:
         order_snapshot = replace(order)

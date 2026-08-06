@@ -112,6 +112,8 @@ class OrdersApiTest(unittest.TestCase):
                     expires_at=602_000,
                     threshold_segment="WD-23",
                     status="OPEN",
+                    wave_guard_status="WAVE_BATCH_NORMAL",
+                    wave_guard_reason="当前波段批次允许开单",
                 ),
             ]:
                 store.save_order(order, "BTCUSDT")
@@ -130,6 +132,8 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(payload["page_size"], 10)
         self.assertEqual(payload["orders"][0]["id"], 2)
         self.assertEqual(payload["orders"][0]["direction"], "SHORT")
+        self.assertEqual(payload["orders"][0]["wave_guard_status"], "WAVE_BATCH_NORMAL")
+        self.assertEqual(payload["orders"][0]["wave_guard_reason"], "当前波段批次允许开单")
 
     def test_observations_api_pages_and_filters_persisted_signals(self):
         with tempfile.TemporaryDirectory() as temp_dir:

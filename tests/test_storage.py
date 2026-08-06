@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
+from app.wave_state import WaveSnapshot
 
 
 def signal(direction="LONG", timeframe_minutes=10):
@@ -100,6 +102,29 @@ def progression_order(
 
 
 class SQLiteMonitorStoreTest(unittest.TestCase):
+    def test_persists_and_restores_wave_runtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            snapshot = WaveSnapshot(
+                state="UP_LEG",
+                raw_state="UP_LEG",
+                window=8,
+                efficiency=0.9,
+                direction_ratio=0.85,
+                atr_strength=1.7,
+                range_position=0.92,
+                confirmations=2,
+                confirmed_at=960_000,
+                allowed_directions=("LONG",),
+            )
+
+            store.save_wave_runtime("BTCUSDT", snapshot, evaluated_at=24_000_000)
+            restored = store.load_wave_runtime("BTCUSDT")
+
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored["evaluated_at"], 24_000_000)
+        self.assertEqual(restored["snapshot"], snapshot)
+
     def test_persists_and_restores_simulated_orders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
@@ -125,6 +150,8 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             saved.wave_raw_state = "DOWN_LEG"
             saved.wave_batch_id = "123|DOWN_LEG|SHORT|WD-05|DPS-1"
             saved.wave_guard_mode = "RECOVERY"
+            saved.wave_guard_status = "WAVE_RECOVERY_READY"
+            saved.wave_guard_reason = "冷却结束，仅允许恢复单"
 
             store.save_order(saved, "BTCUSDT")
             restored = store.load_orders("BTCUSDT")[0]
@@ -132,6 +159,33 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored.wave_state, "DOWN_LEG")
         self.assertEqual(restored.wave_batch_id, saved.wave_batch_id)
         self.assertEqual(restored.wave_guard_mode, "RECOVERY")
+        self.assertEqual(restored.wave_guard_status, "WAVE_RECOVERY_READY")
+        self.assertEqual(restored.wave_guard_reason, "冷却结束，仅允许恢复单")
+
+    def test_cancels_multiple_pending_credits_atomically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            first = StakeProgressionCredit(source_order_id=1, created_at=1_000)
+            second = StakeProgressionCredit(source_order_id=2, created_at=2_000)
+            store.save_stake_progression_credit("BTCUSDT", first)
+            store.save_stake_progression_credit("BTCUSDT", second)
+            missing = StakeProgressionCredit(source_order_id=3, created_at=3_000, status="CANCELLED")
+
+            with self.assertRaises(ValueError):
+                store.cancel_stake_progression_credits(
+                    "BTCUSDT",
+                    [replace(first, status="CANCELLED"), missing],
+                )
+            unchanged = store.load_stake_progression_credits("BTCUSDT")
+            self.assertEqual([item.status for item in unchanged], ["PENDING", "PENDING"])
+
+            store.cancel_stake_progression_credits(
+                "BTCUSDT",
+                [replace(first, status="CANCELLED"), replace(second, status="CANCELLED")],
+            )
+            cancelled = store.load_stake_progression_credits("BTCUSDT")
+
+        self.assertEqual([item.status for item in cancelled], ["CANCELLED", "CANCELLED"])
 
     def test_persists_signal_audit_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:

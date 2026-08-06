@@ -294,11 +294,24 @@ class TwoStageStakeProgression:
             return []
         return self.cancel_pending()
 
-    def cancel_pending(self) -> list[StakeProgressionCredit]:
+    def pending_credits(
+        self,
+        source_order_ids: Iterable[int] | None = None,
+    ) -> list[StakeProgressionCredit]:
+        allowed = None if source_order_ids is None else {int(item) for item in source_order_ids}
+        return [
+            credit
+            for credit in self.credits
+            if credit.status == "PENDING"
+            and (allowed is None or credit.source_order_id in allowed)
+        ]
+
+    def cancel_pending(
+        self,
+        source_order_ids: Iterable[int] | None = None,
+    ) -> list[StakeProgressionCredit]:
         cancelled = []
-        for credit in self.credits:
-            if credit.status != "PENDING":
-                continue
+        for credit in self.pending_credits(source_order_ids):
             credit.status = "CANCELLED"
             cancelled.append(credit)
         return cancelled

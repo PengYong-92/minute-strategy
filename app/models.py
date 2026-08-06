@@ -92,6 +92,8 @@ class Signal:
     wave_confirmed_at: int = 0
     wave_batch_id: str = ""
     wave_guard_mode: str = "NORMAL"
+    wave_guard_status: str = "UNKNOWN"
+    wave_guard_reason: str = ""
 
     @property
     def actionable(self) -> bool:
@@ -145,6 +147,8 @@ class SimulatedOrder:
     wave_confirmed_at: int = 0
     wave_batch_id: str = ""
     wave_guard_mode: str = "NORMAL"
+    wave_guard_status: str = "UNKNOWN"
+    wave_guard_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -184,6 +188,8 @@ class ObservationSignal:
     wave_confirmed_at: int = 0
     wave_batch_id: str = ""
     wave_guard_mode: str = "NORMAL"
+    wave_guard_status: str = "UNKNOWN"
+    wave_guard_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -4,6 +4,10 @@ from typing import Sequence
 from app.models import Kline
 
 
+WAVE_RUNTIME_VERSION = "one-minute-wave-v1"
+MINUTE_MS = 60_000
+
+
 @dataclass(frozen=True)
 class WaveSnapshot:
     state: str
@@ -137,6 +141,116 @@ def analyze_wave(
         confirmed_at=confirmed_at,
         allowed_directions=allowed_directions,
     )
+
+
+def rebuild_wave(
+    klines: Sequence[Kline],
+    *,
+    window: int = 8,
+    atr_window: int = 14,
+    min_efficiency: float = 0.35,
+    min_direction_ratio: float = 0.60,
+    min_atr_strength: float = 0.50,
+) -> WaveSnapshot:
+    ordered = _trailing_contiguous_klines(
+        sorted(klines, key=lambda item: item.close_time)
+    )
+    required = max(window, atr_window + 1)
+    if len(ordered) < required:
+        return _unknown_snapshot(window)
+
+    previous = _unknown_snapshot(window)
+    for end in range(required, len(ordered) + 1):
+        previous = analyze_wave(
+            ordered[max(0, end - required) : end],
+            previous=previous,
+            window=window,
+            atr_window=atr_window,
+            min_efficiency=min_efficiency,
+            min_direction_ratio=min_direction_ratio,
+            min_atr_strength=min_atr_strength,
+        )
+    return previous
+
+
+def advance_wave(
+    klines: Sequence[Kline],
+    previous: WaveSnapshot | None = None,
+    evaluated_at: int = 0,
+    *,
+    window: int = 8,
+    atr_window: int = 14,
+    min_efficiency: float = 0.35,
+    min_direction_ratio: float = 0.60,
+    min_atr_strength: float = 0.50,
+) -> tuple[WaveSnapshot, int]:
+    ordered = sorted(klines, key=lambda item: item.close_time)
+    if not ordered:
+        return previous or _unknown_snapshot(window), max(0, int(evaluated_at))
+
+    latest_time = ordered[-1].close_time
+    restored_time = max(0, int(evaluated_at))
+    if previous is None or restored_time <= 0:
+        return (
+            rebuild_wave(
+                ordered,
+                window=window,
+                atr_window=atr_window,
+                min_efficiency=min_efficiency,
+                min_direction_ratio=min_direction_ratio,
+                min_atr_strength=min_atr_strength,
+            ),
+            latest_time,
+        )
+    if restored_time > latest_time:
+        return previous, restored_time
+    if previous.state == "UNKNOWN":
+        return (
+            rebuild_wave(
+                ordered,
+                window=window,
+                atr_window=atr_window,
+                min_efficiency=min_efficiency,
+                min_direction_ratio=min_direction_ratio,
+                min_atr_strength=min_atr_strength,
+            ),
+            latest_time,
+        )
+
+    newer = [item for item in ordered if item.close_time > restored_time]
+    expected_time = restored_time + MINUTE_MS
+    for item in newer:
+        if item.close_time != expected_time:
+            return rebuild_wave(ordered), latest_time
+        expected_time += MINUTE_MS
+
+    required = max(window, atr_window + 1)
+    current = previous
+    current_time = restored_time
+    for end, item in enumerate(ordered, start=1):
+        if item.close_time <= restored_time or end < required:
+            continue
+        current = analyze_wave(
+            ordered[max(0, end - required) : end],
+            previous=current,
+            window=window,
+            atr_window=atr_window,
+            min_efficiency=min_efficiency,
+            min_direction_ratio=min_direction_ratio,
+            min_atr_strength=min_atr_strength,
+        )
+        current_time = item.close_time
+    return current, current_time
+
+
+def _trailing_contiguous_klines(ordered: Sequence[Kline]) -> list[Kline]:
+    if not ordered:
+        return []
+    start = 0
+    for index in range(1, len(ordered)):
+        if ordered[index].close_time - ordered[index - 1].close_time != MINUTE_MS:
+            start = index
+    return list(ordered[start:])
 
 
 def _allowed_directions(state: str) -> tuple[str, ...]:
