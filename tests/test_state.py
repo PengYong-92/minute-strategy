@@ -333,7 +333,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(len(storage.daily_profile_selections), 1)
         self.assertEqual(state.active_daily_profile_selection["version"], "DPS-20260730-0800")
 
-    def test_daily_selected_observation_profile_opens_without_static_score_or_short_whitelist(self):
+    def test_daily_selected_profile_cannot_promote_wait_signal(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(
             symbol="BTCUSDT",
@@ -377,11 +377,52 @@ class MonitorStateTest(unittest.TestCase):
         decision = state._maybe_open_order(selected, latest, daily_profile_required=required)
 
         self.assertTrue(required)
-        self.assertTrue(selected.daily_profile_selected)
-        self.assertEqual(selected.direction, "SHORT")
+        self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(selected.direction, "WAIT")
         self.assertEqual(selected.score, 0.0)
-        self.assertEqual(decision, "OPENED")
-        self.assertEqual(state.simulator.orders[0].daily_profile_version, "DPS-20260730-0800")
+        self.assertNotEqual(decision, "OPENED")
+        self.assertEqual(state.simulator.orders, [])
+
+    def test_daily_selected_profile_verifies_actionable_same_direction_signal(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(symbol="BTCUSDT", enable_daily_profile_selector=True)
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "effective_from": now,
+            "effective_until": now + 86_400_000,
+            "selected_profiles": [
+                {
+                    "key": "10|short_observe|generic_short_observe|SHORT|WD-22",
+                    "direction": "SHORT",
+                    "sample_size": 32,
+                    "win_rate": 0.65625,
+                    "ev": 1.8125,
+                }
+            ],
+        }
+        primary = Signal(
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="A",
+            reason="实时SHORT已过线",
+            price=100.0,
+            open_time=now - 60_000,
+            score=-84.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            observe_direction="SHORT",
+            observe_only=False,
+        )
+
+        selected, required = state._select_daily_profile_signal(primary, [], now)
+
+        self.assertTrue(required)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertEqual(selected.score, -84.0)
 
     def test_daily_selector_blocks_unselected_profile_but_keeps_observation(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
@@ -416,7 +457,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
         self.assertEqual(len(state.observations), 1)
 
-    def test_daily_selector_can_execute_matching_research_observation_candidate(self):
+    def test_daily_selector_cannot_execute_matching_research_observation_candidate(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(symbol="BTCUSDT", enable_daily_profile_selector=True)
         state.active_daily_profile_selection = {
@@ -452,9 +493,9 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [candidate], now)
 
         self.assertTrue(required)
-        self.assertEqual(selected.direction, "LONG")
-        self.assertEqual(selected.strategy_tag, "low_volume_reclaim_observe")
-        self.assertTrue(selected.daily_profile_selected)
+        self.assertEqual(selected.direction, "WAIT")
+        self.assertNotEqual(selected.strategy_tag, "low_volume_reclaim_observe")
+        self.assertFalse(selected.daily_profile_selected)
 
     def test_daily_selector_uses_previous_profiles_when_evaluation_save_fails(self):
         current = shanghai_timestamp("2026-07-30T08:00:00")

@@ -511,43 +511,41 @@ class MonitorState:
         if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
             return primary_signal, False
 
-        signals = [primary_signal, *observation_candidates]
+        if not primary_signal.actionable:
+            return primary_signal, True
+
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
-            for signal in signals:
-                direction = (signal.observe_direction or signal.direction).upper()
-                if direction not in {"LONG", "SHORT"}:
-                    continue
-                key = daily_profile_key(
-                    signal.timeframe_minutes,
-                    signal.strategy_family,
-                    signal.strategy_tag,
-                    direction,
-                    signal.threshold_segment,
-                )
-                if key != selected_key:
-                    continue
-                return (
-                    replace(
-                        signal,
-                        direction=direction,
-                        reason=(
-                            f"{signal.reason}；每日画像启用 {snapshot.get('version', '')} "
-                            f"N{selected_profile.get('sample_size', 0)} "
-                            f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
-                            f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
-                        ),
-                        session_allowed=True,
-                        session_sample_size=int(selected_profile.get("sample_size", 0)),
-                        session_win_rate=float(selected_profile.get("win_rate", 0.0)),
-                        session_ev=float(selected_profile.get("ev", 0.0)),
-                        observe_only=False,
-                        profile_key=key,
-                        daily_profile_selected=True,
-                        daily_profile_version=str(snapshot.get("version", "")),
+            direction = primary_signal.direction.upper()
+            key = daily_profile_key(
+                primary_signal.timeframe_minutes,
+                primary_signal.strategy_family,
+                primary_signal.strategy_tag,
+                direction,
+                primary_signal.threshold_segment,
+            )
+            if key != selected_key:
+                continue
+            return (
+                replace(
+                    primary_signal,
+                    reason=(
+                        f"{primary_signal.reason}；每日画像启用 {snapshot.get('version', '')} "
+                        f"N{selected_profile.get('sample_size', 0)} "
+                        f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
+                        f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
                     ),
-                    True,
-                )
+                    session_allowed=True,
+                    session_sample_size=int(selected_profile.get("sample_size", 0)),
+                    session_win_rate=float(selected_profile.get("win_rate", 0.0)),
+                    session_ev=float(selected_profile.get("ev", 0.0)),
+                    observe_only=False,
+                    profile_key=key,
+                    daily_profile_selected=True,
+                    daily_profile_version=str(snapshot.get("version", "")),
+                ),
+                True,
+            )
         return primary_signal, True
 
     def _load_latest_daily_profile_selection(self) -> dict | None:
