@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime
@@ -14,7 +15,7 @@ from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
-from app.wave_state import WaveSnapshot, analyze_wave
+from app.wave_state import WaveSnapshot, advance_wave, analyze_wave
 from app.wave_batch_guard import WaveBatchGuardConfig
 
 
@@ -295,6 +296,141 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_restart_restores_minimum_order_gap_from_latest_order(self):
+        storage = RecordingStorage()
+        storage._persist_order(
+            SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="restored",
+                entry_price=100.0,
+                opened_at=600_000,
+                expires_at=1_200_000,
+                threshold_segment="WD-08",
+                wave_batch_id="old-wave",
+            ),
+            "BTCUSDT",
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            max_open_orders=2,
+            min_order_gap_ms=120_000,
+            enable_wave_guard=False,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="new",
+            price=101.0,
+            open_time=660_000,
+            score=85.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            wave_batch_id="new-wave",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(600_001, 101.0, 101.0, 101.0, 101.0, 1.0, 660_000),
+        )
+
+        self.assertEqual(decision, "COOLDOWN")
+        self.assertEqual(len(state.simulator.orders), 1)
+
+    def test_reset_symbol_restores_minimum_order_gap_from_latest_order(self):
+        storage = RecordingStorage()
+        storage._persist_order(
+            SimulatedOrder(
+                id=1,
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="restored",
+                entry_price=100.0,
+                opened_at=600_000,
+                expires_at=1_200_000,
+                threshold_segment="WD-23",
+                wave_batch_id="old-wave",
+            ),
+            "ETHUSDT",
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            max_open_orders=2,
+            min_order_gap_ms=120_000,
+            enable_wave_guard=False,
+        )
+
+        state.reset_symbol("ETHUSDT")
+        signal = Signal(
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="A",
+            reason="new",
+            price=99.0,
+            open_time=660_000,
+            score=-85.0,
+            threshold=70.0,
+            threshold_segment="WD-23",
+            session_allowed=True,
+            wave_batch_id="new-wave",
+        )
+        decision = state._maybe_open_order(
+            signal,
+            Kline(600_001, 99.0, 99.0, 99.0, 99.0, 1.0, 660_000),
+        )
+
+        self.assertEqual(decision, "COOLDOWN")
+        self.assertEqual(len(state.simulator.orders), 1)
+
+    def test_symbol_change_during_analysis_discards_computed_state(self):
+        state = MonitorState(symbol="BTCUSDT")
+        original_advance_wave = advance_wave
+
+        def switch_symbol(*args, **kwargs):
+            state.reset_symbol("ETHUSDT")
+            return original_advance_wave(*args, **kwargs)
+
+        with patch("app.state.advance_wave", side_effect=switch_symbol):
+            state.update_from_klines([kline(1, 100.0, 10.0)])
+
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["symbol"], "ETHUSDT")
+        self.assertEqual(snapshot["kline_count"], 0)
+
+    def test_completed_async_storage_writes_are_released_without_manual_wait(self):
+        state = MonitorState(symbol="BTCUSDT", storage=RecordingStorage())
+        for _ in range(100):
+            state._submit_storage_write(lambda: None)
+
+        deadline = time.monotonic() + 2
+        while state._storage_futures and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        self.assertEqual(len(state._storage_futures), 0)
+
+    def test_async_storage_failure_is_exposed_in_state(self):
+        state = MonitorState(symbol="BTCUSDT", storage=RecordingStorage())
+
+        def fail_write():
+            raise OSError("audit write failed")
+
+        state._submit_storage_write(fail_write)
+        deadline = time.monotonic() + 2
+        while state.snapshot()["last_error"] is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        error = state.snapshot()["last_error"]
+        self.assertIsNotNone(error)
+        self.assertIn("异步存储写入失败", error)
+        self.assertIn("audit write failed", error)
+
     def test_wave_batch_guard_stops_refill_after_first_loss(self):
         state = MonitorState(symbol="BTCUSDT")
         state.simulator.orders.append(
@@ -794,7 +930,11 @@ class MonitorStateTest(unittest.TestCase):
         )
         storage.save_order(loss, "BTCUSDT")
 
-        restarted = MonitorState(symbol="BTCUSDT", storage=storage)
+        restarted = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            min_order_gap_ms=0,
+        )
         restarted.seed_klines(history[-300:])
         restored = restarted._attach_wave_metadata(signal, restarted.wave_state)
 
@@ -849,7 +989,11 @@ class MonitorStateTest(unittest.TestCase):
             ),
             "BTCUSDT",
         )
-        restarted = MonitorState(symbol="BTCUSDT", storage=storage)
+        restarted = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            min_order_gap_ms=0,
+        )
         restarted.seed_klines([])
         restarted.seed_klines(history[-14:])
         restarted.seed_klines(history[-15:])
@@ -1096,7 +1240,11 @@ class MonitorStateTest(unittest.TestCase):
             ),
             "BTCUSDT",
         )
-        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            min_order_gap_ms=0,
+        )
 
         state.seed_klines(history[-301:-1])
         state.seed_klines([history[-1]])

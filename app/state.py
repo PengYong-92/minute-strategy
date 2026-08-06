@@ -79,6 +79,7 @@ class MonitorState:
         now_ms=None,
     ):
         self.symbol = symbol.upper()
+        self._symbol_generation = 0
         self.order_policy = OrderPolicy(
             max_open_orders=max(1, int(max_open_orders)),
             min_order_gap_ms=max(0, int(min_order_gap_ms)),
@@ -129,6 +130,8 @@ class MonitorState:
         self.stake_progression_recovery_warning = ""
         self._storage_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor-storage")
         self._storage_futures: list[Future] = []
+        self._storage_futures_condition = threading.Condition()
+        self._storage_write_failures: list[Exception] = []
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
         self.simulator = self._build_simulator(self.symbol, restored_orders)
@@ -168,14 +171,29 @@ class MonitorState:
         self.last_error: str | None = None
         self.updated_at_ms = 0
         self._opened_signal_keys: set[tuple[int, int, str]] = set()
-        self._last_order_opened_at: int | None = None
+        self._last_order_opened_at = self._latest_order_opened_at(restored_orders)
         self._lock = threading.RLock()
 
-    def update_from_klines(self, klines: Sequence[Kline]) -> None:
+    def capture_symbol_context(self) -> tuple[str, int]:
+        with self._lock:
+            return self.symbol, self._symbol_generation
+
+    def update_from_klines(
+        self,
+        klines: Sequence[Kline],
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> None:
         if not klines:
             return
 
         with self._lock:
+            operation_context = expected_context or (
+                self.symbol,
+                self._symbol_generation,
+            )
+            if not self._matches_symbol_context(operation_context):
+                return
             existing = list(self.klines)
             previous_wave = self.wave_state
             previous_wave_evaluated_at = self._wave_evaluated_at
@@ -212,6 +230,8 @@ class MonitorState:
         selected_signal = choose_trade_signal(merged_klines, fear_greed=fear_greed)
 
         with self._lock:
+            if not self._matches_symbol_context(operation_context):
+                return
             self.fear_greed = fear_greed
             self.klines = merged_klines
             self.wave_state = wave_state
@@ -274,8 +294,16 @@ class MonitorState:
             if self.storage:
                 self._save_signal(self.selected_signal or selected_signal, self.order_decision, self.updated_at_ms)
 
-    def seed_klines(self, klines: Sequence[Kline], warmup_report: dict | None = None) -> None:
+    def seed_klines(
+        self,
+        klines: Sequence[Kline],
+        warmup_report: dict | None = None,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> None:
         with self._lock:
+            if not self._matches_symbol_context(expected_context):
+                return
             self.klines = self._merge_klines(self.klines, klines)
             previous_wave = self.wave_state
             previous_wave_evaluated_at = self._wave_evaluated_at
@@ -338,6 +366,7 @@ class MonitorState:
 
     def reset_symbol(self, symbol: str) -> None:
         with self._lock:
+            self._symbol_generation += 1
             self.symbol = symbol.upper()
             restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
             restored_observations = self._load_restored_observations()
@@ -377,7 +406,17 @@ class MonitorState:
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self._opened_signal_keys.clear()
-            self._last_order_opened_at = None
+            self._last_order_opened_at = self._latest_order_opened_at(restored_orders)
+
+    def _matches_symbol_context(self, expected_context: tuple[str, int] | None) -> bool:
+        return expected_context is None or expected_context == (
+            self.symbol,
+            self._symbol_generation,
+        )
+
+    @staticmethod
+    def _latest_order_opened_at(orders) -> int | None:
+        return max((int(order.opened_at) for order in orders), default=None)
 
     def _build_simulator(self, symbol: str, restored_orders) -> AccountSimulator:
         activated_at = 0
@@ -1385,13 +1424,34 @@ class MonitorState:
     def _submit_storage_write(self, func) -> None:
         if not self.storage:
             return
-        self._storage_futures.append(self._storage_executor.submit(func))
+        with self._storage_futures_condition:
+            future = self._storage_executor.submit(func)
+            self._storage_futures.append(future)
+        future.add_done_callback(self._storage_write_completed)
+
+    def _storage_write_completed(self, future: Future) -> None:
+        try:
+            error = future.exception()
+        except Exception as exc:  # noqa: BLE001 - 已取消任务也必须完成回收与上报。
+            error = exc
+        if error is not None:
+            self.record_error(f"异步存储写入失败: {error}")
+        with self._storage_futures_condition:
+            if error is not None:
+                self._storage_write_failures.append(error)
+                self._storage_write_failures = self._storage_write_failures[-10:]
+            if future in self._storage_futures:
+                self._storage_futures.remove(future)
+            self._storage_futures_condition.notify_all()
 
     def wait_for_storage_writes(self) -> None:
-        pending = list(self._storage_futures)
-        self._storage_futures.clear()
-        for future in pending:
-            future.result()
+        with self._storage_futures_condition:
+            while self._storage_futures:
+                self._storage_futures_condition.wait()
+            failures = list(self._storage_write_failures)
+            self._storage_write_failures.clear()
+        if failures:
+            raise failures[0]
 
     def _empty_rolling_edge(self) -> dict:
         return {

@@ -28,8 +28,9 @@ def start_polling(state: MonitorState, client: BinanceKlineClient, poll_seconds:
     def loop() -> None:
         while True:
             try:
-                klines = client.get_klines(state.symbol, interval="1m", limit=limit)
-                state.update_from_klines(klines)
+                symbol_context = state.capture_symbol_context()
+                klines = client.get_klines(symbol_context[0], interval="1m", limit=limit)
+                state.update_from_klines(klines, expected_context=symbol_context)
             except Exception as exc:  # noqa: BLE001 - 临时网络错误不能中断监控循环。
                 state.record_error(str(exc))
             time.sleep(poll_seconds)
@@ -154,15 +155,16 @@ def apply_warmup(
     include_current_month_daily: bool,
     timeout: float,
 ) -> WarmupReport:
+    symbol_context = state.capture_symbol_context()
     config = WarmupConfig(
-        symbol=state.symbol,
+        symbol=symbol_context[0],
         data_dir=data_dir,
         months=months,
         include_current_month_daily=include_current_month_daily,
         timeout=timeout,
     )
     klines, report = warmup_history(config)
-    state.seed_klines(klines, report.to_dict())
+    state.seed_klines(klines, report.to_dict(), expected_context=symbol_context)
     return report
 
 

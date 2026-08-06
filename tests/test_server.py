@@ -4,14 +4,70 @@ import threading
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
-from app.models import ObservationSignal, SimulatedOrder
-from app.server import make_handler
+from app.history import WarmupReport
+from app.models import Kline, ObservationSignal, SimulatedOrder
+from app.server import apply_warmup, make_handler, start_polling
 from app.state import MonitorState
 from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_polling_discards_response_when_symbol_changes_during_request(self):
+        updated = threading.Event()
+
+        class NotifyingState(MonitorState):
+            def update_from_klines(self, klines, **kwargs):
+                try:
+                    return super().update_from_klines(klines, **kwargs)
+                finally:
+                    updated.set()
+
+        state = NotifyingState(symbol="BTCUSDT")
+
+        class SwitchingClient:
+            def get_klines(self, symbol, interval, limit):
+                self.requested_symbol = symbol
+                state.reset_symbol("ETHUSDT")
+                return [Kline(0, 100.0, 101.0, 99.0, 100.5, 10.0, 59_999)]
+
+        client = SwitchingClient()
+        start_polling(state, client, poll_seconds=3_600, limit=100)
+
+        self.assertTrue(updated.wait(timeout=2))
+        self.assertEqual(client.requested_symbol, "BTCUSDT")
+        self.assertEqual(state.snapshot()["symbol"], "ETHUSDT")
+        self.assertEqual(state.snapshot()["kline_count"], 0)
+
+    def test_warmup_discards_history_when_symbol_changes_during_download(self):
+        state = MonitorState(symbol="BTCUSDT")
+        report = WarmupReport(
+            status="READY",
+            symbol="BTCUSDT",
+            interval="1m",
+            data_dir="/tmp/data",
+            loaded_klines=1,
+        )
+
+        def switching_warmup(_config):
+            state.reset_symbol("ETHUSDT")
+            return [Kline(0, 100.0, 101.0, 99.0, 100.5, 10.0, 59_999)], report
+
+        with patch("app.server.warmup_history", side_effect=switching_warmup):
+            apply_warmup(
+                state,
+                data_dir=Path("/tmp/data"),
+                months=1,
+                include_current_month_daily=False,
+                timeout=1.0,
+            )
+
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["symbol"], "ETHUSDT")
+        self.assertEqual(snapshot["kline_count"], 0)
+        self.assertIsNone(snapshot["warmup"])
+
     def test_state_and_observation_summary_expose_daily_profile_selection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
