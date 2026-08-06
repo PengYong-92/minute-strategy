@@ -118,6 +118,16 @@ class AccountSimulator:
             "profile_key": signal.profile_key,
             "daily_profile_selected": signal.daily_profile_selected,
             "daily_profile_version": signal.daily_profile_version,
+            "wave_state": signal.wave_state,
+            "wave_raw_state": signal.wave_raw_state,
+            "wave_window": signal.wave_window,
+            "wave_efficiency": signal.wave_efficiency,
+            "wave_direction_ratio": signal.wave_direction_ratio,
+            "wave_atr_strength": signal.wave_atr_strength,
+            "wave_confirmations": signal.wave_confirmations,
+            "wave_confirmed_at": signal.wave_confirmed_at,
+            "wave_batch_id": signal.wave_batch_id,
+            "wave_guard_mode": signal.wave_guard_mode,
         }
         terms, credit = self.stake_progression.assign(
             self._next_id,

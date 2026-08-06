@@ -31,6 +31,7 @@ from app.strategy import (
     choose_trade_signal,
     max_trade_edge_for,
 )
+from app.wave_state import WaveSnapshot, analyze_wave
 
 
 DAY_MS = 86_400_000
@@ -68,6 +69,7 @@ class MonitorState:
         live_short_segments: Sequence[str] | None = ("WD-02", "WD-23"),
         enable_daily_profile_selector: bool = False,
         daily_profile_selector_config: DailyProfileSelectorConfig | None = None,
+        enable_wave_guard: bool = True,
         now_ms=None,
     ):
         self.symbol = symbol.upper()
@@ -110,6 +112,7 @@ class MonitorState:
             if str(item).strip()
         }
         self.enable_daily_profile_selector = bool(enable_daily_profile_selector)
+        self.enable_wave_guard = bool(enable_wave_guard)
         self.daily_profile_selector_config = (
             daily_profile_selector_config or DailyProfileSelectorConfig()
         ).normalized()
@@ -126,6 +129,7 @@ class MonitorState:
         self.warmup: dict | None = None
         self.risk_pause: str = ""
         self.klines: list[Kline] = []
+        self.wave_state = analyze_wave(())
         self.signals: list[Signal] = []
         self.observations: list[ObservationSignal] = list(reversed(restored_observations))
         self.daily_profile_selection = self._load_latest_daily_profile_selection()
@@ -146,9 +150,11 @@ class MonitorState:
 
         with self._lock:
             existing = list(self.klines)
+            previous_wave = self.wave_state
 
         merged_klines = self._merge_klines(existing, klines)
         latest = merged_klines[-1]
+        wave_state = analyze_wave(merged_klines, previous=previous_wave)
         fear_greed = self._fear_greed_context()
         new_signals = [
             analyze_volume_price(merged_klines, timeframe_minutes=minutes, fear_greed=fear_greed)
@@ -164,7 +170,7 @@ class MonitorState:
         with self._lock:
             self.fear_greed = fear_greed
             self.klines = merged_klines
-            self.signals = new_signals
+            self.wave_state = wave_state
             self.updated_at_ms = int(time.time() * 1000)
             self.last_error = None
             if self.storage and not self._flush_pending_settlement_events():
@@ -182,6 +188,15 @@ class MonitorState:
                     self._save_observation(observation)
 
             self._refresh_daily_profile_selection(latest.close_time)
+            new_signals = [
+                self._attach_wave_metadata(signal, wave_state) for signal in new_signals
+            ]
+            observation_signals = [
+                self._attach_wave_metadata(signal, wave_state)
+                for signal in observation_signals
+            ]
+            self.signals = new_signals
+            selected_signal = self._apply_wave_guard(selected_signal, wave_state)
             selected_signal, daily_profile_required = self._select_daily_profile_signal(
                 selected_signal,
                 observation_signals,
@@ -231,6 +246,7 @@ class MonitorState:
             self.risk_pause = ""
             self.webhook_error = None
             self.klines = []
+            self.wave_state = analyze_wave(())
             self.signals = []
             self.observations = list(reversed(restored_observations))
             self.daily_profile_selection = self._load_latest_daily_profile_selection()
@@ -332,6 +348,11 @@ class MonitorState:
     ) -> str:
         self.rolling_edge = self._rolling_edge_status(signal, latest)
         should_observe = self._should_record_observation(signal)
+        if signal.wave_guard_mode == "DIRECTION_BLOCKED":
+            if should_observe:
+                self._record_observation(signal, latest, "WAVE_DIRECTION_BLOCKED")
+            self.risk_pause = f"1分钟波段 {signal.wave_state} 不允许 {signal.observe_direction}"
+            return "WAVE_DIRECTION_BLOCKED"
         if daily_profile_required and not signal.daily_profile_selected:
             if should_observe:
                 self._record_observation(signal, latest, "DAILY_PROFILE_NOT_SELECTED")
@@ -436,6 +457,49 @@ class MonitorState:
             self._opened_signal_keys.add(gate.signal_key)
         self._last_order_opened_at = latest.close_time
         return gate.code
+
+    def _apply_wave_guard(self, signal: Signal, wave: WaveSnapshot) -> Signal:
+        guarded = self._attach_wave_metadata(signal, wave)
+        if not self.enable_wave_guard:
+            return replace(guarded, wave_guard_mode="DISABLED")
+        direction = signal.direction.upper()
+        if direction not in {"LONG", "SHORT"}:
+            return guarded
+        if direction in wave.allowed_directions:
+            return guarded
+        return replace(
+            guarded,
+            direction="WAIT",
+            observe_direction=signal.observe_direction or direction,
+            observe_only=True,
+            wave_guard_mode="DIRECTION_BLOCKED",
+            reason=f"{signal.reason}；1分钟波段方向冲突：{wave.state} 不允许 {direction}，等待",
+        )
+
+    def _attach_wave_metadata(self, signal: Signal, wave: WaveSnapshot) -> Signal:
+        direction = signal.direction.upper()
+        profile_version = str(
+            (self.active_daily_profile_selection or {}).get("version", "") or "STATIC"
+        )
+        batch_id = ""
+        if direction in {"LONG", "SHORT"} and wave.confirmed_at > 0:
+            batch_id = (
+                f"{wave.confirmed_at}|{wave.state}|{direction}|"
+                f"{signal.threshold_segment}|{profile_version}"
+            )
+        return replace(
+            signal,
+            wave_state=wave.state,
+            wave_raw_state=wave.raw_state,
+            wave_window=wave.window,
+            wave_efficiency=round(wave.efficiency, 6),
+            wave_direction_ratio=round(wave.direction_ratio, 6),
+            wave_atr_strength=round(wave.atr_strength, 6),
+            wave_confirmations=wave.confirmations,
+            wave_confirmed_at=wave.confirmed_at,
+            wave_batch_id=batch_id,
+            wave_guard_mode="NORMAL",
+        )
 
     def _flush_pending_settlement_events(self) -> bool:
         while self._pending_settlement_events:
@@ -725,6 +789,16 @@ class MonitorState:
             regime=signal.regime,
             source_decision=decision,
             observe_only=True,
+            wave_state=signal.wave_state,
+            wave_raw_state=signal.wave_raw_state,
+            wave_window=signal.wave_window,
+            wave_efficiency=signal.wave_efficiency,
+            wave_direction_ratio=signal.wave_direction_ratio,
+            wave_atr_strength=signal.wave_atr_strength,
+            wave_confirmations=signal.wave_confirmations,
+            wave_confirmed_at=signal.wave_confirmed_at,
+            wave_batch_id=signal.wave_batch_id,
+            wave_guard_mode=signal.wave_guard_mode,
         )
         self.observations.append(observation)
         if self.storage:
@@ -1116,6 +1190,19 @@ class MonitorState:
                 "warmup": self.warmup,
                 "risk_pause": self.risk_pause,
                 "rolling_edge": self.rolling_edge,
+                "wave_state": {
+                    "enabled": self.enable_wave_guard,
+                    "state": self.wave_state.state,
+                    "raw_state": self.wave_state.raw_state,
+                    "window": self.wave_state.window,
+                    "efficiency": self.wave_state.efficiency,
+                    "direction_ratio": self.wave_state.direction_ratio,
+                    "atr_strength": self.wave_state.atr_strength,
+                    "range_position": self.wave_state.range_position,
+                    "confirmations": self.wave_state.confirmations,
+                    "confirmed_at": self.wave_state.confirmed_at,
+                    "allowed_directions": list(self.wave_state.allowed_directions),
+                },
                 "result_sequence_guard": self.result_sequence_guard,
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),

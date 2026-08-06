@@ -104,6 +104,35 @@ class SimulatorTest(unittest.TestCase):
         self.assertTrue(order.daily_profile_selected)
         self.assertEqual(order.daily_profile_version, "DPS-20260730-0800")
 
+    def test_wave_metadata_is_copied_to_order(self):
+        selected = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="波段允许",
+            price=100.0,
+            open_time=0,
+            score=84.0,
+            threshold=79.0,
+            wave_state="UP_LEG",
+            wave_raw_state="UP_LEG",
+            wave_window=8,
+            wave_efficiency=0.8,
+            wave_direction_ratio=0.86,
+            wave_atr_strength=2.1,
+            wave_confirmations=2,
+            wave_confirmed_at=120_000,
+            wave_batch_id="120000|UP_LEG|LONG|WD-00|STATIC",
+            wave_guard_mode="NORMAL",
+        )
+
+        order = AccountSimulator().open_order(selected, entry_price=100.0, opened_at=180_000)
+
+        self.assertEqual(order.wave_state, "UP_LEG")
+        self.assertEqual(order.wave_window, 8)
+        self.assertEqual(order.wave_batch_id, selected.wave_batch_id)
+        self.assertEqual(order.wave_guard_mode, "NORMAL")
+
     def test_long_order_wins_when_expiry_price_is_higher(self):
         simulator = AccountSimulator()
         order = simulator.open_order(signal("LONG"), entry_price=100.0, opened_at=0)

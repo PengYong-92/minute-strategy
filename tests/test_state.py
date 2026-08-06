@@ -14,6 +14,7 @@ from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
+from app.wave_state import WaveSnapshot
 
 
 def kline(idx, close, volume, open_price=None, high=None, low=None):
@@ -266,6 +267,114 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_wave_guard_blocks_short_in_up_leg_and_keeps_long(self):
+        state = MonitorState(symbol="BTCUSDT")
+        wave = WaveSnapshot(
+            state="UP_LEG",
+            raw_state="UP_LEG",
+            window=8,
+            efficiency=0.8,
+            direction_ratio=0.86,
+            atr_strength=2.1,
+            range_position=0.9,
+            confirmations=2,
+            confirmed_at=4_000_000,
+            allowed_directions=("LONG",),
+        )
+        short_signal = Signal(
+            "SHORT",
+            10,
+            "A",
+            "实时SHORT",
+            100.0,
+            4_100_000,
+            score=-84.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+        )
+
+        blocked = state._apply_wave_guard(short_signal, wave)
+        allowed = state._apply_wave_guard(replace(short_signal, direction="LONG", score=84.0), wave)
+
+        self.assertEqual(blocked.direction, "WAIT")
+        self.assertEqual(blocked.observe_direction, "SHORT")
+        self.assertEqual(blocked.wave_guard_mode, "DIRECTION_BLOCKED")
+        self.assertIn("波段方向冲突", blocked.reason)
+        self.assertEqual(allowed.direction, "LONG")
+        self.assertEqual(allowed.wave_guard_mode, "NORMAL")
+        self.assertTrue(allowed.wave_batch_id)
+
+    def test_wave_guard_blocks_turn_and_range_middle(self):
+        state = MonitorState(symbol="BTCUSDT")
+        signal = Signal(
+            "LONG",
+            10,
+            "A",
+            "实时LONG",
+            100.0,
+            4_100_000,
+            score=84.0,
+            threshold=79.0,
+        )
+        for wave_state in ("TURN_UP", "TURN_DOWN", "RANGE_MID"):
+            wave = WaveSnapshot(
+                state=wave_state,
+                raw_state="UP_LEG" if wave_state == "TURN_UP" else wave_state,
+                window=8,
+                efficiency=0.5,
+                direction_ratio=0.7,
+                atr_strength=1.0,
+                range_position=0.5,
+                confirmations=1,
+                confirmed_at=4_000_000,
+                allowed_directions=(),
+            )
+
+            guarded = state._apply_wave_guard(signal, wave)
+
+            self.assertEqual(guarded.direction, "WAIT")
+            self.assertEqual(guarded.wave_guard_mode, "DIRECTION_BLOCKED")
+
+    def test_daily_profile_cannot_restore_wave_blocked_direction(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(symbol="BTCUSDT", enable_daily_profile_selector=True)
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "selected_profiles": [
+                {"key": "10|short_observe|generic_short_observe|SHORT|WD-22"}
+            ],
+        }
+        signal = Signal(
+            "SHORT",
+            10,
+            "A",
+            "实时SHORT",
+            100.0,
+            now,
+            score=-84.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+        )
+        up_wave = WaveSnapshot(
+            "UP_LEG", "UP_LEG", 8, 0.8, 0.8, 2.0, 0.9, 2, now, ("LONG",)
+        )
+
+        guarded = state._apply_wave_guard(signal, up_wave)
+        selected, required = state._select_daily_profile_signal(guarded, [], now)
+        decision = state._maybe_open_order(
+            selected,
+            kline(1, 100.0, 100),
+            daily_profile_required=required,
+        )
+
+        self.assertEqual(selected.direction, "WAIT")
+        self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(decision, "WAVE_DIRECTION_BLOCKED")
+        self.assertEqual(state.simulator.orders, [])
+
     def test_default_order_policy_supports_five_open_orders_two_minutes_apart(self):
         state = MonitorState(symbol="BTCUSDT")
 
@@ -532,7 +641,9 @@ class MonitorStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
             klines = actionable_rebound_klines()
-            state = MonitorState(symbol="BTCUSDT", storage_path=db_path)
+            state = MonitorState(
+                symbol="BTCUSDT", storage_path=db_path, enable_wave_guard=False
+            )
             state.update_from_klines(klines)
             state.wait_for_storage_writes()
 
@@ -705,7 +816,7 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_update_opens_only_one_selected_duration(self):
         klines = actionable_rebound_klines()
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(symbol="BTCUSDT", enable_wave_guard=False)
 
         state.update_from_klines(klines)
         state.update_from_klines(klines)
@@ -720,7 +831,7 @@ class MonitorStateTest(unittest.TestCase):
     def test_state_sends_webhook_only_when_order_opens(self):
         klines = actionable_rebound_klines()
         webhook = RecordingWebhook()
-        state = MonitorState(symbol="BTCUSDT", webhook=webhook)
+        state = MonitorState(symbol="BTCUSDT", webhook=webhook, enable_wave_guard=False)
 
         state.update_from_klines(klines)
         state.update_from_klines(klines)
@@ -1359,7 +1470,13 @@ class MonitorStateTest(unittest.TestCase):
     def test_state_uses_configured_stake_terms_for_orders_and_webhook(self):
         klines = actionable_rebound_klines()
         webhook = RecordingWebhook()
-        state = MonitorState(symbol="BTCUSDT", webhook=webhook, stake=20.0, win_return=36.0)
+        state = MonitorState(
+            symbol="BTCUSDT",
+            webhook=webhook,
+            stake=20.0,
+            win_return=36.0,
+            enable_wave_guard=False,
+        )
 
         state.update_from_klines(klines)
 
@@ -1393,7 +1510,7 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_state_does_not_reopen_while_order_is_open(self):
         klines = actionable_rebound_klines()
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(symbol="BTCUSDT", enable_wave_guard=False)
 
         state.update_from_klines(klines)
         state.update_from_klines(klines + [kline(490, 95.2, 265, open_price=95.5, high=95.6, low=95.1)])
@@ -1581,7 +1698,7 @@ class MonitorStateTest(unittest.TestCase):
                 },
             }
         }
-        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        state = MonitorState(symbol="BTCUSDT", storage=storage, enable_wave_guard=False)
 
         state.update_from_klines(klines)
         opened_at = state.snapshot()["orders"][0]["opened_at"]
@@ -1609,7 +1726,9 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_progression_atomic_event_order_and_recording_restart_restore_active(self):
         storage = RecordingStorage()
-        state = MonitorState(symbol="BTCUSDT", storage=storage, now_ms=lambda: 1_000)
+        state = MonitorState(
+            symbol="BTCUSDT", storage=storage, enable_wave_guard=False, now_ms=lambda: 1_000
+        )
         first_signal = Signal(
             direction="LONG", timeframe_minutes=2, level="A", reason="first",
             price=100.0, open_time=1_000, score=80.0, threshold=70.0,
@@ -1651,7 +1770,12 @@ class MonitorStateTest(unittest.TestCase):
     def test_sqlite_progression_restart_keeps_activation_and_active_second_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
-            state = MonitorState(symbol="BTCUSDT", storage_path=db_path, now_ms=lambda: 1_000)
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage_path=db_path,
+                enable_wave_guard=False,
+                now_ms=lambda: 1_000,
+            )
             first_signal = Signal(
                 direction="LONG", timeframe_minutes=2, level="A", reason="first",
                 price=100.0, open_time=1_000, score=80.0, threshold=70.0,
@@ -1776,7 +1900,11 @@ class MonitorStateTest(unittest.TestCase):
         storage = RecordingStorage()
         webhook = RecordingWebhook()
         state = MonitorState(
-            symbol="BTCUSDT", storage=storage, webhook=webhook, now_ms=lambda: 1_000,
+            symbol="BTCUSDT",
+            storage=storage,
+            webhook=webhook,
+            enable_wave_guard=False,
+            now_ms=lambda: 1_000,
         )
         storage.fail_once("save_open_order_with_credit")
         signal = Signal(
@@ -1836,7 +1964,11 @@ class MonitorStateTest(unittest.TestCase):
         storage = RecordingStorage()
         webhook = RecordingWebhook()
         state = MonitorState(
-            symbol="BTCUSDT", storage=storage, webhook=webhook, now_ms=lambda: 1_000,
+            symbol="BTCUSDT",
+            storage=storage,
+            webhook=webhook,
+            enable_wave_guard=False,
+            now_ms=lambda: 1_000,
         )
         first_signal = Signal(
             direction="LONG", timeframe_minutes=2, level="A", reason="first",
