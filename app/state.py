@@ -1023,6 +1023,7 @@ class MonitorState:
             "rolling_edge": dict(self.rolling_edge),
             "result_sequence_guard": dict(self.result_sequence_guard),
             "wave_batch_guard": dict(self.wave_batch_guard),
+            "wave_state": self._wave_state_to_dict(),
             "profile_guard_shadow": profile_guard,
             "profile_guard_default_shadow": profile_guard_default,
             "profile_guard_selection_policy": profile_guard.get("selection_policy") or {},
@@ -1184,6 +1185,21 @@ class MonitorState:
             "reason": "",
         }
 
+    def _wave_state_to_dict(self) -> dict:
+        return {
+            "enabled": self.enable_wave_guard,
+            "state": self.wave_state.state,
+            "raw_state": self.wave_state.raw_state,
+            "window": self.wave_state.window,
+            "efficiency": self.wave_state.efficiency,
+            "direction_ratio": self.wave_state.direction_ratio,
+            "atr_strength": self.wave_state.atr_strength,
+            "range_position": self.wave_state.range_position,
+            "confirmations": self.wave_state.confirmations,
+            "confirmed_at": self.wave_state.confirmed_at,
+            "allowed_directions": list(self.wave_state.allowed_directions),
+        }
+
     def _empty_wave_batch_guard(self) -> dict:
         config = self.wave_batch_guard_config
         return {
@@ -1266,19 +1282,7 @@ class MonitorState:
                 "warmup": self.warmup,
                 "risk_pause": self.risk_pause,
                 "rolling_edge": self.rolling_edge,
-                "wave_state": {
-                    "enabled": self.enable_wave_guard,
-                    "state": self.wave_state.state,
-                    "raw_state": self.wave_state.raw_state,
-                    "window": self.wave_state.window,
-                    "efficiency": self.wave_state.efficiency,
-                    "direction_ratio": self.wave_state.direction_ratio,
-                    "atr_strength": self.wave_state.atr_strength,
-                    "range_position": self.wave_state.range_position,
-                    "confirmations": self.wave_state.confirmations,
-                    "confirmed_at": self.wave_state.confirmed_at,
-                    "allowed_directions": list(self.wave_state.allowed_directions),
-                },
+                "wave_state": self._wave_state_to_dict(),
                 "result_sequence_guard": self.result_sequence_guard,
                 "wave_batch_guard": self.wave_batch_guard,
                 "profile_guard": self._profile_guard_config(),

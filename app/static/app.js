@@ -89,6 +89,25 @@ function fmtResultSequenceGuard(guard) {
   return `NORMAL · ${scope}${guard.loss_streak || 0}连败 / ${guard.cooldown_minutes || 0}分钟`;
 }
 
+function fmtWaveState(wave) {
+  if (!wave) return DASH;
+  if (!wave.enabled) return "OFF";
+  const allowed = Array.isArray(wave.allowed_directions) && wave.allowed_directions.length
+    ? wave.allowed_directions.join("/")
+    : "无";
+  return `${wave.state || "UNKNOWN"} · 允许${allowed} · 确认${wave.confirmations || 0}`;
+}
+
+function fmtWaveBatchGuard(guard) {
+  if (!guard) return DASH;
+  if (!guard.enabled) return "OFF";
+  const batch = `${guard.batch_orders || 0}单 ${guard.batch_wins || 0}胜/${guard.batch_losses || 0}负`;
+  if (guard.mode === "COOLDOWN") return `COOLDOWN · 至 ${fmtTime(guard.pause_until)}`;
+  if (guard.mode === "RECOVERY") return `RECOVERY · 仅固定10U`;
+  if (guard.blocked) return `${guard.mode || "BLOCKED"} · ${batch}`;
+  return `${guard.mode || "PENDING"} · ${batch}`;
+}
+
 function fmtStakeProgression(progression) {
   if (!progression) return "两单叠加 · 状态数据不完整";
   const secondStake = optionalNum(progression.second_stake);
@@ -129,6 +148,7 @@ function renderStrategySummary(state) {
       : "每日画像选策 OFF",
   );
   setText("result-sequence-guard-badge", fmtResultSequenceGuard(state.result_sequence_guard));
+  setText("wave-batch-guard-badge", fmtWaveBatchGuard(state.wave_batch_guard));
 }
 
 function hasRiskFlag(signal, flag) {
@@ -245,6 +265,20 @@ function rollingEdgeClass(edge) {
 function resultSequenceGuardClass(guard) {
   if (!guard || !guard.enabled) return "";
   return guard.status === "PAUSED" ? "status-risk" : "status-good";
+}
+
+function waveStateClass(wave) {
+  if (!wave || !wave.enabled || wave.state === "UNKNOWN") return "status-muted";
+  return Array.isArray(wave.allowed_directions) && wave.allowed_directions.length
+    ? "status-good"
+    : "status-warn";
+}
+
+function waveBatchGuardClass(guard) {
+  if (!guard || !guard.enabled) return "status-muted";
+  if (guard.blocked || guard.mode === "COOLDOWN") return "status-risk";
+  if (guard.mode === "RECOVERY") return "status-warn";
+  return "status-good";
 }
 
 function webhookClass(webhook) {
@@ -403,6 +437,10 @@ const selectedSignalFields = [
   ["策略族", (s) => s.strategy_family || "unknown"],
   ["策略标签", (s) => s.strategy_tag || "unknown"],
   ["画像键", (s) => s.profile_key || DASH],
+  ["1m波段", (s) => s.wave_state || "UNKNOWN"],
+  ["波段确认", (s) => `${s.wave_confirmations || 0} / ${num(s.wave_efficiency).toFixed(3)}`],
+  ["波段批次", (s) => s.wave_batch_id || DASH],
+  ["波段守卫", (s) => s.wave_guard_mode || "NORMAL"],
 ];
 
 const signalFields = [
@@ -440,6 +478,8 @@ const summaryFields = {
   regime: (state) => (state.selected_signal ? state.selected_signal.regime || "UNKNOWN" : DASH),
   "risk-pause": (state) => state.risk_pause || DASH,
   "rolling-edge-status": (state) => fmtRollingEdge(state.rolling_edge),
+  "wave-state-status": (state) => fmtWaveState(state.wave_state),
+  "wave-batch-guard-status": (state) => fmtWaveBatchGuard(state.wave_batch_guard),
   "result-sequence-guard-status": (state) => fmtResultSequenceGuard(state.result_sequence_guard),
   "webhook-status": (state) => fmtWebhook(state.webhook),
   "order-decision": (state) => state.order_decision || DASH,
@@ -490,7 +530,7 @@ function renderOrders(orders) {
       <td>${escapeHtml(order.timeframe_minutes)}分钟</td>
       <td>${escapeHtml(order.level)}</td>
       <td>${escapeHtml(order.threshold_segment || DASH)}</td>
-      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span></td>
+      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span></td>
       <td>${fmtPct(order.session_win_rate)} / ${fmtMoney(order.session_ev)}</td>
       <td>${fmtMoney(order.stake)}</td>
       <td>${fmtPrice(order.entry_price)}</td>
@@ -893,6 +933,8 @@ async function loadState() {
   $("webhook-status").className = webhookClass(state.webhook);
   $("warmup-status").className = warmupClass(state.warmup);
   $("rolling-edge-status").className = rollingEdgeClass(state.rolling_edge);
+  $("wave-state-status").className = waveStateClass(state.wave_state);
+  $("wave-batch-guard-status").className = waveBatchGuardClass(state.wave_batch_guard);
   $("result-sequence-guard-status").className = resultSequenceGuardClass(state.result_sequence_guard);
   $("short-extension-status").className = shortExtensionClass(state);
   setText("stake-progression-badge", fmtStakeProgression(state.stake_progression));

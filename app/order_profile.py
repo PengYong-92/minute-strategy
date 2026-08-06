@@ -34,6 +34,7 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     guard_shadow = payload.get("profile_guard_shadow") or {}
     default_guard_shadow = payload.get("profile_guard_default_shadow") or {}
     guard_policy = payload.get("profile_guard_selection_policy") or {}
+    wave_batch_guard = payload.get("wave_batch_guard") or {}
     reason = str(signal.get("reason") or "")
     return {
         "symbol": _get(snapshot, "symbol", ""),
@@ -65,6 +66,10 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "mtf_30m_bias": _float(signal.get("mtf_30m_bias")),
         "regime": signal.get("regime") or _get(snapshot, "regime", "") or "",
         "risk_flags": signal.get("risk_flags") or "",
+        "wave_state": signal.get("wave_state") or "UNKNOWN",
+        "wave_raw_state": signal.get("wave_raw_state") or "UNKNOWN",
+        "wave_batch_id": signal.get("wave_batch_id") or "",
+        "wave_guard_mode": signal.get("wave_guard_mode") or wave_batch_guard.get("mode") or "NORMAL",
         "fear_greed_value": fear_greed.get("value"),
         "fear_greed_trend": fear_greed.get("trend") or "",
         "profile_guard_shadow_status": guard_shadow.get("status", ""),
@@ -108,6 +113,8 @@ def summarize_order_samples_with_guard(
         "by_level": _group_summaries(samples, "level", min_group_size=1),
         "by_stake_step": _group_summaries(samples, "stake_progression_step", min_group_size=1),
         "by_regime": _group_summaries(samples, "regime", min_group_size=1),
+        "by_wave_state": _group_summaries(samples, "wave_state", min_group_size=1),
+        "by_wave_guard_mode": _group_summaries(samples, "wave_guard_mode", min_group_size=1),
         "by_fear_greed_trend": _group_summaries(samples, "fear_greed_trend", min_group_size=1),
         "by_reason": _group_summaries(samples, "reason_setup", min_group_size=1),
         "feature_bins": _feature_bins(samples, min_group_size=min_group_size),
@@ -161,6 +168,10 @@ def sample_from_signal(signal: Signal) -> dict[str, Any]:
         "mtf_30m_bias": signal.mtf_30m_bias,
         "regime": signal.regime,
         "risk_flags": signal.risk_flags,
+        "wave_state": signal.wave_state,
+        "wave_raw_state": signal.wave_raw_state,
+        "wave_batch_id": signal.wave_batch_id,
+        "wave_guard_mode": signal.wave_guard_mode,
         "fear_greed_value": signal.fear_greed_value,
         "fear_greed_trend": signal.fear_greed_trend,
     }

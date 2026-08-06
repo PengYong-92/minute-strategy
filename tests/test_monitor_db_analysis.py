@@ -10,6 +10,7 @@ from app.order_profile import (
     evaluate_profile_guard,
     profile_guard_shadow,
     risk_hint_keys_for_sample,
+    sample_from_entry_snapshot,
     sample_from_signal,
     sweep_profile_guard,
     sweep_profile_guard_key_subsets,
@@ -18,6 +19,28 @@ from scripts.analyze_monitor_db import analyze_samples, load_order_samples
 
 
 class MonitorDbAnalysisTest(unittest.TestCase):
+    def test_entry_snapshot_exposes_wave_fields_for_analysis(self):
+        sample = sample_from_entry_snapshot(
+            {
+                "symbol": "BTCUSDT",
+                "order_id": 1,
+                "direction": "SHORT",
+                "entry_payload": {
+                    "signal": {
+                        "wave_state": "DOWN_LEG",
+                        "wave_raw_state": "DOWN_LEG",
+                        "wave_batch_id": "123|DOWN_LEG|SHORT|WD-05|DPS-1",
+                        "wave_guard_mode": "RECOVERY",
+                    },
+                    "wave_batch_guard": {"mode": "RECOVERY"},
+                },
+            }
+        )
+
+        self.assertEqual(sample["wave_state"], "DOWN_LEG")
+        self.assertEqual(sample["wave_batch_id"], "123|DOWN_LEG|SHORT|WD-05|DPS-1")
+        self.assertEqual(sample["wave_guard_mode"], "RECOVERY")
+
     def test_loads_snapshots_and_reports_risk_hints(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
