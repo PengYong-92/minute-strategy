@@ -80,7 +80,7 @@ class TwoStageStakeProgression:
         base_stake: float = 10.0,
         base_win_return: float | None = None,
         max_active: int | None = None,
-        max_open_orders: int = 5,
+        max_open_orders: int = 2,
         activated_at: int | None = None,
         credits: Iterable[StakeProgressionCredit] = (),
         active_second_orders: int | None = None,

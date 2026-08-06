@@ -26,7 +26,7 @@ class AccountSimulator:
         stake_progression_max_orders: int = 2,
         stake_progression_base_only_segments: list[str] | tuple[str, ...] | set[str] | None = None,
         stake_progression_max_active: int = 1,
-        max_open_orders: int = 5,
+        max_open_orders: int = 2,
         stake_progression_activated_at: int = 0,
         stake_progression_credits: Iterable[StakeProgressionCredit] = (),
         active_second_order_ids: Iterable[int] | None = None,

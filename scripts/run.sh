@@ -19,7 +19,7 @@ WARMUP_MONTHS="${WARMUP_MONTHS:-3}"
 WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-20}"
 STAKE="${STAKE:-10}"
 WIN_RETURN="${WIN_RETURN:-}"
-MAX_OPEN_ORDERS="${MAX_OPEN_ORDERS:-5}"
+MAX_OPEN_ORDERS="${MAX_OPEN_ORDERS:-2}"
 MIN_ORDER_GAP_MINUTES="${MIN_ORDER_GAP_MINUTES:-2}"
 STAKE_PROGRESSION="${STAKE_PROGRESSION:-1}"
 ROLLING_EDGE_GUARD="${ROLLING_EDGE_GUARD:-1}"
@@ -78,7 +78,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --warmup-timeout N     单个历史文件下载超时秒数，默认: 20
   --stake N              基础下单金额，默认: 10
   --win-return N         赢单返还金额，默认: stake * 1.8
-  --max-open-orders N    最多同时持有的未结订单数，默认: 5
+  --max-open-orders N    最多同时持有的未结订单数，默认: 2
   --min-order-gap-minutes N
                          两次开单最小间隔分钟数，默认: 2
   --no-stake-progression 关闭两阶段金额叠加

@@ -34,7 +34,7 @@ def signal(direction="LONG", score=82.0, threshold=70.0, segment="WD-12"):
 
 
 class OrderPolicyTest(unittest.TestCase):
-    def test_default_policy_allows_fifth_open_order_and_blocks_sixth(self):
+    def test_default_policy_allows_second_open_order_and_blocks_third(self):
         policy = OrderPolicy()
         latest = kline(20)
         open_orders = [
@@ -49,26 +49,26 @@ class OrderPolicyTest(unittest.TestCase):
                 expires_at=latest.close_time + 600_000,
                 threshold_segment="WD-12",
             )
-            for idx in range(4)
+            for idx in range(1)
         ]
 
-        fifth = policy.evaluate(
+        second = policy.evaluate(
             signal(),
             latest,
             open_orders,
             latest.close_time - 120_000,
             set(),
         )
-        sixth = policy.evaluate(
+        third = policy.evaluate(
             signal(),
             latest,
-            [*open_orders, replace(open_orders[-1], id=5)],
+            [*open_orders, replace(open_orders[-1], id=2)],
             latest.close_time - 120_000,
             set(),
         )
 
-        self.assertTrue(fifth.open_allowed)
-        self.assertEqual(sixth.code, "HOLD_OPEN_ORDER")
+        self.assertTrue(second.open_allowed)
+        self.assertEqual(third.code, "HOLD_OPEN_ORDER")
 
     def test_default_policy_keeps_two_minute_entry_gap(self):
         policy = OrderPolicy()

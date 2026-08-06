@@ -6,7 +6,7 @@
 - 按量价关系生成 10分钟候选分析。
 - 使用动态评分阈值选择是否开10分钟单；30分钟只保留为多周期偏向观察，不再开单。
 - 10分钟信号严格使用最近10根已收盘1分钟K线分析后10分钟方向。
-- 默认最多同时持有5单，两次开单至少间隔2分钟；每次行情更新仍只选择一个最高优先级画像，不会同一分钟批量开单。
+- 默认最多同时持有2单，两次开单至少间隔2分钟；每次行情更新仍只选择一个最高优先级画像，不会同一分钟批量开单。
 - 使用滚动守卫 + 严格两阶段金额叠加模拟下单：第一单固定 10U，赢后产生一次第二级 18U 资格；第二单结算后回到 10U，不存在第三级。
 - 默认最多并行 1 个第二级订单，且所有已入选时段均可参与；`base-only` 兼容列表默认为空。
 - 独立 Web 页面查看点位、预警、订单、胜负、盈亏和胜率。
@@ -49,7 +49,7 @@ bash scripts/run.sh ETHUSDT 8080
 bash scripts/run.sh --symbol BTCUSDT --host 0.0.0.0 --port 8000 --poll-seconds 10 --limit 300
 bash scripts/run.sh --no-warmup
 bash scripts/run.sh --db-path data/monitor.sqlite3
-bash scripts/run.sh --max-open-orders 5 --min-order-gap-minutes 2
+bash scripts/run.sh --max-open-orders 2 --min-order-gap-minutes 2
 bash scripts/run.sh --result-sequence-loss-streak 3 --result-sequence-cooldown-minutes 20 --result-sequence-scope DIRECTION
 bash scripts/run.sh --stake-progression-max-orders 2 --stake-progression-max-active 1 --stake-progression-base-only-segments ""
 bash scripts/run.sh --webhook-url https://event.easy-tx.com/api/signals/ingest

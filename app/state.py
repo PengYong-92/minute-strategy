@@ -41,7 +41,7 @@ class MonitorState:
     def __init__(
         self,
         symbol: str,
-        max_open_orders: int = 5,
+        max_open_orders: int = 2,
         min_order_gap_ms: int = 2 * 60_000,
         fear_greed_provider=None,
         max_klines: int = 140_000,

@@ -116,7 +116,7 @@ function fmtClock(hour, minute) {
 function renderStrategySummary(state) {
   const selection = state.daily_profile_selection || {};
   const config = selection.config || {};
-  const maxOpenOrders = num(state.order_policy && state.order_policy.max_open_orders, 5);
+  const maxOpenOrders = num(state.order_policy && state.order_policy.max_open_orders, 2);
   const selectionLabel = selection.enabled ? "每日画像选策" : "静态策略";
   setText(
     "strategy-summary",

@@ -47,7 +47,7 @@ bash scripts/run.sh
 | `--db-path` | `data/monitor.sqlite3` | SQLite 持久化路径 |
 | `--stake` | `10` | 基础下单金额 |
 | `--win-return` | `stake * 1.8` | 赢单总返还金额 |
-| `--max-open-orders` | `5` | 最多同时持有的未结订单数 |
+| `--max-open-orders` | `2` | 最多同时持有的未结订单数 |
 | `--min-order-gap-minutes` | `2` | 两次开单最小间隔分钟数 |
 | `--stake-progression-max-orders` | `2` | 兼容参数；生产固定为两阶段 |
 | `--stake-progression-max-active` | `1` | 最多并行第二级订单数 |

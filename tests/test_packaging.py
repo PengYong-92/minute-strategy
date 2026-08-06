@@ -347,6 +347,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
             fake_python.chmod(0o755)
             env = os.environ.copy()
             for name in (
+                "MAX_OPEN_ORDERS",
                 "STAKE_PROGRESSION",
                 "STAKE_PROGRESSION_MAX_ORDERS",
                 "STAKE_PROGRESSION_MAX_ACTIVE",
@@ -391,6 +392,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
 
         self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
         self.assertNotIn("--no-stake-progression", default_args)
+        self.assertEqual(default_args[default_args.index("--max-open-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-active") + 1], "1")
         self.assertEqual(default_args[default_args.index("--stake-progression-base-only-segments") + 1], "")

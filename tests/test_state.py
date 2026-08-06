@@ -375,14 +375,14 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "WAVE_DIRECTION_BLOCKED")
         self.assertEqual(state.simulator.orders, [])
 
-    def test_default_order_policy_supports_five_open_orders_two_minutes_apart(self):
+    def test_default_order_policy_supports_two_open_orders_two_minutes_apart(self):
         state = MonitorState(symbol="BTCUSDT")
 
-        self.assertEqual(state.order_policy.max_open_orders, 5)
+        self.assertEqual(state.order_policy.max_open_orders, 2)
         self.assertEqual(state.order_policy.min_order_gap_ms, 2 * 60_000)
         self.assertEqual(
             state.snapshot()["order_policy"],
-            {"max_open_orders": 5, "min_order_gap_ms": 2 * 60_000},
+            {"max_open_orders": 2, "min_order_gap_ms": 2 * 60_000},
         )
 
     def test_daily_profile_status_does_not_repeat_reloaded_active_snapshot_as_pending(self):

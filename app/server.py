@@ -257,8 +257,8 @@ def main() -> None:
     parser.add_argument(
         "--max-open-orders",
         type=int,
-        default=int(os.getenv("MAX_OPEN_ORDERS", "5")),
-        help="最多同时持有的未结订单数，默认: 5",
+        default=int(os.getenv("MAX_OPEN_ORDERS", "2")),
+        help="最多同时持有的未结订单数，默认: 2",
     )
     parser.add_argument(
         "--min-order-gap-minutes",
