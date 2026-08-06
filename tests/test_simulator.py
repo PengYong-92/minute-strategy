@@ -79,7 +79,7 @@ class SimulatorTest(unittest.TestCase):
         self.assertIsNone(order.stake_progression_source_order_id)
         self.assertEqual(order.stake_progression_version, "")
 
-    def test_daily_profile_selection_makes_wait_signal_actionable_and_is_copied_to_order(self):
+    def test_daily_profile_selection_is_copied_from_actionable_signal_to_order(self):
         selected = Signal(
             direction="SHORT",
             timeframe_minutes=10,
@@ -87,7 +87,7 @@ class SimulatorTest(unittest.TestCase):
             reason="每日画像启用",
             price=100.0,
             open_time=0,
-            score=0.0,
+            score=-84.0,
             threshold=80.0,
             strategy_family="short_observe",
             strategy_tag="generic_short_observe",
@@ -99,7 +99,7 @@ class SimulatorTest(unittest.TestCase):
         order = AccountSimulator().open_order(selected, entry_price=100.0, opened_at=0)
 
         self.assertTrue(selected.actionable)
-        self.assertEqual(selected.score, 0.0)
+        self.assertEqual(selected.score, -84.0)
         self.assertEqual(selected.threshold, 80.0)
         self.assertTrue(order.daily_profile_selected)
         self.assertEqual(order.daily_profile_version, "DPS-20260730-0800")

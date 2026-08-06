@@ -82,6 +82,16 @@ class Signal:
     profile_key: str = ""
     daily_profile_selected: bool = False
     daily_profile_version: str = ""
+    wave_state: str = "UNKNOWN"
+    wave_raw_state: str = "UNKNOWN"
+    wave_window: int = 0
+    wave_efficiency: float = 0.0
+    wave_direction_ratio: float = 0.0
+    wave_atr_strength: float = 0.0
+    wave_confirmations: int = 0
+    wave_confirmed_at: int = 0
+    wave_batch_id: str = ""
+    wave_guard_mode: str = "NORMAL"
 
     @property
     def actionable(self) -> bool:
@@ -125,6 +135,16 @@ class SimulatedOrder:
     pnl: float = 0.0
     stake_progression_source_order_id: Optional[int] = None
     stake_progression_version: str = ""
+    wave_state: str = "UNKNOWN"
+    wave_raw_state: str = "UNKNOWN"
+    wave_window: int = 0
+    wave_efficiency: float = 0.0
+    wave_direction_ratio: float = 0.0
+    wave_atr_strength: float = 0.0
+    wave_confirmations: int = 0
+    wave_confirmed_at: int = 0
+    wave_batch_id: str = ""
+    wave_guard_mode: str = "NORMAL"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -154,6 +174,16 @@ class ObservationSignal:
     exit_price: Optional[float] = None
     settled_at: Optional[int] = None
     pnl: float = 0.0
+    wave_state: str = "UNKNOWN"
+    wave_raw_state: str = "UNKNOWN"
+    wave_window: int = 0
+    wave_efficiency: float = 0.0
+    wave_direction_ratio: float = 0.0
+    wave_atr_strength: float = 0.0
+    wave_confirmations: int = 0
+    wave_confirmed_at: int = 0
+    wave_batch_id: str = ""
+    wave_guard_mode: str = "NORMAL"
 
     def to_dict(self) -> dict:
         return asdict(self)
