@@ -12,15 +12,15 @@
 |---|---|
 | 仓库 | `PengYong-92/minute-strategy` |
 | 生产代码分支 | `feature/1m-wave-direction-guard` |
-| 生产提交 | `2dad3040eddb5918e9c9175140f40bd278546266` |
-| 提交摘要 | `feat: add configurable profile entry threshold` |
-| 生产发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-2dad304-20260807-111248` |
+| 生产提交 | `75a3745cb53c39637e82663c9de1a065b8d3307e` |
+| 提交摘要 | `fix: clarify overridden threshold reasons` |
+| 生产发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-75a3745-20260807-114208` |
 | 当前软链 | `/opt/victory-event-monitor/current` |
 | systemd 服务 | `victory-event-monitor` |
 | 内部监听 | `127.0.0.1:18080` |
 | 公网域名 | `https://victory.easy-tx.com` |
 | SQLite | `/opt/victory-event-monitor/shared/data/monitor.sqlite3` |
-| 发布前版本 | `e824cf5`，目录 `event-contract-monitor-e824cf5-20260806-233253` |
+| 发布前版本 | `bc5fa35`，目录 `event-contract-monitor-bc5fa35-20260807-113613` |
 
 重要：截至本文记录时，`origin/main` 仍停留在 `78c8eee`，生产功能分支为 `feature/1m-wave-direction-guard`。生产版本尚未合并到 `main`，不得从 `main` 直接重新部署，否则会回退波段守卫、运行态加固和可配置阈值。
 
@@ -41,6 +41,8 @@
 | `e824cf5` | 修复币种切换竞态、重启开单间隔恢复和异步写入任务泄漏 |
 | `d3806a3` | 固化可配置开单阈值的设计与实施计划 |
 | `2dad304` | 新增阈值启动参数、画像先于波段的执行顺序、阈值审计字段和订单列表列 |
+| `bc5fa35` | 未入选画像也暴露实际开单阈值，同时保留原始动态阈值 |
+| `75a3745` | 清除覆盖模式下旧“动态阈值未达线”拦截文案，避免页面误读 |
 
 ## 4. 当前策略决策顺序
 
@@ -435,7 +437,7 @@ curl -sS -o /dev/null -w 'http=%{http_code} ssl=%{ssl_verify_result}\n' https://
 
 ## 17. 交接验收清单
 
-- [x] 确认生产软链提交为 `2dad304`；
+- [x] 确认生产软链提交为 `75a3745`；
 - [x] 确认服务为 `active` 且 `NRestarts=0`；
 - [x] 确认预热为 `READY` 且 `last_error` 为空；
 - [x] 确认并发2、间隔2分钟；
@@ -523,3 +525,37 @@ systemctl restart victory-event-monitor
 ```
 
 每次调整必须记录新值、服务 `ActiveEnterTimestamp`、订单起始ID和当日画像版本。调整后先确认 `/api/state.trade_score_threshold`，再把新边界后的订单单独统计。不要同时修改65%画像门槛、波段参数或订单守卫，否则无法归因开单量和胜率变化。
+
+## 19. 2026-08-07 阈值显示修复
+
+阈值0首次发布后，未入选画像仍在最新K线分析卡显示原动态阈值，例如 `0.0 / 78.5`，原因文本也保留“动态阈值78.5，不开单”。启动配置实际已经是0，真实决策为 `DAILY_PROFILE_NOT_SELECTED`，但页面表达容易被理解为阈值覆盖未生效。
+
+修复分两步发布：
+
+| 提交 | 发布时间 | 作用 |
+|---|---|---|
+| `bc5fa35` | `2026-08-07 11:37:24 CST` | 未入选画像返回 `threshold=0`、`calculated_threshold=原动态阈值` |
+| `75a3745` | `2026-08-07 11:43:11 CST` | 删除旧动态阈值拦截后缀，原因首句直接说明实际阈值和画像结果 |
+
+当前发布：
+
+```text
+release=/opt/victory-event-monitor/releases/event-contract-monitor-75a3745-20260807-114208
+sha256=89a653c9270829d093046223e30b94d155adfc0e3724ac5e2d505d912253f5d1
+service=active
+NRestarts=0
+warmup.status=READY
+last_error=null
+```
+
+验收时状态：
+
+```text
+score=0.0
+threshold=0.0
+calculated_threshold=78.5
+decision=DAILY_PROFILE_NOT_SELECTED
+reason=低位平量横盘：信号不足；开单阈值0.0（原始动态阈值78.5，仅记录）；当前画像未入选 ... WD-03
+```
+
+这两次修复只改变未入选画像的阈值审计和页面文案，不改变画像选择、方向、波段守卫或开单集合。因此策略效果样本边界仍使用 `2026-08-07 11:15:54 CST`；分析信号审计字段时，需把 `2026-08-07 11:43:11 CST` 作为新显示口径边界。
