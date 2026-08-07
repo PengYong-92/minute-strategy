@@ -1629,6 +1629,10 @@ class MonitorStateTest(unittest.TestCase):
         self.assertTrue(required)
         self.assertEqual(selected.direction, "WAIT")
         self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(selected.threshold, 0.0)
+        self.assertEqual(selected.calculated_threshold, 79.0)
+        self.assertIn("当前画像未入选", selected.reason)
+        self.assertIn("原始动态阈值79.0", selected.reason)
 
     def test_numeric_trade_score_threshold_requires_observe_direction(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")

@@ -808,20 +808,20 @@ class MonitorState:
             direction,
             primary_signal.threshold_segment,
         )
+        effective_threshold = (
+            primary_signal.threshold
+            if manual_threshold is None
+            else manual_threshold
+        )
+        calculated_threshold = (
+            primary_signal.calculated_threshold
+            if primary_signal.calculated_threshold > 0
+            else primary_signal.threshold
+        )
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
             if key != selected_key:
                 continue
-            effective_threshold = (
-                primary_signal.threshold
-                if manual_threshold is None
-                else manual_threshold
-            )
-            calculated_threshold = (
-                primary_signal.calculated_threshold
-                if primary_signal.calculated_threshold > 0
-                else primary_signal.threshold
-            )
             threshold_passed = abs(primary_signal.score) >= effective_threshold
             selected_direction = direction if threshold_passed else "WAIT"
             threshold_reason = ""
@@ -855,6 +855,20 @@ class MonitorState:
                     profile_key=key,
                     daily_profile_selected=True,
                     daily_profile_version=str(snapshot.get("version", "")),
+                ),
+                True,
+            )
+        if manual_threshold is not None:
+            return (
+                replace(
+                    primary_signal,
+                    reason=(
+                        f"{primary_signal.reason}；开单阈值{effective_threshold:.1f}"
+                        f"（原始动态阈值{calculated_threshold:.1f}，仅记录）；"
+                        f"当前画像未入选 {key}"
+                    ),
+                    threshold=effective_threshold,
+                    calculated_threshold=calculated_threshold,
                 ),
                 True,
             )
