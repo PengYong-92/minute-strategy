@@ -18,6 +18,7 @@ WEBHOOK_TIMEOUT="${WEBHOOK_TIMEOUT:-5}"
 WARMUP_MONTHS="${WARMUP_MONTHS:-3}"
 WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-20}"
 STAKE="${STAKE:-10}"
+TRADE_SCORE_THRESHOLD="${TRADE_SCORE_THRESHOLD:-auto}"
 WIN_RETURN="${WIN_RETURN:-}"
 MAX_OPEN_ORDERS="${MAX_OPEN_ORDERS:-2}"
 MIN_ORDER_GAP_MINUTES="${MIN_ORDER_GAP_MINUTES:-2}"
@@ -77,6 +78,8 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --warmup-months N      预热加载的完整月度文件数量，默认: 3
   --warmup-timeout N     单个历史文件下载超时秒数，默认: 20
   --stake N              基础下单金额，默认: 10
+  --trade-score-threshold N|auto
+                         已入选每日画像的开单评分阈值；auto 使用动态阈值，0 表示不限制，默认: auto
   --win-return N         赢单返还金额，默认: stake * 1.8
   --max-open-orders N    最多同时持有的未结订单数，默认: 2
   --min-order-gap-minutes N
@@ -151,7 +154,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
 环境变量覆盖:
   SYMBOL, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
   WEBHOOK_URL, WEBHOOK_TOKEN, WEBHOOK_TIMEOUT,
-  WARMUP_MONTHS, WARMUP_TIMEOUT, STAKE, WIN_RETURN,
+  WARMUP_MONTHS, WARMUP_TIMEOUT, STAKE, TRADE_SCORE_THRESHOLD, WIN_RETURN,
   MAX_OPEN_ORDERS, MIN_ORDER_GAP_MINUTES,
   STAKE_PROGRESSION, ROLLING_EDGE_GUARD, STAKE_PROGRESSION_MAX_ORDERS,
   RESULT_SEQUENCE_GUARD, RESULT_SEQUENCE_LOSS_STREAK,
@@ -302,6 +305,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --stake=*)
       STAKE="${1#*=}"
+      shift
+      ;;
+    --trade-score-threshold)
+      require_value "$1" "${2:-}"
+      TRADE_SCORE_THRESHOLD="$2"
+      shift 2
+      ;;
+    --trade-score-threshold=*)
+      TRADE_SCORE_THRESHOLD="${1#*=}"
       shift
       ;;
     --win-return)
@@ -704,6 +716,7 @@ exec "$PYTHON_BIN" -m app.server \
   --warmup-months "$WARMUP_MONTHS" \
   --warmup-timeout "$WARMUP_TIMEOUT" \
   --stake "$STAKE" \
+  --trade-score-threshold "$TRADE_SCORE_THRESHOLD" \
   ${WIN_RETURN:+--win-return "$WIN_RETURN"} \
   --max-open-orders "$MAX_OPEN_ORDERS" \
   --min-order-gap-minutes "$MIN_ORDER_GAP_MINUTES" \

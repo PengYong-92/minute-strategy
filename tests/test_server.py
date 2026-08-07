@@ -1,3 +1,4 @@
+import argparse
 import json
 import tempfile
 import threading
@@ -6,6 +7,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+import app.server as server_module
 from app.history import WarmupReport
 from app.models import Kline, ObservationSignal, SimulatedOrder
 from app.server import apply_warmup, make_handler, start_polling
@@ -14,6 +16,19 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_trade_score_threshold_accepts_auto_and_range(self):
+        self.assertIsNone(server_module._trade_score_threshold("auto"))
+        self.assertIsNone(server_module._trade_score_threshold(""))
+        self.assertEqual(server_module._trade_score_threshold("0"), 0.0)
+        self.assertEqual(server_module._trade_score_threshold("35.5"), 35.5)
+        self.assertEqual(server_module._trade_score_threshold("95"), 95.0)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            server_module._trade_score_threshold("-1")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            server_module._trade_score_threshold("96")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            server_module._trade_score_threshold("invalid")
+
     def test_polling_discards_response_when_symbol_changes_during_request(self):
         updated = threading.Event()
 

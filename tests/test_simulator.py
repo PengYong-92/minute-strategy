@@ -89,6 +89,7 @@ class SimulatorTest(unittest.TestCase):
             open_time=0,
             score=-84.0,
             threshold=80.0,
+            calculated_threshold=92.0,
             strategy_family="short_observe",
             strategy_tag="generic_short_observe",
             threshold_segment="WD-02",
@@ -103,6 +104,8 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(selected.threshold, 80.0)
         self.assertTrue(order.daily_profile_selected)
         self.assertEqual(order.daily_profile_version, "DPS-20260730-0800")
+        self.assertEqual(order.threshold, 80.0)
+        self.assertEqual(order.calculated_threshold, 92.0)
 
     def test_wave_metadata_is_copied_to_order(self):
         selected = Signal(

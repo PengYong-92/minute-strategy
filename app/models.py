@@ -94,6 +94,7 @@ class Signal:
     wave_guard_mode: str = "NORMAL"
     wave_guard_status: str = "UNKNOWN"
     wave_guard_reason: str = ""
+    calculated_threshold: float = 0.0
 
     @property
     def actionable(self) -> bool:
@@ -149,6 +150,7 @@ class SimulatedOrder:
     wave_guard_mode: str = "NORMAL"
     wave_guard_status: str = "UNKNOWN"
     wave_guard_reason: str = ""
+    calculated_threshold: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)

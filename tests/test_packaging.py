@@ -62,6 +62,8 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("对照升级建议", app_js)
         self.assertIn("PROMOTE_RECOMMENDED_GUARD", app_js)
         self.assertIn("策略版本表现", app_js)
+        self.assertIn("开单阈值", index_html)
+        self.assertIn("calculated_threshold", app_js)
         self.assertIn("选中key", app_js)
         self.assertIn("READY_TO_BLOCK", app_js)
         self.assertIn("升级建议", app_js)
@@ -354,6 +356,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
             env = os.environ.copy()
             for name in (
                 "MAX_OPEN_ORDERS",
+                "TRADE_SCORE_THRESHOLD",
                 "RESULT_SEQUENCE_GUARD",
                 "STAKE_PROGRESSION",
                 "STAKE_PROGRESSION_MAX_ORDERS",
@@ -385,6 +388,8 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
                     str(ROOT / "scripts" / "run.sh"),
                     "--stake-progression-max-active",
                     "4",
+                    "--trade-score-threshold",
+                    "0",
                     "--stake-progression-base-only-segments",
                     "",
                 ],
@@ -401,12 +406,14 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
         self.assertNotIn("--no-stake-progression", default_args)
         self.assertIn("--no-result-sequence-guard", default_args)
         self.assertEqual(default_args[default_args.index("--max-open-orders") + 1], "2")
+        self.assertEqual(default_args[default_args.index("--trade-score-threshold") + 1], "auto")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-active") + 1], "1")
         self.assertEqual(default_args[default_args.index("--stake-progression-base-only-segments") + 1], "")
 
         self.assertEqual(custom_result.returncode, 0, custom_result.stderr + custom_result.stdout)
         self.assertEqual(custom_args[custom_args.index("--stake-progression-max-active") + 1], "4")
+        self.assertEqual(custom_args[custom_args.index("--trade-score-threshold") + 1], "0")
         self.assertEqual(custom_args[custom_args.index("--stake-progression-base-only-segments") + 1], "")
 
     def test_package_script_creates_portable_archives_with_runtime_files(self):

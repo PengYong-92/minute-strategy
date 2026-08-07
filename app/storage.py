@@ -763,6 +763,10 @@ class SQLiteMonitorStore:
         for row in rows:
             payload = json.loads(row["payload"])
             clean_payload = {key: value for key, value in payload.items() if key in accepted}
+            if "calculated_threshold" not in payload:
+                clean_payload["calculated_threshold"] = float(
+                    clean_payload.get("threshold", 0.0)
+                )
             orders.append(SimulatedOrder(**clean_payload))
         return orders
 

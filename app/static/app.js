@@ -523,6 +523,11 @@ function renderSelectedSignal(signal, decision) {
     : "";
 }
 
+function orderCalculatedThreshold(order) {
+  const calculated = num(order.calculated_threshold);
+  return calculated > 0 ? calculated : num(order.threshold);
+}
+
 function renderOrders(orders) {
   $("orders").innerHTML = orders.length ? orders.map((order) => `
     <tr class="${orderTone(order)}">
@@ -533,6 +538,7 @@ function renderOrders(orders) {
       <td>${escapeHtml(order.threshold_segment || DASH)}</td>
       <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_status || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span></td>
       <td>${fmtPct(order.session_win_rate)} / ${fmtMoney(order.session_ev)}</td>
+      <td>${num(order.threshold).toFixed(1)}<br><span>评分 ${Math.abs(num(order.score)).toFixed(1)} · 原始 ${orderCalculatedThreshold(order).toFixed(1)}</span></td>
       <td>${fmtMoney(order.stake)}</td>
       <td>${fmtPrice(order.entry_price)}</td>
       <td>${fmtTime(order.opened_at)}</td>
@@ -543,7 +549,7 @@ function renderOrders(orders) {
       <td class="${num(order.pnl) >= 0 ? "long" : "short"}">${order.status === "SETTLED" ? fmtMoney(order.pnl) : DASH}</td>
       <td class="reason">${escapeHtml(order.reason)}<br><span>状态 ${escapeHtml(order.regime || "UNKNOWN")}</span></td>
     </tr>
-  `).join("") : `<tr><td colspan="16" class="empty-row">没有符合筛选条件的订单</td></tr>`;
+  `).join("") : `<tr><td colspan="17" class="empty-row">没有符合筛选条件的订单</td></tr>`;
 }
 
 function renderObservations(observations) {

@@ -182,6 +182,21 @@ def _env_float(name: str, default: float | None) -> float | None:
     return float(value)
 
 
+def _trade_score_threshold(value: str) -> float | None:
+    normalized = str(value).strip().lower()
+    if normalized in {"", "auto"}:
+        return None
+    try:
+        threshold = float(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "开单评分阈值必须是 auto 或 0 到 95 的数字"
+        ) from exc
+    if not 0.0 <= threshold <= 95.0:
+        raise argparse.ArgumentTypeError("开单评分阈值必须在 0 到 95 之间")
+    return threshold
+
+
 def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
@@ -256,6 +271,12 @@ def main() -> None:
         help="单个历史文件下载超时秒数，默认: 20",
     )
     parser.add_argument("--stake", type=float, default=float(os.getenv("STAKE", "10")), help="基础下单金额，默认: 10")
+    parser.add_argument(
+        "--trade-score-threshold",
+        type=_trade_score_threshold,
+        default=os.getenv("TRADE_SCORE_THRESHOLD", "auto"),
+        help="已入选每日画像的开单评分阈值，auto 使用动态阈值，0 表示不限制，默认: auto",
+    )
     parser.add_argument(
         "--max-open-orders",
         type=int,
@@ -495,6 +516,7 @@ def main() -> None:
         webhook=webhook,
         stake=args.stake,
         win_return=win_return,
+        trade_score_threshold=args.trade_score_threshold,
         enable_rolling_edge_guard=not args.no_rolling_edge_guard,
         result_sequence_guard_config=ResultSequenceGuardConfig(
             enabled=not args.no_result_sequence_guard,

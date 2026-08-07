@@ -1485,6 +1485,280 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "BELOW_THRESHOLD")
         self.assertEqual(state.simulator.orders, [])
 
+    def test_numeric_trade_score_threshold_promotes_matching_daily_profile(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=True,
+            trade_score_threshold=0.0,
+        )
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "effective_from": now,
+            "effective_until": now + 86_400_000,
+            "selected_profiles": [
+                {
+                    "key": "10|short_observe|generic_short_observe|SHORT|WD-22",
+                    "direction": "SHORT",
+                    "sample_size": 32,
+                    "win_rate": 0.65625,
+                    "ev": 1.8125,
+                }
+            ],
+        }
+        primary = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="中位平量横盘：信号不足",
+            price=100.0,
+            open_time=now - 60_000,
+            score=0.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            observe_direction="SHORT",
+            observe_only=True,
+        )
+
+        selected, required = state._select_daily_profile_signal(primary, [], now)
+
+        self.assertTrue(required)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertTrue(selected.actionable)
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertFalse(selected.observe_only)
+        self.assertEqual(selected.threshold, 0.0)
+        self.assertEqual(selected.calculated_threshold, 79.0)
+        self.assertEqual(
+            state.snapshot()["trade_score_threshold"],
+            {"mode": "OVERRIDE", "value": 0.0},
+        )
+
+    def test_auto_trade_score_threshold_is_exposed_in_snapshot(self):
+        state = MonitorState(symbol="BTCUSDT")
+
+        self.assertEqual(
+            state.snapshot()["trade_score_threshold"],
+            {"mode": "AUTO", "value": None},
+        )
+
+    def test_numeric_trade_score_threshold_still_blocks_score_below_override(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=True,
+            trade_score_threshold=35.0,
+        )
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "effective_from": now,
+            "effective_until": now + 86_400_000,
+            "selected_profiles": [
+                {
+                    "key": "10|short_observe|generic_short_observe|SHORT|WD-22",
+                    "direction": "SHORT",
+                    "sample_size": 32,
+                    "win_rate": 0.65625,
+                    "ev": 1.8125,
+                }
+            ],
+        }
+        primary = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="中位平量横盘：信号不足",
+            price=100.0,
+            open_time=now - 60_000,
+            score=-34.9,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            observe_direction="SHORT",
+            observe_only=True,
+        )
+
+        selected, required = state._select_daily_profile_signal(primary, [], now)
+
+        self.assertTrue(required)
+        self.assertEqual(selected.direction, "WAIT")
+        self.assertFalse(selected.actionable)
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertEqual(selected.threshold, 35.0)
+        self.assertEqual(selected.calculated_threshold, 79.0)
+
+    def test_numeric_trade_score_threshold_does_not_promote_unselected_profile(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=True,
+            trade_score_threshold=0.0,
+        )
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "effective_from": now,
+            "effective_until": now + 86_400_000,
+            "selected_profiles": [
+                {"key": "10|short_observe|generic_short_observe|SHORT|WD-23"}
+            ],
+        }
+        primary = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="中位平量横盘：信号不足",
+            price=100.0,
+            open_time=now - 60_000,
+            score=-90.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            observe_direction="SHORT",
+            observe_only=True,
+        )
+
+        selected, required = state._select_daily_profile_signal(primary, [], now)
+
+        self.assertTrue(required)
+        self.assertEqual(selected.direction, "WAIT")
+        self.assertFalse(selected.daily_profile_selected)
+
+    def test_numeric_trade_score_threshold_requires_observe_direction(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=True,
+            trade_score_threshold=0.0,
+        )
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "effective_from": now,
+            "effective_until": now + 86_400_000,
+            "selected_profiles": [
+                {"key": "10|rebound|drop_reclaim|LONG|WD-22"}
+            ],
+        }
+        primary = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="原方向未过动态阈值",
+            price=100.0,
+            open_time=now - 60_000,
+            score=0.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="rebound",
+            strategy_tag="drop_reclaim",
+            observe_direction="",
+        )
+
+        selected, required = state._select_daily_profile_signal(primary, [], now)
+
+        self.assertFalse(required)
+        self.assertFalse(selected.actionable)
+        self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(selected.threshold, 79.0)
+
+    def test_promoted_daily_profile_is_still_blocked_by_wave_direction(self):
+        now = shanghai_timestamp("2026-07-30T08:00:00")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=True,
+            trade_score_threshold=0.0,
+        )
+        state.active_daily_profile_selection = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "effective_from": now,
+            "effective_until": now + 86_400_000,
+            "selected_profiles": [
+                {"key": "10|short_observe|generic_short_observe|SHORT|WD-22"}
+            ],
+        }
+        primary = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="中位平量横盘：信号不足",
+            price=100.0,
+            open_time=now - 60_000,
+            threshold=79.0,
+            threshold_segment="WD-22",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            observe_direction="SHORT",
+            observe_only=True,
+        )
+        up_wave = WaveSnapshot(
+            state="UP_LEG",
+            raw_state="UP_LEG",
+            window=8,
+            efficiency=0.8,
+            direction_ratio=0.86,
+            atr_strength=2.1,
+            range_position=0.9,
+            confirmations=2,
+            allowed_directions=("LONG",),
+            confirmed_at=now - 120_000,
+        )
+
+        selected, required = state._select_daily_profile_signal(primary, [], now)
+        guarded = state._apply_wave_guard(selected, up_wave)
+
+        self.assertTrue(required)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertEqual(guarded.direction, "WAIT")
+        self.assertEqual(guarded.wave_guard_status, "DIRECTION_BLOCKED")
+        self.assertTrue(guarded.daily_profile_selected)
+
+    def test_state_update_applies_daily_profile_before_wave_guard(self):
+        state = MonitorState(symbol="BTCUSDT")
+        primary = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="等待画像",
+            price=100.0,
+            open_time=0,
+        )
+        promoted = replace(
+            primary,
+            direction="SHORT",
+            level="A",
+            daily_profile_selected=True,
+        )
+        calls = []
+
+        def select_profile(signal, observation_candidates, current_time):
+            calls.append(("profile", signal.direction))
+            return promoted, True
+
+        def apply_wave(signal, wave):
+            calls.append(("wave", signal.direction))
+            return signal
+
+        with (
+            patch("app.state.choose_trade_signal", return_value=primary),
+            patch.object(state, "_select_daily_profile_signal", side_effect=select_profile),
+            patch.object(state, "_apply_wave_guard", side_effect=apply_wave),
+            patch.object(state, "_maybe_open_order", return_value="OPENED"),
+        ):
+            state.update_from_klines(
+                [Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 59_999)]
+            )
+
+        self.assertEqual(calls, [("profile", "WAIT"), ("wave", "SHORT")])
+        self.assertEqual(state.selected_signal.direction, "SHORT")
+
     def test_daily_selected_profile_verifies_actionable_same_direction_signal(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(symbol="BTCUSDT", enable_daily_profile_selector=True)

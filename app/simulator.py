@@ -110,6 +110,7 @@ class AccountSimulator:
             "threshold_segment": signal.threshold_segment,
             "score": signal.score,
             "threshold": signal.threshold,
+            "calculated_threshold": signal.calculated_threshold,
             "session_allowed": signal.session_allowed,
             "session_sample_size": signal.session_sample_size,
             "session_win_rate": signal.session_win_rate,

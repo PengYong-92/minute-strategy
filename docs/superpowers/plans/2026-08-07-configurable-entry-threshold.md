@@ -82,7 +82,7 @@ Expected: threshold promotion and post-profile wave tests fail.
 
 - [ ] **Step 3: Implement minimal selection behavior**
 
-Store a normalized `float | None` override on `MonitorState`. Change `_select_daily_profile_signal` to match only `primary_signal` using `(observe_direction or direction)` and the complete daily profile key. In override mode, save the original threshold, apply the override, and set the candidate direction only when `abs(score) >= override`.
+Store a normalized `float | None` override on `MonitorState`. Change `_select_daily_profile_signal` to match only `primary_signal`; AUTO mode uses its executable direction, while override mode requires `observe_direction`, and both use the complete daily profile key. In override mode, save the original threshold, apply the override, and set the candidate direction only when `abs(score) >= override`.
 
 Change update order from:
 

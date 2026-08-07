@@ -23,6 +23,7 @@ def signal(direction="LONG", timeframe_minutes=10):
         open_time=0,
         score=82.0,
         threshold=70.0,
+        calculated_threshold=81.5,
         threshold_segment="WD-12",
         session_allowed=True,
         session_sample_size=37,
@@ -141,6 +142,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored[0].status, "SETTLED")
         self.assertEqual(restored[0].result, "WIN")
         self.assertEqual(restored[0].pnl, 8.0)
+        self.assertEqual(restored[0].calculated_threshold, 81.5)
 
     def test_persists_and_restores_wave_batch_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -559,6 +561,8 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
             legacy_order = progression_order(1).to_dict()
+            legacy_order["threshold"] = 79.0
+            legacy_order.pop("calculated_threshold")
             legacy_order.pop("stake_progression_source_order_id")
             legacy_order.pop("stake_progression_version")
             for key in list(legacy_order):
@@ -621,6 +625,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored[0].wave_state, "UNKNOWN")
         self.assertEqual(restored[0].wave_batch_id, "")
         self.assertEqual(restored[0].wave_guard_mode, "NORMAL")
+        self.assertEqual(restored[0].calculated_threshold, 79.0)
 
     def test_round_trips_all_credit_states_in_stable_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -74,6 +74,7 @@ class MonitorState:
         live_short_segments: Sequence[str] | None = ("WD-02", "WD-23"),
         enable_daily_profile_selector: bool = False,
         daily_profile_selector_config: DailyProfileSelectorConfig | None = None,
+        trade_score_threshold: float | None = None,
         enable_wave_guard: bool = True,
         wave_batch_guard_config: WaveBatchGuardConfig | None = None,
         now_ms=None,
@@ -119,6 +120,11 @@ class MonitorState:
             if str(item).strip()
         }
         self.enable_daily_profile_selector = bool(enable_daily_profile_selector)
+        if trade_score_threshold is not None and not 0.0 <= float(trade_score_threshold) <= 95.0:
+            raise ValueError("trade_score_threshold must be between 0 and 95")
+        self.trade_score_threshold = (
+            None if trade_score_threshold is None else float(trade_score_threshold)
+        )
         self.enable_wave_guard = bool(enable_wave_guard)
         self.wave_batch_guard_config = (
             wave_batch_guard_config or WaveBatchGuardConfig()
@@ -278,12 +284,12 @@ class MonitorState:
                 for signal in observation_signals
             ]
             self.signals = new_signals
-            selected_signal = self._apply_wave_guard(selected_signal, wave_state)
             selected_signal, daily_profile_required = self._select_daily_profile_signal(
                 selected_signal,
                 observation_signals,
                 latest.close_time,
             )
+            selected_signal = self._apply_wave_guard(selected_signal, wave_state)
             self.selected_signal = selected_signal
             self.order_decision = self._maybe_open_order(
                 selected_signal,
@@ -784,35 +790,68 @@ class MonitorState:
         if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
             return primary_signal, False
 
-        if not primary_signal.actionable:
+        manual_threshold = self.trade_score_threshold
+        if manual_threshold is None and not primary_signal.actionable:
             return primary_signal, False
 
+        direction = (
+            primary_signal.direction
+            if manual_threshold is None
+            else primary_signal.observe_direction
+        ).upper()
+        if direction not in {"LONG", "SHORT"}:
+            return primary_signal, False
+        key = daily_profile_key(
+            primary_signal.timeframe_minutes,
+            primary_signal.strategy_family,
+            primary_signal.strategy_tag,
+            direction,
+            primary_signal.threshold_segment,
+        )
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
-            direction = primary_signal.direction.upper()
-            key = daily_profile_key(
-                primary_signal.timeframe_minutes,
-                primary_signal.strategy_family,
-                primary_signal.strategy_tag,
-                direction,
-                primary_signal.threshold_segment,
-            )
             if key != selected_key:
                 continue
+            effective_threshold = (
+                primary_signal.threshold
+                if manual_threshold is None
+                else manual_threshold
+            )
+            calculated_threshold = (
+                primary_signal.calculated_threshold
+                if primary_signal.calculated_threshold > 0
+                else primary_signal.threshold
+            )
+            threshold_passed = abs(primary_signal.score) >= effective_threshold
+            selected_direction = direction if threshold_passed else "WAIT"
+            threshold_reason = ""
+            if manual_threshold is not None:
+                threshold_reason = (
+                    f"；开单阈值{effective_threshold:.1f}"
+                    f"（原始动态阈值{calculated_threshold:.1f}）"
+                )
+                if not threshold_passed:
+                    threshold_reason += "，评分未达线"
             return (
                 replace(
                     primary_signal,
+                    direction=selected_direction,
+                    level=self._trade_level(abs(primary_signal.score), effective_threshold),
                     reason=(
                         f"{primary_signal.reason}；每日画像启用 {snapshot.get('version', '')} "
                         f"N{selected_profile.get('sample_size', 0)} "
                         f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
                         f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
+                        f"{threshold_reason}"
                     ),
+                    threshold=effective_threshold,
+                    calculated_threshold=calculated_threshold,
                     session_allowed=True,
                     session_sample_size=int(selected_profile.get("sample_size", 0)),
                     session_win_rate=float(selected_profile.get("win_rate", 0.0)),
                     session_ev=float(selected_profile.get("ev", 0.0)),
-                    observe_only=False,
+                    observe_direction=direction,
+                    observe_only=not threshold_passed,
                     profile_key=key,
                     daily_profile_selected=True,
                     daily_profile_version=str(snapshot.get("version", "")),
@@ -820,6 +859,14 @@ class MonitorState:
                 True,
             )
         return primary_signal, True
+
+    @staticmethod
+    def _trade_level(score: float, threshold: float) -> str:
+        if score >= threshold + 18.0:
+            return "S"
+        if score >= threshold:
+            return "A"
+        return "B"
 
     def _load_latest_daily_profile_selection(self) -> dict | None:
         if not self.storage:
@@ -1322,6 +1369,7 @@ class MonitorState:
                 "max_open_orders": self.order_policy.max_open_orders,
                 "min_order_gap_ms": self.order_policy.min_order_gap_ms,
             },
+            "trade_score_threshold": self._trade_score_threshold_status(),
         }
         self._submit_storage_write(
             lambda order=order_snapshot, symbol=symbol, snapshot=entry_snapshot: (
@@ -1400,6 +1448,12 @@ class MonitorState:
             "config": {
                 **self.daily_profile_selector_config.__dict__,
             },
+        }
+
+    def _trade_score_threshold_status(self) -> dict:
+        return {
+            "mode": "AUTO" if self.trade_score_threshold is None else "OVERRIDE",
+            "value": self.trade_score_threshold,
         }
 
     def _update_order_entry_snapshot_settlement(
@@ -1590,6 +1644,7 @@ class MonitorState:
                     "max_open_orders": self.order_policy.max_open_orders,
                     "min_order_gap_ms": self.order_policy.min_order_gap_ms,
                 },
+                "trade_score_threshold": self._trade_score_threshold_status(),
                 "webhook": self.webhook.status() if self.webhook else {"enabled": False, "last_error": None},
                 "webhook_error": self.webhook_error,
                 "signals": [signal.to_dict() for signal in self.signals],

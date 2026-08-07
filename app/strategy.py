@@ -1334,6 +1334,7 @@ def _signal(
         price_change_pct=round(price_change_pct, 5),
         score=round(score, 1),
         threshold=round(threshold, 1),
+        calculated_threshold=round(threshold, 1),
         volume_threshold=round(volume_threshold, 3),
         move_threshold_pct=round(move_threshold_pct, 5),
         close_strength=round(close_strength, 3),
