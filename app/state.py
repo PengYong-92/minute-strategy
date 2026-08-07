@@ -818,6 +818,7 @@ class MonitorState:
             if primary_signal.calculated_threshold > 0
             else primary_signal.threshold
         )
+        display_reason = self._without_dynamic_threshold_block(primary_signal)
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
             if key != selected_key:
@@ -838,7 +839,7 @@ class MonitorState:
                     direction=selected_direction,
                     level=self._trade_level(abs(primary_signal.score), effective_threshold),
                     reason=(
-                        f"{primary_signal.reason}；每日画像启用 {snapshot.get('version', '')} "
+                        f"{display_reason}；每日画像启用 {snapshot.get('version', '')} "
                         f"N{selected_profile.get('sample_size', 0)} "
                         f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
                         f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
@@ -863,7 +864,7 @@ class MonitorState:
                 replace(
                     primary_signal,
                     reason=(
-                        f"{primary_signal.reason}；开单阈值{effective_threshold:.1f}"
+                        f"{display_reason}；开单阈值{effective_threshold:.1f}"
                         f"（原始动态阈值{calculated_threshold:.1f}，仅记录）；"
                         f"当前画像未入选 {key}"
                     ),
@@ -873,6 +874,16 @@ class MonitorState:
                 True,
             )
         return primary_signal, True
+
+    @staticmethod
+    def _without_dynamic_threshold_block(signal: Signal) -> str:
+        suffix = (
+            f"；分数 {abs(signal.score):.1f} < "
+            f"动态阈值 {signal.threshold:.1f}，不开单"
+        )
+        if signal.reason.endswith(suffix):
+            return signal.reason[: -len(suffix)]
+        return signal.reason
 
     @staticmethod
     def _trade_level(score: float, threshold: float) -> str:

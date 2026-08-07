@@ -1511,7 +1511,7 @@ class MonitorStateTest(unittest.TestCase):
             direction="WAIT",
             timeframe_minutes=10,
             level="B",
-            reason="中位平量横盘：信号不足",
+            reason="中位平量横盘：信号不足；分数 0.0 < 动态阈值 79.0，不开单",
             price=100.0,
             open_time=now - 60_000,
             score=0.0,
@@ -1532,6 +1532,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertFalse(selected.observe_only)
         self.assertEqual(selected.threshold, 0.0)
         self.assertEqual(selected.calculated_threshold, 79.0)
+        self.assertNotIn("动态阈值 79.0，不开单", selected.reason)
         self.assertEqual(
             state.snapshot()["trade_score_threshold"],
             {"mode": "OVERRIDE", "value": 0.0},
@@ -1612,10 +1613,10 @@ class MonitorStateTest(unittest.TestCase):
             direction="WAIT",
             timeframe_minutes=10,
             level="B",
-            reason="中位平量横盘：信号不足",
+            reason="中位平量横盘：信号不足；分数 0.0 < 动态阈值 79.0，不开单",
             price=100.0,
             open_time=now - 60_000,
-            score=-90.0,
+            score=0.0,
             threshold=79.0,
             threshold_segment="WD-22",
             strategy_family="short_observe",
@@ -1633,6 +1634,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(selected.calculated_threshold, 79.0)
         self.assertIn("当前画像未入选", selected.reason)
         self.assertIn("原始动态阈值79.0", selected.reason)
+        self.assertNotIn("动态阈值 79.0，不开单", selected.reason)
 
     def test_numeric_trade_score_threshold_requires_observe_direction(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
