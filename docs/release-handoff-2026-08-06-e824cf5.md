@@ -1,10 +1,10 @@
-# 2026-08-06 生产发布交接文档
+# 2026-08-06 至 2026-08-07 生产发布交接文档
 
 ## 1. 文档目的
 
-本文记录 `minute-strategy` 在 2026-08-06 发布的 1分钟波段方向与批次守卫版本，包括代码变更、生产配置、数据基线、验证结果、已知差异和后续观察要求。
+本文记录 `minute-strategy` 在 2026-08-06 发布的1分钟波段方向与批次守卫，以及2026-08-07发布的可配置开单评分阈值版本，包括代码变更、生产配置、数据基线、验证结果、已知差异和后续观察要求。
 
-接手人员应先阅读本文，再查看 `docs/current-strategy.md` 第32节和 `docs/superpowers/specs/2026-08-06-1m-wave-direction-guard-design.md`。
+接手人员应先阅读本文，再查看 `docs/current-strategy.md` 第32至33节、`docs/superpowers/specs/2026-08-06-1m-wave-direction-guard-design.md` 和 `docs/superpowers/specs/2026-08-07-configurable-entry-threshold-design.md`。
 
 ## 2. 发布身份
 
@@ -12,17 +12,17 @@
 |---|---|
 | 仓库 | `PengYong-92/minute-strategy` |
 | 生产代码分支 | `feature/1m-wave-direction-guard` |
-| 生产提交 | `e824cf5e2c0e41038640fb50af26e188fc2e792f` |
-| 提交摘要 | `fix: harden monitor runtime consistency` |
-| 生产发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-e824cf5-20260806-233253` |
+| 生产提交 | `2dad3040eddb5918e9c9175140f40bd278546266` |
+| 提交摘要 | `feat: add configurable profile entry threshold` |
+| 生产发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-2dad304-20260807-111248` |
 | 当前软链 | `/opt/victory-event-monitor/current` |
 | systemd 服务 | `victory-event-monitor` |
 | 内部监听 | `127.0.0.1:18080` |
 | 公网域名 | `https://victory.easy-tx.com` |
 | SQLite | `/opt/victory-event-monitor/shared/data/monitor.sqlite3` |
-| 发布前版本 | `78c8eee`，目录 `event-contract-monitor-20260805-78c8eee` |
+| 发布前版本 | `e824cf5`，目录 `event-contract-monitor-e824cf5-20260806-233253` |
 
-重要：截至本文记录时，`origin/main` 仍停留在 `78c8eee`。生产版本尚未合并到 `main`，不得从 `main` 直接重新部署，否则会回退本次策略修正。
+重要：截至本文记录时，`origin/main` 仍停留在 `78c8eee`，生产功能分支为 `feature/1m-wave-direction-guard`。生产版本尚未合并到 `main`，不得从 `main` 直接重新部署，否则会回退波段守卫、运行态加固和可配置阈值。
 
 ## 3. 本次代码提交链
 
@@ -39,6 +39,8 @@
 | `34d1aa0` | API、页面和订单画像增加波段与批次状态 |
 | `799c360` | 加固波段锚点、资格取消、首次升级和重启恢复 |
 | `e824cf5` | 修复币种切换竞态、重启开单间隔恢复和异步写入任务泄漏 |
+| `d3806a3` | 固化可配置开单阈值的设计与实施计划 |
+| `2dad304` | 新增阈值启动参数、画像先于波段的执行顺序、阈值审计字段和订单列表列 |
 
 ## 4. 当前策略决策顺序
 
@@ -47,19 +49,22 @@
 开单链路顺序固定为：
 
 1. 使用已闭合1分钟K线更新当前波段。
-2. 原有10分钟量价、MACD、RSI和BOLL逻辑生成 `LONG`、`SHORT` 或 `WAIT`。
-3. 波段守卫验证实时方向是否被当前波段允许。
-4. 每日画像匹配同方向、同策略族、同策略标签和同WD/WE时段。
-5. 检查评分、时段、并发、2分钟间隔、重复信号和风险守卫。
-6. 波段批次守卫检查首亏锁定、失败批次、全局冷却和恢复状态。
-7. 全部检查通过后，才分配10U基础金额或一个有效18U资格。
-8. 原子保存订单和滚单资格，异步保存审计快照和观察记录。
+2. 原有10分钟量价、MACD、RSI和BOLL逻辑计算评分、动态阈值、主画像标签和观察方向。
+3. 每日画像精确匹配周期、策略族、策略标签、观察方向和WD/WE时段。
+4. `auto` 使用原动态阈值；数值模式使用启动阈值，达到后才形成画像方向。
+5. 波段守卫验证画像方向是否被当前1分钟波段允许。
+6. 检查时段、并发、2分钟间隔、重复信号和风险守卫。
+7. 波段批次守卫检查首亏锁定、失败批次、全局冷却和恢复状态。
+8. 全部检查通过后，才分配10U基础金额或一个有效18U资格。
+9. 原子保存订单和滚单资格，异步保存审计快照和观察记录。
 
-任何后置模块都不能执行以下操作：
+任何模块都不能执行以下操作：
 
-- 把 `WAIT` 改成 `LONG` 或 `SHORT`；
+- 从研究观察候选列表直接生成订单方向；
+- 在数值模式缺少明确 `observe_direction` 时生成方向；
 - 把 `LONG` 和 `SHORT` 互换；
-- 用画像、滚单资格或守卫恢复状态绕过实时评分阈值。
+- 用阈值覆盖绕过每日画像精确匹配；
+- 用画像或滚单资格绕过1分钟波段、并发、间隔和批次守卫。
 
 ## 5. 每日画像权限和生产门槛
 
@@ -69,7 +74,7 @@
 timeframe_minutes | strategy_family | strategy_tag | direction | threshold_segment
 ```
 
-画像只验证已成立的实时方向，不提供方向，不降低评分阈值。
+`TRADE_SCORE_THRESHOLD=auto` 时，画像只验证已成立且达到动态阈值的实时方向。显式数值模式只允许当天已入选的主画像使用其 `observe_direction` 形成候选方向；研究观察候选仍然不能执行。
 
 ### 5.1 当前服务器门槛
 
@@ -95,7 +100,24 @@ DAILY_PROFILE_ACTIVATION_TIME=08:00
 
 含义：新画像和已启用画像都必须达到65%胜率且EV不低于0，样本数至少20。
 
+开单评分阈值使用独立 drop-in：
+
+```text
+/etc/systemd/system/victory-event-monitor.service.d/60-trade-score-threshold.conf
+```
+
+当前内容：
+
+```ini
+[Service]
+Environment=TRADE_SCORE_THRESHOLD=0
+```
+
+仓库默认仍是 `auto`。生产值0只对当天精确入选画像移除评分限制，不移除画像、波段、并发、间隔、滚动和批次守卫。
+
 ### 5.2 65%配置的生效边界
+
+本小节记录2026-08-06重启后的历史边界；当前2026-08-07快照和验证结果见第18节。
 
 65%门槛在 2026-08-06 23:56 重启后加载。它只修改了服务器 systemd 启动参数，没有修改仓库中的程序默认值。
 
@@ -299,13 +321,13 @@ wave_guard_reason
 - 发布包解压后核心模块导入：通过；
 - 按要求未运行历史回放或回测。
 
-### 11.2 生产验证
+### 11.2 2026-08-06历史生产验证
 
 发布和65%配置重启后的结果：
 
 - systemd：`active/running`；
 - `NRestarts=0`；
-- 当前发布软链指向 `e824cf5`；
+- 当时发布软链指向 `e824cf5`；
 - HTTPS状态：200；
 - SSL校验结果：0；
 - 预热：`READY`；
@@ -339,6 +361,7 @@ wave_guard_reason
 | `DAILY_PROFILE_MIN_SAMPLES` | 20 | 最低独立样本数 |
 | `DAILY_PROFILE_MIN_WIN_RATE` | 0.65 | 新画像门槛 |
 | `DAILY_PROFILE_EXIT_WIN_RATE` | 0.65 | 已启用画像退出线 |
+| `TRADE_SCORE_THRESHOLD` | 0 | 已入选画像实际开单评分阈值 |
 | `RESULT_SEQUENCE_GUARD` | 0 | 旧守卫关闭 |
 | `ROLLING_EDGE_GUARD` | 0 | 旧滚动优势拦截关闭 |
 | `PROFILE_GUARD` | 0 | 当前仅保留画像审计 |
@@ -374,7 +397,7 @@ curl -sS -o /dev/null -w 'http=%{http_code} ssl=%{ssl_verify_result}\n' https://
 
 ## 14. 后续样本统计口径
 
-当前发布后订单数为0，尚不能评价新策略胜率或收益。
+2026-08-07阈值版本的生产样本边界为 `2026-08-07 11:15:54 CST`。该时刻订单数为0、观察样本5850；验收结束时订单仍为0、观察样本5851。不得把此边界前的订单用于评价阈值0版本。
 
 积累样本后应按以下维度分别统计：
 
@@ -396,29 +419,107 @@ curl -sS -o /dev/null -w 'http=%{http_code} ssl=%{ssl_verify_result}\n' https://
 
 1. 生产提交尚未合并到 `main`。应先合并或明确继续以功能分支作为发布源。
 2. 65%门槛目前只在服务器启动配置中，仓库默认仍是60%。以后重新部署时必须保留 drop-in，或另行把默认值同步到代码。
-3. 本节点按要求没有历史回测，只有单元测试和生产运行验证。
-4. 新订单基线为0，批次守卫和18U实际效果需要生产样本验证。
+3. 阈值0节点按要求没有历史回测，只有380项单元测试、独立代码复审和生产运行验证。
+4. 新订单基线为0，阈值0的开单数量、胜率、批次守卫和18U实际效果都需要生产样本验证。
 5. 数据库订单清理未备份，旧192笔订单及关联资格不可从当前数据库恢复。
 6. `WAVE_BATCH_UNAVAILABLE` 在当前没有可执行信号或批次ID时是兼容状态，不等于守卫失效。
 7. `TURN_UP`、`TURN_DOWN`、`RANGE_MID` 和 `UNKNOWN` 允许方向为空是设计行为。
 
 ## 16. 建议下一步
 
-1. 2026-08-07 08:00后验证65%画像快照，记录入选数量和多空分布。
-2. 只以本次发布后新订单作为策略效果样本。
-3. 样本达到预定规模后，先分析方向、波段、时段和批次，不先调参。
+1. 只以 `2026-08-07 11:15:54 CST` 后的新订单作为阈值0效果样本。
+2. 逐单检查订单列表中的评分、实际开单阈值和原始动态阈值。
+3. 样本达到预定规模后，先按方向、画像、波段、阈值和批次分析，再决定是否从0向上提高阈值。
 4. 将 `feature/1m-wave-direction-guard` 合并到主分支，避免生产版本长期游离。
 5. 决定是否把65%默认值写回代码；在此之前保留服务器 drop-in。
 
 ## 17. 交接验收清单
 
-- [ ] 确认生产软链提交为 `e824cf5`；
-- [ ] 确认服务为 `active` 且 `NRestarts=0`；
-- [ ] 确认预热为 `READY` 且 `last_error` 为空；
-- [ ] 确认并发2、间隔2分钟；
-- [ ] 确认画像入选和退出门槛均为65%；
-- [ ] 确认旧结算序列守卫关闭；
-- [ ] 确认波段与批次守卫API字段存在；
-- [ ] 确认08:00后画像全部满足65%；
+- [x] 确认生产软链提交为 `2dad304`；
+- [x] 确认服务为 `active` 且 `NRestarts=0`；
+- [x] 确认预热为 `READY` 且 `last_error` 为空；
+- [x] 确认并发2、间隔2分钟；
+- [x] 确认画像入选和退出门槛均为65%；
+- [x] 确认旧结算序列守卫关闭；
+- [x] 确认波段与批次守卫API字段存在；
+- [x] 确认08:00后画像全部满足65%；
 - [ ] 确认后续部署不从旧 `main` 覆盖生产；
-- [ ] 确认新订单按本发布节点独立统计。
+- [x] 确认新订单按 `2026-08-07 11:15:54 CST` 节点独立统计。
+
+## 18. 2026-08-07 可配置阈值发布记录
+
+### 18.1 发布制品
+
+| 项目 | 值 |
+|---|---|
+| 代码提交 | `2dad3040eddb5918e9c9175140f40bd278546266` |
+| 功能分支 | `feature/1m-wave-direction-guard` |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-2dad304-20260807-111248` |
+| 最小包 | `event-contract-monitor-2dad304-20260807-111248-minimal.tar.gz` |
+| SHA-256 | `4a61d186fe00a7aead43fd876a9680b945403cf6743aa22820fd6f3f0c7d4938` |
+| 服务启动边界 | `2026-08-07 11:15:54 CST` |
+
+最小包只包含 `app/`、`scripts/run.sh`、`README.md` 和 `.gitignore`，不包含测试、研究报告、本地数据、SQLite、Git元数据或密钥。服务器解压后已执行导入和阈值状态断言。按要求未创建发布备份，未清空订单或观察样本，未修改nginx和证书配置。
+
+### 18.2 功能变化
+
+1. 新增 `TRADE_SCORE_THRESHOLD=auto|0..95` 和 `--trade-score-threshold`，空值等同 `auto`。
+2. `auto` 保持旧动态阈值；数值模式只对每日精确入选且具有明确观察方向的当前主画像生效。
+3. 每日画像先确定候选方向，再执行1分钟波段方向守卫，画像不能绕过波段。
+4. 研究观察候选、未入选画像和缺少观察方向的信号不能因阈值0生成订单。
+5. 信号和订单新增 `calculated_threshold`；旧订单API缺字段时回退到 `threshold`。
+6. 订单列表新增“开单阈值”列，显示实际阈值、评分和原始动态阈值。
+7. `/api/state.trade_score_threshold` 明确返回 `AUTO` 或 `OVERRIDE` 模式及数值。
+
+阈值0以后仍顺序执行画像、波段、最大2笔未结订单、2分钟间隔、重复信号、批次首亏锁定、全局冷却、滚动优势和画像守卫。它不是全局无条件开单开关。
+
+### 18.3 发布验证
+
+发布后确认：
+
+```text
+service=active
+NRestarts=0
+release=/opt/victory-event-monitor/releases/event-contract-monitor-2dad304-20260807-111248
+https=200
+ssl_verify_result=0
+warmup.status=READY
+warmup.loaded_klines=141120
+kline_count=140000
+last_error=null
+trade_score_threshold.mode=OVERRIDE
+trade_score_threshold.value=0.0
+orders=0
+observations=5851
+journal warning+=0
+```
+
+当前每日画像为 `DPS-20260807-0800`，共5个：
+
+| 方向 | 时段 | 样本 | 胜率 | EV |
+|---|---|---:|---:|---:|
+| SHORT | WD-11 | 25 | 72.00% | 2.96U |
+| SHORT | WD-07 | 27 | 70.37% | 2.67U |
+| LONG | WD-01 | 26 | 69.23% | 2.46U |
+| SHORT | WD-08 | 24 | 66.67% | 2.00U |
+| LONG | WD-04 | 26 | 65.38% | 1.77U |
+
+验收时当前主画像为 `LONG WD-03`，波段为 `RANGE_LOW` 并允许LONG，但WD-03未入选，因此决策是 `DAILY_PROFILE_NOT_SELECTED`。从服务启动边界到验收时，审计记录只有该决策，没有 `BELOW_THRESHOLD`。这证明阈值0已生效，同时未绕过每日画像。
+
+### 18.4 后续调高阈值
+
+只修改 drop-in 中的数值，例如：
+
+```ini
+[Service]
+Environment=TRADE_SCORE_THRESHOLD=20
+```
+
+然后执行：
+
+```bash
+systemctl daemon-reload
+systemctl restart victory-event-monitor
+```
+
+每次调整必须记录新值、服务 `ActiveEnterTimestamp`、订单起始ID和当日画像版本。调整后先确认 `/api/state.trade_score_threshold`，再把新边界后的订单单独统计。不要同时修改65%画像门槛、波段参数或订单守卫，否则无法归因开单量和胜率变化。
