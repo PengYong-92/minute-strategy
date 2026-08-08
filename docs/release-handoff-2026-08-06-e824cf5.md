@@ -559,3 +559,108 @@ reason=低位平量横盘：信号不足；开单阈值0.0（原始动态阈值7
 ```
 
 这两次修复只改变未入选画像的阈值审计和页面文案，不改变画像选择、方向、波段守卫或开单集合。因此策略效果样本边界仍使用 `2026-08-07 11:15:54 CST`；分析信号审计字段时，需把 `2026-08-07 11:43:11 CST` 作为新显示口径边界。
+
+## 20. 2026-08-08 订单量恢复发布
+
+### 20.1 回归原因
+
+本节点确认订单量下降不是单一阈值问题，而是四项规则叠加：
+
+1. 每日画像选择器只检查主信号，已经积累出高胜率的研究观察画像不能成为订单。
+2. `TRADE_SCORE_THRESHOLD=0` 反而把未成立的主 `WAIT` 信号按画像方向强制提升。清理前12笔订单中2胜10负、PnL -84U，11笔评分为0，说明该放行路径质量明显低于原观察画像路径。
+3. 1分钟波段方向守卫和波段批次守卫默认直接否决方向或后续订单，进一步压缩订单量。
+4. 画像窗口改为7天后仍统一要求20个独立样本；每个周末小时在7天内理论上最多约12个独立10分钟样本，因此所有 `WE` 画像都不可能入选。
+
+### 20.2 当前决策链
+
+本次恢复后的生产行为：
+
+1. 每日画像同时检查已成立主信号和研究观察候选。
+2. 观察候选按 `周期|策略族|策略标签|方向|时段` 完整键入选后可以成为正式订单。
+3. 未成立的主 `WAIT` 信号不能再由数值评分阈值提升。
+4. `TRADE_SCORE_THRESHOLD` 保留启动兼容和API审计，数值模式返回 `AUDIT_ONLY`，不改变开单集合；生产使用 `auto`。
+5. 1分钟波段继续计算、持久化和展示，但默认不改变订单方向。
+6. 波段批次守卫默认关闭；同方向连续3亏冷却20分钟和滚动优势守卫恢复启用。
+7. 并发上限仍为2，最小开单间隔仍为2分钟，10U/18U两阶段金额逻辑不变。
+8. 每日画像胜率入选和退出线均为60%，EV不低于0；工作日最少20样本，周末最少10样本。
+9. 同一天修改画像配置时立即重评当天快照，配置不变时仍每天只评估一次。
+
+保留的加固和审计包括：异步SQLite保存、订单入口快照、`calculated_threshold`、订单阈值页面列、波段运行态、币种切换隔离、开单间隔恢复和异步写入错误上报。
+
+### 20.3 提交与发布
+
+| 项目 | 值 |
+|---|---|
+| 恢复观察画像订单提交 | `0ff3b11` |
+| 配置变化当天重评提交 | `f3a12ff` |
+| 周末独立样本门槛提交 | `fa5f1bc` |
+| 分支 | `feature/1m-wave-direction-guard` |
+| 最终发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-fa5f1bc-20260808-132214` |
+| 最小包 | `event-contract-monitor-fa5f1bc-20260808-132214-minimal.tar.gz` |
+| 包大小 | `116KB` |
+| SHA-256 | `218ba061519d8c0d04c159a8a4c929cca903575347b4f4f9fa2f6d1c73c101f8` |
+| 最终服务边界 | `2026-08-08 13:23:43 CST` |
+
+按要求没有创建数据库备份，没有修改nginx和SSL。最终启动前清空模拟订单、订单入口快照和金额叠加资格/运行态；观察样本和每日画像历史均保留。
+
+### 20.4 最终生产参数
+
+| 参数 | 值 |
+|---|---:|
+| `DAILY_PROFILE_LOOKBACK_DAYS` | 7 |
+| `DAILY_PROFILE_MIN_SAMPLES` | 20 |
+| `DAILY_PROFILE_WEEKEND_MIN_SAMPLES` | 10 |
+| `DAILY_PROFILE_MIN_WIN_RATE` | 0.60 |
+| `DAILY_PROFILE_EXIT_WIN_RATE` | 0.60 |
+| `DAILY_PROFILE_MIN_EV` / `EXIT_EV` | 0 |
+| `TRADE_SCORE_THRESHOLD` | auto |
+| `MAX_OPEN_ORDERS` | 2 |
+| `MIN_ORDER_GAP_MINUTES` | 2 |
+| `ROLLING_EDGE_GUARD` | 1 |
+| `RESULT_SEQUENCE_GUARD` | 1 |
+| `RESULT_SEQUENCE_LOSS_STREAK` | 3 |
+| `RESULT_SEQUENCE_COOLDOWN_MINUTES` | 20 |
+| `RESULT_SEQUENCE_SCOPE` | DIRECTION |
+| `PROFILE_GUARD` | 0 |
+| `STAKE_PROGRESSION` | 1 |
+| `STAKE_PROGRESSION_MAX_ACTIVE` | 1 |
+
+### 20.5 发布验收和新样本边界
+
+最终验收结果：
+
+```text
+service=active
+NRestarts=0
+warmup.status=READY
+warmup.loaded_klines=142560
+last_error=null
+https=200
+ssl_verify_result=0
+orders=0
+open_orders=0
+observation_signals=6161
+daily_profile_selections=10
+trade_score_threshold.mode=AUTO
+rolling_edge.observe_only=false
+result_sequence_guard.enabled=true
+wave_state.enabled=false
+wave_batch_guard.enabled=false
+daily_profiles=22（WD 13 / WE 9）
+```
+
+当前9个周末画像：
+
+| 方向 | 时段 | 样本 | 胜率 | EV |
+|---|---|---:|---:|---:|
+| SHORT | WE-10 | 12 | 75.00% | 3.50U |
+| LONG | WE-20 | 11 | 72.73% | 3.09U |
+| LONG | WE-21 | 10 | 70.00% | 2.60U |
+| SHORT | WE-14 | 10 | 70.00% | 2.60U |
+| SHORT | WE-16 | 10 | 70.00% | 2.60U |
+| SHORT | WE-22 | 10 | 70.00% | 2.60U |
+| LONG | WE-04 | 12 | 66.67% | 2.00U |
+| SHORT | WE-15 | 11 | 63.64% | 1.45U |
+| SHORT | WE-13 | 10 | 60.00% | 0.80U |
+
+`2026-08-08 13:23:43 CST` 为新的实际样本边界，订单ID从1重新开始。当前时段 `WE-05` 未入选，因此验收时决策仍为 `DAILY_PROFILE_NOT_SELECTED`；这只表示当前完整画像键未命中，不代表周末或全局暂停。后续只使用该边界后的订单评价本节点，先观察订单量、LONG/SHORT胜率、PnL、连亏长度和守卫命中情况，再调整其他参数。
