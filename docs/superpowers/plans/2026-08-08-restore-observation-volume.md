@@ -6,7 +6,7 @@
 
 - Daily-selected observation candidates may become executable signals again.
 - A daily-selected candidate bypasses its original dynamic score threshold because its independent settled-sample profile is the admission condition.
-- `TRADE_SCORE_THRESHOLD` remains accepted for deployment compatibility but is audit-only and cannot promote a primary `WAIT` signal.
+- `TRADE_SCORE_THRESHOLD` remains accepted for deployment compatibility but is audit-only and cannot independently promote a primary `WAIT`; an exact daily-profile match may still promote its explicit observation direction.
 - The one-minute wave model and wave-batch state remain recorded and displayed, but are disabled as order blockers by default.
 - The rolling-edge guard and result-sequence loss guard remain the active loss controls.
 - Production defaults remain two concurrent orders with a two-minute minimum entry gap.

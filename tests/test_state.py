@@ -1430,8 +1430,8 @@ class MonitorStateTest(unittest.TestCase):
             daily_profile_required=required,
         )
 
-        self.assertEqual(selected.direction, "WAIT")
-        self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertTrue(selected.daily_profile_selected)
         self.assertEqual(decision, "WAVE_DIRECTION_BLOCKED")
         self.assertEqual(state.simulator.orders, [])
         self.assertEqual(state.observations[-1].wave_guard_status, "DIRECTION_BLOCKED")
@@ -1551,7 +1551,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.daily_profile_selection["selected_count"], 1)
         self.assertEqual(state.active_daily_profile_selection, state.daily_profile_selection)
 
-    def test_daily_selected_profile_cannot_promote_wait_signal(self):
+    def test_daily_selected_profile_promotes_wait_signal_with_observe_direction(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(
             symbol="BTCUSDT",
@@ -1595,13 +1595,16 @@ class MonitorStateTest(unittest.TestCase):
         decision = state._maybe_open_order(selected, latest, daily_profile_required=required)
 
         self.assertTrue(required)
-        self.assertFalse(selected.daily_profile_selected)
-        self.assertEqual(selected.direction, "WAIT")
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertTrue(selected.actionable)
+        self.assertFalse(selected.observe_only)
         self.assertEqual(selected.score, 0.0)
-        self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
-        self.assertEqual(state.simulator.orders, [])
+        self.assertEqual(selected.threshold, 79.0)
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(len(state.simulator.orders), 1)
 
-    def test_numeric_trade_score_threshold_cannot_promote_wait_primary(self):
+    def test_numeric_trade_score_threshold_does_not_override_daily_profile_threshold(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(
             symbol="BTCUSDT",
@@ -1642,12 +1645,13 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [], now)
 
         self.assertTrue(required)
-        self.assertEqual(selected.direction, "WAIT")
-        self.assertFalse(selected.actionable)
-        self.assertFalse(selected.daily_profile_selected)
-        self.assertTrue(selected.observe_only)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertTrue(selected.actionable)
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertFalse(selected.observe_only)
         self.assertEqual(selected.threshold, 79.0)
-        self.assertIn("动态阈值 79.0，不开单", selected.reason)
+        self.assertEqual(selected.calculated_threshold, 79.0)
+        self.assertNotIn("动态阈值 79.0，不开单", selected.reason)
         self.assertEqual(
             state.snapshot()["trade_score_threshold"],
             {"mode": "AUDIT_ONLY", "value": 0.0},
@@ -1702,9 +1706,9 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [], now)
 
         self.assertTrue(required)
-        self.assertEqual(selected.direction, "WAIT")
-        self.assertFalse(selected.actionable)
-        self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(selected.direction, "SHORT")
+        self.assertTrue(selected.actionable)
+        self.assertTrue(selected.daily_profile_selected)
         self.assertEqual(selected.threshold, 79.0)
 
     def test_numeric_trade_score_threshold_does_not_promote_unselected_profile(self):
@@ -1747,7 +1751,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(selected.threshold, 79.0)
         self.assertIn("动态阈值 79.0，不开单", selected.reason)
 
-    def test_numeric_trade_score_threshold_requires_observe_direction(self):
+    def test_daily_profile_uses_existing_direction_when_observe_direction_is_empty(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(
             symbol="BTCUSDT",
@@ -1781,8 +1785,9 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [], now)
 
         self.assertTrue(required)
-        self.assertFalse(selected.actionable)
-        self.assertFalse(selected.daily_profile_selected)
+        self.assertTrue(selected.actionable)
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertEqual(selected.direction, "LONG")
         self.assertEqual(selected.threshold, 79.0)
 
     def test_promoted_daily_profile_is_still_blocked_by_wave_direction(self):

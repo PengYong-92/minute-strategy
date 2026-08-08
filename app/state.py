@@ -804,9 +804,12 @@ class MonitorState:
         if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
             return primary_signal, False
 
-        candidates: list[tuple[Signal, str]] = []
-        if primary_signal.actionable:
-            candidates.append((primary_signal, primary_signal.direction.upper()))
+        candidates: list[tuple[Signal, str]] = [
+            (
+                primary_signal,
+                (primary_signal.observe_direction or primary_signal.direction).upper(),
+            )
+        ]
         candidates.extend(
             (signal, (signal.observe_direction or signal.direction).upper())
             for signal in observation_candidates
