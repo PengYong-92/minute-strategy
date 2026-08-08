@@ -1507,6 +1507,50 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(len(storage.daily_profile_selections), 1)
         self.assertEqual(state.active_daily_profile_selection["version"], "DPS-20260730-0800")
 
+    def test_daily_profile_selection_re_evaluates_same_day_when_config_changes(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        storage = RecordingStorage()
+        config = DailyProfileSelectorConfig(
+            min_samples=1,
+            min_win_rate=0.60,
+            exit_win_rate=0.60,
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+            daily_profile_selector_config=config,
+        )
+        previous = {
+            "version": "DPS-20260730-0800",
+            "status": "READY",
+            "evaluated_at": cutoff,
+            "lookback_start": cutoff - 7 * 86_400_000,
+            "lookback_end": cutoff,
+            "effective_from": current,
+            "effective_until": current + 86_400_000,
+            "config": {
+                **config.normalized().__dict__,
+                "min_win_rate": 0.65,
+                "exit_win_rate": 0.65,
+            },
+            "selected_profiles": [],
+            "selected_count": 0,
+        }
+        state.daily_profile_selection = dict(previous)
+        state.active_daily_profile_selection = dict(previous)
+        state.observations.append(
+            settled_observation(1, "WIN", cutoff - 20 * 60_000)
+        )
+
+        state._refresh_daily_profile_selection(current)
+
+        self.assertEqual(len(storage.daily_profile_selections), 1)
+        self.assertEqual(state.daily_profile_selection["config"]["min_win_rate"], 0.60)
+        self.assertEqual(state.daily_profile_selection["selected_count"], 1)
+        self.assertEqual(state.active_daily_profile_selection, state.daily_profile_selection)
+
     def test_daily_selected_profile_cannot_promote_wait_signal(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(

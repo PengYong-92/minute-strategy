@@ -752,7 +752,11 @@ class MonitorState:
             activation_minute=config.activation_minute,
         )
         latest = self.daily_profile_selection
-        if latest is None or int(latest.get("effective_from", -1)) != target["effective_from"]:
+        if (
+            latest is None
+            or int(latest.get("effective_from", -1)) != target["effective_from"]
+            or not self._daily_profile_config_matches(latest, config)
+        ):
             previous = latest or self._load_latest_daily_profile_selection()
             try:
                 next_snapshot = build_daily_selection(
@@ -777,6 +781,16 @@ class MonitorState:
         loader = getattr(self.storage, "load_daily_profile_selection", None) if self.storage else None
         active = loader(self.symbol, current_time) if loader is not None else None
         self.active_daily_profile_selection = active
+
+    @staticmethod
+    def _daily_profile_config_matches(
+        snapshot: dict,
+        config: DailyProfileSelectorConfig,
+    ) -> bool:
+        stored = snapshot.get("config")
+        if not isinstance(stored, dict):
+            return False
+        return all(stored.get(key) == value for key, value in config.__dict__.items())
 
     def _select_daily_profile_signal(
         self,
