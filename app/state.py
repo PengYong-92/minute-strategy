@@ -75,7 +75,7 @@ class MonitorState:
         enable_daily_profile_selector: bool = False,
         daily_profile_selector_config: DailyProfileSelectorConfig | None = None,
         trade_score_threshold: float | None = None,
-        enable_wave_guard: bool = True,
+        enable_wave_guard: bool = False,
         wave_batch_guard_config: WaveBatchGuardConfig | None = None,
         now_ms=None,
     ):
@@ -91,7 +91,7 @@ class MonitorState:
         self.rolling_edge_config = rolling_edge_config or RollingEdgeConfig()
         self.enable_rolling_edge_guard = enable_rolling_edge_guard
         self.result_sequence_guard_config = (
-            result_sequence_guard_config or ResultSequenceGuardConfig(enabled=False)
+            result_sequence_guard_config or ResultSequenceGuardConfig()
         ).normalized()
         self.stake = stake
         self.win_return = win_return
@@ -127,7 +127,7 @@ class MonitorState:
         )
         self.enable_wave_guard = bool(enable_wave_guard)
         self.wave_batch_guard_config = (
-            wave_batch_guard_config or WaveBatchGuardConfig()
+            wave_batch_guard_config or WaveBatchGuardConfig(enabled=False)
         ).normalized()
         self.daily_profile_selector_config = (
             daily_profile_selector_config or DailyProfileSelectorConfig()
@@ -790,89 +790,56 @@ class MonitorState:
         if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
             return primary_signal, False
 
-        manual_threshold = self.trade_score_threshold
-        if manual_threshold is None and not primary_signal.actionable:
-            return primary_signal, False
-
-        direction = (
-            primary_signal.direction
-            if manual_threshold is None
-            else primary_signal.observe_direction
-        ).upper()
-        if direction not in {"LONG", "SHORT"}:
-            return primary_signal, False
-        key = daily_profile_key(
-            primary_signal.timeframe_minutes,
-            primary_signal.strategy_family,
-            primary_signal.strategy_tag,
-            direction,
-            primary_signal.threshold_segment,
+        candidates: list[tuple[Signal, str]] = []
+        if primary_signal.actionable:
+            candidates.append((primary_signal, primary_signal.direction.upper()))
+        candidates.extend(
+            (signal, (signal.observe_direction or signal.direction).upper())
+            for signal in observation_candidates
         )
-        effective_threshold = (
-            primary_signal.threshold
-            if manual_threshold is None
-            else manual_threshold
-        )
-        calculated_threshold = (
-            primary_signal.calculated_threshold
-            if primary_signal.calculated_threshold > 0
-            else primary_signal.threshold
-        )
-        display_reason = self._without_dynamic_threshold_block(primary_signal)
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
-            if key != selected_key:
-                continue
-            threshold_passed = abs(primary_signal.score) >= effective_threshold
-            selected_direction = direction if threshold_passed else "WAIT"
-            threshold_reason = ""
-            if manual_threshold is not None:
-                threshold_reason = (
-                    f"；开单阈值{effective_threshold:.1f}"
-                    f"（原始动态阈值{calculated_threshold:.1f}）"
+            for signal, direction in candidates:
+                if direction not in {"LONG", "SHORT"}:
+                    continue
+                key = daily_profile_key(
+                    signal.timeframe_minutes,
+                    signal.strategy_family,
+                    signal.strategy_tag,
+                    direction,
+                    signal.threshold_segment,
                 )
-                if not threshold_passed:
-                    threshold_reason += "，评分未达线"
-            return (
-                replace(
-                    primary_signal,
-                    direction=selected_direction,
-                    level=self._trade_level(abs(primary_signal.score), effective_threshold),
-                    reason=(
-                        f"{display_reason}；每日画像启用 {snapshot.get('version', '')} "
-                        f"N{selected_profile.get('sample_size', 0)} "
-                        f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
-                        f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
-                        f"{threshold_reason}"
+                if key != selected_key:
+                    continue
+                calculated_threshold = (
+                    signal.calculated_threshold
+                    if signal.calculated_threshold > 0
+                    else signal.threshold
+                )
+                return (
+                    replace(
+                        signal,
+                        direction=direction,
+                        reason=(
+                            f"{self._without_dynamic_threshold_block(signal)}；"
+                            f"每日画像启用 {snapshot.get('version', '')} "
+                            f"N{selected_profile.get('sample_size', 0)} "
+                            f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
+                            f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
+                        ),
+                        calculated_threshold=calculated_threshold,
+                        session_allowed=True,
+                        session_sample_size=int(selected_profile.get("sample_size", 0)),
+                        session_win_rate=float(selected_profile.get("win_rate", 0.0)),
+                        session_ev=float(selected_profile.get("ev", 0.0)),
+                        observe_direction=direction,
+                        observe_only=False,
+                        profile_key=key,
+                        daily_profile_selected=True,
+                        daily_profile_version=str(snapshot.get("version", "")),
                     ),
-                    threshold=effective_threshold,
-                    calculated_threshold=calculated_threshold,
-                    session_allowed=True,
-                    session_sample_size=int(selected_profile.get("sample_size", 0)),
-                    session_win_rate=float(selected_profile.get("win_rate", 0.0)),
-                    session_ev=float(selected_profile.get("ev", 0.0)),
-                    observe_direction=direction,
-                    observe_only=not threshold_passed,
-                    profile_key=key,
-                    daily_profile_selected=True,
-                    daily_profile_version=str(snapshot.get("version", "")),
-                ),
-                True,
-            )
-        if manual_threshold is not None:
-            return (
-                replace(
-                    primary_signal,
-                    reason=(
-                        f"{display_reason}；开单阈值{effective_threshold:.1f}"
-                        f"（原始动态阈值{calculated_threshold:.1f}，仅记录）；"
-                        f"当前画像未入选 {key}"
-                    ),
-                    threshold=effective_threshold,
-                    calculated_threshold=calculated_threshold,
-                ),
-                True,
-            )
+                    True,
+                )
         return primary_signal, True
 
     @staticmethod
@@ -884,14 +851,6 @@ class MonitorState:
         if signal.reason.endswith(suffix):
             return signal.reason[: -len(suffix)]
         return signal.reason
-
-    @staticmethod
-    def _trade_level(score: float, threshold: float) -> str:
-        if score >= threshold + 18.0:
-            return "S"
-        if score >= threshold:
-            return "A"
-        return "B"
 
     def _load_latest_daily_profile_selection(self) -> dict | None:
         if not self.storage:
@@ -1477,7 +1436,7 @@ class MonitorState:
 
     def _trade_score_threshold_status(self) -> dict:
         return {
-            "mode": "AUTO" if self.trade_score_threshold is None else "OVERRIDE",
+            "mode": "AUTO" if self.trade_score_threshold is None else "AUDIT_ONLY",
             "value": self.trade_score_threshold,
         }
 

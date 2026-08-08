@@ -404,7 +404,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
 
         self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
         self.assertNotIn("--no-stake-progression", default_args)
-        self.assertIn("--no-result-sequence-guard", default_args)
+        self.assertNotIn("--no-result-sequence-guard", default_args)
         self.assertEqual(default_args[default_args.index("--max-open-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--trade-score-threshold") + 1], "auto")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-orders") + 1], "2")

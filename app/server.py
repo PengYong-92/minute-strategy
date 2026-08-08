@@ -275,7 +275,7 @@ def main() -> None:
         "--trade-score-threshold",
         type=_trade_score_threshold,
         default=os.getenv("TRADE_SCORE_THRESHOLD", "auto"),
-        help="已入选每日画像的开单评分阈值，auto 使用动态阈值，0 表示不限制，默认: auto",
+        help="兼容审计参数，不改变开单资格；默认: auto",
     )
     parser.add_argument(
         "--max-open-orders",
@@ -349,8 +349,8 @@ def main() -> None:
     parser.add_argument(
         "--no-result-sequence-guard",
         action="store_true",
-        default=not _env_bool("RESULT_SEQUENCE_GUARD", False),
-        help="关闭旧结算序列冷却守卫；生产默认关闭，由波段批次守卫替代",
+        default=not _env_bool("RESULT_SEQUENCE_GUARD", True),
+        help="关闭同方向连续亏损冷却守卫，默认启用",
     )
     parser.add_argument(
         "--result-sequence-loss-streak",

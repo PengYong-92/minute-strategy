@@ -24,7 +24,7 @@ MAX_OPEN_ORDERS="${MAX_OPEN_ORDERS:-2}"
 MIN_ORDER_GAP_MINUTES="${MIN_ORDER_GAP_MINUTES:-2}"
 STAKE_PROGRESSION="${STAKE_PROGRESSION:-1}"
 ROLLING_EDGE_GUARD="${ROLLING_EDGE_GUARD:-1}"
-RESULT_SEQUENCE_GUARD="${RESULT_SEQUENCE_GUARD:-0}"
+RESULT_SEQUENCE_GUARD="${RESULT_SEQUENCE_GUARD:-1}"
 RESULT_SEQUENCE_LOSS_STREAK="${RESULT_SEQUENCE_LOSS_STREAK:-3}"
 RESULT_SEQUENCE_COOLDOWN_MINUTES="${RESULT_SEQUENCE_COOLDOWN_MINUTES:-20}"
 RESULT_SEQUENCE_SCOPE="${RESULT_SEQUENCE_SCOPE:-DIRECTION}"
@@ -79,7 +79,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --warmup-timeout N     单个历史文件下载超时秒数，默认: 20
   --stake N              基础下单金额，默认: 10
   --trade-score-threshold N|auto
-                         已入选每日画像的开单评分阈值；auto 使用动态阈值，0 表示不限制，默认: auto
+                         兼容审计参数，不改变开单资格，默认: auto
   --win-return N         赢单返还金额，默认: stake * 1.8
   --max-open-orders N    最多同时持有的未结订单数，默认: 2
   --min-order-gap-minutes N
@@ -88,7 +88,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --no-rolling-edge-guard
                          关闭滚动优势守卫，仅保留状态观察
   --no-result-sequence-guard
-                         关闭旧结算序列冷却守卫，生产默认已关闭
+                         关闭同方向连续亏损冷却守卫，默认启用
   --result-sequence-loss-streak N
                          同方向连续已结算亏损触发笔数，默认: 3
   --result-sequence-cooldown-minutes N

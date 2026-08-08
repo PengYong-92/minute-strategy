@@ -98,7 +98,9 @@ class Signal:
 
     @property
     def actionable(self) -> bool:
-        return self.direction in {"LONG", "SHORT"} and abs(self.score) >= self.threshold
+        return self.direction in {"LONG", "SHORT"} and (
+            self.daily_profile_selected or abs(self.score) >= self.threshold
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -432,7 +432,10 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("audit write failed", error)
 
     def test_wave_batch_guard_stops_refill_after_first_loss(self):
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         state.simulator.orders.append(
             SimulatedOrder(
                 id=1,
@@ -474,7 +477,12 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_wave_batch_lock_cancels_and_persists_pending_progression_credit(self):
         storage = RecordingStorage()
-        state = MonitorState(symbol="BTCUSDT", storage=storage, now_ms=lambda: 0)
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            now_ms=lambda: 0,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         first = state.simulator.open_order(
             Signal("LONG", 1, "A", "first", 100.0, 0, wave_batch_id="source-wave"),
             100.0,
@@ -578,7 +586,11 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "RECOVERY")
 
     def test_wave_global_cooldown_refreshes_and_cancels_credit_while_signal_waits(self):
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         for order_id, batch_id, opened_minute in (
             (1, "wave-a", 0),
             (2, "wave-a", 2),
@@ -627,7 +639,11 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.simulator.stake_progression.credits[-1].status, "CANCELLED")
 
     def test_new_wave_cancels_old_credit_before_opening_base_order(self):
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_wave_guard=True,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         state.simulator.orders.append(
             SimulatedOrder(
                 id=1,
@@ -679,7 +695,11 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.simulator.orders[-1].stake_progression_step, 1)
 
     def test_turn_state_cancels_credit_before_any_new_signal(self):
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_wave_guard=True,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         state.simulator.orders.append(
             SimulatedOrder(
                 id=1,
@@ -750,7 +770,13 @@ class MonitorStateTest(unittest.TestCase):
             StakeProgressionCredit(source_order_id=1, created_at=600_000),
             "BTCUSDT",
         )
-        state = MonitorState(symbol="BTCUSDT", storage=storage, now_ms=lambda: 0)
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            now_ms=lambda: 0,
+            enable_wave_guard=True,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         storage.fail_once("cancel_stake_progression_credits")
         signal = Signal(
             direction="LONG",
@@ -781,7 +807,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("资格取消持久化失败", state.last_error)
 
     def test_wave_guard_blocks_short_in_up_leg_and_keeps_long(self):
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(symbol="BTCUSDT", enable_wave_guard=True)
         wave = WaveSnapshot(
             state="UP_LEG",
             raw_state="UP_LEG",
@@ -819,6 +845,39 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(allowed.wave_guard_mode, "NORMAL")
         self.assertTrue(allowed.wave_batch_id)
 
+    def test_wave_guard_records_state_without_blocking_by_default(self):
+        state = MonitorState(symbol="BTCUSDT")
+        wave = WaveSnapshot(
+            state="UP_LEG",
+            raw_state="UP_LEG",
+            window=8,
+            efficiency=0.8,
+            direction_ratio=0.86,
+            atr_strength=2.1,
+            range_position=0.9,
+            confirmations=2,
+            confirmed_at=4_000_000,
+            allowed_directions=("LONG",),
+        )
+        signal = Signal(
+            "SHORT",
+            10,
+            "A",
+            "实时SHORT",
+            100.0,
+            4_100_000,
+            score=-84.0,
+            threshold=79.0,
+            threshold_segment="WD-22",
+        )
+
+        observed = state._apply_wave_guard(signal, wave)
+
+        self.assertEqual(observed.direction, "SHORT")
+        self.assertEqual(observed.wave_guard_mode, "DISABLED")
+        self.assertEqual(observed.wave_guard_status, "DISABLED")
+        self.assertTrue(observed.wave_batch_id)
+
     def test_seed_rebuilds_wave_anchor_and_preserves_loss_lock_after_restart(self):
         closes = [100.0] * 12 + [100.2, 100.5, 100.9, 101.3, 101.8, 102.3, 102.9, 103.5, 104.1]
         history = []
@@ -854,7 +913,10 @@ class MonitorStateTest(unittest.TestCase):
         before_restart.wave_state = uninterrupted
         original = before_restart._attach_wave_metadata(signal, uninterrupted)
 
-        restarted = MonitorState(symbol="BTCUSDT")
+        restarted = MonitorState(
+            symbol="BTCUSDT",
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
         restarted.seed_klines(history)
         restored = restarted._attach_wave_metadata(signal, restarted.wave_state)
         restarted.simulator.orders.append(
@@ -934,6 +996,7 @@ class MonitorStateTest(unittest.TestCase):
             symbol="BTCUSDT",
             storage=storage,
             min_order_gap_ms=0,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
         )
         restarted.seed_klines(history[-300:])
         restored = restarted._attach_wave_metadata(signal, restarted.wave_state)
@@ -993,6 +1056,7 @@ class MonitorStateTest(unittest.TestCase):
             symbol="BTCUSDT",
             storage=storage,
             min_order_gap_ms=0,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
         )
         restarted.seed_klines([])
         restarted.seed_klines(history[-14:])
@@ -1081,6 +1145,8 @@ class MonitorStateTest(unittest.TestCase):
             symbol="BTCUSDT",
             storage=storage,
             now_ms=lambda: history[-1].close_time,
+            enable_wave_guard=True,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
         )
         state.seed_klines(history)
         signal = state._attach_wave_metadata(
@@ -1244,6 +1310,7 @@ class MonitorStateTest(unittest.TestCase):
             symbol="BTCUSDT",
             storage=storage,
             min_order_gap_ms=0,
+            wave_batch_guard_config=WaveBatchGuardConfig(),
         )
 
         state.seed_klines(history[-301:-1])
@@ -1294,7 +1361,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("波段运行态持久化失败", state.last_error)
 
     def test_wave_guard_blocks_turn_and_range_middle(self):
-        state = MonitorState(symbol="BTCUSDT")
+        state = MonitorState(symbol="BTCUSDT", enable_wave_guard=True)
         signal = Signal(
             "LONG",
             10,
@@ -1326,7 +1393,11 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_daily_profile_cannot_restore_wave_blocked_direction(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
-        state = MonitorState(symbol="BTCUSDT", enable_daily_profile_selector=True)
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=True,
+            enable_wave_guard=True,
+        )
         state.active_daily_profile_selection = {
             "version": "DPS-20260730-0800",
             "status": "READY",
@@ -1375,8 +1446,9 @@ class MonitorStateTest(unittest.TestCase):
             state.snapshot()["order_policy"],
             {"max_open_orders": 2, "min_order_gap_ms": 2 * 60_000},
         )
-        self.assertFalse(state.snapshot()["result_sequence_guard"]["enabled"])
-        self.assertTrue(state.snapshot()["wave_batch_guard"]["enabled"])
+        self.assertTrue(state.snapshot()["result_sequence_guard"]["enabled"])
+        self.assertFalse(state.snapshot()["wave_state"]["enabled"])
+        self.assertFalse(state.snapshot()["wave_batch_guard"]["enabled"])
 
     def test_daily_profile_status_does_not_repeat_reloaded_active_snapshot_as_pending(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
@@ -1478,14 +1550,14 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [], now)
         decision = state._maybe_open_order(selected, latest, daily_profile_required=required)
 
-        self.assertFalse(required)
+        self.assertTrue(required)
         self.assertFalse(selected.daily_profile_selected)
         self.assertEqual(selected.direction, "WAIT")
         self.assertEqual(selected.score, 0.0)
-        self.assertEqual(decision, "BELOW_THRESHOLD")
+        self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
         self.assertEqual(state.simulator.orders, [])
 
-    def test_numeric_trade_score_threshold_promotes_matching_daily_profile(self):
+    def test_numeric_trade_score_threshold_cannot_promote_wait_primary(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(
             symbol="BTCUSDT",
@@ -1526,16 +1598,15 @@ class MonitorStateTest(unittest.TestCase):
         selected, required = state._select_daily_profile_signal(primary, [], now)
 
         self.assertTrue(required)
-        self.assertEqual(selected.direction, "SHORT")
-        self.assertTrue(selected.actionable)
-        self.assertTrue(selected.daily_profile_selected)
-        self.assertFalse(selected.observe_only)
-        self.assertEqual(selected.threshold, 0.0)
-        self.assertEqual(selected.calculated_threshold, 79.0)
-        self.assertNotIn("动态阈值 79.0，不开单", selected.reason)
+        self.assertEqual(selected.direction, "WAIT")
+        self.assertFalse(selected.actionable)
+        self.assertFalse(selected.daily_profile_selected)
+        self.assertTrue(selected.observe_only)
+        self.assertEqual(selected.threshold, 79.0)
+        self.assertIn("动态阈值 79.0，不开单", selected.reason)
         self.assertEqual(
             state.snapshot()["trade_score_threshold"],
-            {"mode": "OVERRIDE", "value": 0.0},
+            {"mode": "AUDIT_ONLY", "value": 0.0},
         )
 
     def test_auto_trade_score_threshold_is_exposed_in_snapshot(self):
@@ -1546,7 +1617,7 @@ class MonitorStateTest(unittest.TestCase):
             {"mode": "AUTO", "value": None},
         )
 
-    def test_numeric_trade_score_threshold_still_blocks_score_below_override(self):
+    def test_numeric_trade_score_threshold_is_audit_only_for_below_threshold_primary(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(
             symbol="BTCUSDT",
@@ -1589,9 +1660,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertTrue(required)
         self.assertEqual(selected.direction, "WAIT")
         self.assertFalse(selected.actionable)
-        self.assertTrue(selected.daily_profile_selected)
-        self.assertEqual(selected.threshold, 35.0)
-        self.assertEqual(selected.calculated_threshold, 79.0)
+        self.assertFalse(selected.daily_profile_selected)
+        self.assertEqual(selected.threshold, 79.0)
 
     def test_numeric_trade_score_threshold_does_not_promote_unselected_profile(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
@@ -1630,11 +1700,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertTrue(required)
         self.assertEqual(selected.direction, "WAIT")
         self.assertFalse(selected.daily_profile_selected)
-        self.assertEqual(selected.threshold, 0.0)
-        self.assertEqual(selected.calculated_threshold, 79.0)
-        self.assertIn("当前画像未入选", selected.reason)
-        self.assertIn("原始动态阈值79.0", selected.reason)
-        self.assertNotIn("动态阈值 79.0，不开单", selected.reason)
+        self.assertEqual(selected.threshold, 79.0)
+        self.assertIn("动态阈值 79.0，不开单", selected.reason)
 
     def test_numeric_trade_score_threshold_requires_observe_direction(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
@@ -1669,7 +1736,7 @@ class MonitorStateTest(unittest.TestCase):
 
         selected, required = state._select_daily_profile_signal(primary, [], now)
 
-        self.assertFalse(required)
+        self.assertTrue(required)
         self.assertFalse(selected.actionable)
         self.assertFalse(selected.daily_profile_selected)
         self.assertEqual(selected.threshold, 79.0)
@@ -1680,6 +1747,7 @@ class MonitorStateTest(unittest.TestCase):
             symbol="BTCUSDT",
             enable_daily_profile_selector=True,
             trade_score_threshold=0.0,
+            enable_wave_guard=True,
         )
         state.active_daily_profile_selection = {
             "version": "DPS-20260730-0800",
@@ -1717,7 +1785,8 @@ class MonitorStateTest(unittest.TestCase):
             confirmed_at=now - 120_000,
         )
 
-        selected, required = state._select_daily_profile_signal(primary, [], now)
+        baseline = Signal("WAIT", 10, "B", "无主信号", 100.0, now)
+        selected, required = state._select_daily_profile_signal(baseline, [primary], now)
         guarded = state._apply_wave_guard(selected, up_wave)
 
         self.assertTrue(required)
@@ -1841,7 +1910,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
         self.assertEqual(len(state.observations), 1)
 
-    def test_daily_selector_cannot_execute_matching_research_observation_candidate(self):
+    def test_daily_selector_executes_matching_research_observation_candidate(self):
         now = shanghai_timestamp("2026-07-30T08:00:00")
         state = MonitorState(symbol="BTCUSDT", enable_daily_profile_selector=True)
         state.active_daily_profile_selection = {
@@ -1875,11 +1944,21 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         selected, required = state._select_daily_profile_signal(primary, [candidate], now)
+        latest = Kline(now - 60_000, 100.0, 100.0, 100.0, 100.0, 1.0, now)
+        decision = state._maybe_open_order(
+            selected,
+            latest,
+            daily_profile_required=required,
+        )
 
-        self.assertFalse(required)
-        self.assertEqual(selected.direction, "WAIT")
-        self.assertNotEqual(selected.strategy_tag, "low_volume_reclaim_observe")
-        self.assertFalse(selected.daily_profile_selected)
+        self.assertTrue(required)
+        self.assertEqual(selected.direction, "LONG")
+        self.assertEqual(selected.strategy_tag, "low_volume_reclaim_observe")
+        self.assertTrue(selected.daily_profile_selected)
+        self.assertTrue(selected.actionable)
+        self.assertFalse(selected.observe_only)
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.simulator.orders[-1].strategy_tag, "low_volume_reclaim_observe")
 
     def test_daily_selector_uses_previous_profiles_when_evaluation_save_fails(self):
         current = shanghai_timestamp("2026-07-30T08:00:00")
