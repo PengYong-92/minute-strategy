@@ -44,6 +44,7 @@ LIVE_SHORT_SEGMENTS="${LIVE_SHORT_SEGMENTS:-WD-02,WD-23}"
 DAILY_PROFILE_SELECTOR="${DAILY_PROFILE_SELECTOR:-1}"
 DAILY_PROFILE_LOOKBACK_DAYS="${DAILY_PROFILE_LOOKBACK_DAYS:-7}"
 DAILY_PROFILE_MIN_SAMPLES="${DAILY_PROFILE_MIN_SAMPLES:-20}"
+DAILY_PROFILE_WEEKEND_MIN_SAMPLES="${DAILY_PROFILE_WEEKEND_MIN_SAMPLES:-10}"
 DAILY_PROFILE_MIN_WIN_RATE="${DAILY_PROFILE_MIN_WIN_RATE:-0.60}"
 DAILY_PROFILE_MIN_EV="${DAILY_PROFILE_MIN_EV:-0}"
 DAILY_PROFILE_EXIT_WIN_RATE="${DAILY_PROFILE_EXIT_WIN_RATE:-0.60}"
@@ -126,7 +127,9 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --daily-profile-lookback-days N
                          每日画像统计回看天数，默认: 7
   --daily-profile-min-samples N
-                         新画像入选所需最小独立样本数，默认: 20
+                         工作日新画像入选所需最小独立样本数，默认: 20
+  --daily-profile-weekend-min-samples N
+                         周末新画像入选所需最小独立样本数，默认: 10
   --daily-profile-min-win-rate N
                          新画像入选最低胜率，默认: 0.60
   --daily-profile-min-ev N
@@ -165,7 +168,8 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   OBSERVATION_PROFILE_MIN_SAMPLES, OBSERVATION_PROFILE_MIN_WIN_RATE,
   OBSERVATION_PROFILE_MIN_EV, OBSERVATION_PROFILE_MIN_EDGE, LIVE_SHORT_SEGMENTS,
   DAILY_PROFILE_SELECTOR, DAILY_PROFILE_LOOKBACK_DAYS,
-  DAILY_PROFILE_MIN_SAMPLES, DAILY_PROFILE_MIN_WIN_RATE, DAILY_PROFILE_MIN_EV,
+  DAILY_PROFILE_MIN_SAMPLES, DAILY_PROFILE_WEEKEND_MIN_SAMPLES,
+  DAILY_PROFILE_MIN_WIN_RATE, DAILY_PROFILE_MIN_EV,
   DAILY_PROFILE_EXIT_WIN_RATE, DAILY_PROFILE_EXIT_EV,
   DAILY_PROFILE_DEGRADED_RUNS, DAILY_PROFILE_MAX_ACTIVE,
   DAILY_PROFILE_EVALUATION_TIME, DAILY_PROFILE_ACTIVATION_TIME,
@@ -514,6 +518,15 @@ while [ "$#" -gt 0 ]; do
       DAILY_PROFILE_MIN_SAMPLES="${1#*=}"
       shift
       ;;
+    --daily-profile-weekend-min-samples)
+      require_value "$1" "${2:-}"
+      DAILY_PROFILE_WEEKEND_MIN_SAMPLES="$2"
+      shift 2
+      ;;
+    --daily-profile-weekend-min-samples=*)
+      DAILY_PROFILE_WEEKEND_MIN_SAMPLES="${1#*=}"
+      shift
+      ;;
     --daily-profile-min-win-rate)
       require_value "$1" "${2:-}"
       DAILY_PROFILE_MIN_WIN_RATE="$2"
@@ -736,6 +749,7 @@ exec "$PYTHON_BIN" -m app.server \
   --live-short-segments "$LIVE_SHORT_SEGMENTS" \
   --daily-profile-lookback-days "$DAILY_PROFILE_LOOKBACK_DAYS" \
   --daily-profile-min-samples "$DAILY_PROFILE_MIN_SAMPLES" \
+  --daily-profile-weekend-min-samples "$DAILY_PROFILE_WEEKEND_MIN_SAMPLES" \
   --daily-profile-min-win-rate "$DAILY_PROFILE_MIN_WIN_RATE" \
   --daily-profile-min-ev "$DAILY_PROFILE_MIN_EV" \
   --daily-profile-exit-win-rate "$DAILY_PROFILE_EXIT_WIN_RATE" \

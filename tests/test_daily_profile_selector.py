@@ -50,6 +50,49 @@ def observation(
 
 
 class DailyProfileSelectorTest(unittest.TestCase):
+    def test_weekend_profiles_use_attainable_sample_floor_in_seven_day_window(self):
+        cutoff = timestamp("2026-08-08T07:50:00")
+        results = ["WIN"] * 7 + ["LOSS"] * 3
+        rows = []
+        for index, result in enumerate(results):
+            opened_at = cutoff - (index + 2) * 600_000
+            rows.append(
+                observation(
+                    f"weekend-{index}",
+                    result,
+                    opened_at,
+                    segment="WE-05",
+                )
+            )
+            rows.append(
+                observation(
+                    f"weekday-{index}",
+                    result,
+                    opened_at,
+                    segment="WD-05",
+                )
+            )
+
+        snapshot = build_daily_selection(
+            rows,
+            cutoff,
+            config=DailyProfileSelectorConfig(
+                lookback_days=7,
+                min_samples=20,
+                weekend_min_samples=10,
+            ),
+        )
+
+        self.assertEqual(
+            [item["threshold_segment"] for item in snapshot["selected_profiles"]],
+            ["WE-05"],
+        )
+        weekday = next(
+            item for item in snapshot["candidates"] if item["threshold_segment"] == "WD-05"
+        )
+        self.assertEqual(weekday["selection_state"], "INSUFFICIENT_SAMPLES")
+        self.assertIn("< 20", weekday["selection_reason"])
+
     def test_default_rule_has_no_profile_cap_and_rejects_below_60_percent(self):
         cutoff = timestamp("2026-07-30T07:50:00")
         rows = []

@@ -446,7 +446,13 @@ def main() -> None:
         "--daily-profile-min-samples",
         type=int,
         default=int(os.getenv("DAILY_PROFILE_MIN_SAMPLES", "20")),
-        help="新画像入选所需最小独立样本数，默认: 20",
+        help="工作日新画像入选所需最小独立样本数，默认: 20",
+    )
+    parser.add_argument(
+        "--daily-profile-weekend-min-samples",
+        type=int,
+        default=int(os.getenv("DAILY_PROFILE_WEEKEND_MIN_SAMPLES", "10")),
+        help="周末新画像入选所需最小独立样本数，默认: 10",
     )
     parser.add_argument(
         "--daily-profile-min-win-rate",
@@ -542,6 +548,7 @@ def main() -> None:
         daily_profile_selector_config=DailyProfileSelectorConfig(
             lookback_days=args.daily_profile_lookback_days,
             min_samples=args.daily_profile_min_samples,
+            weekend_min_samples=args.daily_profile_weekend_min_samples,
             min_win_rate=args.daily_profile_min_win_rate,
             min_ev=args.daily_profile_min_ev,
             exit_win_rate=args.daily_profile_exit_win_rate,

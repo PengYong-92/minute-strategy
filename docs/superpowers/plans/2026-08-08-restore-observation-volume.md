@@ -10,6 +10,7 @@
 - The one-minute wave model and wave-batch state remain recorded and displayed, but are disabled as order blockers by default.
 - The rolling-edge guard and result-sequence loss guard remain the active loss controls.
 - Production defaults remain two concurrent orders with a two-minute minimum entry gap.
+- Daily profiles require 20 independent weekday samples and 10 weekend samples so the seven-day window can admit weekend profiles without lowering the 60% win-rate floor.
 
 ## Implementation
 

@@ -15,6 +15,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 class DailyProfileSelectorConfig:
     lookback_days: int = 7
     min_samples: int = 20
+    weekend_min_samples: int = 10
     min_win_rate: float = 0.60
     min_ev: float = 0.0
     exit_win_rate: float = 0.60
@@ -30,6 +31,7 @@ class DailyProfileSelectorConfig:
         return DailyProfileSelectorConfig(
             lookback_days=max(1, int(self.lookback_days)),
             min_samples=max(1, int(self.min_samples)),
+            weekend_min_samples=max(1, int(self.weekend_min_samples)),
             min_win_rate=min(1.0, max(0.0, float(self.min_win_rate))),
             min_ev=float(self.min_ev),
             exit_win_rate=min(1.0, max(0.0, float(self.exit_win_rate))),
@@ -195,8 +197,13 @@ def _candidate_summary(
     pnl = round(sum(float(item.pnl) for item in samples), 4)
     win_rate = wins / sample_size if sample_size else 0.0
     ev = round(pnl / sample_size, 4) if sample_size else 0.0
+    min_samples = (
+        config.weekend_min_samples
+        if parts[4].upper().startswith("WE-")
+        else config.min_samples
+    )
     entry_qualified = (
-        sample_size >= config.min_samples
+        sample_size >= min_samples
         and win_rate >= config.min_win_rate
         and ev >= config.min_ev
     )
@@ -205,7 +212,7 @@ def _candidate_summary(
     selected = False
     if previous is not None:
         degraded = (
-            sample_size < config.min_samples
+            sample_size < min_samples
             or win_rate < config.exit_win_rate
             or ev <= config.exit_ev
         )
@@ -225,9 +232,9 @@ def _candidate_summary(
         selected = True
         state = "SELECTED"
         reason = "达到新增画像启用条件"
-    elif sample_size < config.min_samples:
+    elif sample_size < min_samples:
         state = "INSUFFICIENT_SAMPLES"
-        reason = f"独立样本 {sample_size} < {config.min_samples}"
+        reason = f"独立样本 {sample_size} < {min_samples}"
     elif win_rate < config.min_win_rate:
         state = "LOW_WIN_RATE"
         reason = f"胜率 {win_rate:.2%} < {config.min_win_rate:.2%}"
@@ -243,6 +250,7 @@ def _candidate_summary(
         "direction": parts[3],
         "threshold_segment": parts[4],
         "sample_size": sample_size,
+        "min_samples_required": min_samples,
         "wins": wins,
         "losses": sample_size - wins,
         "win_rate": round(win_rate, 6),

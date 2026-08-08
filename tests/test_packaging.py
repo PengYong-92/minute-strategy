@@ -195,6 +195,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
         self.assertIn("--no-daily-profile-selector", result.stdout)
         self.assertIn("--daily-profile-lookback-days", result.stdout)
         self.assertIn("--daily-profile-min-samples", result.stdout)
+        self.assertIn("--daily-profile-weekend-min-samples", result.stdout)
         self.assertIn("--daily-profile-min-win-rate", result.stdout)
         self.assertIn("--daily-profile-min-ev", result.stdout)
         self.assertIn("--daily-profile-exit-win-rate", result.stdout)
@@ -263,6 +264,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
                     "DAILY_PROFILE_SELECTOR": "0",
                     "DAILY_PROFILE_LOOKBACK_DAYS": "8",
                     "DAILY_PROFILE_MIN_SAMPLES": "25",
+                    "DAILY_PROFILE_WEEKEND_MIN_SAMPLES": "9",
                     "DAILY_PROFILE_MIN_WIN_RATE": "0.61",
                     "DAILY_PROFILE_MIN_EV": "1.2",
                     "DAILY_PROFILE_EXIT_WIN_RATE": "0.57",
@@ -324,6 +326,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
         self.assertIn("--no-daily-profile-selector", args)
         self.assertEqual(args[args.index("--daily-profile-lookback-days") + 1], "8")
         self.assertEqual(args[args.index("--daily-profile-min-samples") + 1], "25")
+        self.assertEqual(args[args.index("--daily-profile-weekend-min-samples") + 1], "9")
         self.assertEqual(args[args.index("--daily-profile-min-win-rate") + 1], "0.61")
         self.assertEqual(args[args.index("--daily-profile-min-ev") + 1], "1.2")
         self.assertEqual(args[args.index("--daily-profile-exit-win-rate") + 1], "0.57")
