@@ -82,13 +82,6 @@ SESSION_EDGE_BY_TIMEFRAME = {
         "WE-13": SessionEdge(6, 0.6667, 2.0000),
         "WE-17": SessionEdge(10, 0.7000, 2.6000),
     },
-    30: {
-        "WD-00": SessionEdge(11, 0.6364, 1.4545),
-        "WD-05": SessionEdge(15, 0.6667, 2.0000),
-        "WD-15": SessionEdge(36, 0.6389, 1.5000),
-        "WE-21": SessionEdge(8, 0.7500, 3.5000),
-        "WE-23": SessionEdge(8, 0.7500, 3.5000),
-    },
 }
 
 
@@ -155,6 +148,8 @@ def analyze_volume_price(
     timeframe_minutes: int,
     fear_greed: FearGreedContext | None = None,
 ) -> Signal:
+    if timeframe_minutes not in LIVE_TRADE_TIMEFRAMES:
+        raise ValueError("only 10-minute analysis is supported")
     if not klines:
         return _signal("WAIT", timeframe_minutes, "B", "暂无K线数据", 0.0, 0)
 
@@ -234,15 +229,13 @@ def analyze_volume_price(
     threshold = _dynamic_direction_threshold(base_threshold, raw_direction)
     threshold = _session_adjusted_threshold(
         threshold,
-        timeframe_minutes,
         session_edge,
         allow_unprofiled=trend_broad_short,
     )
     fear_greed_adjustment = _fear_greed_threshold_adjustment(raw_direction, fear_greed)
-    regime_adjustment = _regime_threshold_adjustment(raw_direction, timeframe_minutes, regime, technical)
+    regime_adjustment = _regime_threshold_adjustment(raw_direction, regime, technical)
     threshold = round(_clamp(threshold + fear_greed_adjustment + regime_adjustment, 58.0, 95.0), 1)
     session_edge_min = _session_min_edge(
-        timeframe_minutes,
         session_edge,
         raw_direction,
         allow_unprofiled=trend_broad_short,
@@ -975,7 +968,6 @@ def _regime_label(
 
 def _regime_threshold_adjustment(
     direction: str,
-    timeframe_minutes: int,
     regime: str,
     technical: TechnicalContext,
 ) -> float:
@@ -983,14 +975,10 @@ def _regime_threshold_adjustment(
     if regime == "FEAR_FALLING":
         if direction == "SHORT":
             adjustment += 4.0
-        elif direction == "LONG" and timeframe_minutes == 30:
-            adjustment += 3.0
     elif regime == "FEAR_RISING":
         if direction == "LONG" and technical.bollinger_position >= 0.88:
             adjustment += 3.0
     elif regime == "GREED_RISING" and direction == "LONG":
-        adjustment += 2.0
-    elif regime == "HIGH_VOL" and timeframe_minutes == 30:
         adjustment += 2.0
     return round(_clamp(adjustment, 0.0, 6.0), 1)
 
@@ -1130,11 +1118,10 @@ def _profile_key(strategy_family: str, direction: str, threshold_segment: str) -
 
 def _session_adjusted_threshold(
     base_threshold: float,
-    timeframe_minutes: int,
     edge: SessionEdge | None,
     allow_unprofiled: bool = False,
 ) -> float:
-    adjustment = 2.0 if timeframe_minutes == 30 else 0.0
+    adjustment = 0.0
     if edge is None:
         if not allow_unprofiled:
             adjustment += 8.0
@@ -1146,12 +1133,11 @@ def _session_adjusted_threshold(
 
 
 def _session_min_edge(
-    timeframe_minutes: int,
     edge: SessionEdge | None,
     direction: str = "LONG",
     allow_unprofiled: bool = False,
 ) -> float:
-    minimum = MIN_TRADE_EDGE + (2.0 if timeframe_minutes == 30 else 0.0)
+    minimum = MIN_TRADE_EDGE
     if direction == "SHORT":
         minimum += SHORT_EDGE_PREMIUM
     if edge is None:
@@ -1387,8 +1373,7 @@ def _session_edge(timeframe_minutes: int, threshold_segment: str, direction: str
 def _candidate_rank(signal: Signal) -> float:
     edge = abs(signal.score) - signal.threshold
     session_quality = signal.session_ev * 3.0 + signal.session_win_rate * 10.0
-    timeframe_penalty = 1.5 if signal.timeframe_minutes == 30 else 0.0
-    return edge + session_quality - timeframe_penalty
+    return edge + session_quality
 
 
 def _cn_position(position: str) -> str:

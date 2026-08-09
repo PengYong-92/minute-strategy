@@ -1,11 +1,11 @@
 # 当前策略说明
 
-更新时间：2026-08-07
+更新时间：2026-08-09
 代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
 
 ## 1. 策略目标与运行周期
 
-当前程序是 BTC/USDT 等币安现货 1分钟K线驱动的事件合约监控策略。实盘运行只开 10分钟事件合约，30分钟周期目前不作为开单周期，只保留在历史参数和多周期趋势偏向计算中。
+当前程序是 BTC/USDT 等币安现货 1分钟K线驱动的事件合约监控策略。策略分析入口和实盘运行只接受 10分钟事件合约；30分钟订单周期的 edge、阈值修正、候选排序和分析入口已经删除。`mtf_30m_bias` 仍作为当前10分钟策略的内部偏向输入保留，本阶段不改写该活跃依赖。
 
 核心目标：
 
@@ -669,8 +669,6 @@ SHORT_THRESHOLD_PREMIUM = 8
 threshold += 8 if direction == SHORT
 ```
 
-30分钟额外提高 2，但当前实盘不启用 30分钟开单。
-
 最终阈值会再经过：
 
 1. 分时段 edge 调整。
@@ -700,15 +698,7 @@ threshold += 8 if direction == SHORT
 | WE-13 | 6 | 66.67% | 2.0000 |
 | WE-17 | 10 | 70.00% | 2.6000 |
 
-30分钟 LONG 表仍保留在代码中，但当前不会开 30分钟单：
-
-| 时段 | 样本 | 胜率 | EV |
-|---|---:|---:|---:|
-| WD-00 | 11 | 63.64% | 1.4545 |
-| WD-05 | 15 | 66.67% | 2.0000 |
-| WD-15 | 36 | 63.89% | 1.5000 |
-| WE-21 | 8 | 75.00% | 3.5000 |
-| WE-23 | 8 | 75.00% | 3.5000 |
+30分钟 LONG session edge 已从当前运行代码删除。
 
 ### 10.2 SHORT session edge
 
@@ -758,8 +748,6 @@ edge = abs(score) - threshold
 ```text
 MIN_TRADE_EDGE = 10
 ```
-
-30分钟会加 2，但当前实盘不启用 30分钟。
 
 SHORT 额外最小边际：
 
@@ -890,13 +878,9 @@ otherwise -> NEUTRAL
 
 ```text
 FEAR_FALLING + SHORT: +4
-FEAR_FALLING + LONG + 30分钟: +3
 FEAR_RISING + LONG + bollinger_position >= 0.88: +3
 GREED_RISING + LONG: +2
-HIGH_VOL + 30分钟: +2
 ```
-
-当前实盘只开 10分钟，所以 30分钟相关调整不影响开单。
 
 ## 13. 最终开单条件
 

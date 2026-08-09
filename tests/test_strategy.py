@@ -67,7 +67,84 @@ def fear_falling_mid_drop_klines(drop_total=0.6, volume=125):
     return klines
 
 
+def neutral_mid_klines():
+    klines = []
+    for offset in range(120):
+        close = 100.0 + (0.02 if offset % 2 else -0.02)
+        high = 110.0 if offset == 0 else close + 0.1
+        low = 90.0 if offset == 0 else close - 0.1
+        klines.append(
+            kline(
+                1200 + offset,
+                close,
+                100.0,
+                open_price=close,
+                high=high,
+                low=low,
+            )
+        )
+    return klines
+
+
 class StrategyTest(unittest.TestCase):
+    def test_generic_short_profile_identity_is_stable(self):
+        klines = neutral_mid_klines()
+        latest = klines[-1]
+        klines[-1] = Kline(
+            open_time=latest.open_time,
+            open=100.1,
+            high=101.0,
+            low=99.95,
+            close=100.0,
+            volume=100.0,
+            close_time=latest.close_time,
+        )
+
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
+
+        self.assertEqual(signal.timeframe_minutes, 10)
+        self.assertEqual(signal.direction, "WAIT")
+        self.assertFalse(signal.actionable)
+        self.assertEqual(
+            (signal.strategy_family, signal.strategy_tag, signal.observe_direction),
+            ("short_observe", "generic_short_observe", "SHORT"),
+        )
+        self.assertEqual(
+            signal.profile_key,
+            f"short_observe|SHORT|{signal.threshold_segment}",
+        )
+
+    def test_generic_long_profile_identity_is_stable(self):
+        klines = neutral_mid_klines()
+        latest = klines[-1]
+        klines[-1] = Kline(
+            open_time=latest.open_time,
+            open=99.9,
+            high=100.05,
+            low=99.0,
+            close=100.0,
+            volume=100.0,
+            close_time=latest.close_time,
+        )
+
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
+
+        self.assertEqual(signal.timeframe_minutes, 10)
+        self.assertEqual(signal.direction, "WAIT")
+        self.assertFalse(signal.actionable)
+        self.assertEqual(
+            (signal.strategy_family, signal.strategy_tag, signal.observe_direction),
+            ("long_observe", "generic_long_observe", "LONG"),
+        )
+        self.assertEqual(
+            signal.profile_key,
+            f"long_observe|LONG|{signal.threshold_segment}",
+        )
+
+    def test_volume_price_analysis_rejects_non_10m_timeframes(self):
+        with self.assertRaisesRegex(ValueError, "only 10-minute analysis is supported"):
+            analyze_volume_price(neutral_mid_klines(), timeframe_minutes=30)
+
     def test_wd00_keeps_tight_overheat_edge_after_recent_replay(self):
         self.assertEqual(max_trade_edge_for(10, "WD-00", "LONG"), 16.0)
 
@@ -140,12 +217,10 @@ class StrategyTest(unittest.TestCase):
     def test_one_year_weak_sessions_are_not_hard_disabled(self):
         self.assertIsNotNone(_session_edge(10, "WD-00", "LONG"))
         self.assertIsNotNone(_session_edge(10, "WD-08", "LONG"))
-        self.assertIsNotNone(_session_edge(30, "WD-15", "LONG"))
 
     def test_one_year_positive_sessions_remain_allowed(self):
         self.assertIsNotNone(_session_edge(10, "WD-20", "LONG"))
         self.assertIsNotNone(_session_edge(10, "WD-18", "LONG"))
-        self.assertIsNotNone(_session_edge(30, "WE-21", "LONG"))
 
     def test_low_position_high_volume_rise_is_observation_only_after_psychology_review(self):
         klines = baseline_klines()
@@ -171,10 +246,10 @@ class StrategyTest(unittest.TestCase):
                 kline(80 + offset, close, 300, open_price=110.0, high=111.5, low=109.7)
             )
 
-        signal = analyze_volume_price(klines, timeframe_minutes=30)
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
 
         self.assertEqual(signal.direction, "WAIT")
-        self.assertEqual(signal.timeframe_minutes, 30)
+        self.assertEqual(signal.timeframe_minutes, 10)
         self.assertIn("高位放量滞涨", signal.reason)
         self.assertIn("不开单", signal.reason)
 
@@ -350,7 +425,7 @@ class StrategyTest(unittest.TestCase):
         self.assertGreater(greedy.threshold, neutral.threshold)
         self.assertGreater(greedy.fear_greed_adjustment, 0.0)
 
-    def test_choose_best_candidate_ignores_30m_candidates_for_live_orders(self):
+    def test_choose_best_candidate_ignores_non_live_candidates(self):
         ten = Signal(
             direction="LONG",
             timeframe_minutes=10,
@@ -365,11 +440,11 @@ class StrategyTest(unittest.TestCase):
             session_win_rate=0.68,
             session_ev=2.0,
         )
-        thirty = Signal(
+        non_live = Signal(
             direction="LONG",
-            timeframe_minutes=30,
+            timeframe_minutes=15,
             level="A",
-            reason="30m",
+            reason="non-live",
             price=100.0,
             open_time=0,
             score=83.0,
@@ -379,11 +454,11 @@ class StrategyTest(unittest.TestCase):
             session_win_rate=0.68,
             session_ev=2.1,
         )
-        superior_thirty = Signal(
+        superior_non_live = Signal(
             direction="LONG",
-            timeframe_minutes=30,
+            timeframe_minutes=15,
             level="A",
-            reason="30m strong",
+            reason="non-live strong",
             price=100.0,
             open_time=0,
             score=92.0,
@@ -394,8 +469,8 @@ class StrategyTest(unittest.TestCase):
             session_ev=4.2,
         )
 
-        self.assertEqual(choose_best_candidate([ten, thirty]).timeframe_minutes, 10)
-        self.assertEqual(choose_best_candidate([ten, superior_thirty]).timeframe_minutes, 10)
+        self.assertEqual(choose_best_candidate([ten, non_live]).timeframe_minutes, 10)
+        self.assertEqual(choose_best_candidate([ten, superior_non_live]).timeframe_minutes, 10)
 
     def test_high_position_high_volume_drop_waits_when_short_indicators_do_not_confirm(self):
         klines = [kline(660 + i, 100.0, 100, high=108.0, low=99.5) for i in range(80)]
@@ -702,24 +777,6 @@ class StrategyTest(unittest.TestCase):
         self.assertGreater(signal.session_ev, 0.0)
         self.assertGreater(signal.session_edge_min, 0.0)
 
-    def test_30m_session_policy_is_independent_from_10m_allowed_segments(self):
-        klines = [
-            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
-            for i in range(60, 210)
-        ]
-        for offset in range(30):
-            idx = 210 + offset
-            open_price = 100.0 - offset * 0.08
-            close = open_price - 0.08
-            klines.append(kline(idx, close, 170, open_price=open_price, high=open_price + 0.04, low=close - 0.08))
-
-        signal = analyze_volume_price(klines, timeframe_minutes=30)
-
-        self.assertEqual(signal.threshold_segment, "WD-03")
-        self.assertFalse(signal.session_allowed)
-        self.assertEqual(signal.direction, "WAIT")
-        self.assertIn("30分钟 WD-03", signal.reason)
-
     def test_signal_exposes_aggregated_10m_and_30m_bias(self):
         klines = [kline(i, 100 + i * 0.03, 100) for i in range(120)]
         for offset in range(30):
@@ -779,23 +836,6 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(signal.analysis_window_minutes, 10)
         self.assertEqual(signal.threshold_window_minutes, 10)
         self.assertAlmostEqual(signal.price_change_pct, 0.10, places=4)
-
-    def test_30m_signal_uses_previous_30_closed_minutes_as_analysis_window(self):
-        klines = [kline(i, 100.0, 100) for i in range(80)]
-        for offset in range(30):
-            idx = 80 + offset
-            open_price = 100.0 + offset
-            close = 101.0 + offset
-            if offset == 29:
-                close = 130.0
-            klines.append(kline(idx, close, 220, open_price=open_price, high=max(open_price, close), low=open_price))
-
-        signal = analyze_volume_price(klines, timeframe_minutes=30)
-
-        self.assertEqual(signal.analysis_window_minutes, 30)
-        self.assertEqual(signal.threshold_window_minutes, 30)
-        self.assertAlmostEqual(signal.price_change_pct, 0.30, places=4)
-
 
 if __name__ == "__main__":
     unittest.main()
