@@ -15,9 +15,10 @@
 - Fear & Greed 实盘动态获取并缓存，用作方向风险阈值调节，不直接决定方向。
 - 所有 LONG/SHORT 候选继续异步记录观察结果。每天北京时间 07:50 按 `周期 + 策略族 + 策略标签 + 方向 + WD/WE时段` 评估最近7天独立样本，08:00启用全部合格画像并固定运行到次日08:00。
 - 每日画像选择器默认要求20个独立样本、60%胜率和非负EV。画像只能验证已经达到实时评分阈值的同方向信号，不能把 WAIT 改成 LONG/SHORT，不能改写方向，也不能降低实时阈值。
-- 默认启用波段批次守卫：同一波段最多2单，首亏后不补位；60分钟内两个全亏批次触发60分钟全局冷却，冷却后只允许一笔固定10U恢复单。
+- 默认启用实时画像退化守卫：同一完整画像键在当前 DPS 版本内连续3笔已结算真实订单亏损后冷却60分钟；冷却结束只允许一笔10U基础试探，试探结算前阻止同画像继续开单。
+- 默认启用波段批次守卫：同一波段最多2单，首亏后不补位；60分钟内两个全亏批次触发60分钟全局冷却，冷却后只允许一笔固定10U恢复单。普通波段恢复单不生成18U资格；同时标记为画像退化试探时按画像试探规则处理。
 - 每根已闭合1分钟K线都会同步持久化波段状态、最后评估时间和原始确认锚点。服务重启先恢复该快照，再增量重放后续预热K线；即使波段起点早于最近300根K线，同一实际波段的批次ID和首亏锁定仍保持不变。首次升级没有快照时从持久化订单保守继承同状态锚点并取消旧18U资格；快照后K线不连续时直接建立新波段身份。转折或新波段会原子取消旧18U资格。
-- 旧按方向结算序列守卫保留兼容实现但生产默认关闭，避免与波段规律守卫重复拦截。
+- 按方向结算序列守卫默认启用：LONG与SHORT分别按连续已结算亏损触发方向冷却，不改变信号方向。
 - 模拟订单和观察单都按各自到期分钟对应的 K 线结算；轮询中断后不会借用恢复时的更晚价格。重启时恢复8天缓冲，再按固定截止点精确截取7天观察窗口，不受页面500条展示上限影响。
 
 ## 启动
@@ -53,12 +54,15 @@ bash scripts/run.sh --symbol BTCUSDT --host 0.0.0.0 --port 8000 --poll-seconds 1
 bash scripts/run.sh --no-warmup
 bash scripts/run.sh --db-path data/monitor.sqlite3
 bash scripts/run.sh --max-open-orders 2 --min-order-gap-minutes 2
+PROFILE_DEGRADATION_COOLDOWN_MINUTES=60 bash scripts/run.sh
 RESULT_SEQUENCE_GUARD=1 bash scripts/run.sh --result-sequence-loss-streak 3 --result-sequence-cooldown-minutes 20 --result-sequence-scope DIRECTION
 bash scripts/run.sh --stake-progression-max-orders 2 --stake-progression-max-active 1 --stake-progression-base-only-segments ""
 bash scripts/run.sh --webhook-url https://event.easy-tx.com/api/signals/ingest
 ```
 
 金额叠加默认由 `STAKE_PROGRESSION=1`、`STAKE_PROGRESSION_MAX_ORDERS=2`、`STAKE_PROGRESSION_MAX_ACTIVE=1` 和空的 `STAKE_PROGRESSION_BASE_ONLY_SEGMENTS` 控制。`max-orders` 与 `base-only` 参数继续接受旧部署配置，但生产执行固定为两阶段，默认不排除任何已入选时段。
+
+实时画像退化只新增 `PROFILE_DEGRADATION_COOLDOWN_MINUTES=60`（命令行对应 `--profile-degradation-cooldown-minutes 60`）一个启动参数，`0` 表示关闭。连续亏损触发数固定为3，不提供额外的启用、最小样本、胜率或EV参数。守卫按“完整画像键 + 当前 DPS 版本”读取已结算真实订单；冷却后只放行一笔10U基础试探，试探未结算时继续阻止同画像。试探赢恢复 `NORMAL`，并可按两阶段金额规则产生下一笔18U资格，即使该单同时属于波段恢复；试探亏则从该单结算时间重新冷却。
 
 每日画像选择参数：
 
@@ -77,7 +81,7 @@ bash scripts/run.sh \
 
 使用 `--no-daily-profile-selector` 可临时回退到静态主策略。旧观察画像参数继续兼容，但只能验证已经过线的同方向实时信号，不能提升 WAIT 或改写方向；每日选择器启用时不执行该兼容逻辑。
 
-旧结算序列守卫兼容参数（生产默认关闭，设置 `RESULT_SEQUENCE_GUARD=1` 才启用）：
+方向结算序列守卫参数（默认启用，可设置 `RESULT_SEQUENCE_GUARD=0` 关闭）：
 
 - `--no-result-sequence-guard`：关闭旧守卫。
 - `--result-sequence-loss-streak`：触发所需连续已结算亏损数，默认 `3`。
@@ -266,7 +270,7 @@ python3 -m app.backtest \
 - 最多并行第二级订单数默认是 1；`--stake-progression-base-only-segments` 默认空，因此所有已入选时段均可参与金额叠加。该参数继续保留用于兼容旧部署。
 - 每日画像选择替代旧的单信号动态放行；只有实时方向已成立、评分达到阈值且完整画像键匹配当日快照才具备开单资格。
 - 未结订单达到2单时不再开新单；未满2单且距离上一单不少于2分钟时可以继续开单。
-- 同一波段批次最多2单，出现首亏后不再补单；全局冷却与恢复状态不消费或生成18U资格。
+- 同一波段批次最多2单，出现首亏后不再补单；全局冷却与普通波段恢复状态不消费或生成18U资格，画像退化试探例外。
 - 波段切换、转折、批次锁定和全局恢复会先原子持久化取消旧18U资格；写库失败时保持资格未取消并暂停开单。
 - 新单最小间隔默认2分钟。
 

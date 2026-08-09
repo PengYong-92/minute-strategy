@@ -1,7 +1,7 @@
 # 当前策略说明
 
-更新时间：2026-08-09
-代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
+更新时间：2026-08-10
+代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/profile_degradation_guard.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
 
 ## 1. 策略目标与运行周期
 
@@ -60,7 +60,8 @@ bash scripts/run.sh
 | `--no-persistence` | 关闭参数 | 关闭 SQLite 持久化 |
 | `--no-webhook` | 关闭参数 | 关闭 webhook 推送 |
 | `--no-daily-profile-selector` | 关闭参数 | 关闭每日观察画像选策，回退静态主策略 |
-| `--no-result-sequence-guard` | 默认关闭 | 旧按方向连亏守卫兼容开关；生产由波段批次守卫替代 |
+| `--no-result-sequence-guard` | 关闭参数 | 关闭默认启用的按方向结算序列守卫 |
+| `--profile-degradation-cooldown-minutes` | `60` | 完整画像连续3笔真实亏损后的冷却分钟数；`0` 关闭 |
 | `--daily-profile-lookback-days` | `7` | 每日画像统计窗口 |
 | `--daily-profile-min-samples` | `20` | 新画像入选最小独立样本 |
 | `--daily-profile-min-win-rate` | `0.60` | 新画像入选最低胜率，低于该值不入选 |
@@ -897,7 +898,7 @@ signal.actionable == True
 未结订单数 < 2
 距离上一单 >= 2分钟
 非重复 signal_key
-未触发同日同分段连续亏损暂停
+未触发完整画像实时退化冷却或试探等待
 未触发波段批次锁定或全局冷却
 未触发滚动守卫 DEGRADED
 ```
@@ -922,7 +923,7 @@ and abs(score) >= threshold
 | `HOLD_OPEN_ORDER` | 未结订单已达到2单 |
 | `COOLDOWN` | 距离上一单不足2分钟 |
 | `DUPLICATE_SIGNAL` | 同一信号已开过 |
-| `RISK_PAUSED` | 同日同分段连续亏损达到 3 单 |
+| `PROFILE_DEGRADATION_BLOCKED` | 当前完整画像处于退化冷却，或基础试探单尚未结算 |
 | `SHORT_OBSERVE_ONLY` | 静态兼容模式下非实单时段的 SHORT，只记录观察 |
 | `WAVE_BATCH_LOSS_LOCKED` | 当前波段批次已有亏损，不再补单 |
 | `WAVE_BATCH_FULL` | 当前波段批次已达到2单 |
@@ -976,21 +977,26 @@ and (win_rate < min_win_rate or ev <= min_ev)
 
 衰退时不再开单，返回 `ROLLING_EDGE_BLOCKED`。
 
-## 15. 同日同分段连续亏损暂停
+## 15. 风险控制层与实时画像退化
 
-风控会检查当天已结算订单：
+当前风险控制按不同统计范围分层，不能把一个层级的样本或恢复状态复用于另一个层级：
+
+| 层级 | 范围 | 触发 | 恢复 |
+|---|---|---|---|
+| 每日画像 | 完整画像/7天观察 | 60%与EV | 次日重评 |
+| 实时画像退化 | 完整画像/当前DPS实单 | 固定连续亏损3单 | 配置冷却+基础试探 |
+| 方向序列 | LONG或SHORT实单 | 连亏阈值 | 方向冷却 |
+| 滚动优势 | 现有滚动key | 胜率/EV退化 | 滚动样本恢复 |
+
+实时画像退化守卫只读取 `SETTLED` 且结果为 `WIN/LOSS` 的真实模拟订单，并按“完整画像键 + 当前 `daily_profile_version`（DPS版本）”精确隔离。连续亏损触发数固定为3；唯一启动参数是：
 
 ```text
-day = latest.close_time // 86400000
+PROFILE_DEGRADATION_COOLDOWN_MINUTES=60
 ```
 
-只看同一个 `threshold_segment` 的订单，从最新往前统计连续亏损。若达到 3 单：
+`0` 表示关闭，不提供额外的 enable、最小样本、胜率或EV参数。冷却结束后只允许一笔10U基础试探，不消费已有18U资格；试探未结算时阻止同画像继续开单。试探赢后恢复 `NORMAL`，并允许按两阶段金额规则生成下一笔18U资格，即使该单同时属于波段恢复；试探亏则从该单结算时间重新进入完整冷却。
 
-```text
-RISK_PAUSED
-```
-
-该规则按 UTC 自然日计算。
+旧 segment-day 规则及 `OrderPolicy.risk_pause_reason` / `RISK_PAUSED` 已移除。它们按 UTC 日期和时段统计，不再代表当前开单逻辑。
 
 ## 16. 订单模型与盈亏结算
 
@@ -1233,7 +1239,7 @@ short_observe_only = True
 
 当前策略只做10分钟事件合约。原量价和技术指标先生成实时评分、动态阈值和画像标签，每日完整画像再精确匹配方向、策略族、策略标签和时段。`TRADE_SCORE_THRESHOLD=auto` 时画像不能提升 `WAIT`；显式数值模式允许已入选主画像按该阈值形成方向，但随后必须通过1分钟波段及全部订单守卫。每日画像生效时不使用固定 SHORT 时段白名单，静态兼容模式仍保留 `WD-02/WD-23` 小口。
 
-当前生产资金管理严格使用 `10U -> 18U -> 重置10U` 两阶段；第一级赢后才产生一次第二级资格，不存在第三级，最多并行第二级订单数默认是1，且所有已入选时段默认均可参与。总未结订单上限为2；批次锁定、全局冷却和恢复单不消费或生成18U资格。
+当前生产资金管理严格使用 `10U -> 18U -> 重置10U` 两阶段；第一级赢后才产生一次第二级资格，不存在第三级，最多并行第二级订单数默认是1，且所有已入选时段默认均可参与。总未结订单上限为2；批次锁定、全局冷却和普通波段恢复单不消费或生成18U资格，画像退化试探例外。
 
 当前策略不是“看到下跌就追空”，而是：
 
@@ -1256,7 +1262,8 @@ K线窗口
  -> 1分钟波段方向否决
  -> 订单状态 / 冷却 / 重复信号
  -> 波段批次 / 全局恢复守卫
- -> 同日连续亏损风控
+ -> 完整画像实时退化冷却 / 基础试探
+ -> 方向结算序列守卫
  -> 滚动守卫
  -> 10U/18U金额分配
  -> 模拟开单 + webhook + 入场快照
@@ -1893,7 +1900,7 @@ timeframe_minutes | strategy_family | strategy_tag | direction | threshold_segme
 18U二级订单结算 -> 资格结束，回到10U
 ```
 
-转折、新波段、画像版本切换、批次锁定或全局冷却时，旧波段所有尚未消费的 `PENDING` 资格变为 `CANCELLED`。取消操作先在SQLite单个事务中提交，成功后才修改内存；事务失败则保留内存 `PENDING`、返回 `STORAGE_ERROR` 并暂停开单，防止重启后资格复活。恢复单固定10U，即使数据库中存在待用资格也不消费；恢复单盈利也不生成18U资格。只有恢复到正常新波段后，新的10U赢单才能产生资格。
+转折、新波段、画像版本切换、批次锁定或全局冷却时，旧波段所有尚未消费的 `PENDING` 资格变为 `CANCELLED`。取消操作先在SQLite单个事务中提交，成功后才修改内存；事务失败则保留内存 `PENDING`、返回 `STORAGE_ERROR` 并暂停开单，防止重启后资格复活。普通波段恢复单固定10U，即使数据库中存在待用资格也不消费；普通波段恢复单盈利也不生成18U资格。若该单同时标记为画像退化试探，试探赢按实时画像退化规则恢复 `NORMAL` 并允许生成下一笔18U资格。
 
 ### 32.6 保存与页面
 
@@ -1995,10 +2002,12 @@ calculated_threshold  原策略计算的动态阈值
  -> 每日画像完整键筛选
  -> 最大2笔未结订单 / 最小2分钟间隔 / 重复信号
  -> SHORT静态兼容限制（仅每日画像关闭时生效）
+ -> 波段批次守卫（按配置启用）
+ -> 完整画像实时退化守卫（当前DPS实单连续3亏）
  -> 同方向连续3亏冷却20分钟
  -> 滚动优势守卫
  -> 画像守卫（默认影子观察）
- -> 10U/18U两阶段金额
+ -> 10U/18U两阶段金额；退化恢复只放行10U基础试探
  -> 模拟开单、Webhook和入口快照
 ```
 
@@ -2012,6 +2021,8 @@ calculated_threshold  原策略计算的动态阈值
 ### 34.4 当前风险边界
 
 - 最多同时2笔，最小间隔2分钟。
+- 同一完整画像键在当前DPS版本内连续3笔真实亏损后，默认冷却60分钟；冷却后只允许一笔10U基础试探，未结算时阻止同画像。
+- 画像退化试探赢恢复正常并可产生下一笔18U资格，即使同时属于波段恢复；试探亏重新冷却。
 - 同方向连续3笔已结算亏损后冷却20分钟，默认启用。
 - 滚动优势守卫默认启用。
 - 两阶段金额仍为第一笔10U，赢后下一笔18U，随后重置；最多一个并行18U资格。
