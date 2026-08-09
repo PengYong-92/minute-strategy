@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import fields
 from unittest.mock import patch
 
 from app.models import Kline, Signal, SimulatedOrder
@@ -26,7 +27,7 @@ def signal(direction="LONG", timeframe_minutes=10, threshold_segment="WD-12"):
 class SimulatorTest(unittest.TestCase):
     def test_simulated_order_progression_metadata_defaults_are_backward_compatible(self):
         self.assertEqual(
-            list(SimulatedOrder.__dataclass_fields__)[-2:],
+            [field.name for field in fields(SimulatedOrder)][-2:],
             ["profile_degradation_probe", "profile_degradation_triggered_at"],
         )
         order = SimulatedOrder(
@@ -48,7 +49,7 @@ class SimulatorTest(unittest.TestCase):
 
     def test_signal_probe_metadata_defaults_preserve_legacy_positional_arguments(self):
         self.assertEqual(
-            list(Signal.__dataclass_fields__)[-2:],
+            [field.name for field in fields(Signal)][-2:],
             ["profile_degradation_probe", "profile_degradation_triggered_at"],
         )
         legacy = Signal("LONG", 1, "A", "legacy", 100.0, 0, 2.5)
@@ -204,12 +205,17 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(simulator.stake_progression.credits, [])
 
     def test_profile_degradation_probe_uses_base_stake_without_consuming_pending_credit(self):
-        self.assertIn("profile_degradation_probe", Signal.__dataclass_fields__)
-        simulator = AccountSimulator(enable_stake_progression=True, stake_progression_activated_at=0)
+        self.assertIn("profile_degradation_probe", {field.name for field in fields(Signal)})
+        simulator = AccountSimulator(
+            stake=12.5,
+            win_return=22.5,
+            enable_stake_progression=True,
+            stake_progression_activated_at=0,
+        )
         simulator.open_order(signal(timeframe_minutes=1), 100.0, 0)
         simulator.settle_expired_orders(60_000, 101.0)
         pending = simulator.stake_progression.credits[0]
-        self.assertEqual(simulator.stake_progression.second_stake, 18.0)
+        self.assertEqual(simulator.stake_progression.second_stake, simulator.win_return)
         self.assertEqual(pending.status, "PENDING")
         probe_signal = Signal(
             "LONG",
@@ -231,13 +237,14 @@ class SimulatorTest(unittest.TestCase):
 
         self.assertTrue(probe.profile_degradation_probe)
         self.assertEqual(probe.profile_degradation_triggered_at, 55_000)
-        self.assertEqual(probe.stake, 10.0)
+        self.assertEqual(probe.stake, simulator.stake)
+        self.assertEqual(probe.win_return, simulator.win_return)
         self.assertEqual(probe.stake_progression_step, 1)
         self.assertIsNone(consumed)
         self.assertEqual(pending.status, "PENDING")
 
     def test_profile_degradation_probe_win_generates_pending_credit(self):
-        self.assertIn("profile_degradation_probe", Signal.__dataclass_fields__)
+        self.assertIn("profile_degradation_probe", {field.name for field in fields(Signal)})
         simulator = AccountSimulator(enable_stake_progression=True, stake_progression_activated_at=0)
         probe_signal = Signal(
             "LONG",
@@ -262,6 +269,39 @@ class SimulatorTest(unittest.TestCase):
         self.assertIsNone(consumed)
         self.assertEqual(probe.wave_guard_mode, "NORMAL")
         self.assertEqual(events[0].order.result, "WIN")
+        self.assertEqual(events[0].progression_credit.status, "PENDING")
+        self.assertEqual(events[0].progression_credit.source_order_id, probe.id)
+        self.assertEqual(simulator.stake_progression.credits[0].status, "PENDING")
+
+    def test_profile_degradation_probe_recovery_win_generates_pending_credit(self):
+        simulator = AccountSimulator(
+            enable_stake_progression=True,
+            stake_progression_activated_at=0,
+        )
+        probe_signal = Signal(
+            "LONG",
+            1,
+            "A",
+            "profile degradation recovery probe",
+            100.0,
+            0,
+            wave_guard_mode="RECOVERY",
+            profile_degradation_probe=True,
+            profile_degradation_triggered_at=1,
+        )
+        probe, consumed = simulator.open_order_with_credit(
+            probe_signal,
+            100.0,
+            0,
+            allow_progression=False,
+        )
+
+        events = simulator.settle_expired_order_events(60_000, 101.0)
+
+        self.assertIsNone(consumed)
+        self.assertEqual(probe.stake_progression_step, 1)
+        self.assertEqual(events[0].order.result, "WIN")
+        self.assertIsNotNone(events[0].progression_credit)
         self.assertEqual(events[0].progression_credit.status, "PENDING")
         self.assertEqual(events[0].progression_credit.source_order_id, probe.id)
         self.assertEqual(simulator.stake_progression.credits[0].status, "PENDING")

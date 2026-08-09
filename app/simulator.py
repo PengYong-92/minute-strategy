@@ -254,7 +254,10 @@ class AccountSimulator:
             order.stake_progression_step,
             result,
             settled_at,
-            allow_credit=order.wave_guard_mode != "RECOVERY",
+            allow_credit=(
+                order.wave_guard_mode != "RECOVERY"
+                or order.profile_degradation_probe is True
+            ),
         )
 
         order.status = "SETTLED"
