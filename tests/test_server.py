@@ -6,6 +6,8 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,16 +23,23 @@ from app.storage import SQLiteMonitorStore
 class OrdersApiTest(unittest.TestCase):
     def test_main_injects_profile_degradation_cooldown_config(self):
         cases = (
-            ({}, [], 60),
-            ({"PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75"}, [], 75),
+            ({}, [], 60, 60),
+            ({"PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75"}, [], 75, 75),
+            (
+                {"PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75"},
+                ["--profile-degradation-cooldown-minutes", "30"],
+                30,
+                30,
+            ),
             (
                 {"PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75"},
                 ["--profile-degradation-cooldown-minutes", "-5"],
+                -5,
                 0,
             ),
         )
 
-        for environment, profile_args, expected in cases:
+        for environment, profile_args, raw_expected, normalized_expected in cases:
             with self.subTest(environment=environment, profile_args=profile_args):
                 fake_server = SimpleNamespace(
                     serve_forever=lambda: None,
@@ -61,7 +70,90 @@ class OrdersApiTest(unittest.TestCase):
                 config = monitor_state.call_args.kwargs[
                     "profile_degradation_guard_config"
                 ]
-                self.assertEqual(config.normalized().cooldown_minutes, expected)
+                self.assertIsInstance(config.cooldown_minutes, int)
+                self.assertEqual(config.cooldown_minutes, raw_expected)
+                self.assertEqual(
+                    config.normalized().cooldown_minutes,
+                    normalized_expected,
+                )
+
+    def test_main_reports_invalid_profile_degradation_env_through_argparse(self):
+        for value in ("bad", ""):
+            with self.subTest(value=value):
+                stderr = StringIO()
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"PROFILE_DEGRADATION_COOLDOWN_MINUTES": value},
+                        clear=True,
+                    ),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                        ],
+                    ),
+                    patch("app.server.MonitorState") as monitor_state,
+                    patch("app.server.start_polling") as start_polling_mock,
+                    patch("app.server.ThreadingHTTPServer") as server_mock,
+                    redirect_stderr(stderr),
+                ):
+                    caught = None
+                    try:
+                        server_module.main()
+                    except BaseException as exc:  # argparse exits through SystemExit.
+                        caught = exc
+
+                self.assertIsInstance(caught, SystemExit)
+                self.assertEqual(caught.code, 2)
+                self.assertIn(
+                    "argument --profile-degradation-cooldown-minutes: invalid int value",
+                    stderr.getvalue(),
+                )
+                self.assertNotIn("Traceback", stderr.getvalue())
+                monitor_state.assert_not_called()
+                start_polling_mock.assert_not_called()
+                server_mock.assert_not_called()
+
+    def test_help_works_with_invalid_profile_degradation_env(self):
+        for value in ("bad", ""):
+            with self.subTest(value=value):
+                stdout = StringIO()
+                stderr = StringIO()
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"PROFILE_DEGRADATION_COOLDOWN_MINUTES": value},
+                        clear=True,
+                    ),
+                    patch.object(sys, "argv", ["app.server", "--help"]),
+                    patch("app.server.MonitorState") as monitor_state,
+                    patch("app.server.start_polling") as start_polling_mock,
+                    patch("app.server.ThreadingHTTPServer") as server_mock,
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    caught = None
+                    try:
+                        server_module.main()
+                    except BaseException as exc:  # argparse exits through SystemExit.
+                        caught = exc
+
+                self.assertIsInstance(caught, SystemExit)
+                self.assertEqual(caught.code, 0)
+                self.assertIn(
+                    "--profile-degradation-cooldown-minutes",
+                    stdout.getvalue(),
+                )
+                self.assertIn("完整画像连续亏损3单后的冷却分钟数", stdout.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+                monitor_state.assert_not_called()
+                start_polling_mock.assert_not_called()
+                server_mock.assert_not_called()
 
     def test_trade_score_threshold_accepts_auto_and_range(self):
         self.assertIsNone(server_module._trade_score_threshold("auto"))

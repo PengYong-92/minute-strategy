@@ -393,7 +393,7 @@ def main() -> None:
     parser.add_argument(
         "--profile-degradation-cooldown-minutes",
         type=int,
-        default=int(os.getenv("PROFILE_DEGRADATION_COOLDOWN_MINUTES", "60")),
+        default=os.getenv("PROFILE_DEGRADATION_COOLDOWN_MINUTES", "60"),
         help="完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60",
     )
     parser.add_argument(
