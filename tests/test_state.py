@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal, SimulatedOrder
+from app.profile_degradation_guard import MINUTE_MS, ProfileDegradationGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
@@ -82,6 +83,91 @@ def settled_observation(
         exit_price=101.0 if result == "WIN" else 99.0,
         settled_at=opened_at + 600_000,
         pnl=8.0 if result == "WIN" else -10.0,
+    )
+
+
+PROFILE_KEY = "1|drop_reclaim|live_profile|LONG|WD-08"
+PROFILE_VERSION = "DPS-20260810-0800"
+
+
+def selected_profile_signal(
+    current_time: int,
+    *,
+    profile_key: str = PROFILE_KEY,
+    daily_profile_version: str = PROFILE_VERSION,
+    reason: str = "selected live profile",
+    wave_batch_id: str = "",
+) -> Signal:
+    return Signal(
+        direction="LONG",
+        timeframe_minutes=1,
+        level="A",
+        reason=reason,
+        price=100.0,
+        open_time=current_time,
+        score=90.0,
+        threshold=70.0,
+        threshold_segment="WD-08",
+        session_allowed=True,
+        observe_direction="LONG",
+        strategy_family="drop_reclaim",
+        strategy_tag="live_profile",
+        profile_key=profile_key,
+        daily_profile_selected=True,
+        daily_profile_version=daily_profile_version,
+        wave_batch_id=wave_batch_id,
+    )
+
+
+def latest_kline(current_time: int, close: float = 100.0) -> Kline:
+    return Kline(
+        open_time=current_time - MINUTE_MS,
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=1.0,
+        close_time=current_time,
+    )
+
+
+def settle_profile_losses(
+    state: "MonitorState",
+    *,
+    profile_key: str = PROFILE_KEY,
+    daily_profile_version: str = PROFILE_VERSION,
+    wave_batch_ids: tuple[str, ...] = ("", "", ""),
+) -> None:
+    for index, (opened_minute, wave_batch_id) in enumerate(
+        zip((1, 3, 5), wave_batch_ids),
+        start=1,
+    ):
+        opened_at = opened_minute * MINUTE_MS
+        state.simulator.open_order(
+            selected_profile_signal(
+                opened_at,
+                profile_key=profile_key,
+                daily_profile_version=daily_profile_version,
+                reason=f"profile loss {index}",
+                wave_batch_id=wave_batch_id,
+            ),
+            entry_price=100.0,
+            opened_at=opened_at,
+        )
+        state.simulator.settle_expired_orders(
+            opened_at + MINUTE_MS,
+            99.0,
+        )
+
+
+def profile_guard_state(**kwargs) -> "MonitorState":
+    return MonitorState(
+        symbol="BTCUSDT",
+        max_open_orders=2,
+        min_order_gap_ms=0,
+        enable_rolling_edge_guard=False,
+        result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        **kwargs,
     )
 
 
@@ -296,6 +382,258 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_profile_degradation_blocks_selected_profile_after_three_losses(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            min_order_gap_ms=0,
+            enable_rolling_edge_guard=False,
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        )
+        settle_profile_losses(state)
+        current_time = 7 * MINUTE_MS
+        signal = selected_profile_signal(current_time)
+
+        decision = state._maybe_open_order(
+            signal,
+            latest_kline(current_time),
+        )
+
+        snapshot = state.snapshot()
+        self.assertEqual(decision, "PROFILE_DEGRADATION_BLOCKED")
+        self.assertEqual(snapshot["profile_degradation_guard"]["status"], "COOLDOWN")
+        self.assertEqual(
+            snapshot["profile_degradation_guard"]["consecutive_losses"],
+            3,
+        )
+        self.assertEqual(
+            snapshot["observations"][0]["source_decision"],
+            "PROFILE_DEGRADATION_BLOCKED",
+        )
+
+    def test_profile_recovery_probe_uses_base_stake_without_consuming_pending_credit(self):
+        state = profile_guard_state()
+        settle_profile_losses(state)
+        pending = StakeProgressionCredit(
+            source_order_id=99,
+            created_at=10 * MINUTE_MS,
+        )
+        state.simulator.stake_progression.credits.append(pending)
+        current_time = 66 * MINUTE_MS
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+
+        probe = state.simulator.orders[-1]
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(guard["status"], "RECOVERY_READY")
+        self.assertFalse(guard["allow_progression"])
+        self.assertEqual(guard["pause_until"], current_time)
+        self.assertTrue(probe.profile_degradation_probe)
+        self.assertEqual(probe.profile_degradation_triggered_at, 6 * MINUTE_MS)
+        self.assertEqual(probe.reason, "selected live profile；画像退化试探单")
+        self.assertEqual(probe.stake, 10.0)
+        self.assertEqual(probe.stake_progression_step, 1)
+        self.assertEqual(pending.status, "PENDING")
+        self.assertTrue(state.selected_signal.profile_degradation_probe)
+
+        blocked = state._maybe_open_order(
+            selected_profile_signal(67 * MINUTE_MS, reason="second profile signal"),
+            latest_kline(67 * MINUTE_MS),
+        )
+
+        pending_guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(blocked, "PROFILE_DEGRADATION_BLOCKED")
+        self.assertEqual(pending_guard["status"], "RECOVERY_PENDING")
+        self.assertEqual(pending_guard["probe_order_id"], probe.id)
+        self.assertEqual(len(state.simulator.orders), 4)
+
+    def test_profile_degradation_is_scoped_to_exact_profile(self):
+        state = profile_guard_state()
+        settle_profile_losses(state)
+        current_time = 7 * MINUTE_MS
+        other_profile = "1|drop_reclaim|other_profile|LONG|WD-08"
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time, profile_key=other_profile),
+            latest_kline(current_time),
+        )
+
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(guard["status"], "NORMAL")
+        self.assertEqual(guard["profile_key"], other_profile)
+        self.assertEqual(guard["consecutive_losses"], 0)
+
+    def test_unselected_daily_profile_keeps_existing_rejection_priority(self):
+        state = profile_guard_state()
+        settle_profile_losses(state)
+        current_time = 7 * MINUTE_MS
+        signal = replace(
+            selected_profile_signal(current_time),
+            daily_profile_selected=False,
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
+        self.assertEqual(guard["status"], "NORMAL")
+        self.assertEqual(guard["profile_key"], "")
+
+    def test_profile_probe_win_restores_normal_state(self):
+        state = profile_guard_state()
+        settle_profile_losses(state)
+        boundary = 66 * MINUTE_MS
+        state._maybe_open_order(
+            selected_profile_signal(boundary),
+            latest_kline(boundary),
+        )
+        probe = state.simulator.orders[-1]
+        state.simulator.settle_expired_orders(67 * MINUTE_MS, 101.0)
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(68 * MINUTE_MS, reason="after probe win"),
+            latest_kline(68 * MINUTE_MS),
+        )
+
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(probe.result, "WIN")
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(guard["status"], "NORMAL")
+        self.assertEqual(guard["consecutive_losses"], 0)
+        self.assertFalse(state.simulator.orders[-1].profile_degradation_probe)
+
+    def test_profile_probe_loss_restarts_cooldown_from_settlement(self):
+        state = profile_guard_state()
+        settle_profile_losses(state)
+        boundary = 66 * MINUTE_MS
+        state._maybe_open_order(
+            selected_profile_signal(boundary),
+            latest_kline(boundary),
+        )
+        probe = state.simulator.orders[-1]
+        state.simulator.settle_expired_orders(67 * MINUTE_MS, 99.0)
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(68 * MINUTE_MS, reason="after probe loss"),
+            latest_kline(68 * MINUTE_MS),
+        )
+
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(probe.result, "LOSS")
+        self.assertEqual(decision, "PROFILE_DEGRADATION_BLOCKED")
+        self.assertEqual(guard["status"], "COOLDOWN")
+        self.assertEqual(guard["consecutive_losses"], 4)
+        self.assertEqual(guard["last_loss_settled_at"], 67 * MINUTE_MS)
+        self.assertEqual(guard["pause_until"], 127 * MINUTE_MS)
+
+    def test_profile_degradation_rebuilds_identically_after_sqlite_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            running = profile_guard_state(storage=store, now_ms=lambda: 0)
+            settle_profile_losses(running)
+            for order in running.simulator.orders:
+                store.save_order(order, "BTCUSDT")
+            current_time = 7 * MINUTE_MS
+            signal = selected_profile_signal(current_time)
+            latest = latest_kline(current_time)
+
+            before_decision = running._maybe_open_order(signal, latest)
+            before_guard = dict(running.snapshot()["profile_degradation_guard"])
+            running.wait_for_storage_writes()
+
+            restarted = profile_guard_state(storage=store, now_ms=lambda: 0)
+            after_decision = restarted._maybe_open_order(signal, latest)
+            after_guard = dict(restarted.snapshot()["profile_degradation_guard"])
+            restarted.wait_for_storage_writes()
+
+        self.assertEqual(before_decision, "PROFILE_DEGRADATION_BLOCKED")
+        self.assertEqual(after_decision, before_decision)
+        self.assertEqual(after_guard, before_guard)
+
+    def test_wave_recovery_and_profile_probe_both_disable_progression(self):
+        state = profile_guard_state(
+            wave_batch_guard_config=WaveBatchGuardConfig(),
+        )
+        for index, (opened_minute, batch_id) in enumerate(
+            ((0, "wave-a"), (2, "wave-a"), (30, "wave-b"), (32, "wave-b")),
+            start=1,
+        ):
+            opened_at = opened_minute * MINUTE_MS
+            state.simulator.open_order(
+                selected_profile_signal(
+                    opened_at,
+                    reason=f"failed wave order {index}",
+                    wave_batch_id=batch_id,
+                ),
+                entry_price=100.0,
+                opened_at=opened_at,
+            )
+            state.simulator.settle_expired_orders(opened_at + MINUTE_MS, 99.0)
+        current_time = 93 * MINUTE_MS
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time, wave_batch_id="wave-c"),
+            latest_kline(current_time),
+        )
+
+        order = state.simulator.orders[-1]
+        snapshot = state.snapshot()
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(snapshot["wave_batch_guard"]["mode"], "RECOVERY")
+        self.assertEqual(snapshot["profile_degradation_guard"]["status"], "RECOVERY_READY")
+        self.assertFalse(snapshot["profile_degradation_guard"]["allow_progression"])
+        self.assertEqual(order.wave_guard_mode, "RECOVERY")
+        self.assertTrue(order.profile_degradation_probe)
+        self.assertEqual(order.stake, 10.0)
+        self.assertEqual(order.stake_progression_step, 1)
+
+    def test_zero_profile_cooldown_disables_guard_without_blocking(self):
+        state = profile_guard_state(
+            profile_degradation_guard_config=ProfileDegradationGuardConfig(
+                cooldown_minutes=0
+            ),
+        )
+        settle_profile_losses(state)
+        current_time = 7 * MINUTE_MS
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+
+        order = state.simulator.orders[-1]
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(decision, "OPENED")
+        self.assertFalse(guard["enabled"])
+        self.assertEqual(guard["status"], "DISABLED")
+        self.assertEqual(guard["cooldown_minutes"], 0)
+        self.assertFalse(order.profile_degradation_probe)
+
+    def test_reset_symbol_resets_profile_degradation_state(self):
+        state = profile_guard_state()
+        settle_profile_losses(state)
+        current_time = 7 * MINUTE_MS
+        state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+
+        state.reset_symbol("ETHUSDT")
+
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertTrue(guard["enabled"])
+        self.assertEqual(guard["status"], "NORMAL")
+        self.assertEqual(guard["profile_key"], "")
+        self.assertEqual(guard["consecutive_losses"], 0)
+
     def test_daily_profile_rejection_precedes_mechanical_admission(self):
         state = MonitorState(symbol="BTCUSDT", max_open_orders=1)
         state.simulator.open_order(

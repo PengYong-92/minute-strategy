@@ -149,6 +149,17 @@ class OrdersApiTest(unittest.TestCase):
         self.assertIn("allowed_directions", state_payload["wave_state"])
         self.assertIn("wave_batch_guard", state_payload)
         self.assertIn("mode", state_payload["wave_batch_guard"])
+        self.assertIn("profile_degradation_guard", state_payload)
+        self.assertTrue(
+            {
+                "enabled",
+                "status",
+                "cooldown_minutes",
+                "profile_key",
+                "pause_until",
+                "probe_order_id",
+            }.issubset(state_payload["profile_degradation_guard"])
+        )
         self.assertEqual(summary_payload["groups"][0]["selection_state"], "ACTIVE")
         self.assertEqual(summary_payload["groups"][0]["selection_reason"], "今日主程序已启用")
 

@@ -15,6 +15,11 @@ from app.daily_profile_selector import (
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal
 from app.order_policy import OrderGate, OrderPolicy
 from app.order_profile import profile_guard_shadow, summarize_order_samples_with_guard
+from app.profile_degradation_guard import (
+    ProfileDegradationGuardConfig,
+    ProfileDegradationGuardDecision,
+    evaluate_profile_degradation_guard,
+)
 from app.result_sequence_guard import (
     ResultSequenceGuardConfig,
     ResultSequenceGuardDecision,
@@ -78,6 +83,7 @@ class MonitorState:
         enable_wave_guard: bool = False,
         wave_batch_guard_config: WaveBatchGuardConfig | None = None,
         now_ms=None,
+        profile_degradation_guard_config: ProfileDegradationGuardConfig | None = None,
     ):
         self.symbol = symbol.upper()
         self._symbol_generation = 0
@@ -92,6 +98,9 @@ class MonitorState:
         self.enable_rolling_edge_guard = enable_rolling_edge_guard
         self.result_sequence_guard_config = (
             result_sequence_guard_config or ResultSequenceGuardConfig()
+        ).normalized()
+        self.profile_degradation_guard_config = (
+            profile_degradation_guard_config or ProfileDegradationGuardConfig()
         ).normalized()
         self.stake = stake
         self.win_return = win_return
@@ -174,6 +183,7 @@ class MonitorState:
         self.rolling_edge: dict = self._empty_rolling_edge()
         self.result_sequence_guard: dict = self._empty_result_sequence_guard()
         self.wave_batch_guard: dict = self._empty_wave_batch_guard()
+        self.profile_degradation_guard: dict = self._empty_profile_degradation_guard()
         self.last_error: str | None = None
         self.updated_at_ms = 0
         self._opened_signal_keys: set[tuple[int, int, str]] = set()
@@ -409,6 +419,7 @@ class MonitorState:
             self.rolling_edge = self._empty_rolling_edge()
             self.result_sequence_guard = self._empty_result_sequence_guard()
             self.wave_batch_guard = self._empty_wave_batch_guard()
+            self.profile_degradation_guard = self._empty_profile_degradation_guard()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self._opened_signal_keys.clear()
@@ -589,6 +600,38 @@ class MonitorState:
         if batch_decision.mode == "RECOVERY":
             signal = replace(signal, wave_guard_mode="RECOVERY")
             self.selected_signal = signal
+        profile_decision = ProfileDegradationGuardDecision()
+        if (
+            signal.daily_profile_selected
+            and signal.profile_key
+            and signal.daily_profile_version
+        ):
+            profile_decision = evaluate_profile_degradation_guard(
+                self.simulator.orders,
+                current_time=latest.close_time,
+                profile_key=signal.profile_key,
+                daily_profile_version=signal.daily_profile_version,
+                config=self.profile_degradation_guard_config,
+            )
+            self.profile_degradation_guard = self._profile_degradation_guard_to_dict(
+                profile_decision
+            )
+            if profile_decision.status in {"COOLDOWN", "RECOVERY_PENDING"}:
+                return self._block_order(
+                    signal,
+                    latest,
+                    "PROFILE_DEGRADATION_BLOCKED",
+                    profile_decision.reason,
+                    should_observe=should_observe,
+                )
+            if profile_decision.status == "RECOVERY_READY":
+                signal = replace(
+                    signal,
+                    reason=f"{signal.reason}；画像退化试探单",
+                    profile_degradation_probe=True,
+                    profile_degradation_triggered_at=profile_decision.triggered_at,
+                )
+                self.selected_signal = signal
         sequence_decision = evaluate_result_sequence_guard(
             self.simulator.orders,
             current_time=latest.close_time,
@@ -637,7 +680,10 @@ class MonitorState:
             latest,
             gate,
             should_observe=should_observe,
-            allow_progression=batch_decision.allow_progression,
+            allow_progression=(
+                batch_decision.allow_progression
+                and profile_decision.allow_progression
+            ),
         )
 
     def _block_order(
@@ -1596,6 +1642,43 @@ class MonitorState:
             "reason": "",
         }
 
+    def _empty_profile_degradation_guard(self) -> dict:
+        config = self.profile_degradation_guard_config
+        return {
+            "enabled": config.cooldown_minutes > 0,
+            "status": "NORMAL" if config.cooldown_minutes > 0 else "DISABLED",
+            "blocked": False,
+            "cooldown_minutes": config.cooldown_minutes,
+            "profile_key": "",
+            "daily_profile_version": "",
+            "consecutive_losses": 0,
+            "last_loss_settled_at": 0,
+            "pause_until": 0,
+            "probe_order_id": 0,
+            "triggered_at": 0,
+            "allow_progression": True,
+            "reason": "",
+        }
+
+    def _profile_degradation_guard_to_dict(
+        self,
+        decision: ProfileDegradationGuardDecision,
+    ) -> dict:
+        return {
+            **self._empty_profile_degradation_guard(),
+            "status": decision.status,
+            "blocked": decision.blocked,
+            "profile_key": decision.profile_key,
+            "daily_profile_version": decision.daily_profile_version,
+            "consecutive_losses": decision.consecutive_losses,
+            "last_loss_settled_at": decision.last_loss_settled_at,
+            "pause_until": decision.pause_until,
+            "probe_order_id": decision.probe_order_id,
+            "triggered_at": decision.triggered_at,
+            "allow_progression": decision.allow_progression,
+            "reason": decision.reason,
+        }
+
     def _wave_state_to_dict(self) -> dict:
         return {
             "enabled": self.enable_wave_guard,
@@ -1696,6 +1779,7 @@ class MonitorState:
                 "wave_state": self._wave_state_to_dict(),
                 "result_sequence_guard": self.result_sequence_guard,
                 "wave_batch_guard": self.wave_batch_guard,
+                "profile_degradation_guard": self.profile_degradation_guard,
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),
