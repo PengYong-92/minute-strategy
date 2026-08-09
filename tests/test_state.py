@@ -296,6 +296,267 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_daily_profile_rejection_precedes_mechanical_admission(self):
+        state = MonitorState(symbol="BTCUSDT", max_open_orders=1)
+        state.simulator.open_order(
+            Signal("LONG", 10, "A", "existing", 100.0, 0),
+            entry_price=100.0,
+            opened_at=0,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="unselected daily profile",
+            price=101.0,
+            open_time=120_000,
+            score=90.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(60_000, 101.0, 101.0, 101.0, 101.0, 1.0, 120_000),
+            daily_profile_required=True,
+        )
+
+        snapshot = state.snapshot()
+        self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
+        self.assertEqual(snapshot["stats"]["total_orders"], 1)
+        self.assertEqual(
+            snapshot["observations"][0]["source_decision"],
+            "DAILY_PROFILE_NOT_SELECTED",
+        )
+
+    def test_hold_and_cooldown_precede_risk_guards_and_clear_stale_pause(self):
+        latest = Kline(2_940_001, 100.0, 100.0, 100.0, 100.0, 1.0, 3_000_000)
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="guarded setup",
+            price=100.0,
+            open_time=latest.close_time,
+            score=90.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        for expected in ("HOLD_OPEN_ORDER", "COOLDOWN"):
+            with self.subTest(expected=expected):
+                state = MonitorState(
+                    symbol="BTCUSDT",
+                    max_open_orders=1 if expected == "HOLD_OPEN_ORDER" else 2,
+                    min_order_gap_ms=120_000,
+                    rolling_edge_config=RollingEdgeConfig(min_samples=3),
+                )
+                for idx in range(3):
+                    state.simulator.orders.append(
+                        SimulatedOrder(
+                            id=idx + 1,
+                            direction="LONG",
+                            timeframe_minutes=10,
+                            level="A",
+                            reason="guarded setup",
+                            entry_price=100.0,
+                            opened_at=600_000 + idx * 600_000,
+                            expires_at=1_200_000 + idx * 600_000,
+                            threshold_segment="WD-08",
+                            status="SETTLED",
+                            result="LOSS",
+                            exit_price=99.0,
+                            settled_at=1_200_000 + idx * 600_000,
+                            pnl=-10.0,
+                        )
+                    )
+                if expected == "HOLD_OPEN_ORDER":
+                    state.simulator.orders.append(
+                        SimulatedOrder(
+                            id=4,
+                            direction="SHORT",
+                            timeframe_minutes=10,
+                            level="A",
+                            reason="open",
+                            entry_price=100.0,
+                            opened_at=2_000_000,
+                            expires_at=3_600_000,
+                            status="OPEN",
+                        )
+                    )
+                else:
+                    state._last_order_opened_at = latest.close_time - 60_000
+                state.risk_pause = "stale risk pause"
+
+                decision = state._maybe_open_order(signal, latest)
+
+                self.assertEqual(decision, expected)
+                self.assertEqual(state.risk_pause, "")
+                self.assertEqual(
+                    state.snapshot()["result_sequence_guard"]["consecutive_losses"],
+                    0,
+                )
+
+    def test_result_sequence_guard_precedes_rolling_edge_guard(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            rolling_edge_config=RollingEdgeConfig(min_samples=3),
+        )
+        for idx in range(3):
+            state.simulator.orders.append(
+                SimulatedOrder(
+                    id=idx + 1,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="guarded setup",
+                    entry_price=100.0,
+                    opened_at=600_000 + idx * 600_000,
+                    expires_at=1_200_000 + idx * 600_000,
+                    threshold_segment="WD-08",
+                    status="SETTLED",
+                    result="LOSS",
+                    exit_price=99.0,
+                    settled_at=1_200_000 + idx * 600_000,
+                    pnl=-10.0,
+                )
+            )
+        latest = Kline(2_940_001, 100.0, 100.0, 100.0, 100.0, 1.0, 3_000_000)
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="guarded setup",
+            price=100.0,
+            open_time=latest.close_time,
+            score=90.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        decision = state._maybe_open_order(signal, latest)
+        snapshot = state.snapshot()
+
+        self.assertEqual(decision, "RESULT_SEQUENCE_GUARD_BLOCKED")
+        self.assertEqual(snapshot["rolling_edge"]["status"], "DEGRADED")
+        self.assertIn("结算序列守卫", snapshot["risk_pause"])
+        self.assertNotIn("滚动优势衰退", snapshot["risk_pause"])
+        self.assertEqual(
+            snapshot["observations"][0]["source_decision"],
+            "RESULT_SEQUENCE_GUARD_BLOCKED",
+        )
+
+    def test_successful_open_persists_atomically_before_follow_up_side_effects(self):
+        webhook = RecordingWebhook()
+
+        class BoundaryRecordingStorage(RecordingStorage):
+            def __init__(self):
+                super().__init__()
+                self.state = None
+                self.atomic_boundary = None
+
+            def save_open_order_with_credit(self, order, symbol, credit):
+                super().save_open_order_with_credit(order, symbol, credit)
+                self.atomic_boundary = {
+                    "orders": len(self.state.simulator.orders),
+                    "observations": len(self.state.observations),
+                    "entry_snapshots": len(self.entry_snapshots),
+                    "webhooks": len(webhook.calls),
+                }
+
+        storage = BoundaryRecordingStorage()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            webhook=webhook,
+            now_ms=lambda: 1_000,
+        )
+        storage.state = state
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="observable open",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000),
+        )
+        state.wait_for_storage_writes()
+        snapshot = state.snapshot()
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual([call[0] for call in storage.atomic_calls], ["open"])
+        self.assertEqual(
+            storage.atomic_boundary,
+            {"orders": 1, "observations": 0, "entry_snapshots": 0, "webhooks": 0},
+        )
+        self.assertEqual(len(snapshot["orders"]), 1)
+        self.assertEqual(len(snapshot["observations"]), 1)
+        self.assertEqual(snapshot["observations"][0]["source_decision"], "OPENED")
+        self.assertEqual(len(storage.entry_snapshots), 1)
+        self.assertEqual(len(webhook.calls), 1)
+
+    def test_mechanical_rejections_clear_stale_risk_pause(self):
+        latest = Kline(60_001, 100.0, 100.0, 100.0, 100.0, 1.0, 120_000)
+        cases = (
+            (
+                "BELOW_THRESHOLD",
+                Signal(
+                    direction="WAIT",
+                    timeframe_minutes=10,
+                    level="B",
+                    reason="below threshold",
+                    price=100.0,
+                    open_time=latest.close_time,
+                    score=0.0,
+                    threshold=70.0,
+                ),
+                None,
+            ),
+            (
+                "COOLDOWN",
+                Signal(
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="cooldown",
+                    price=100.0,
+                    open_time=latest.close_time,
+                    score=90.0,
+                    threshold=70.0,
+                    threshold_segment="WD-08",
+                    session_allowed=True,
+                ),
+                latest.close_time - 60_000,
+            ),
+        )
+
+        for expected, signal, last_opened_at in cases:
+            with self.subTest(expected=expected):
+                state = MonitorState(symbol="BTCUSDT", min_order_gap_ms=120_000)
+                state._last_order_opened_at = last_opened_at
+                state.risk_pause = "stale risk pause"
+
+                decision = state._maybe_open_order(signal, latest)
+
+                self.assertEqual(decision, expected)
+                self.assertEqual(state.snapshot()["risk_pause"], "")
+
     def test_restart_restores_minimum_order_gap_from_latest_order(self):
         storage = RecordingStorage()
         storage._persist_order(
@@ -3318,7 +3579,9 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         self.assertEqual(decision, "STORAGE_ERROR")
+        self.assertEqual(storage.atomic_calls, [])
         self.assertEqual(state.simulator.orders, [])
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 0)
         self.assertEqual(state.simulator.stats()["pending_credits"], 0)
         self.assertEqual(webhook.calls, [])
         self.assertEqual(storage.entry_snapshots, [])

@@ -13,7 +13,7 @@ from app.daily_profile_selector import (
     selection_window,
 )
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal
-from app.order_policy import OrderPolicy
+from app.order_policy import OrderGate, OrderPolicy
 from app.order_profile import profile_guard_shadow, summarize_order_samples_with_guard
 from app.result_sequence_guard import (
     ResultSequenceGuardConfig,
@@ -532,36 +532,23 @@ class MonitorState:
                 return "STORAGE_ERROR"
             self._wave_bootstrap_cancel_pending = False
         if signal.wave_guard_mode == "DIRECTION_BLOCKED":
-            if should_observe:
-                self._record_observation(signal, latest, "WAVE_DIRECTION_BLOCKED")
-            self.risk_pause = f"1分钟波段 {signal.wave_state} 不允许 {signal.observe_direction}"
-            return "WAVE_DIRECTION_BLOCKED"
-        if daily_profile_required and not signal.daily_profile_selected:
-            if should_observe:
-                self._record_observation(signal, latest, "DAILY_PROFILE_NOT_SELECTED")
-            self.risk_pause = "当前信号未进入今日启用画像，仅记录观察"
-            return "DAILY_PROFILE_NOT_SELECTED"
-        gate = self.order_policy.evaluate(
-            signal,
-            latest,
-            self.simulator.orders,
-            self._last_order_opened_at,
-            self._opened_signal_keys,
-        )
-        promoted_signal = None
-        if not self.enable_daily_profile_selector:
-            promoted_signal = self._observation_profile_promoted_signal(signal, latest, gate.code)
-        if promoted_signal is not None:
-            signal = promoted_signal
-            self.selected_signal = signal
-            self.rolling_edge = self._rolling_edge_status(signal, latest)
-            gate = self.order_policy.evaluate(
+            return self._block_order(
                 signal,
                 latest,
-                self.simulator.orders,
-                self._last_order_opened_at,
-                self._opened_signal_keys,
+                "WAVE_DIRECTION_BLOCKED",
+                f"1分钟波段 {signal.wave_state} 不允许 {signal.observe_direction}",
+                should_observe=should_observe,
             )
+        if daily_profile_required and not signal.daily_profile_selected:
+            return self._block_order(
+                signal,
+                latest,
+                "DAILY_PROFILE_NOT_SELECTED",
+                "当前信号未进入今日启用画像，仅记录观察",
+                should_observe=should_observe,
+            )
+
+        signal, gate = self._admit_order_candidate(signal, latest)
         if not gate.open_allowed:
             if should_observe:
                 self._record_observation(signal, latest, gate.code)
@@ -571,9 +558,13 @@ class MonitorState:
             and not signal.daily_profile_selected
             and signal.threshold_segment.upper() not in self.live_short_segments
         ):
-            self._record_observation(signal, latest, "SHORT_OBSERVE_ONLY")
-            self.risk_pause = "SHORT观察模式：仅记录信号，不开模拟订单，不推送Webhook"
-            return "SHORT_OBSERVE_ONLY"
+            return self._block_order(
+                signal,
+                latest,
+                "SHORT_OBSERVE_ONLY",
+                "SHORT观察模式：仅记录信号，不开模拟订单，不推送Webhook",
+                should_observe=True,
+            )
         if signal.direction == "SHORT" and signal.observe_only:
             signal = replace(
                 signal,
@@ -588,10 +579,13 @@ class MonitorState:
         )
         self.selected_signal = signal
         if batch_decision.blocked:
-            if should_observe:
-                self._record_observation(signal, latest, batch_decision.code)
-            self.risk_pause = batch_decision.reason
-            return batch_decision.code
+            return self._block_order(
+                signal,
+                latest,
+                batch_decision.code,
+                batch_decision.reason,
+                should_observe=should_observe,
+            )
         if batch_decision.mode == "RECOVERY":
             signal = replace(signal, wave_guard_mode="RECOVERY")
             self.selected_signal = signal
@@ -603,35 +597,101 @@ class MonitorState:
         )
         self.result_sequence_guard = self._result_sequence_guard_to_dict(sequence_decision)
         if sequence_decision.blocked:
-            if should_observe:
-                self._record_observation(signal, latest, "RESULT_SEQUENCE_GUARD_BLOCKED")
-            self.risk_pause = sequence_decision.reason
-            return "RESULT_SEQUENCE_GUARD_BLOCKED"
-        if self.enable_rolling_edge_guard and self.rolling_edge["status"] == "DEGRADED":
-            if should_observe:
-                self._record_observation(signal, latest, "ROLLING_EDGE_BLOCKED")
-            self.risk_pause = (
-                f"滚动优势衰退 {self.rolling_edge['key']} "
-                f"样本 {self.rolling_edge['sample_size']} 胜率 {self.rolling_edge['win_rate']:.2%} "
-                f"EV {self.rolling_edge['ev']:.2f}，暂停开单"
+            return self._block_order(
+                signal,
+                latest,
+                "RESULT_SEQUENCE_GUARD_BLOCKED",
+                sequence_decision.reason,
+                should_observe=should_observe,
             )
-            return "ROLLING_EDGE_BLOCKED"
+        if self.enable_rolling_edge_guard and self.rolling_edge["status"] == "DEGRADED":
+            return self._block_order(
+                signal,
+                latest,
+                "ROLLING_EDGE_BLOCKED",
+                (
+                    f"滚动优势衰退 {self.rolling_edge['key']} "
+                    f"样本 {self.rolling_edge['sample_size']} "
+                    f"胜率 {self.rolling_edge['win_rate']:.2%} "
+                    f"EV {self.rolling_edge['ev']:.2f}，暂停开单"
+                ),
+                should_observe=should_observe,
+            )
         profile_guard = self._profile_guard_shadow(signal)
         if self.enable_profile_guard and profile_guard["status"] == "WOULD_BLOCK":
-            if should_observe:
-                self._record_observation(signal, latest, "PROFILE_GUARD_BLOCKED")
-            self.risk_pause = (
-                "画像守卫命中 "
-                f"{'/'.join(profile_guard['hit_keys'])}，"
-                f"H{profile_guard['min_history']}/G{profile_guard['min_group_size']}，暂停开单"
+            return self._block_order(
+                signal,
+                latest,
+                "PROFILE_GUARD_BLOCKED",
+                (
+                    "画像守卫命中 "
+                    f"{'/'.join(profile_guard['hit_keys'])}，"
+                    f"H{profile_guard['min_history']}/"
+                    f"G{profile_guard['min_group_size']}，暂停开单"
+                ),
+                should_observe=should_observe,
             )
-            return "PROFILE_GUARD_BLOCKED"
 
+        return self._execute_open_order(
+            signal,
+            latest,
+            gate,
+            should_observe=should_observe,
+            allow_progression=batch_decision.allow_progression,
+        )
+
+    def _block_order(
+        self,
+        signal: Signal,
+        latest: Kline,
+        code: str,
+        reason: str,
+        *,
+        should_observe: bool,
+    ) -> str:
+        if should_observe:
+            self._record_observation(signal, latest, code)
+        self.risk_pause = reason
+        return code
+
+    def _admit_order_candidate(self, signal: Signal, latest: Kline) -> tuple[Signal, OrderGate]:
+        gate = self.order_policy.evaluate(
+            signal,
+            latest,
+            self.simulator.orders,
+            self._last_order_opened_at,
+            self._opened_signal_keys,
+        )
+        promoted_signal = None
+        if not self.enable_daily_profile_selector:
+            promoted_signal = self._observation_profile_promoted_signal(signal, latest, gate.code)
+        if promoted_signal is not None and promoted_signal is not signal:
+            signal = promoted_signal
+            self.selected_signal = signal
+            self.rolling_edge = self._rolling_edge_status(signal, latest)
+            gate = self.order_policy.evaluate(
+                signal,
+                latest,
+                self.simulator.orders,
+                self._last_order_opened_at,
+                self._opened_signal_keys,
+            )
+        return signal, gate
+
+    def _execute_open_order(
+        self,
+        signal: Signal,
+        latest: Kline,
+        gate: OrderGate,
+        *,
+        should_observe: bool,
+        allow_progression: bool,
+    ) -> str:
         order, consumed_credit = self.simulator.open_order_with_credit(
             signal,
             entry_price=latest.close,
             opened_at=latest.close_time,
-            allow_progression=batch_decision.allow_progression,
+            allow_progression=allow_progression,
         )
         if self.storage:
             try:
