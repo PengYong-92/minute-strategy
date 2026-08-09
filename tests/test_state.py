@@ -86,7 +86,7 @@ def settled_observation(
     )
 
 
-PROFILE_KEY = "1|drop_reclaim|live_profile|LONG|WD-08"
+PROFILE_KEY = "10|drop_reclaim|live_profile|LONG|WD-08"
 PROFILE_VERSION = "DPS-20260810-0800"
 
 
@@ -100,7 +100,7 @@ def selected_profile_signal(
 ) -> Signal:
     return Signal(
         direction="LONG",
-        timeframe_minutes=1,
+        timeframe_minutes=10,
         level="A",
         reason=reason,
         price=100.0,
@@ -139,7 +139,7 @@ def settle_profile_losses(
     wave_batch_ids: tuple[str, ...] = ("", "", ""),
 ) -> None:
     for index, (opened_minute, wave_batch_id) in enumerate(
-        zip((1, 3, 5), wave_batch_ids),
+        zip((0, 11, 22), wave_batch_ids),
         start=1,
     ):
         opened_at = opened_minute * MINUTE_MS
@@ -155,7 +155,7 @@ def settle_profile_losses(
             opened_at=opened_at,
         )
         state.simulator.settle_expired_orders(
-            opened_at + MINUTE_MS,
+            opened_at + 10 * MINUTE_MS,
             99.0,
         )
 
@@ -390,7 +390,7 @@ class MonitorStateTest(unittest.TestCase):
             result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
         )
         settle_profile_losses(state)
-        current_time = 7 * MINUTE_MS
+        current_time = 33 * MINUTE_MS
         signal = selected_profile_signal(current_time)
 
         decision = state._maybe_open_order(
@@ -415,10 +415,10 @@ class MonitorStateTest(unittest.TestCase):
         settle_profile_losses(state)
         pending = StakeProgressionCredit(
             source_order_id=99,
-            created_at=10 * MINUTE_MS,
+            created_at=33 * MINUTE_MS,
         )
         state.simulator.stake_progression.credits.append(pending)
-        current_time = 66 * MINUTE_MS
+        current_time = 92 * MINUTE_MS
 
         decision = state._maybe_open_order(
             selected_profile_signal(current_time),
@@ -432,7 +432,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertFalse(guard["allow_progression"])
         self.assertEqual(guard["pause_until"], current_time)
         self.assertTrue(probe.profile_degradation_probe)
-        self.assertEqual(probe.profile_degradation_triggered_at, 6 * MINUTE_MS)
+        self.assertEqual(probe.profile_degradation_triggered_at, 32 * MINUTE_MS)
         self.assertEqual(probe.reason, "selected live profile；画像退化试探单")
         self.assertEqual(probe.stake, 10.0)
         self.assertEqual(probe.stake_progression_step, 1)
@@ -440,8 +440,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertTrue(state.selected_signal.profile_degradation_probe)
 
         blocked = state._maybe_open_order(
-            selected_profile_signal(67 * MINUTE_MS, reason="second profile signal"),
-            latest_kline(67 * MINUTE_MS),
+            selected_profile_signal(93 * MINUTE_MS, reason="second profile signal"),
+            latest_kline(93 * MINUTE_MS),
         )
 
         pending_guard = state.snapshot()["profile_degradation_guard"]
@@ -453,8 +453,8 @@ class MonitorStateTest(unittest.TestCase):
     def test_profile_degradation_is_scoped_to_exact_profile(self):
         state = profile_guard_state()
         settle_profile_losses(state)
-        current_time = 7 * MINUTE_MS
-        other_profile = "1|drop_reclaim|other_profile|LONG|WD-08"
+        current_time = 33 * MINUTE_MS
+        other_profile = "10|drop_reclaim|other_profile|LONG|WD-08"
 
         decision = state._maybe_open_order(
             selected_profile_signal(current_time, profile_key=other_profile),
@@ -470,7 +470,7 @@ class MonitorStateTest(unittest.TestCase):
     def test_unselected_daily_profile_keeps_existing_rejection_priority(self):
         state = profile_guard_state()
         settle_profile_losses(state)
-        current_time = 7 * MINUTE_MS
+        current_time = 33 * MINUTE_MS
         signal = replace(
             selected_profile_signal(current_time),
             daily_profile_selected=False,
@@ -490,17 +490,17 @@ class MonitorStateTest(unittest.TestCase):
     def test_profile_probe_win_restores_normal_state(self):
         state = profile_guard_state()
         settle_profile_losses(state)
-        boundary = 66 * MINUTE_MS
+        boundary = 92 * MINUTE_MS
         state._maybe_open_order(
             selected_profile_signal(boundary),
             latest_kline(boundary),
         )
         probe = state.simulator.orders[-1]
-        state.simulator.settle_expired_orders(67 * MINUTE_MS, 101.0)
+        state.simulator.settle_expired_orders(102 * MINUTE_MS, 101.0)
 
         decision = state._maybe_open_order(
-            selected_profile_signal(68 * MINUTE_MS, reason="after probe win"),
-            latest_kline(68 * MINUTE_MS),
+            selected_profile_signal(103 * MINUTE_MS, reason="after probe win"),
+            latest_kline(103 * MINUTE_MS),
         )
 
         guard = state.snapshot()["profile_degradation_guard"]
@@ -513,17 +513,17 @@ class MonitorStateTest(unittest.TestCase):
     def test_profile_probe_loss_restarts_cooldown_from_settlement(self):
         state = profile_guard_state()
         settle_profile_losses(state)
-        boundary = 66 * MINUTE_MS
+        boundary = 92 * MINUTE_MS
         state._maybe_open_order(
             selected_profile_signal(boundary),
             latest_kline(boundary),
         )
         probe = state.simulator.orders[-1]
-        state.simulator.settle_expired_orders(67 * MINUTE_MS, 99.0)
+        state.simulator.settle_expired_orders(102 * MINUTE_MS, 99.0)
 
         decision = state._maybe_open_order(
-            selected_profile_signal(68 * MINUTE_MS, reason="after probe loss"),
-            latest_kline(68 * MINUTE_MS),
+            selected_profile_signal(103 * MINUTE_MS, reason="after probe loss"),
+            latest_kline(103 * MINUTE_MS),
         )
 
         guard = state.snapshot()["profile_degradation_guard"]
@@ -531,8 +531,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "PROFILE_DEGRADATION_BLOCKED")
         self.assertEqual(guard["status"], "COOLDOWN")
         self.assertEqual(guard["consecutive_losses"], 4)
-        self.assertEqual(guard["last_loss_settled_at"], 67 * MINUTE_MS)
-        self.assertEqual(guard["pause_until"], 127 * MINUTE_MS)
+        self.assertEqual(guard["last_loss_settled_at"], 102 * MINUTE_MS)
+        self.assertEqual(guard["pause_until"], 162 * MINUTE_MS)
 
     def test_profile_degradation_rebuilds_identically_after_sqlite_restart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -541,7 +541,7 @@ class MonitorStateTest(unittest.TestCase):
             settle_profile_losses(running)
             for order in running.simulator.orders:
                 store.save_order(order, "BTCUSDT")
-            current_time = 7 * MINUTE_MS
+            current_time = 33 * MINUTE_MS
             signal = selected_profile_signal(current_time)
             latest = latest_kline(current_time)
 
@@ -563,7 +563,7 @@ class MonitorStateTest(unittest.TestCase):
             wave_batch_guard_config=WaveBatchGuardConfig(),
         )
         for index, (opened_minute, batch_id) in enumerate(
-            ((0, "wave-a"), (2, "wave-a"), (30, "wave-b"), (32, "wave-b")),
+            ((0, "wave-a"), (11, "wave-a"), (30, "wave-b"), (41, "wave-b")),
             start=1,
         ):
             opened_at = opened_minute * MINUTE_MS
@@ -576,8 +576,8 @@ class MonitorStateTest(unittest.TestCase):
                 entry_price=100.0,
                 opened_at=opened_at,
             )
-            state.simulator.settle_expired_orders(opened_at + MINUTE_MS, 99.0)
-        current_time = 93 * MINUTE_MS
+            state.simulator.settle_expired_orders(opened_at + 10 * MINUTE_MS, 99.0)
+        current_time = 111 * MINUTE_MS
 
         decision = state._maybe_open_order(
             selected_profile_signal(current_time, wave_batch_id="wave-c"),
@@ -602,7 +602,7 @@ class MonitorStateTest(unittest.TestCase):
             ),
         )
         settle_profile_losses(state)
-        current_time = 7 * MINUTE_MS
+        current_time = 33 * MINUTE_MS
 
         decision = state._maybe_open_order(
             selected_profile_signal(current_time),
@@ -620,7 +620,7 @@ class MonitorStateTest(unittest.TestCase):
     def test_reset_symbol_resets_profile_degradation_state(self):
         state = profile_guard_state()
         settle_profile_losses(state)
-        current_time = 7 * MINUTE_MS
+        current_time = 33 * MINUTE_MS
         state._maybe_open_order(
             selected_profile_signal(current_time),
             latest_kline(current_time),
