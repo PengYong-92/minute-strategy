@@ -512,6 +512,7 @@ class MonitorState:
         *,
         daily_profile_required: bool = False,
     ) -> str:
+        self.risk_pause = ""
         self.rolling_edge = self._rolling_edge_status(signal, latest)
         should_observe = self._should_record_observation(signal)
         batch_decision = evaluate_wave_batch_guard(
@@ -547,7 +548,6 @@ class MonitorState:
             self._last_order_opened_at,
             self._opened_signal_keys,
         )
-        self.risk_pause = gate.risk_pause
         promoted_signal = None
         if not self.enable_daily_profile_selector:
             promoted_signal = self._observation_profile_promoted_signal(signal, latest, gate.code)
@@ -562,7 +562,6 @@ class MonitorState:
                 self._last_order_opened_at,
                 self._opened_signal_keys,
             )
-            self.risk_pause = gate.risk_pause
         if not gate.open_allowed:
             if should_observe:
                 self._record_observation(signal, latest, gate.code)

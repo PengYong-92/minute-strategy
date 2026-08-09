@@ -2056,8 +2056,11 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(snapshot["stats"]["total_orders"], 1)
         self.assertEqual(snapshot["orders"][0]["status"], "OPEN")
 
-    def test_risk_pause_after_three_segment_losses(self):
-        state = MonitorState(symbol="BTCUSDT")
+    def test_segment_losses_are_left_to_explicit_risk_guards(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        )
         for idx in range(3):
             state.simulator.orders.append(
                 SimulatedOrder(
@@ -2089,11 +2092,12 @@ class MonitorStateTest(unittest.TestCase):
             threshold_segment="WD-00",
             session_allowed=True,
         )
+        state.risk_pause = "stale risk pause"
 
         decision = state._maybe_open_order(signal, kline(70, 100.0, 100))
 
-        self.assertEqual(decision, "RISK_PAUSED")
-        self.assertIn("连续亏损", state.snapshot()["risk_pause"])
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.snapshot()["risk_pause"], "")
 
     def test_result_sequence_guard_pauses_only_the_losing_direction(self):
         state = MonitorState(

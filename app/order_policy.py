@@ -9,7 +9,6 @@ from app.strategy import max_trade_edge_for
 class OrderGate:
     code: str
     open_allowed: bool = False
-    risk_pause: str = ""
     signal_key: tuple[int, int, str] | None = None
 
 
@@ -42,10 +41,6 @@ class OrderPolicy:
         if signal_key in opened_signal_keys:
             return OrderGate(code="DUPLICATE_SIGNAL", signal_key=signal_key)
 
-        risk_pause = self.risk_pause_reason(signal, latest, orders)
-        if risk_pause:
-            return OrderGate(code="RISK_PAUSED", risk_pause=risk_pause, signal_key=signal_key)
-
         return OrderGate(code="OPENED", open_allowed=True, signal_key=signal_key)
 
     @staticmethod
@@ -60,27 +55,3 @@ class OrderPolicy:
         if edge >= 0:
             return "EDGE_TOO_SMALL"
         return "BELOW_THRESHOLD"
-
-    @staticmethod
-    def risk_pause_reason(signal: Signal, latest: Kline, orders: Sequence[SimulatedOrder]) -> str:
-        day = latest.close_time // 86_400_000
-        settled_today = [
-            order
-            for order in orders
-            if order.status == "SETTLED"
-            and order.settled_at is not None
-            and order.settled_at // 86_400_000 == day
-        ]
-        segment_orders = [
-            order
-            for order in settled_today
-            if order.threshold_segment == signal.threshold_segment
-        ]
-        consecutive_losses = 0
-        for order in sorted(segment_orders, key=lambda item: item.settled_at or 0, reverse=True):
-            if order.result != "LOSS":
-                break
-            consecutive_losses += 1
-        if consecutive_losses >= 3:
-            return f"{signal.threshold_segment} 连续亏损 {consecutive_losses} 单，暂停该时段"
-        return ""

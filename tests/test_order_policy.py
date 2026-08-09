@@ -97,7 +97,7 @@ class OrderPolicyTest(unittest.TestCase):
         self.assertFalse(gate.open_allowed)
         self.assertEqual(gate.code, "DUPLICATE_SIGNAL")
 
-    def test_pauses_after_three_segment_losses(self):
+    def test_segment_losses_do_not_block_mechanical_admission(self):
         policy = OrderPolicy(max_open_orders=1, min_order_gap_ms=600_000)
         losses = [
             SimulatedOrder(
@@ -121,9 +121,8 @@ class OrderPolicyTest(unittest.TestCase):
 
         gate = policy.evaluate(signal(segment="WD-00"), kline(70), losses, None, set())
 
-        self.assertFalse(gate.open_allowed)
-        self.assertEqual(gate.code, "RISK_PAUSED")
-        self.assertIn("连续亏损", gate.risk_pause)
+        self.assertTrue(gate.open_allowed)
+        self.assertEqual(gate.code, "OPENED")
 
     def test_wait_decision_keeps_wd00_overheat_edge_tight(self):
         decision = OrderPolicy.wait_decision(signal(score=86.0, threshold=70.0, segment="WD-00"))
