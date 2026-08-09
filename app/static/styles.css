@@ -436,6 +436,11 @@ td span {
   font-size: 12px;
 }
 
+.order-probe-label {
+  color: var(--yellow);
+  font-weight: 600;
+}
+
 .empty-row {
   color: var(--muted);
   text-align: center;

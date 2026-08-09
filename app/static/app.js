@@ -108,6 +108,22 @@ function fmtWaveBatchGuard(guard) {
   return `${guard.mode || "PENDING"} · ${batch}`;
 }
 
+function fmtProfileDegradationGuard(guard) {
+  if (!guard) return DASH;
+  if (guard.enabled === false || guard.status === "DISABLED") return "关闭";
+  if (guard.enabled !== true || !guard.status) return DASH;
+  if (["NORMAL", "NOT_APPLICABLE"].includes(guard.status)) return "正常";
+  const profileKey = guard.profile_key || DASH;
+  if (guard.status === "COOLDOWN") {
+    return `冷却 · ${profileKey} · 连亏${guard.consecutive_losses ?? 0}`;
+  }
+  if (guard.status === "RECOVERY_READY") return `待试探 · ${profileKey}`;
+  if (guard.status === "RECOVERY_PENDING") {
+    return `试探待结算 · 订单#${guard.probe_order_id || DASH}`;
+  }
+  return DASH;
+}
+
 function fmtStakeProgression(progression) {
   if (!progression) return "两单叠加 · 状态数据不完整";
   const secondStake = optionalNum(progression.second_stake);
@@ -279,6 +295,16 @@ function waveBatchGuardClass(guard) {
   if (guard.blocked || guard.mode === "COOLDOWN") return "status-risk";
   if (guard.mode === "RECOVERY") return "status-warn";
   return "status-good";
+}
+
+function profileDegradationGuardClass(guard) {
+  if (!guard || guard.enabled !== true || !guard.status || guard.status === "DISABLED") {
+    return "status-muted";
+  }
+  if (["NORMAL", "NOT_APPLICABLE"].includes(guard.status)) return "status-good";
+  if (guard.status === "COOLDOWN") return "status-risk";
+  if (["RECOVERY_READY", "RECOVERY_PENDING"].includes(guard.status)) return "status-warn";
+  return "status-muted";
 }
 
 function webhookClass(webhook) {
@@ -481,6 +507,7 @@ const summaryFields = {
   "rolling-edge-status": (state) => fmtRollingEdge(state.rolling_edge),
   "wave-state-status": (state) => fmtWaveState(state.wave_state),
   "wave-batch-guard-status": (state) => fmtWaveBatchGuard(state.wave_batch_guard),
+  "profile-degradation-guard-status": (state) => fmtProfileDegradationGuard(state.profile_degradation_guard),
   "result-sequence-guard-status": (state) => fmtResultSequenceGuard(state.result_sequence_guard),
   "webhook-status": (state) => fmtWebhook(state.webhook),
   "order-decision": (state) => state.order_decision || DASH,
@@ -536,7 +563,7 @@ function renderOrders(orders) {
       <td>${escapeHtml(order.timeframe_minutes)}分钟</td>
       <td>${escapeHtml(order.level)}</td>
       <td>${escapeHtml(order.threshold_segment || DASH)}</td>
-      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_status || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span></td>
+      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_status || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span>${order.profile_degradation_probe === true ? '<br><span class="order-probe-label">基础试探</span>' : ""}</td>
       <td>${fmtPct(order.session_win_rate)} / ${fmtMoney(order.session_ev)}</td>
       <td>${num(order.threshold).toFixed(1)}<br><span>评分 ${Math.abs(num(order.score)).toFixed(1)} · 原始 ${orderCalculatedThreshold(order).toFixed(1)}</span></td>
       <td>${fmtMoney(order.stake)}</td>
@@ -942,6 +969,7 @@ async function loadState() {
   $("rolling-edge-status").className = rollingEdgeClass(state.rolling_edge);
   $("wave-state-status").className = waveStateClass(state.wave_state);
   $("wave-batch-guard-status").className = waveBatchGuardClass(state.wave_batch_guard);
+  $("profile-degradation-guard-status").className = profileDegradationGuardClass(state.profile_degradation_guard);
   $("result-sequence-guard-status").className = resultSequenceGuardClass(state.result_sequence_guard);
   $("short-extension-status").className = shortExtensionClass(state);
   setText("stake-progression-badge", fmtStakeProgression(state.stake_progression));

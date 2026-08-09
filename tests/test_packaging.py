@@ -34,8 +34,11 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("result-sequence-guard-status", index_html)
         self.assertIn("wave-state-status", index_html)
         self.assertIn("wave-batch-guard-status", index_html)
+        self.assertIn("profile-degradation-guard-status", index_html)
         self.assertIn("fmtWaveState", app_js)
         self.assertIn("fmtWaveBatchGuard", app_js)
+        self.assertIn("fmtProfileDegradationGuard", app_js)
+        self.assertIn("profile_degradation_probe", app_js)
         self.assertIn("wave_guard_status", app_js)
         self.assertIn("wave_guard_reason", app_js)
         self.assertIn("daily-profile-list", index_html)
@@ -148,6 +151,119 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
                 "两单叠加 · 状态数据不完整",
                 "两单叠加 · 状态数据不完整",
             ],
+        )
+
+    def test_dashboard_formats_profile_degradation_guard_and_marks_probe_orders(self):
+        script = """
+const fs = require("fs");
+const elements = new Map();
+global.document = {
+  getElementById(id) {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        addEventListener() {},
+        className: "",
+        disabled: false,
+        innerHTML: "",
+        textContent: "",
+        value: "20",
+      });
+    }
+    return elements.get(id);
+  },
+};
+global.fetch = () => new Promise(() => {});
+global.setInterval = () => 0;
+const source = fs.readFileSync(process.argv[1], "utf8");
+eval(source + `\n
+const guards = [
+  null,
+  {enabled: false, status: "NORMAL"},
+  {enabled: true, status: "DISABLED"},
+  {enabled: true, status: "NORMAL"},
+  {enabled: true, status: "NOT_APPLICABLE"},
+  {enabled: true, status: "COOLDOWN", profile_key: "WD-02", consecutive_losses: 3},
+  {enabled: true, status: "COOLDOWN", profile_key: "", consecutive_losses: 2},
+  {enabled: true, status: "RECOVERY_READY", profile_key: "WD-23"},
+  {enabled: true, status: "RECOVERY_READY", profile_key: ""},
+  {enabled: true, status: "RECOVERY_PENDING", probe_order_id: 42},
+];
+
+function makeOrder(id, probe) {
+  return {
+    id,
+    direction: "LONG",
+    timeframe_minutes: 10,
+    level: "A",
+    threshold_segment: "WD-02",
+    strategy_tag: probe ? "probe-tag" : "regular-tag",
+    strategy_family: "base-family",
+    wave_state: "NORMAL",
+    wave_guard_status: "PASS",
+    wave_guard_mode: "NORMAL",
+    session_win_rate: 0.5,
+    session_ev: 0.2,
+    threshold: 10,
+    score: 11,
+    calculated_threshold: 10,
+    stake: 10,
+    entry_price: 100,
+    opened_at: 1,
+    exit_price: 101,
+    settled_at: 2,
+    status: "SETTLED",
+    result: "WIN",
+    pnl: 8,
+    reason: "ok",
+    regime: "NORMAL",
+    profile_degradation_probe: probe,
+  };
+}
+
+renderOrders([makeOrder(101, true), makeOrder(102, false)]);
+const rows = elements.get("orders").innerHTML.split("</tr>");
+renderOrders([makeOrder(103, false)]);
+const regularOnlyHtml = elements.get("orders").innerHTML;
+const probeLabel = '<span class="order-probe-label">基础试探</span>';
+
+process.stdout.write(JSON.stringify({
+  guards: guards.map((guard) => [
+    fmtProfileDegradationGuard(guard),
+    profileDegradationGuardClass(guard),
+  ]),
+  probeRowLabelCount: rows[0].split(probeLabel).length - 1,
+  regularRowHasLabel: rows[1].includes(probeLabel),
+  regularOnlyHasLabel: regularOnlyHtml.includes(probeLabel),
+}));`);
+"""
+        result = run(
+            ["node", "-e", script, str(ROOT / "app" / "static" / "app.js")],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "guards": [
+                    ["-", "status-muted"],
+                    ["关闭", "status-muted"],
+                    ["关闭", "status-muted"],
+                    ["正常", "status-good"],
+                    ["正常", "status-good"],
+                    ["冷却 · WD-02 · 连亏3", "status-risk"],
+                    ["冷却 · - · 连亏2", "status-risk"],
+                    ["待试探 · WD-23", "status-warn"],
+                    ["待试探 · -", "status-warn"],
+                    ["试探待结算 · 订单#42", "status-warn"],
+                ],
+                "probeRowLabelCount": 1,
+                "regularRowHasLabel": False,
+                "regularOnlyHasLabel": False,
+            },
         )
 
     def test_run_script_exposes_help_without_starting_monitor(self):
