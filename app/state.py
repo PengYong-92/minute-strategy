@@ -533,17 +533,28 @@ class MonitorState:
             config=self.wave_batch_guard_config,
         )
         self.wave_batch_guard = self._wave_batch_guard_to_dict(batch_decision)
-        if batch_decision.blocked or batch_decision.mode == "RECOVERY":
+        profile_decision = self._refresh_profile_degradation_guard(
+            signal,
+            latest.close_time,
+        )
+        preserve_progression_credit = (
+            batch_decision.mode == "RECOVERY"
+            and profile_decision.status == "RECOVERY_READY"
+        )
+        if batch_decision.blocked or (
+            batch_decision.mode == "RECOVERY" and not preserve_progression_credit
+        ):
             if not self._cancel_pending_progression_credits():
                 return "STORAGE_ERROR"
             self._wave_bootstrap_cancel_pending = False
-        else:
+        elif batch_decision.mode != "RECOVERY":
             stale_source_ids = self._stale_progression_credit_source_ids(signal)
             if stale_source_ids and not self._cancel_pending_progression_credits(stale_source_ids):
                 return "STORAGE_ERROR"
             self._wave_bootstrap_cancel_pending = False
+        else:
+            self._wave_bootstrap_cancel_pending = False
         if signal.wave_guard_mode == "DIRECTION_BLOCKED":
-            self._refresh_profile_degradation_guard(signal, latest.close_time)
             return self._block_order(
                 signal,
                 latest,
@@ -552,7 +563,6 @@ class MonitorState:
                 should_observe=should_observe,
             )
         if daily_profile_required and not signal.daily_profile_selected:
-            self._refresh_profile_degradation_guard(signal, latest.close_time)
             return self._block_order(
                 signal,
                 latest,
@@ -562,10 +572,6 @@ class MonitorState:
             )
 
         signal, gate = self._admit_order_candidate(signal, latest)
-        profile_decision = self._refresh_profile_degradation_guard(
-            signal,
-            latest.close_time,
-        )
         if not gate.open_allowed:
             if should_observe:
                 self._record_observation(signal, latest, gate.code)
@@ -650,20 +656,21 @@ class MonitorState:
                 ),
                 should_observe=should_observe,
             )
-        profile_guard = self._profile_guard_shadow(signal)
-        if self.enable_profile_guard and profile_guard["status"] == "WOULD_BLOCK":
-            return self._block_order(
-                signal,
-                latest,
-                "PROFILE_GUARD_BLOCKED",
-                (
-                    "画像守卫命中 "
-                    f"{'/'.join(profile_guard['hit_keys'])}，"
-                    f"H{profile_guard['min_history']}/"
-                    f"G{profile_guard['min_group_size']}，暂停开单"
-                ),
-                should_observe=should_observe,
-            )
+        if self.enable_profile_guard:
+            profile_guard = self._profile_guard_shadow(signal)
+            if profile_guard["status"] == "WOULD_BLOCK":
+                return self._block_order(
+                    signal,
+                    latest,
+                    "PROFILE_GUARD_BLOCKED",
+                    (
+                        "画像守卫命中 "
+                        f"{'/'.join(profile_guard['hit_keys'])}，"
+                        f"H{profile_guard['min_history']}/"
+                        f"G{profile_guard['min_group_size']}，暂停开单"
+                    ),
+                    should_observe=should_observe,
+                )
 
         return self._execute_open_order(
             signal,

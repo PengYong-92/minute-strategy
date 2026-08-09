@@ -112,6 +112,26 @@ class ProfileDegradationGuardTest(unittest.TestCase):
         self.assertEqual(decision.triggered_at, 10 * MINUTE_MS)
         self.assertEqual(decision.reason, "画像恢复试探单尚未结算")
 
+    def test_future_open_probe_is_ignored_until_its_open_time(self):
+        probe = order(
+            4,
+            None,
+            None,
+            status="OPEN",
+            probe=True,
+            triggered_at=10 * MINUTE_MS,
+            opened_at=80 * MINUTE_MS,
+        )
+        history = [*three_losses(), probe]
+
+        before_open = self.evaluate(history, 70 * MINUTE_MS)
+        at_open = self.evaluate(history, 80 * MINUTE_MS)
+
+        self.assertEqual(before_open.status, "RECOVERY_READY")
+        self.assertEqual(before_open.probe_order_id, 0)
+        self.assertEqual(at_open.status, "RECOVERY_PENDING")
+        self.assertEqual(at_open.probe_order_id, 4)
+
     def test_probe_win_returns_to_normal(self):
         probe = order(
             4,

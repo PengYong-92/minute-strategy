@@ -637,6 +637,11 @@ class MonitorStateTest(unittest.TestCase):
                 opened_at=opened_at,
             )
             state.simulator.settle_expired_orders(opened_at + 10 * MINUTE_MS, 99.0)
+        pending = StakeProgressionCredit(
+            source_order_id=99,
+            created_at=52 * MINUTE_MS,
+        )
+        state.simulator.stake_progression.credits.append(pending)
         current_time = 111 * MINUTE_MS
 
         decision = state._maybe_open_order(
@@ -655,6 +660,9 @@ class MonitorStateTest(unittest.TestCase):
         self.assertTrue(order.profile_degradation_probe)
         self.assertEqual(order.stake, 10.0)
         self.assertEqual(order.stake_progression_step, 1)
+        self.assertEqual(pending.status, "PENDING")
+        self.assertIsNone(pending.consumed_at)
+        self.assertIsNone(pending.consumed_order_id)
 
     def test_zero_profile_cooldown_disables_guard_without_blocking(self):
         state = profile_guard_state(
@@ -3483,6 +3491,23 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(promotion["min_ev"], 4.0)
         self.assertEqual(promotion["min_edge"], 10.0)
         self.assertEqual(promotion["live_short_segments"], ["WD-02", "WD-23"])
+
+    def test_disabled_profile_guard_skips_shadow_on_formal_decision_path(self):
+        state = profile_guard_state(enable_profile_guard=False)
+        current_time = 1 * MINUTE_MS
+
+        with patch.object(
+            state,
+            "_profile_guard_shadow",
+            return_value={"status": "NORMAL"},
+        ) as shadow:
+            decision = state._maybe_open_order(
+                selected_profile_signal(current_time),
+                latest_kline(current_time),
+            )
+
+        self.assertEqual(decision, "OPENED")
+        shadow.assert_not_called()
 
     def test_profile_guard_can_block_when_explicitly_enabled(self):
         storage = RecordingStorage()

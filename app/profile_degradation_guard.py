@@ -106,6 +106,7 @@ def evaluate_profile_degradation_guard(
     pause_until = triggered_at + resolved.cooldown_minutes * MINUTE_MS
     open_probes = _parse_open_probes(
         orders,
+        current_time=now,
         triggered_at=triggered_at,
         profile_key=target_profile,
         daily_profile_version=target_version,
@@ -188,6 +189,7 @@ def _parse_settled_orders(
 def _parse_open_probes(
     orders: Sequence[Any],
     *,
+    current_time: int,
     triggered_at: int,
     profile_key: str,
     daily_profile_version: str,
@@ -210,6 +212,7 @@ def _parse_open_probes(
         if (
             order_id is None
             or opened_at is None
+            or opened_at > current_time
             or probe_triggered_at is None
             or probe_triggered_at != triggered_at
         ):
