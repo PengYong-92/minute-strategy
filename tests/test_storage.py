@@ -2,7 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import fields, replace
 from unittest import mock
 from pathlib import Path
 
@@ -165,7 +165,10 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored.wave_guard_reason, "冷却结束，仅允许恢复单")
 
     def test_persists_and_restores_profile_degradation_probe_metadata(self):
-        self.assertIn("profile_degradation_probe", SimulatedOrder.__dataclass_fields__)
+        self.assertIn(
+            "profile_degradation_probe",
+            {field.name for field in fields(SimulatedOrder)},
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
             saved = progression_order(1)
