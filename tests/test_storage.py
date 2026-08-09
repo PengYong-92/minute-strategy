@@ -164,6 +164,20 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored.wave_guard_status, "WAVE_RECOVERY_READY")
         self.assertEqual(restored.wave_guard_reason, "冷却结束，仅允许恢复单")
 
+    def test_persists_and_restores_profile_degradation_probe_metadata(self):
+        self.assertIn("profile_degradation_probe", SimulatedOrder.__dataclass_fields__)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            saved = progression_order(1)
+            saved.profile_degradation_probe = True
+            saved.profile_degradation_triggered_at = 987_654
+
+            store.save_order(saved, "BTCUSDT")
+            restored = store.load_orders("BTCUSDT")[0]
+
+        self.assertTrue(restored.profile_degradation_probe)
+        self.assertEqual(restored.profile_degradation_triggered_at, 987_654)
+
     def test_cancels_multiple_pending_credits_atomically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -565,6 +579,8 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             legacy_order.pop("calculated_threshold")
             legacy_order.pop("stake_progression_source_order_id")
             legacy_order.pop("stake_progression_version")
+            legacy_order.pop("profile_degradation_probe", None)
+            legacy_order.pop("profile_degradation_triggered_at", None)
             for key in list(legacy_order):
                 if key.startswith("wave_"):
                     legacy_order.pop(key)
@@ -626,6 +642,14 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored[0].wave_batch_id, "")
         self.assertEqual(restored[0].wave_guard_mode, "NORMAL")
         self.assertEqual(restored[0].calculated_threshold, 79.0)
+        self.assertIs(
+            getattr(restored[0], "profile_degradation_probe", None),
+            False,
+        )
+        self.assertEqual(
+            getattr(restored[0], "profile_degradation_triggered_at", None),
+            0,
+        )
 
     def test_round_trips_all_credit_states_in_stable_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:

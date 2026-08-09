@@ -134,6 +134,8 @@ class AccountSimulator:
             "wave_guard_mode": signal.wave_guard_mode,
             "wave_guard_status": signal.wave_guard_status,
             "wave_guard_reason": signal.wave_guard_reason,
+            "profile_degradation_probe": signal.profile_degradation_probe,
+            "profile_degradation_triggered_at": signal.profile_degradation_triggered_at,
         }
         if allow_progression:
             terms, credit = self.stake_progression.assign(
