@@ -204,6 +204,11 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
         self.assertIn("--daily-profile-max-active", result.stdout)
         self.assertIn("--daily-profile-evaluation-time", result.stdout)
         self.assertIn("--daily-profile-activation-time", result.stdout)
+        self.assertIn("--profile-degradation-cooldown-minutes", result.stdout)
+        self.assertIn(
+            "完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60",
+            result.stdout,
+        )
         self.assertIn("每天北京时间", result.stdout)
         self.assertIn("观察画像", result.stdout)
 
@@ -273,6 +278,7 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
                     "DAILY_PROFILE_MAX_ACTIVE": "2",
                     "DAILY_PROFILE_EVALUATION_TIME": "07:45",
                     "DAILY_PROFILE_ACTIVATION_TIME": "08:05",
+                    "PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75",
                 }
             )
 
@@ -335,6 +341,67 @@ eval(source + `\nprocess.stdout.write(JSON.stringify([
         self.assertEqual(args[args.index("--daily-profile-max-active") + 1], "2")
         self.assertEqual(args[args.index("--daily-profile-evaluation-time") + 1], "07:45")
         self.assertEqual(args[args.index("--daily-profile-activation-time") + 1], "08:05")
+        self.assertEqual(args.count("--profile-degradation-cooldown-minutes"), 1)
+        self.assertEqual(
+            args[args.index("--profile-degradation-cooldown-minutes") + 1],
+            "75",
+        )
+
+    def test_run_script_forwards_profile_degradation_cooldown_default_and_cli_forms(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then',
+                        "  cat >/dev/null",
+                        "  exit 0",
+                        "fi",
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("PROFILE_DEGRADATION_COOLDOWN_MINUTES", None)
+            env.update(
+                {
+                    "PYTHON_BIN": str(fake_python),
+                    "FAKE_PYTHON_LOG": str(log_path),
+                }
+            )
+
+            cases = (
+                ([], "60"),
+                (["--profile-degradation-cooldown-minutes", "30"], "30"),
+                (["--profile-degradation-cooldown-minutes=45"], "45"),
+            )
+            captured = []
+            for cli_args, expected in cases:
+                result = run(
+                    ["bash", str(ROOT / "scripts" / "run.sh"), *cli_args],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                args = log_path.read_text(encoding="utf-8").splitlines()
+                captured.append((result, args, expected))
+
+        for result, args, expected in captured:
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(args.count("--profile-degradation-cooldown-minutes"), 1)
+            self.assertEqual(
+                args[args.index("--profile-degradation-cooldown-minutes") + 1],
+                expected,
+            )
 
     def test_run_script_forwards_two_stage_defaults_and_accepts_empty_base_only_cli(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -34,6 +34,7 @@ STAKE_PROGRESSION_BASE_ONLY_SEGMENTS="${STAKE_PROGRESSION_BASE_ONLY_SEGMENTS-}"
 PROFILE_GUARD="${PROFILE_GUARD:-0}"
 PROFILE_GUARD_MIN_HISTORY="${PROFILE_GUARD_MIN_HISTORY:-15}"
 PROFILE_GUARD_MIN_GROUP_SIZE="${PROFILE_GUARD_MIN_GROUP_SIZE:-2}"
+PROFILE_DEGRADATION_COOLDOWN_MINUTES="${PROFILE_DEGRADATION_COOLDOWN_MINUTES:-60}"
 OBSERVATION_PROFILE_PROMOTION="${OBSERVATION_PROFILE_PROMOTION:-1}"
 OBSERVATION_PROFILE_LOOKBACK_DAYS="${OBSERVATION_PROFILE_LOOKBACK_DAYS:-7}"
 OBSERVATION_PROFILE_MIN_SAMPLES="${OBSERVATION_PROFILE_MIN_SAMPLES:-12}"
@@ -108,6 +109,8 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
                          画像守卫启用前需要的历史订单数量，默认: 15
   --profile-guard-min-group-size N
                          画像守卫单个弱点最小历史样本数，默认: 2
+  --profile-degradation-cooldown-minutes N
+                         完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60
   --no-observation-profile-promotion
                          关闭已结算观察画像对静态时段拦截的动态放行
   --observation-profile-lookback-days N
@@ -164,6 +167,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   RESULT_SEQUENCE_COOLDOWN_MINUTES, RESULT_SEQUENCE_SCOPE,
   STAKE_PROGRESSION_MAX_ACTIVE, STAKE_PROGRESSION_BASE_ONLY_SEGMENTS,
   PROFILE_GUARD, PROFILE_GUARD_MIN_HISTORY, PROFILE_GUARD_MIN_GROUP_SIZE,
+  PROFILE_DEGRADATION_COOLDOWN_MINUTES,
   OBSERVATION_PROFILE_PROMOTION, OBSERVATION_PROFILE_LOOKBACK_DAYS,
   OBSERVATION_PROFILE_MIN_SAMPLES, OBSERVATION_PROFILE_MIN_WIN_RATE,
   OBSERVATION_PROFILE_MIN_EV, OBSERVATION_PROFILE_MIN_EDGE, LIVE_SHORT_SEGMENTS,
@@ -436,6 +440,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --profile-guard-min-group-size=*)
       PROFILE_GUARD_MIN_GROUP_SIZE="${1#*=}"
+      shift
+      ;;
+    --profile-degradation-cooldown-minutes)
+      require_value "$1" "${2:-}"
+      PROFILE_DEGRADATION_COOLDOWN_MINUTES="$2"
+      shift 2
+      ;;
+    --profile-degradation-cooldown-minutes=*)
+      PROFILE_DEGRADATION_COOLDOWN_MINUTES="${1#*=}"
       shift
       ;;
     --no-observation-profile-promotion)
@@ -741,6 +754,7 @@ exec "$PYTHON_BIN" -m app.server \
   --stake-progression-base-only-segments "$STAKE_PROGRESSION_BASE_ONLY_SEGMENTS" \
   --profile-guard-min-history "$PROFILE_GUARD_MIN_HISTORY" \
   --profile-guard-min-group-size "$PROFILE_GUARD_MIN_GROUP_SIZE" \
+  --profile-degradation-cooldown-minutes "$PROFILE_DEGRADATION_COOLDOWN_MINUTES" \
   --observation-profile-lookback-days "$OBSERVATION_PROFILE_LOOKBACK_DAYS" \
   --observation-profile-min-samples "$OBSERVATION_PROFILE_MIN_SAMPLES" \
   --observation-profile-min-win-rate "$OBSERVATION_PROFILE_MIN_WIN_RATE" \

@@ -12,6 +12,7 @@ from app.binance_client import BinanceKlineClient
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.fear_greed import FearGreedProvider
 from app.history import WarmupConfig, WarmupReport, warmup_history
+from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import MonitorState
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
@@ -390,6 +391,12 @@ def main() -> None:
         help="画像守卫单个弱点最小历史样本数，默认: 2",
     )
     parser.add_argument(
+        "--profile-degradation-cooldown-minutes",
+        type=int,
+        default=int(os.getenv("PROFILE_DEGRADATION_COOLDOWN_MINUTES", "60")),
+        help="完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60",
+    )
+    parser.add_argument(
         "--no-observation-profile-promotion",
         action="store_true",
         default=not _env_bool("OBSERVATION_PROFILE_PROMOTION", True),
@@ -537,6 +544,9 @@ def main() -> None:
         enable_profile_guard=args.profile_guard,
         profile_guard_min_history=args.profile_guard_min_history,
         profile_guard_min_group_size=args.profile_guard_min_group_size,
+        profile_degradation_guard_config=ProfileDegradationGuardConfig(
+            cooldown_minutes=args.profile_degradation_cooldown_minutes,
+        ),
         enable_observation_profile_promotion=not args.no_observation_profile_promotion,
         observation_profile_lookback_days=args.observation_profile_lookback_days,
         observation_profile_min_samples=args.observation_profile_min_samples,

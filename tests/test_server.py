@@ -1,10 +1,13 @@
 import argparse
 import json
+import os
+import sys
 import tempfile
 import threading
 import unittest
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import app.server as server_module
@@ -16,6 +19,50 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_main_injects_profile_degradation_cooldown_config(self):
+        cases = (
+            ({}, [], 60),
+            ({"PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75"}, [], 75),
+            (
+                {"PROFILE_DEGRADATION_COOLDOWN_MINUTES": "75"},
+                ["--profile-degradation-cooldown-minutes", "-5"],
+                0,
+            ),
+        )
+
+        for environment, profile_args, expected in cases:
+            with self.subTest(environment=environment, profile_args=profile_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *profile_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch("app.server.start_polling"),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                config = monitor_state.call_args.kwargs[
+                    "profile_degradation_guard_config"
+                ]
+                self.assertEqual(config.normalized().cooldown_minutes, expected)
+
     def test_trade_score_threshold_accepts_auto_and_range(self):
         self.assertIsNone(server_module._trade_score_threshold("auto"))
         self.assertIsNone(server_module._trade_score_threshold(""))
