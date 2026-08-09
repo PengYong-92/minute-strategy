@@ -710,3 +710,70 @@ profile_ev=1.45U
 ```
 
 第一笔订单使用服务启动时最近一根已闭合K线，因此K线时间比服务重启边界早14秒。第二笔订单间隔2分钟产生，随后达到 `MAX_OPEN_ORDERS=2`，不再继续开单。数据库没有再次清空：修复前订单数为0，新订单继续从ID 1记录。后续评估以本节发布边界和订单ID 1为起点。
+
+## 22. 2026-08-09 删除30分钟订单死分支
+
+### 22.1 变更边界
+
+本次只删除生产从未调用的30分钟订单周期能力：
+
+- 30分钟 LONG session edge 表；
+- 非10分钟 `analyze_volume_price` 分析入口；
+- 30分钟阈值和最小边际加成；
+- 30分钟 regime 阈值修正；
+- 30分钟候选排序惩罚。
+
+10分钟开单条件、`generic_long_observe` / `generic_short_observe` 画像身份、每日画像匹配、滚动 edge、并发、2分钟间隔、两阶段金额和现有守卫均未修改。`mtf_30m_bias` 仍参与当前10分钟判断，因此本节点明确保留，不把活跃策略变更混入死代码清理。
+
+### 22.2 等价性验证
+
+旧代码中被删除的阈值、最小边际、regime 和候选排序分支只在 `timeframe_minutes == 30` 时生效；生产入口固定使用 `LIVE_TRADE_TIMEFRAMES = (10,)`，10分钟对应旧加成为0。新增特征测试锁定通用 LONG/SHORT 的策略族、标签、观察方向、画像键和不可直接开单语义。
+
+发布前验证结果：
+
+```text
+聚焦测试：131项通过
+全量测试：384项通过
+Python compileall：通过
+JavaScript node --check：通过
+Shell bash -n：通过
+```
+
+### 22.3 发布身份
+
+| 项目 | 值 |
+|---|---|
+| 生产代码提交 | `12e33e0` |
+| 分支 | `feature/1m-wave-direction-guard` |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-12e33e0-20260809-231155` |
+| 最小包 | `event-contract-monitor-12e33e0-20260809-minimal.tar.gz` |
+| 包大小 | `154KB` |
+| SHA-256 | `12211eccb73f486454b9160c92b033536ea175d4017cda413d8e3833c9fc7fb0` |
+| `strategy.py` SHA-256 | `116a394b3ea0accafc04024274412e9baf642c74eaead58a82eeef947d01c91a` |
+| 服务重启边界 | `2026-08-09 23:13:54 CST` |
+
+### 22.4 发布后核对
+
+发布未清空订单、观察画像、滚单资格或预热缓存，也未修改 systemd、Nginx和SSL配置。发布前后状态对比：
+
+```text
+service=active
+NRestarts=0
+warning日志=0
+https页面=200
+api/state=200
+last_error=null
+orders=70（41胜 / 29负 / 未结0）
+pending_credits=1
+daily_profile_version=DPS-20260809-0800
+daily_profile_min_win_rate=60%
+trade_score_threshold=AUTO
+max_open_orders=2
+min_order_gap_ms=120000
+result_sequence_guard=ON / DIRECTION / 3亏 / 20分钟
+wave_state=OFF
+wave_batch_guard=OFF
+profile_guard=OFF
+```
+
+预热K线由发布前142560根增加到发布后144000根，是重启时从共享缓存加载了更完整的数据范围；预热状态始终为 `READY`，不是策略或配置变化。线上 `strategy.py` 与本地 `12e33e0` 文件哈希一致。
