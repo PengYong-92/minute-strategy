@@ -10,21 +10,23 @@ from app.profile_degradation_guard import (
 
 
 def order(
-    order_id: int,
+    order_id: object,
     result: str | None,
-    settled_at: int | None,
+    settled_at: object,
     *,
     profile: str = "p1",
     version: str = "v1",
     status: str = "SETTLED",
-    probe: bool = False,
-    triggered_at: int = 0,
-    opened_at: int | None = None,
+    probe: object = False,
+    triggered_at: object = 0,
+    opened_at: object = None,
 ) -> SimpleNamespace:
     resolved_opened_at = (
         opened_at
         if opened_at is not None
-        else max(0, int(settled_at or 0) - 10 * MINUTE_MS)
+        else max(0, settled_at - 10 * MINUTE_MS)
+        if isinstance(settled_at, int)
+        else 0
     )
     return SimpleNamespace(
         id=order_id,
@@ -198,6 +200,115 @@ class ProfileDegradationGuardTest(unittest.TestCase):
 
         self.assertEqual(decision.status, "NORMAL")
         self.assertEqual(decision.consecutive_losses, 2)
+
+    def test_malformed_settled_order_numeric_fields_are_ignored(self):
+        valid = three_losses()[:2]
+
+        for field, value in (("settled_at", "invalid"), ("id", "invalid")):
+            with self.subTest(field=field):
+                malformed = order(3, "LOSS", 5 * MINUTE_MS)
+                setattr(malformed, field, value)
+
+                decision = self.evaluate([*valid, malformed], 10 * MINUTE_MS)
+
+                self.assertEqual(decision.status, "NORMAL")
+                self.assertEqual(decision.consecutive_losses, 2)
+
+    def test_malformed_open_probe_numeric_fields_are_ignored(self):
+        for field, value in (
+            ("profile_degradation_triggered_at", "invalid"),
+            ("opened_at", "invalid"),
+        ):
+            with self.subTest(field=field):
+                malformed = order(
+                    4,
+                    None,
+                    None,
+                    status="OPEN",
+                    probe=True,
+                    triggered_at=10 * MINUTE_MS,
+                    opened_at=70 * MINUTE_MS,
+                )
+                setattr(malformed, field, value)
+
+                decision = self.evaluate(
+                    [*three_losses(), malformed],
+                    71 * MINUTE_MS,
+                )
+
+                self.assertEqual(decision.status, "RECOVERY_READY")
+                self.assertEqual(decision.probe_order_id, 0)
+
+    def test_probe_marker_requires_literal_boolean_true(self):
+        for marker in (1, "false", "true"):
+            with self.subTest(marker=marker):
+                unmarked = order(
+                    4,
+                    None,
+                    None,
+                    status="OPEN",
+                    probe=marker,
+                    triggered_at=10 * MINUTE_MS,
+                    opened_at=70 * MINUTE_MS,
+                )
+
+                decision = self.evaluate(
+                    [*three_losses(), unmarked],
+                    71 * MINUTE_MS,
+                )
+
+                self.assertEqual(decision.status, "RECOVERY_READY")
+                self.assertEqual(decision.probe_order_id, 0)
+
+    def test_open_probe_requires_matching_trigger_marker_and_scope(self):
+        nonmatching = [
+            order(
+                4,
+                None,
+                None,
+                status="OPEN",
+                probe=True,
+                triggered_at=9 * MINUTE_MS,
+                opened_at=70 * MINUTE_MS,
+            ),
+            order(
+                5,
+                None,
+                None,
+                status="OPEN",
+                probe=False,
+                triggered_at=10 * MINUTE_MS,
+                opened_at=70 * MINUTE_MS,
+            ),
+            order(
+                6,
+                None,
+                None,
+                status="OPEN",
+                probe=True,
+                triggered_at=10 * MINUTE_MS,
+                opened_at=70 * MINUTE_MS,
+                profile="p2",
+            ),
+            order(
+                7,
+                None,
+                None,
+                status="OPEN",
+                probe=True,
+                triggered_at=10 * MINUTE_MS,
+                opened_at=70 * MINUTE_MS,
+                version="v2",
+            ),
+        ]
+
+        decision = self.evaluate(
+            [*three_losses(), *nonmatching],
+            71 * MINUTE_MS,
+        )
+
+        self.assertEqual(decision.status, "RECOVERY_READY")
+        self.assertEqual(decision.probe_order_id, 0)
 
     def test_zero_settlement_timestamp_is_nonempty_and_counted(self):
         history = [
