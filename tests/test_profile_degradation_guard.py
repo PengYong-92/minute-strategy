@@ -80,6 +80,7 @@ class ProfileDegradationGuardTest(unittest.TestCase):
         self.assertEqual(decision.last_loss_settled_at, 10 * MINUTE_MS)
         self.assertEqual(decision.triggered_at, 10 * MINUTE_MS)
         self.assertEqual(decision.pause_until, 70 * MINUTE_MS)
+        self.assertEqual(decision.reason, "画像连续三笔亏损，进入冷却")
 
     def test_exact_cooldown_boundary_is_recovery_ready(self):
         decision = self.evaluate(three_losses(), 70 * MINUTE_MS)
@@ -89,6 +90,7 @@ class ProfileDegradationGuardTest(unittest.TestCase):
         self.assertFalse(decision.allow_progression)
         self.assertEqual(decision.pause_until, 70 * MINUTE_MS)
         self.assertEqual(decision.triggered_at, 10 * MINUTE_MS)
+        self.assertEqual(decision.reason, "画像冷却结束，允许一笔基础金额试探单")
 
     def test_open_probe_for_same_trigger_is_recovery_pending(self):
         probe = order(
@@ -108,6 +110,7 @@ class ProfileDegradationGuardTest(unittest.TestCase):
         self.assertFalse(decision.allow_progression)
         self.assertEqual(decision.probe_order_id, 4)
         self.assertEqual(decision.triggered_at, 10 * MINUTE_MS)
+        self.assertEqual(decision.reason, "画像恢复试探单尚未结算")
 
     def test_probe_win_returns_to_normal(self):
         probe = order(
@@ -125,6 +128,7 @@ class ProfileDegradationGuardTest(unittest.TestCase):
         self.assertTrue(decision.allow_progression)
         self.assertEqual(decision.consecutive_losses, 0)
         self.assertEqual(decision.triggered_at, 0)
+        self.assertEqual(decision.reason, "画像连续亏损未达到三笔")
 
     def test_probe_loss_restarts_full_cooldown_from_probe_settlement(self):
         probe = order(
@@ -161,6 +165,7 @@ class ProfileDegradationGuardTest(unittest.TestCase):
                 self.assertEqual(decision.status, "DISABLED")
                 self.assertFalse(decision.blocked)
                 self.assertTrue(decision.allow_progression)
+                self.assertEqual(decision.reason, "画像退化守卫已关闭")
 
     def test_fewer_than_three_trailing_losses_remain_normal(self):
         decision = self.evaluate(three_losses()[:2], 11 * MINUTE_MS)
@@ -351,6 +356,7 @@ class ProfileDegradationGuardTest(unittest.TestCase):
                 self.assertEqual(decision.status, "NOT_APPLICABLE")
                 self.assertFalse(decision.blocked)
                 self.assertTrue(decision.allow_progression)
+                self.assertEqual(decision.reason, "画像键或每日画像版本不完整")
 
 
 if __name__ == "__main__":

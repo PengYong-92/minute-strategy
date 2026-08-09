@@ -160,10 +160,10 @@ def settle_profile_losses(
         )
 
 
-def profile_guard_state(**kwargs) -> "MonitorState":
+def profile_guard_state(*, max_open_orders: int = 2, **kwargs) -> "MonitorState":
     return MonitorState(
         symbol="BTCUSDT",
-        max_open_orders=2,
+        max_open_orders=max_open_orders,
         min_order_gap_ms=0,
         enable_rolling_edge_guard=False,
         result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
@@ -409,9 +409,10 @@ class MonitorStateTest(unittest.TestCase):
             snapshot["observations"][0]["source_decision"],
             "PROFILE_DEGRADATION_BLOCKED",
         )
+        self.assertEqual(snapshot["risk_pause"], "画像连续三笔亏损，进入冷却")
 
     def test_profile_recovery_probe_uses_base_stake_without_consuming_pending_credit(self):
-        state = profile_guard_state()
+        state = profile_guard_state(max_open_orders=1)
         settle_profile_losses(state)
         pending = StakeProgressionCredit(
             source_order_id=99,
@@ -428,9 +429,11 @@ class MonitorStateTest(unittest.TestCase):
         probe = state.simulator.orders[-1]
         guard = state.snapshot()["profile_degradation_guard"]
         self.assertEqual(decision, "OPENED")
-        self.assertEqual(guard["status"], "RECOVERY_READY")
+        self.assertEqual(guard["status"], "RECOVERY_PENDING")
+        self.assertTrue(guard["blocked"])
         self.assertFalse(guard["allow_progression"])
         self.assertEqual(guard["pause_until"], current_time)
+        self.assertEqual(guard["probe_order_id"], probe.id)
         self.assertTrue(probe.profile_degradation_probe)
         self.assertEqual(probe.profile_degradation_triggered_at, 32 * MINUTE_MS)
         self.assertEqual(probe.reason, "selected live profile；画像退化试探单")
@@ -445,7 +448,7 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         pending_guard = state.snapshot()["profile_degradation_guard"]
-        self.assertEqual(blocked, "PROFILE_DEGRADATION_BLOCKED")
+        self.assertEqual(blocked, "HOLD_OPEN_ORDER")
         self.assertEqual(pending_guard["status"], "RECOVERY_PENDING")
         self.assertEqual(pending_guard["probe_order_id"], probe.id)
         self.assertEqual(len(state.simulator.orders), 4)
@@ -453,7 +456,15 @@ class MonitorStateTest(unittest.TestCase):
     def test_profile_degradation_is_scoped_to_exact_profile(self):
         state = profile_guard_state()
         settle_profile_losses(state)
-        current_time = 33 * MINUTE_MS
+        state._maybe_open_order(
+            selected_profile_signal(33 * MINUTE_MS),
+            latest_kline(33 * MINUTE_MS),
+        )
+        self.assertEqual(
+            state.snapshot()["profile_degradation_guard"]["status"],
+            "COOLDOWN",
+        )
+        current_time = 34 * MINUTE_MS
         other_profile = "10|drop_reclaim|other_profile|LONG|WD-08"
 
         decision = state._maybe_open_order(
@@ -467,25 +478,50 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(guard["profile_key"], other_profile)
         self.assertEqual(guard["consecutive_losses"], 0)
 
-    def test_unselected_daily_profile_keeps_existing_rejection_priority(self):
-        state = profile_guard_state()
-        settle_profile_losses(state)
-        current_time = 33 * MINUTE_MS
-        signal = replace(
-            selected_profile_signal(current_time),
-            daily_profile_selected=False,
+    def test_non_applicable_candidates_clear_previous_profile_state(self):
+        candidates = (
+            (
+                "unselected",
+                replace(
+                    selected_profile_signal(34 * MINUTE_MS),
+                    daily_profile_selected=False,
+                ),
+                True,
+                "DAILY_PROFILE_NOT_SELECTED",
+            ),
+            (
+                "missing profile key",
+                replace(
+                    selected_profile_signal(34 * MINUTE_MS),
+                    profile_key="",
+                ),
+                False,
+                "OPENED",
+            ),
         )
+        for label, candidate, daily_profile_required, expected_decision in candidates:
+            with self.subTest(label=label):
+                state = profile_guard_state()
+                settle_profile_losses(state)
+                state._maybe_open_order(
+                    selected_profile_signal(33 * MINUTE_MS),
+                    latest_kline(33 * MINUTE_MS),
+                )
+                self.assertEqual(
+                    state.snapshot()["profile_degradation_guard"]["status"],
+                    "COOLDOWN",
+                )
 
-        decision = state._maybe_open_order(
-            signal,
-            latest_kline(current_time),
-            daily_profile_required=True,
-        )
+                decision = state._maybe_open_order(
+                    candidate,
+                    latest_kline(34 * MINUTE_MS),
+                    daily_profile_required=daily_profile_required,
+                )
 
-        guard = state.snapshot()["profile_degradation_guard"]
-        self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
-        self.assertEqual(guard["status"], "NORMAL")
-        self.assertEqual(guard["profile_key"], "")
+                guard = state.snapshot()["profile_degradation_guard"]
+                self.assertEqual(decision, expected_decision)
+                self.assertEqual(guard["status"], "NORMAL")
+                self.assertEqual(guard["profile_key"], "")
 
     def test_profile_probe_win_restores_normal_state(self):
         state = profile_guard_state()
@@ -550,13 +586,37 @@ class MonitorStateTest(unittest.TestCase):
             running.wait_for_storage_writes()
 
             restarted = profile_guard_state(storage=store, now_ms=lambda: 0)
+            restart_empty_guard = dict(
+                restarted.snapshot()["profile_degradation_guard"]
+            )
             after_decision = restarted._maybe_open_order(signal, latest)
             after_guard = dict(restarted.snapshot()["profile_degradation_guard"])
             restarted.wait_for_storage_writes()
 
         self.assertEqual(before_decision, "PROFILE_DEGRADATION_BLOCKED")
+        self.assertEqual(restart_empty_guard["status"], "NORMAL")
+        self.assertEqual(restart_empty_guard["profile_key"], "")
+        self.assertEqual(restart_empty_guard["consecutive_losses"], 0)
         self.assertEqual(after_decision, before_decision)
         self.assertEqual(after_guard, before_guard)
+
+    def test_profile_probe_storage_failure_rolls_back_pending_state(self):
+        storage = RecordingStorage()
+        state = profile_guard_state(storage=storage, now_ms=lambda: 0)
+        settle_profile_losses(state)
+        storage.fail_once("save_open_order_with_credit")
+        boundary = 92 * MINUTE_MS
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(boundary),
+            latest_kline(boundary),
+        )
+
+        guard = state.snapshot()["profile_degradation_guard"]
+        self.assertEqual(decision, "STORAGE_ERROR")
+        self.assertEqual(guard["status"], "RECOVERY_READY")
+        self.assertEqual(guard["probe_order_id"], 0)
+        self.assertEqual(len(state.simulator.orders), 3)
 
     def test_wave_recovery_and_profile_probe_both_disable_progression(self):
         state = profile_guard_state(
@@ -588,7 +648,8 @@ class MonitorStateTest(unittest.TestCase):
         snapshot = state.snapshot()
         self.assertEqual(decision, "OPENED")
         self.assertEqual(snapshot["wave_batch_guard"]["mode"], "RECOVERY")
-        self.assertEqual(snapshot["profile_degradation_guard"]["status"], "RECOVERY_READY")
+        self.assertEqual(snapshot["profile_degradation_guard"]["status"], "RECOVERY_PENDING")
+        self.assertEqual(snapshot["profile_degradation_guard"]["probe_order_id"], order.id)
         self.assertFalse(snapshot["profile_degradation_guard"]["allow_progression"])
         self.assertEqual(order.wave_guard_mode, "RECOVERY")
         self.assertTrue(order.profile_degradation_probe)

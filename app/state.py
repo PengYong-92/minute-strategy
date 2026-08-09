@@ -543,6 +543,7 @@ class MonitorState:
                 return "STORAGE_ERROR"
             self._wave_bootstrap_cancel_pending = False
         if signal.wave_guard_mode == "DIRECTION_BLOCKED":
+            self._refresh_profile_degradation_guard(signal, latest.close_time)
             return self._block_order(
                 signal,
                 latest,
@@ -551,6 +552,7 @@ class MonitorState:
                 should_observe=should_observe,
             )
         if daily_profile_required and not signal.daily_profile_selected:
+            self._refresh_profile_degradation_guard(signal, latest.close_time)
             return self._block_order(
                 signal,
                 latest,
@@ -560,6 +562,10 @@ class MonitorState:
             )
 
         signal, gate = self._admit_order_candidate(signal, latest)
+        profile_decision = self._refresh_profile_degradation_guard(
+            signal,
+            latest.close_time,
+        )
         if not gate.open_allowed:
             if should_observe:
                 self._record_observation(signal, latest, gate.code)
@@ -600,38 +606,22 @@ class MonitorState:
         if batch_decision.mode == "RECOVERY":
             signal = replace(signal, wave_guard_mode="RECOVERY")
             self.selected_signal = signal
-        profile_decision = ProfileDegradationGuardDecision()
-        if (
-            signal.daily_profile_selected
-            and signal.profile_key
-            and signal.daily_profile_version
-        ):
-            profile_decision = evaluate_profile_degradation_guard(
-                self.simulator.orders,
-                current_time=latest.close_time,
-                profile_key=signal.profile_key,
-                daily_profile_version=signal.daily_profile_version,
-                config=self.profile_degradation_guard_config,
+        if profile_decision.status in {"COOLDOWN", "RECOVERY_PENDING"}:
+            return self._block_order(
+                signal,
+                latest,
+                "PROFILE_DEGRADATION_BLOCKED",
+                profile_decision.reason,
+                should_observe=should_observe,
             )
-            self.profile_degradation_guard = self._profile_degradation_guard_to_dict(
-                profile_decision
+        if profile_decision.status == "RECOVERY_READY":
+            signal = replace(
+                signal,
+                reason=f"{signal.reason}；画像退化试探单",
+                profile_degradation_probe=True,
+                profile_degradation_triggered_at=profile_decision.triggered_at,
             )
-            if profile_decision.status in {"COOLDOWN", "RECOVERY_PENDING"}:
-                return self._block_order(
-                    signal,
-                    latest,
-                    "PROFILE_DEGRADATION_BLOCKED",
-                    profile_decision.reason,
-                    should_observe=should_observe,
-                )
-            if profile_decision.status == "RECOVERY_READY":
-                signal = replace(
-                    signal,
-                    reason=f"{signal.reason}；画像退化试探单",
-                    profile_degradation_probe=True,
-                    profile_degradation_triggered_at=profile_decision.triggered_at,
-                )
-                self.selected_signal = signal
+            self.selected_signal = signal
         sequence_decision = evaluate_result_sequence_guard(
             self.simulator.orders,
             current_time=latest.close_time,
@@ -750,6 +740,8 @@ class MonitorState:
                 self.simulator.rollback_open_order(order.id)
                 self._set_storage_error("开单持久化失败", exc)
                 return "STORAGE_ERROR"
+        if signal.profile_degradation_probe:
+            self._refresh_profile_degradation_guard(signal, latest.close_time)
         if should_observe:
             self._record_observation(signal, latest, "OPENED")
         if self.storage:
@@ -1678,6 +1670,30 @@ class MonitorState:
             "allow_progression": decision.allow_progression,
             "reason": decision.reason,
         }
+
+    def _refresh_profile_degradation_guard(
+        self,
+        signal: Signal,
+        current_time: int,
+    ) -> ProfileDegradationGuardDecision:
+        if not (
+            signal.daily_profile_selected
+            and signal.profile_key
+            and signal.daily_profile_version
+        ):
+            self.profile_degradation_guard = self._empty_profile_degradation_guard()
+            return ProfileDegradationGuardDecision(
+                status=self.profile_degradation_guard["status"]
+            )
+        decision = evaluate_profile_degradation_guard(
+            self.simulator.orders,
+            current_time=current_time,
+            profile_key=signal.profile_key,
+            daily_profile_version=signal.daily_profile_version,
+            config=self.profile_degradation_guard_config,
+        )
+        self.profile_degradation_guard = self._profile_degradation_guard_to_dict(decision)
+        return decision
 
     def _wave_state_to_dict(self) -> dict:
         return {

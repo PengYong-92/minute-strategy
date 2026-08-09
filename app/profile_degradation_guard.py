@@ -66,13 +66,13 @@ def evaluate_profile_degradation_guard(
     if resolved.cooldown_minutes == 0:
         return ProfileDegradationGuardDecision(
             status="DISABLED",
-            reason="Profile degradation guard is disabled",
+            reason="画像退化守卫已关闭",
             **scope,
         )
     if not target_profile or not target_version:
         return ProfileDegradationGuardDecision(
             status="NOT_APPLICABLE",
-            reason="A complete profile key and version are required",
+            reason="画像键或每日画像版本不完整",
             **scope,
         )
 
@@ -97,7 +97,7 @@ def evaluate_profile_degradation_guard(
     }
     if consecutive_losses < PROFILE_DEGRADATION_LOSS_STREAK:
         return ProfileDegradationGuardDecision(
-            reason="Profile loss streak is below the trigger",
+            reason="画像连续亏损未达到三笔",
             **scope,
             **streak,
         )
@@ -119,7 +119,7 @@ def evaluate_profile_degradation_guard(
             pause_until=pause_until,
             probe_order_id=probe.id,
             triggered_at=triggered_at,
-            reason="The recovery probe is still open",
+            reason="画像恢复试探单尚未结算",
             **scope,
             **streak,
         )
@@ -131,7 +131,7 @@ def evaluate_profile_degradation_guard(
             allow_progression=False,
             pause_until=pause_until,
             triggered_at=triggered_at,
-            reason="Three trailing profile losses triggered cooldown",
+            reason="画像连续三笔亏损，进入冷却",
             **scope,
             **streak,
         )
@@ -141,7 +141,7 @@ def evaluate_profile_degradation_guard(
         allow_progression=False,
         pause_until=pause_until,
         triggered_at=triggered_at,
-        reason="Cooldown completed; one base-stake probe is allowed",
+        reason="画像冷却结束，允许一笔基础金额试探单",
         **scope,
         **streak,
     )
