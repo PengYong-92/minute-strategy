@@ -4,19 +4,21 @@
 
 本文汇总 `minute-strategy` 截至2026-08-10的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
 
+`docs/release-handoff.md` 是项目唯一的发布交接文档。后续发布只更新或追加本文，不再创建带日期、提交号或版本号的交接文档副本。
+
 接手人员应先阅读 `docs/current-strategy.md` 掌握现行逻辑，再使用本文核对发布边界。历史设计和实施过程不再保留在工作树，可通过 Git 历史及 `v2026.08.10-profile-degradation-guard` 标签追溯。
 
 ### 1.1 当前阅读基线
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `b77a35f46370ebe0b5971102bd6a2624f769aae4` |
+| 当前功能基线 | `23fc78dca05bff549f2470268764b18088f4363d` |
 | 固化标签 | `v2026.08.10-profile-degradation-guard` |
-| 当前生产提交 | `12e33e0` |
-| 当前生产事实 | 第22节 |
-| 本地未部署功能 | 第23节，实时画像退化守卫 |
+| 当前生产提交 | `23fc78dca05bff549f2470268764b18088f4363d` |
+| 当前生产事实 | 第25节 |
+| 本地未部署功能 | 无 |
 
-`b77a35f` 之后的项目清理只收敛文档和本地生成物，不修改开单逻辑。第2至21节是历史发布快照；如与第22至23节冲突，以时间更晚的章节为准。
+第2至24节是历史发布或本地开发快照；如与第25节冲突，以第25节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 保留为同代码基线分支。
 
 ## 2. 发布身份
 
@@ -857,3 +859,90 @@ profile_guard=OFF
 | `dist/` | 可重新生成的发布包 | Git忽略；发布包生成和使用后可清理 |
 
 旧过程计划、设计稿和早期策略前置审计已从工作树删除。需要复盘时使用 Git 历史或固化标签，不再复制回当前文档目录。
+
+## 25. 2026-08-10 实时画像退化守卫与当天统计发布
+
+### 25.1 发布内容
+
+本次将第23节已经完成但未部署的实时画像退化守卫正式发布，并增加页面与API的当天交易统计。10分钟开单画像、观察候选放行、滚动优势、方向连亏守卫、两单并发、2分钟间隔和10U/18U两阶段金额逻辑均保持不变。
+
+新增生产行为：
+
+1. 按“完整画像键 + 当前DPS版本”检查已结算真实订单；同画像连续亏损3笔后冷却60分钟。
+2. 冷却结束只允许一笔10U基础试探；试探未结算前阻止该画像继续开单。
+3. 试探盈利恢复正常并可生成下一笔18U资格；试探亏损从结算时间重新冷却60分钟。
+4. API `stats.today` 按北京时间结算日期统计当天PnL、已结订单、胜负和胜率。
+5. 页面同时展示总盈亏、总胜率、今日盈亏和今日胜率；总统计口径未改变。
+
+### 25.2 发布身份
+
+| 项目 | 值 |
+|---|---|
+| 生产代码提交 | `23fc78dca05bff549f2470268764b18088f4363d` |
+| 生产代码分支 | `main`，功能分支代码同步 |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-23fc78d-20260810-161745` |
+| 最小包 | `event-contract-monitor-23fc78d-20260810-161745-minimal.tar.gz` |
+| 包大小 | `122134 bytes` |
+| SHA-256 | `71350abe7dbfe6b680bc80458974f98dd4cc85047a2e15666b4a51587a9c2548` |
+| 服务启动边界 | `2026-08-10 16:22:20 CST` |
+
+最小包仅包含 `app/`、`scripts/run.sh`、`README.md` 和 `.gitignore`。本次未修改systemd、Nginx或SSL配置，未清空、迁移或备份SQLite；订单、观察样本、每日画像和滚单资格沿用共享数据目录。
+
+### 25.3 发布前后数据一致性
+
+发布前后总统计保持一致：
+
+```text
+total_orders=141
+settled_orders=141
+open_orders=0
+wins=88
+losses=53
+win_rate=62.41%
+total_pnl=+198.0U
+```
+
+发布后首次返回的北京时间当天统计：
+
+```text
+date=2026-08-10
+settled_orders=67
+wins=43
+losses=24
+win_rate=64.18%
+pnl=+115.2U
+```
+
+上述当天统计由现有订单的 `settled_at` 即时聚合，不新增统计表，也不改变订单结算结果。
+
+### 25.4 生产验收
+
+```text
+release=/opt/victory-event-monitor/releases/event-contract-monitor-23fc78d-20260810-161745
+service=active
+NRestarts=0
+https=200
+ssl_verify_result=0
+warmup.status=READY
+warmup.loaded_klines=145440
+kline_count=140000
+last_error=null
+profile_degradation_guard=ON / NORMAL / 60分钟
+daily_profile_version=DPS-20260810-0800
+daily_profiles=24
+daily_profile_min_win_rate=60%
+trade_score_threshold=AUTO
+max_open_orders=2
+min_order_gap_ms=120000
+result_sequence_guard=ON / DIRECTION / 3亏 / 20分钟
+rolling_edge_guard=ON
+warning日志=0
+```
+
+本地发布前验证为429项测试通过，Python编译、JavaScript语法、Shell语法、Git差异检查和最小包服务器导入均通过。
+
+### 25.5 后续观察口径
+
+`2026-08-10 16:22:20 CST` 是实时画像退化守卫的生产启用边界。评估该守卫时只使用此时间之后新结算的订单，重点记录完整画像键、DPS版本、连续亏损数、冷却命中、试探订单结果和后续18U资格；不要把边界前141笔订单计入守卫效果样本。
+
+当天统计是展示口径，不是新的策略筛选条件。日切按北京时间00:00执行，总收益和总胜率继续覆盖该币种数据库中的全部订单。
