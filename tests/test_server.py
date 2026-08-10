@@ -284,6 +284,10 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(state_payload["stake_progression"]["max_orders"], 2)
         self.assertEqual(state_payload["stake_progression"]["max_active"], 1)
         self.assertIn("next_stake", state_payload["stake_progression"])
+        self.assertEqual(
+            set(state_payload["stats"]["today"]),
+            {"date", "pnl", "settled_orders", "wins", "losses", "win_rate"},
+        )
         self.assertIn("wave_state", state_payload)
         self.assertIn("allowed_directions", state_payload["wave_state"])
         self.assertIn("wave_batch_guard", state_payload)

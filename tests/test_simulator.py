@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import fields
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from app.models import Kline, Signal, SimulatedOrder
@@ -711,6 +712,50 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual((stats["next_stake"], stats["next_win_return"]), (18.0, 32.4))
         self.assertEqual(stats["stake_progression_base_only_segments"], [])
         self.assertEqual(event.progression_credit.status, "PENDING")
+
+    def test_stats_reports_orders_settled_today_in_shanghai(self):
+        shanghai = timezone(timedelta(hours=8))
+
+        def timestamp_ms(day: int, hour: int = 0, minute: int = 0, second: int = 0) -> int:
+            value = datetime(2026, 8, day, hour, minute, second, tzinfo=shanghai)
+            return int(value.timestamp() * 1000)
+
+        simulator = AccountSimulator()
+
+        def settle_at(settled_at: int, *, won: bool) -> None:
+            order = simulator.open_order(
+                signal("LONG", timeframe_minutes=1),
+                entry_price=100.0,
+                opened_at=settled_at - 60_000,
+            )
+            simulator.settle_expired_orders(
+                order.expires_at,
+                101.0 if won else 99.0,
+            )
+
+        settle_at(timestamp_ms(9, 23, 59, 59), won=True)
+        settle_at(timestamp_ms(10), won=False)
+        settle_at(timestamp_ms(10, 11, 30), won=True)
+        settle_at(timestamp_ms(11), won=True)
+        simulator.open_order(
+            signal("LONG", timeframe_minutes=1),
+            entry_price=100.0,
+            opened_at=timestamp_ms(10, 12),
+        )
+
+        stats = simulator.stats(now_ms=timestamp_ms(10, 18))
+
+        self.assertEqual(
+            stats["today"],
+            {
+                "date": "2026-08-10",
+                "pnl": -2.0,
+                "settled_orders": 2,
+                "wins": 1,
+                "losses": 1,
+                "win_rate": 0.5,
+            },
+        )
 
     def test_same_market_batch_settles_each_expired_order_only_once(self):
         simulator = AccountSimulator(enable_stake_progression=True)

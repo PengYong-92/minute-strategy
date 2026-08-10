@@ -117,7 +117,7 @@ button:disabled {
 }
 
 .summary-cards {
-  grid-template-columns: repeat(6, minmax(150px, 1fr));
+  grid-template-columns: repeat(8, minmax(130px, 1fr));
 }
 
 .status-cards {
@@ -458,6 +458,12 @@ td span {
   background: var(--red-bg);
 }
 
+@media (max-width: 1400px) {
+  .summary-cards {
+    grid-template-columns: repeat(4, minmax(150px, 1fr));
+  }
+}
+
 @media (max-width: 1000px) {
   header {
     align-items: flex-start;
@@ -485,7 +491,10 @@ td span {
     padding: 14px;
   }
 
-  .summary-cards,
+  .summary-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .status-cards,
   .order-filters {
     grid-template-columns: 1fr;

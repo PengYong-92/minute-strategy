@@ -19,6 +19,13 @@ class PackagingTest(unittest.TestCase):
         styles_css = (ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("每日画像选策", index_html)
+        self.assertIn("今日盈亏", index_html)
+        self.assertIn('id="today-balance"', index_html)
+        self.assertIn("今日胜率", index_html)
+        self.assertIn('id="today-win-rate"', index_html)
+        self.assertIn('"today-balance"', app_js)
+        self.assertIn('"today-win-rate"', app_js)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr));", styles_css)
         self.assertIn("SHORT扩展", index_html)
         self.assertIn("short-extension-status", index_html)
         self.assertIn("strategy-profile", index_html)

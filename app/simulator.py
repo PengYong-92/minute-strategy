@@ -1,6 +1,8 @@
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from time import time
 
 from app.models import Kline, Signal, SimulatedOrder
 from app.stake_progression import (
@@ -9,6 +11,9 @@ from app.stake_progression import (
     StakeProgressionCredit,
     TwoStageStakeProgression,
 )
+
+
+SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
@@ -271,10 +276,23 @@ class AccountSimulator:
             progression_credit=replace(credit) if credit is not None else None,
         )
 
-    def stats(self) -> dict:
+    def stats(self, now_ms: int | None = None) -> dict:
         settled = [order for order in self.orders if order.status == "SETTLED"]
         wins = [order for order in settled if order.result == "WIN"]
         losses = [order for order in settled if order.result == "LOSS"]
+        effective_now_ms = int(time() * 1000) if now_ms is None else int(now_ms)
+        current_time = datetime.fromtimestamp(effective_now_ms / 1000, SHANGHAI_TIMEZONE)
+        day_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_ms = int(day_start.timestamp() * 1000)
+        day_end_ms = day_start_ms + 24 * 60 * 60 * 1000
+        today_settled = [
+            order
+            for order in settled
+            if order.settled_at is not None
+            and day_start_ms <= int(order.settled_at) < day_end_ms
+        ]
+        today_wins = [order for order in today_settled if order.result == "WIN"]
+        today_losses = [order for order in today_settled if order.result == "LOSS"]
         progression = self.stake_progression.status()
         stats = {
             "balance": round(self.balance, 4),
@@ -288,6 +306,18 @@ class AccountSimulator:
             "win_return": self.win_return,
             "win_net": round(self.win_return - self.stake, 4),
             "loss_net": -self.stake,
+            "today": {
+                "date": day_start.date().isoformat(),
+                "pnl": round(sum(order.pnl for order in today_settled), 4),
+                "settled_orders": len(today_settled),
+                "wins": len(today_wins),
+                "losses": len(today_losses),
+                "win_rate": (
+                    round(len(today_wins) / len(today_settled), 4)
+                    if today_settled
+                    else 0.0
+                ),
+            },
         }
         stats.update(progression)
         stats.update(
