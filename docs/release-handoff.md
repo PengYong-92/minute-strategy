@@ -12,13 +12,13 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `863ff5d168262e9cb2fc7754b838107f3cbd1f2a` |
-| 固化标签 | `v2026.08.12-optimization-observability`（创建后指向本次文档提交） |
-| 当前生产提交 | `23fc78dca05bff549f2470268764b18088f4363d` |
-| 当前生产事实 | 第28节 |
-| 本地未部署功能 | 第27至28节统计与观察能力 |
+| 当前功能基线 | `02369bf2d2f17372486eb378f3473f3cf154b108` |
+| 固化标签 | `v2026.08.12-optimization-observability`（指向 `02369bf`） |
+| 当前生产提交 | `02369bf2d2f17372486eb378f3473f3cf154b108` |
+| 当前生产事实 | 第29节 |
+| 本地未部署功能 | 无；第28.6节候选继续只观察，不启用真实准入 |
 
-第2至27节是历史发布、本地开发或较早分析快照；如与第28节冲突，以第28节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 保留为同代码基线分支。第27节只代表本地未部署状态。
+第2至28节是历史发布、本地开发或较早分析快照；如与第29节冲突，以第29节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 保留为历史功能分支。第27至28节记录的统计与观察能力已随第29节发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
 
 ## 2. 发布身份
 
@@ -1179,3 +1179,75 @@ tar.gz与zip均生成成功；归档包含app/quality_score.py、静态页面和
 ```
 
 本次只提交并推送仓库及标签，不部署服务器、不重启服务、不清空模拟订单。当前生产仍是 `23fc78dca05bff549f2470268764b18088f4363d`；后续部署必须从本标签或其对应 `main` 提交发布，并另行记录生产提交、发布目录、服务重启边界及新样本起点。
+
+## 29. 2026-08-12 优化观测版本生产发布
+
+### 29.1 发布身份与边界
+
+| 项目 | 发布值 |
+|---|---|
+| 生产提交 | `02369bf2d2f17372486eb378f3473f3cf154b108` |
+| 固化标签 | `v2026.08.12-optimization-observability` |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-02369bf-20260812-175520` |
+| 发布前目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-23fc78d-20260810-161745` |
+| 当前软链 | `/opt/victory-event-monitor/current` |
+| 服务重启边界 | `2026-08-12 17:57:54 CST` |
+| systemd服务 | `victory-event-monitor`，`active/running` |
+| 内部监听 | `127.0.0.1:18080` |
+| 公网域名 | `https://victory.easy-tx.com` |
+| SQLite | `/opt/victory-event-monitor/shared/data/monitor.sqlite3` |
+
+本次采用不含 `data/` 的发布包原子切换软链，保留发布前目录作为快速回退点。没有清空、复制、迁移或替换SQLite，没有修改systemd启动参数、Nginx逻辑或SSL配置。
+
+发布前后订单连续性检查：
+
+```text
+orders rows: 324 -> 324
+max order_id: 324 -> 324
+open orders: 0 -> 0
+```
+
+因此既有模拟订单完整保留。服务继续直接使用原共享数据库路径，新订单从324号之后连续编号。
+
+### 29.2 验收结果
+
+发布前重新执行：
+
+```text
+python3 -m unittest discover -s tests -v
+Ran 446 tests in 8.133s
+OK
+
+python3 -m compileall -q app scripts tests
+exit=0
+```
+
+发布包为 `event-contract-monitor-02369bf-20260812-175520.tar.gz`，SHA-256：
+
+```text
+7f8871892235648c5edb1bf22e76274218920915a6592decb7630538792dcafb
+```
+
+包内容检查确认不含 `data/` 和 `monitor.sqlite3`。服务器端解包后编译通过，服务状态为 `active/running`，最近服务警告为空。
+
+运行态验收：
+
+```text
+symbol=BTCUSDT
+kline_count=140000
+last_error=null
+total_orders=324
+open_orders=0
+active_profile=DPS-20260812-0800
+order_profile.snapshot_count=324
+order_profile.sample_count=324
+signal_audit.sample_count=5000
+```
+
+`/api/state` 已返回画像周期统计，`/api/order-profile` 已返回 `FIRST/SECOND` 与完整画像/DPS分组，`/api/signal-audit-summary` 已返回守卫和并发位置汇总。HTTP入口正常跳转HTTPS，TLS域名为 `victory.easy-tx.com`，HTTPS `/api/state` 返回 `200`。预热数据、订单恢复和新页面静态资源均已加载。
+
+### 29.3 新样本口径
+
+`2026-08-12 17:57:54 CST` 是本次观测字段的生产起点。该时间之后的新信号、观察样本和订单开始原生记录 `QS_V1_SHADOW`、开单前 `FIRST/SECOND` 上下文及完整守卫审计；旧订单的并发位置可按开单和到期时间重建，但旧订单没有影子质量评分时必须继续标记为 `UNSCORED`。
+
+本次发布不启用以下真实拦截：第二并发LONG仅限 `UP_LEG`、质量评分准入、2亏冷却、画像影子守卫。后续必须按本节边界累计新样本，先比较胜率，再比较PnL、EV、订单量、最大回撤和最长连亏，不能把发布前后的观测字段完整度混为同一批样本。
