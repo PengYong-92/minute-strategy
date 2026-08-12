@@ -142,7 +142,6 @@ class MonitorState:
         self.daily_profile_selector_config = (
             daily_profile_selector_config or DailyProfileSelectorConfig()
         ).normalized()
-        self.webhook_error: str | None = None
         self.stake_progression_recovery_warning = ""
         self._storage_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor-storage")
         self._storage_futures: list[Future] = []
@@ -396,7 +395,6 @@ class MonitorState:
             self.fear_greed = None
             self.warmup = None
             self.risk_pause = ""
-            self.webhook_error = None
             self.klines = []
             restored_wave_runtime = self._load_wave_runtime()
             self.wave_state = (
@@ -756,16 +754,16 @@ class MonitorState:
                 self.simulator.rollback_open_order(order.id)
                 self._set_storage_error("开单持久化失败", exc)
                 return "STORAGE_ERROR"
+        if gate.signal_key:
+            self._opened_signal_keys.add(gate.signal_key)
+        self._last_order_opened_at = latest.close_time
+        self._send_webhook(signal, order)
         if signal.profile_degradation_probe:
             self._refresh_profile_degradation_guard(signal, latest.close_time)
         if should_observe:
             self._record_observation(signal, latest, "OPENED")
         if self.storage:
             self._save_order_entry_snapshot(order, signal, latest)
-        self._send_webhook(signal, order)
-        if gate.signal_key:
-            self._opened_signal_keys.add(gate.signal_key)
-        self._last_order_opened_at = latest.close_time
         return gate.code
 
     def _apply_wave_guard(self, signal: Signal, wave: WaveSnapshot) -> Signal:
@@ -1831,10 +1829,8 @@ class MonitorState:
             return
         try:
             self.webhook.send_signal(self.symbol, signal, amount=order.stake if order else None)
-        except Exception as exc:  # noqa: BLE001 - 外部推送只是副作用，不能中断监控。
-            self.webhook_error = str(exc)
-        else:
-            self.webhook_error = None
+        except Exception:  # noqa: BLE001 - 最低延迟模式明确静默丢弃分发异常。
+            return
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1863,8 +1859,14 @@ class MonitorState:
                     "min_order_gap_ms": self.order_policy.min_order_gap_ms,
                 },
                 "trade_score_threshold": self._trade_score_threshold_status(),
-                "webhook": self.webhook.status() if self.webhook else {"enabled": False, "last_error": None},
-                "webhook_error": self.webhook_error,
+                "webhook": self.webhook.status() if self.webhook else {
+                    "enabled": False,
+                    "url": None,
+                    "last_error": None,
+                    "last_payload": None,
+                    "last_sent_at_ms": None,
+                },
+                "webhook_error": None,
                 "signals": [signal.to_dict() for signal in self.signals],
                 "selected_signal": self.selected_signal.to_dict() if self.selected_signal else None,
                 "order_decision": self.order_decision,

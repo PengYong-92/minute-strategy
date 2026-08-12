@@ -67,8 +67,6 @@ function fmtWarmup(warmup) {
 
 function fmtWebhook(webhook) {
   if (!webhook || !webhook.enabled) return "OFF";
-  if (webhook.last_error) return `ERROR · ${webhook.last_error}`;
-  if (webhook.last_sent_at_ms) return `ON · ${fmtTime(webhook.last_sent_at_ms)}`;
   return "ON";
 }
 
@@ -309,7 +307,7 @@ function profileDegradationGuardClass(guard) {
 
 function webhookClass(webhook) {
   if (!webhook || !webhook.enabled) return "status-muted";
-  return webhook.last_error ? "status-risk" : "status-good";
+  return "status-good";
 }
 
 function shortExtensionClass(state) {

@@ -1,4 +1,5 @@
 import json
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
@@ -27,11 +28,6 @@ class WebhookSignalProxy:
     enabled: bool = True
     transport: Transport | None = None
 
-    def __post_init__(self) -> None:
-        self.last_error: str | None = None
-        self.last_payload: dict | None = None
-        self.last_sent_at_ms: int | None = None
-
     def build_payload(self, symbol: str, signal: Signal, message: str | None = None, amount: float | None = None) -> dict:
         payload = {
             "importToken": self.import_token,
@@ -52,32 +48,34 @@ class WebhookSignalProxy:
         if signal.direction not in {"LONG", "SHORT"}:
             return
 
-        payload = self.build_payload(symbol, signal, message, amount=amount)
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
+            payload = self.build_payload(symbol, signal, message, amount=amount)
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             transport = self.transport or self._post_json
-            transport(self.url, body, self.timeout_seconds)
-        except Exception as exc:  # noqa: BLE001 - 外部推送失败不能中断行情监控。
-            self.last_error = str(exc)
-            raise
-        else:
-            import time
-
-            self.last_payload = payload
-            self.last_error = None
-            self.last_sent_at_ms = int(time.time() * 1000)
+            threading.Thread(
+                target=self._send_once,
+                args=(transport, self.url, body, self.timeout_seconds),
+                name="webhook-signal-sender",
+                daemon=True,
+            ).start()
+        except Exception:  # noqa: BLE001 - 最低延迟模式明确接受线程启动失败时丢弃信号。
+            return
 
     def status(self) -> dict:
-        last_payload = dict(self.last_payload) if self.last_payload else None
-        if last_payload and "importToken" in last_payload:
-            last_payload["importToken"] = "***"
         return {
             "enabled": self.enabled,
             "url": self.url,
-            "last_error": self.last_error,
-            "last_payload": last_payload,
-            "last_sent_at_ms": self.last_sent_at_ms,
+            "last_error": None,
+            "last_payload": None,
+            "last_sent_at_ms": None,
         }
+
+    @staticmethod
+    def _send_once(transport: Transport, url: str, body: bytes, timeout: float) -> None:
+        try:
+            transport(url, body, timeout)
+        except Exception:  # noqa: BLE001 - 不确认、不重试、不记录，失败信号直接丢弃。
+            return
 
     @staticmethod
     def _post_json(url: str, body: bytes, timeout: float) -> None:
@@ -90,5 +88,5 @@ class WebhookSignalProxy:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read()
+        with urllib.request.urlopen(request, timeout=timeout):
+            pass

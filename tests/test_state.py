@@ -18,6 +18,7 @@ from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
 from app.wave_state import WaveSnapshot, advance_wave, analyze_wave
 from app.wave_batch_guard import WaveBatchGuardConfig
+from app.webhook import WebhookSignalProxy
 
 
 def kline(idx, close, volume, open_price=None, high=None, low=None):
@@ -919,6 +920,79 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(snapshot["observations"][0]["source_decision"], "OPENED")
         self.assertEqual(len(storage.entry_snapshots), 1)
         self.assertEqual(len(webhook.calls), 1)
+
+    def test_webhook_triggers_before_entry_snapshot_profile_summary(self):
+        events = []
+
+        class OrderingStorage(RecordingStorage):
+            def order_profile_summary(self, symbol, **kwargs):
+                events.append("profile_summary")
+                return None
+
+        class OrderingWebhook(RecordingWebhook):
+            def send_signal(self, symbol, signal, message=None, amount=None):
+                events.append("webhook")
+                super().send_signal(symbol, signal, message=message, amount=amount)
+
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=OrderingStorage(),
+            webhook=OrderingWebhook(),
+            now_ms=lambda: 1_000,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="fast webhook",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(events[0], "webhook")
+
+    def test_webhook_dispatch_failure_does_not_interrupt_committed_order(self):
+        class FailingWebhook(RecordingWebhook):
+            def send_signal(self, symbol, signal, message=None, amount=None):
+                raise TypeError("payload failed")
+
+        state = MonitorState(
+            symbol="BTCUSDT",
+            webhook=FailingWebhook(),
+            min_order_gap_ms=120_000,
+            now_ms=lambda: 1_000,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="committed order",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+        )
+        latest = Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000)
+
+        decision = state._maybe_open_order(signal, latest)
+        repeated = state._maybe_open_order(signal, latest)
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(repeated, "COOLDOWN")
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
 
     def test_mechanical_rejections_clear_stale_risk_pause(self):
         latest = Kline(60_001, 100.0, 100.0, 100.0, 100.0, 1.0, 120_000)
@@ -2920,6 +2994,35 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(webhook.calls[0][3], state.snapshot()["orders"][0]["reason"])
         self.assertEqual(webhook.calls[0][4], state.snapshot()["orders"][0]["stake"])
         self.assertTrue(state.snapshot()["webhook"]["enabled"])
+
+    def test_slow_webhook_transport_does_not_block_market_update(self):
+        transport_started = threading.Event()
+        release_transport = threading.Event()
+        update_finished = threading.Event()
+
+        def blocking_transport(url, body, timeout):
+            transport_started.set()
+            release_transport.wait(timeout=2)
+
+        state = MonitorState(
+            symbol="BTCUSDT",
+            webhook=WebhookSignalProxy(transport=blocking_transport),
+            enable_wave_guard=False,
+        )
+
+        updater = threading.Thread(
+            target=lambda: (
+                state.update_from_klines(actionable_rebound_klines()),
+                update_finished.set(),
+            )
+        )
+        updater.start()
+
+        self.assertTrue(transport_started.wait(timeout=2))
+        self.assertTrue(update_finished.wait(timeout=0.5))
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+        release_transport.set()
+        updater.join(timeout=2)
 
     def test_short_signal_is_observed_without_opening_order_or_webhook(self):
         webhook = RecordingWebhook()
