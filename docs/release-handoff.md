@@ -12,7 +12,7 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `02369bf2d2f17372486eb378f3473f3cf154b108` |
+| 当前功能基线 | `07cfc3f`（Webhook最低延迟异步发送，尚未发布） |
 | 固化标签 | `v2026.08.12-optimization-observability`（指向 `02369bf`） |
 | 当前生产提交 | `02369bf2d2f17372486eb378f3473f3cf154b108` |
 | 当前生产事实 | 第29节 |
@@ -1255,6 +1255,8 @@ signal_audit.sample_count=5000
 ## 30. 2026-08-12 Webhook最低延迟异步发送设计
 
 状态：`本地已实现并验证，未发布服务器`。
+
+功能提交：`07cfc3f`（`perf: dispatch webhooks without blocking`）。
 
 ### 30.1 现状检查
 
