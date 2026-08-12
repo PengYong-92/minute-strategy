@@ -181,6 +181,45 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertTrue(restored.profile_degradation_probe)
         self.assertEqual(restored.profile_degradation_triggered_at, 987_654)
 
+    def test_persists_and_restores_shadow_quality_score_payloads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            scored_signal = replace(
+                signal(),
+                quality_score=68.5,
+                quality_score_version="QS_V1_SHADOW",
+                quality_score_mode="SHADOW_ONLY",
+                quality_score_context="LONG_FIRST",
+                quality_score_components={"wave_state": 6.0},
+                quality_score_inputs={"slot": "FIRST"},
+            )
+            order = AccountSimulator().open_order(
+                scored_signal,
+                entry_price=100.0,
+                opened_at=1_000,
+            )
+            scored_observation = replace(
+                observation("quality-score"),
+                quality_score=72.0,
+                quality_score_version="QS_V1_SHADOW",
+                quality_score_mode="SHADOW_ONLY",
+                quality_score_context="SHORT_SECOND",
+                quality_score_components={"volume": 5.0},
+                quality_score_inputs={"slot": "SECOND"},
+            )
+
+            store.save_order(order, "BTCUSDT")
+            store.save_observation(scored_observation, "BTCUSDT")
+            restored_order = store.load_orders("BTCUSDT")[0]
+            restored_observation = store.load_observations("BTCUSDT")[0]
+
+        self.assertEqual(restored_order.quality_score, 68.5)
+        self.assertEqual(restored_order.quality_score_context, "LONG_FIRST")
+        self.assertEqual(restored_order.quality_score_components["wave_state"], 6.0)
+        self.assertEqual(restored_observation.quality_score, 72.0)
+        self.assertEqual(restored_observation.quality_score_context, "SHORT_SECOND")
+        self.assertEqual(restored_observation.quality_score_inputs["slot"], "SECOND")
+
     def test_cancels_multiple_pending_credits_atomically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -218,6 +257,55 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(rows[0]["decision"], "OPENED")
         self.assertEqual(rows[0]["direction"], "LONG")
         self.assertEqual(rows[0]["regime"], "FEAR_RISING")
+
+    def test_signal_audit_summary_groups_guard_hits_by_profile_and_slot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            guarded = replace(
+                signal(),
+                profile_key="10|drop_reclaim|long_observe|LONG|WD-08",
+                daily_profile_version="DPS-1",
+                order_slot="SECOND",
+            )
+            store.save_signal(
+                "BTCUSDT",
+                guarded,
+                decision="RESULT_SEQUENCE_GUARD_BLOCKED",
+                created_at_ms=1_234,
+                audit_context={
+                    "result_sequence_guard": {"status": "COOLDOWN"},
+                    "profile_degradation_guard": {"status": "NORMAL"},
+                },
+            )
+            store.save_signal(
+                "BTCUSDT",
+                guarded,
+                decision="OPENED",
+                created_at_ms=2_234,
+                audit_context={
+                    "result_sequence_guard": {"status": "NORMAL"},
+                    "profile_degradation_guard": {"status": "RECOVERY_READY"},
+                },
+            )
+
+            summary = store.signal_audit_summary("BTCUSDT")
+
+        self.assertEqual(summary["sample_count"], 2)
+        decisions = {item["key"]: item["count"] for item in summary["by_decision"]}
+        self.assertEqual(decisions["RESULT_SEQUENCE_GUARD_BLOCKED"], 1)
+        self.assertEqual(decisions["OPENED"], 1)
+        contexts = {item["key"]: item for item in summary["by_profile_dps_slot"]}
+        context = contexts[
+            "10|drop_reclaim|long_observe|LONG|WD-08|DPS-1|SECOND"
+        ]
+        self.assertEqual(context["signals"], 2)
+        self.assertEqual(context["blocked"], 1)
+        sequence_status = {
+            item["key"]: item["count"]
+            for item in summary["by_result_sequence_status"]
+        }
+        self.assertEqual(sequence_status["COOLDOWN"], 1)
+        self.assertEqual(sequence_status["NORMAL"], 1)
 
     def test_persists_order_entry_snapshot_and_updates_settlement(self):
         with tempfile.TemporaryDirectory() as temp_dir:

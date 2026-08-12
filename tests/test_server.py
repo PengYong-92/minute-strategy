@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import app.server as server_module
 from app.history import WarmupReport
-from app.models import Kline, ObservationSignal, SimulatedOrder
+from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
 from app.server import apply_warmup, make_handler, start_polling
 from app.state import MonitorState
 from app.storage import SQLiteMonitorStore
@@ -288,6 +288,21 @@ class OrdersApiTest(unittest.TestCase):
             set(state_payload["stats"]["today"]),
             {"date", "pnl", "settled_orders", "wins", "losses", "win_rate"},
         )
+        self.assertEqual(
+            state_payload["stats"]["profile_period"],
+            {
+                "active": True,
+                "version": "DPS-20260730-0800",
+                "effective_from": 1_000,
+                "effective_until": 86_401_000,
+                "pnl": 0.0,
+                "settled_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "by_direction_slot": [],
+            },
+        )
         self.assertIn("wave_state", state_payload)
         self.assertIn("allowed_directions", state_payload["wave_state"])
         self.assertIn("wave_batch_guard", state_payload)
@@ -488,6 +503,45 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(payload["total"]["orders"], 2)
         self.assertEqual(payload["total"]["losses"], 2)
         self.assertIn("LEVEL_A_REBOUND", {item["key"] for item in payload["risk_hints"]})
+
+    def test_signal_audit_summary_api_reports_guard_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            audited = state._attach_quality_score(
+                Signal(
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="audit",
+                    price=100.0,
+                    open_time=1_000,
+                    profile_key="10|drop_reclaim|long_observe|LONG|WD-08",
+                    daily_profile_version="DPS-1",
+                )
+            )
+            store.save_signal(
+                "BTCUSDT",
+                audited,
+                "RESULT_SEQUENCE_GUARD_BLOCKED",
+                1_000,
+                audit_context={
+                    "result_sequence_guard": {"status": "COOLDOWN"},
+                    "profile_degradation_guard": {"status": "NORMAL"},
+                },
+            )
+            server = _serve(state)
+            try:
+                payload = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/signal-audit-summary"
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertEqual(payload["sample_count"], 1)
+        self.assertEqual(payload["by_decision"][0]["key"], "RESULT_SEQUENCE_GUARD_BLOCKED")
+        self.assertEqual(payload["by_result_sequence_status"][0]["key"], "COOLDOWN")
 
 
 def _serve(state):

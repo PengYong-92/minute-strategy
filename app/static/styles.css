@@ -117,7 +117,7 @@ button:disabled {
 }
 
 .summary-cards {
-  grid-template-columns: repeat(8, minmax(130px, 1fr));
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
 }
 
 .status-cards {

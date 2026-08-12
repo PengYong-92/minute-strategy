@@ -81,6 +81,9 @@ def make_handler(state: MonitorState, warmup_loader=None):
             if parsed.path == "/api/order-profile":
                 self._send_json(state.order_profile_summary())
                 return
+            if parsed.path == "/api/signal-audit-summary":
+                self._send_json(state.signal_audit_summary())
+                return
             if parsed.path == "/api/config":
                 query = parse_qs(parsed.query)
                 symbol = query.get("symbol", [None])[0]

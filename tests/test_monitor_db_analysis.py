@@ -12,6 +12,7 @@ from app.order_profile import (
     risk_hint_keys_for_sample,
     sample_from_entry_snapshot,
     sample_from_signal,
+    summarize_order_samples,
     sweep_profile_guard,
     sweep_profile_guard_key_subsets,
 )
@@ -19,6 +20,103 @@ from scripts.analyze_monitor_db import analyze_samples, load_order_samples
 
 
 class MonitorDbAnalysisTest(unittest.TestCase):
+    def test_order_profile_excludes_open_snapshots_from_result_statistics(self):
+        settled = sample_from_entry_snapshot(
+            {
+                "order_id": 1,
+                "opened_at": 1_000,
+                "expires_at": 601_000,
+                "settled_at": 601_000,
+                "result": "WIN",
+                "pnl": 8.0,
+                "entry_payload": {"signal": {}},
+            }
+        )
+        open_sample = sample_from_entry_snapshot(
+            {
+                "order_id": 2,
+                "opened_at": 700_000,
+                "expires_at": 1_300_000,
+                "result": None,
+                "pnl": 0.0,
+                "entry_payload": {"signal": {}},
+            }
+        )
+
+        report = summarize_order_samples([settled, open_sample], min_group_size=1)
+
+        self.assertEqual(report["snapshot_count"], 2)
+        self.assertEqual(report["sample_count"], 1)
+        self.assertEqual(report["open_orders"], 1)
+        self.assertEqual(report["total"]["orders"], 1)
+        self.assertEqual(report["total"]["wins"], 1)
+        self.assertEqual(report["total"]["losses"], 0)
+
+    def test_order_profile_reconstructs_concurrency_slot_and_groups_by_profile_period(self):
+        def snapshot(order_id, opened_at, expires_at, result, pnl, version):
+            return sample_from_entry_snapshot(
+                {
+                    "order_id": order_id,
+                    "direction": "LONG",
+                    "timeframe_minutes": 10,
+                    "threshold_segment": "WD-08",
+                    "opened_at": opened_at,
+                    "expires_at": expires_at,
+                    "settled_at": expires_at,
+                    "result": result,
+                    "pnl": pnl,
+                    "entry_payload": {
+                        "signal": {
+                            "strategy_family": "drop_reclaim",
+                            "strategy_tag": "long_observe",
+                            "profile_key": "10|drop_reclaim|long_observe|LONG|WD-08",
+                            "daily_profile_version": version,
+                        }
+                    },
+                }
+            )
+
+        report = summarize_order_samples(
+            [
+                snapshot(1, 1_000, 601_000, "WIN", 8.0, "DPS-1"),
+                snapshot(2, 121_000, 721_000, "LOSS", -10.0, "DPS-1"),
+                snapshot(3, 800_000, 1_400_000, "WIN", 8.0, "DPS-2"),
+            ],
+            min_group_size=1,
+        )
+
+        by_direction_slot = {item["key"]: item for item in report["by_direction_slot"]}
+        self.assertEqual(by_direction_slot["LONG_FIRST"]["orders"], 2)
+        self.assertEqual(by_direction_slot["LONG_SECOND"]["orders"], 1)
+        by_profile_slot = {item["key"]: item for item in report["by_profile_slot"]}
+        second = by_profile_slot["10|drop_reclaim|long_observe|LONG|WD-08|SECOND"]
+        self.assertEqual(second["dps_count"], 1)
+        self.assertEqual(second["sample_state"], "COLLECTING")
+        self.assertFalse(second["cross_dps_ready"])
+        exact = {item["key"]: item for item in report["by_profile_dps_slot"]}
+        self.assertEqual(
+            exact["10|drop_reclaim|long_observe|LONG|WD-08|DPS-1|SECOND"]["losses"],
+            1,
+        )
+
+    def test_negative_edge_uses_below_first_cutoff_bin(self):
+        sample = sample_from_entry_snapshot(
+            {
+                "opened_at": 1_000,
+                "settled_at": 2_000,
+                "result": "LOSS",
+                "pnl": -10.0,
+                "edge": -78.5,
+                "entry_payload": {"signal": {}},
+            }
+        )
+        report = summarize_order_samples(
+            [sample],
+            min_group_size=1,
+        )
+
+        self.assertEqual(report["feature_bins"]["edge"][0]["key"], "<0")
+
     def test_entry_snapshot_exposes_wave_fields_for_analysis(self):
         sample = sample_from_entry_snapshot(
             {
@@ -40,6 +138,53 @@ class MonitorDbAnalysisTest(unittest.TestCase):
         self.assertEqual(sample["wave_state"], "DOWN_LEG")
         self.assertEqual(sample["wave_batch_id"], "123|DOWN_LEG|SHORT|WD-05|DPS-1")
         self.assertEqual(sample["wave_guard_mode"], "RECOVERY")
+
+    def test_entry_snapshot_exposes_shadow_quality_score(self):
+        sample = sample_from_entry_snapshot(
+            {
+                "symbol": "BTCUSDT",
+                "order_id": 1,
+                "direction": "LONG",
+                "entry_payload": {
+                    "signal": {
+                        "quality_score": 68.5,
+                        "quality_score_version": "QS_V1_SHADOW",
+                        "quality_score_mode": "SHADOW_ONLY",
+                        "quality_score_context": "LONG_SECOND",
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(sample["quality_score"], 68.5)
+        self.assertEqual(sample["quality_score_version"], "QS_V1_SHADOW")
+        self.assertEqual(sample["quality_score_mode"], "SHADOW_ONLY")
+        self.assertEqual(sample["quality_score_context"], "LONG_SECOND")
+
+    def test_order_profile_reports_profile_degradation_probe_results(self):
+        probe = sample_from_entry_snapshot(
+            {
+                "order_id": 1,
+                "opened_at": 1_000,
+                "expires_at": 601_000,
+                "settled_at": 601_000,
+                "result": "WIN",
+                "pnl": 8.0,
+                "entry_payload": {
+                    "signal": {
+                        "profile_degradation_probe": True,
+                        "profile_degradation_triggered_at": 500,
+                    }
+                },
+            }
+        )
+
+        report = summarize_order_samples([probe], min_group_size=1)
+
+        self.assertTrue(probe["profile_degradation_probe"])
+        self.assertEqual(probe["profile_degradation_triggered_at"], 500)
+        self.assertEqual(report["profile_degradation_probes"]["orders"], 1)
+        self.assertEqual(report["profile_degradation_probes"]["wins"], 1)
 
     def test_loads_snapshots_and_reports_risk_hints(self):
         with tempfile.TemporaryDirectory() as temp_dir:

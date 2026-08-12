@@ -337,9 +337,11 @@ class RecordingStorage:
             self.fail_once_methods.remove(method_name)
             raise OSError(f"{method_name} failed")
 
-    def save_signal(self, symbol, signal, decision, created_at_ms):
+    def save_signal(self, symbol, signal, decision, created_at_ms, audit_context=None):
         self._wait_for_write_gate()
-        self.signals.append((symbol, signal.to_dict(), decision, created_at_ms))
+        self.signals.append(
+            (symbol, signal.to_dict(), decision, created_at_ms, audit_context)
+        )
 
     def save_observation(self, observation, symbol):
         self._wait_for_write_gate()
@@ -3476,6 +3478,85 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(snapshot["orders"][0]["profile_key"], "drop_reclaim|LONG|WD-12")
         self.assertEqual(snapshot["observations"][0]["source_decision"], "OPENED")
 
+    def test_opened_order_and_observation_keep_same_pre_open_quality_context(self):
+        state = MonitorState(symbol="BTCUSDT")
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="影子评分上下文",
+            price=100.0,
+            open_time=4_200_000,
+            score=90.0,
+            threshold=70.0,
+            threshold_segment="WD-12",
+            session_allowed=True,
+            strategy_family="drop_reclaim",
+            strategy_tag="quality_context_test",
+            observe_direction="LONG",
+        )
+        scored = state._attach_quality_score(signal)
+
+        decision = state._maybe_open_order(scored, kline(70, 100.0, 100))
+        snapshot = state.snapshot()
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(snapshot["orders"][0]["quality_score_context"], "LONG_FIRST")
+        self.assertEqual(snapshot["observations"][0]["quality_score_context"], "LONG_FIRST")
+        self.assertEqual(
+            snapshot["orders"][0]["quality_score"],
+            snapshot["observations"][0]["quality_score"],
+        )
+
+    def test_shadow_quality_score_failure_does_not_block_existing_order_path(self):
+        state = MonitorState(symbol="BTCUSDT")
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="影子评分故障隔离",
+            price=100.0,
+            open_time=4_200_000,
+            score=90.0,
+            threshold=70.0,
+            threshold_segment="WD-12",
+            session_allowed=True,
+        )
+
+        with patch(
+            "app.state.attach_shadow_quality_score",
+            side_effect=RuntimeError("synthetic quality score failure"),
+        ):
+            decision = state._maybe_open_order(signal, kline(70, 100.0, 100))
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+        self.assertEqual(state.snapshot()["orders"][0]["order_slot"], "FIRST")
+        self.assertIn("影子质量评分失败", state.last_error)
+
+    def test_shadow_quality_score_does_not_change_end_to_end_order_identity(self):
+        klines = actionable_rebound_klines()
+        baseline = MonitorState(symbol="BTCUSDT", enable_wave_guard=False)
+        scored = MonitorState(symbol="BTCUSDT", enable_wave_guard=False)
+
+        with patch(
+            "app.state.attach_shadow_quality_score",
+            side_effect=lambda signal, **_kwargs: signal,
+        ):
+            baseline.update_from_klines(klines)
+        scored.update_from_klines(klines)
+
+        baseline_orders = [
+            (order.id, order.direction, order.opened_at, order.expires_at)
+            for order in baseline.simulator.orders
+        ]
+        scored_orders = [
+            (order.id, order.direction, order.opened_at, order.expires_at)
+            for order in scored.simulator.orders
+        ]
+        self.assertEqual(scored.order_decision, baseline.order_decision)
+        self.assertEqual(scored_orders, baseline_orders)
+
     def test_profile_guard_defaults_to_observe_only(self):
         state = MonitorState(symbol="BTCUSDT")
         snapshot = state.snapshot()
@@ -3796,6 +3877,10 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(order_payload["status"], "OPEN")
         self.assertEqual(entry_snapshot["signal"]["direction"], order_payload["direction"])
         self.assertIn("strategy_tag", entry_snapshot["signal"])
+        self.assertEqual(entry_snapshot["signal"]["quality_score_mode"], "SHADOW_ONLY")
+        self.assertEqual(entry_snapshot["signal"]["quality_score_version"], "QS_V1_SHADOW")
+        self.assertEqual(entry_snapshot["signal"]["quality_score"], order_payload["quality_score"])
+        self.assertTrue(entry_snapshot["signal"]["quality_score_components"])
         self.assertEqual(entry_snapshot["rolling_edge"]["status"], "NORMAL")
         self.assertIn("result_sequence_guard", entry_snapshot)
         self.assertEqual(entry_snapshot["profile_guard_shadow"]["variant"], "recommended_key_subset")

@@ -500,6 +500,14 @@ const summaryFields = {
   "win-rate": (state) => `${(num(state.stats.win_rate) * 100).toFixed(2)}%`,
   "today-balance": (state) => fmtMoney((state.stats.today || {}).pnl),
   "today-win-rate": (state) => `${(num((state.stats.today || {}).win_rate) * 100).toFixed(2)}%`,
+  "profile-period-balance": (state) => {
+    const period = state.stats.profile_period || {};
+    return period.active ? fmtMoney(period.pnl) : DASH;
+  },
+  "profile-period-win-rate": (state) => {
+    const period = state.stats.profile_period || {};
+    return period.active ? `${(num(period.win_rate) * 100).toFixed(2)}%` : DASH;
+  },
   "total-orders": (state) => `${state.stats.total_orders} / 未结 ${state.stats.open_orders}`,
   "updated-at": (state) => fmtTime(state.updated_at_ms),
   "fear-greed": (state) => fmtFearGreed(state.fear_greed),

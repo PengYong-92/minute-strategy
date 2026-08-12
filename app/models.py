@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 
@@ -82,6 +82,7 @@ class Signal:
     profile_key: str = ""
     daily_profile_selected: bool = False
     daily_profile_version: str = ""
+    order_slot: str = field(default="", kw_only=True)
     wave_state: str = "UNKNOWN"
     wave_raw_state: str = "UNKNOWN"
     wave_window: int = 0
@@ -95,6 +96,12 @@ class Signal:
     wave_guard_status: str = "UNKNOWN"
     wave_guard_reason: str = ""
     calculated_threshold: float = 0.0
+    quality_score: float = 0.0
+    quality_score_version: str = ""
+    quality_score_mode: str = ""
+    quality_score_context: str = ""
+    quality_score_components: dict[str, float] = field(default_factory=dict)
+    quality_score_inputs: dict[str, object] = field(default_factory=dict)
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
 
@@ -132,6 +139,7 @@ class SimulatedOrder:
     profile_key: str = ""
     daily_profile_selected: bool = False
     daily_profile_version: str = ""
+    order_slot: str = field(default="", kw_only=True)
     stake: float = 10.0
     win_return: float = 18.0
     stake_progression_step: int = 1
@@ -155,6 +163,12 @@ class SimulatedOrder:
     wave_guard_status: str = "UNKNOWN"
     wave_guard_reason: str = ""
     calculated_threshold: float = 0.0
+    quality_score: float = 0.0
+    quality_score_version: str = ""
+    quality_score_mode: str = ""
+    quality_score_context: str = ""
+    quality_score_components: dict[str, float] = field(default_factory=dict)
+    quality_score_inputs: dict[str, object] = field(default_factory=dict)
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
 
@@ -198,6 +212,15 @@ class ObservationSignal:
     wave_guard_mode: str = "NORMAL"
     wave_guard_status: str = "UNKNOWN"
     wave_guard_reason: str = ""
+    profile_key: str = ""
+    daily_profile_version: str = ""
+    order_slot: str = field(default="", kw_only=True)
+    quality_score: float = 0.0
+    quality_score_version: str = ""
+    quality_score_mode: str = ""
+    quality_score_context: str = ""
+    quality_score_components: dict[str, float] = field(default_factory=dict)
+    quality_score_inputs: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

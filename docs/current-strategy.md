@@ -2032,7 +2032,7 @@ calculated_threshold  原策略计算的动态阈值
 - 两阶段金额仍为第一笔10U，赢后下一笔18U，随后重置；最多一个并行18U资格。
 - 每日画像的60%门槛负责先保证有足够订单，再根据新节点实际样本逐步优化，不以单个波段状态一次性关闭整类信号。
 
-## 35. 当日表现统计
+## 35. 当日与画像周期表现统计
 
 页面顶部同时展示累计表现和北京时间当日表现。累计字段继续使用全部模拟订单；当日字段只统计 `settled_at` 落在北京时间当天 `[00:00, 次日00:00)` 的已结算订单，按结算日归属，不按开单日归属，未结订单不进入当日胜率或收益。
 
@@ -2050,3 +2050,56 @@ calculated_threshold  原策略计算的动态阈值
 ```
 
 当日没有已结算订单时，收益和胜率均为0。该统计只读取模拟订单结果，不修改开单、结算、缓存、画像或风险守卫逻辑。
+
+页面同时新增“画像周期盈亏”和“画像周期胜率”。画像周期不按自然日切分，而是使用当前已激活每日画像的 `effective_from`、`effective_until` 和 `version`，只统计同时满足以下条件的已结算订单：
+
+1. `settled_at` 落在 `[effective_from, effective_until)`；
+2. 订单的 `daily_profile_version` 与当前画像 `version` 精确一致。
+
+`/api/state.stats.profile_period` 返回：
+
+```json
+{
+  "active": true,
+  "version": "DPS-20260812-0800",
+  "effective_from": 1786492800000,
+  "effective_until": 1786579200000,
+  "pnl": -20.0,
+  "settled_orders": 2,
+  "wins": 0,
+  "losses": 2,
+  "win_rate": 0.0,
+  "by_direction_slot": [
+    {
+      "key": "LONG_SECOND",
+      "orders": 2,
+      "wins": 0,
+      "losses": 2,
+      "win_rate": 0.0,
+      "pnl": -20.0,
+      "ev": -10.0
+    }
+  ]
+}
+```
+
+没有已激活画像时，`active=false`，版本为空，生效时间为 `null`，收益、订单数和胜率均为0；页面显示 `-`。画像周期统计用于评价当前DPS版本，不能替代00:00自然日财务统计，也不参与开单、结算、每日画像选择或任何风险守卫。
+
+## 36. 并发位置、订单画像与守卫审计
+
+每个候选、观察样本、模拟订单和入口快照显式记录 `order_slot=FIRST|SECOND`。该字段按开单前是否存在未到期订单计算，与 `stake_progression_step=1|2` 完全独立：首个并发位置可能使用18U第二阶段金额，第二并发位置也可能使用10U基础金额。恢复旧数据库时，缺失的 `order_slot` 按 `opened_at/expires_at` 重建。
+
+`/api/order-profile` 只使用 `result in {WIN, LOSS}` 的入口快照计算胜率、PnL、EV、分组、特征分箱、风险提示和守卫回放，并返回：
+
+- `snapshot_count`：读取的全部入口快照数；
+- `sample_count`：进入结果统计的已结样本数；
+- `open_orders`：未结入口快照数；
+- `by_direction_slot`：LONG/SHORT与FIRST/SECOND四种上下文；
+- `by_profile_slot`：完整画像键与并发位置，附DPS数量、10笔观察状态和跨至少2个DPS的就绪状态；
+- `by_profile_dps_slot`：完整画像键、DPS版本和并发位置的精确分组；
+- `profile_degradation_probes`：画像退化试探单的真实结算表现；
+- `by_quality_context`和质量评分分箱：`QS_V1_SHADOW`影子评分观察结果。
+
+`/api/signal-audit-summary`汇总最近5000条信号审计，按决策、完整画像键、DPS版本、并发位置以及方向连亏守卫、画像退化守卫、波段批次守卫和滚动优势状态统计。它用于评价“哪些候选被拦截”，不改变任何守卫参数。
+
+`QS_V1_SHADOW`只记录评分、分项和原始输入。它不参与 `Signal.actionable`、每日画像选择、方向判断、动态阈值、风险守卫、最大并发、开单间隔或10U/18U资格。单一 `画像 × SECOND` 少于10笔标记为 `COLLECTING`；达到10笔仅进入观察；达到10笔且覆盖至少2个DPS才标记跨周期就绪，仍需独立评估后才能改动真实准入。

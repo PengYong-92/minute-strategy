@@ -8,7 +8,12 @@ from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 
 
-def signal(direction="LONG", timeframe_minutes=10, threshold_segment="WD-12"):
+def signal(
+    direction="LONG",
+    timeframe_minutes=10,
+    threshold_segment="WD-12",
+    daily_profile_version="",
+):
     return Signal(
         direction=direction,
         timeframe_minutes=timeframe_minutes,
@@ -22,10 +27,28 @@ def signal(direction="LONG", timeframe_minutes=10, threshold_segment="WD-12"):
         session_win_rate=0.6757,
         session_ev=2.1622,
         session_edge_min=10.0,
+        daily_profile_version=daily_profile_version,
     )
 
 
 class SimulatorTest(unittest.TestCase):
+    def test_order_slot_is_independent_from_stake_progression_step(self):
+        simulator = AccountSimulator(
+            enable_stake_progression=True,
+            stake_progression_max_active=1,
+            max_open_orders=2,
+        )
+        first = simulator.open_order(signal(), entry_price=100.0, opened_at=0)
+        simulator.settle_expired_orders(first.expires_at, 101.0)
+
+        progressed = simulator.open_order(signal(), entry_price=101.0, opened_at=601_000)
+        concurrent = simulator.open_order(signal(), entry_price=101.0, opened_at=721_000)
+
+        self.assertEqual(progressed.order_slot, "FIRST")
+        self.assertEqual(progressed.stake_progression_step, 2)
+        self.assertEqual(concurrent.order_slot, "SECOND")
+        self.assertEqual(concurrent.stake_progression_step, 1)
+
     def test_simulated_order_progression_metadata_defaults_are_backward_compatible(self):
         self.assertEqual(
             [field.name for field in fields(SimulatedOrder)][-2:],
@@ -754,6 +777,144 @@ class SimulatorTest(unittest.TestCase):
                 "wins": 1,
                 "losses": 1,
                 "win_rate": 0.5,
+            },
+        )
+
+    def test_stats_reports_only_orders_settled_in_active_daily_profile_period(self):
+        shanghai = timezone(timedelta(hours=8))
+
+        def timestamp_ms(day: int, hour: int = 0, minute: int = 0) -> int:
+            value = datetime(2026, 8, day, hour, minute, tzinfo=shanghai)
+            return int(value.timestamp() * 1000)
+
+        simulator = AccountSimulator()
+
+        def settle_at(settled_at: int, *, version: str, won: bool) -> None:
+            order = simulator.open_order(
+                signal(
+                    "LONG",
+                    timeframe_minutes=1,
+                    daily_profile_version=version,
+                ),
+                entry_price=100.0,
+                opened_at=settled_at - 60_000,
+            )
+            simulator.settle_expired_orders(
+                order.expires_at,
+                101.0 if won else 99.0,
+            )
+
+        effective_from = timestamp_ms(12, 8)
+        effective_until = timestamp_ms(13, 8)
+        settle_at(timestamp_ms(12, 7, 59), version="DPS-20260811-0800", won=False)
+        settle_at(timestamp_ms(12, 8), version="DPS-20260811-0800", won=True)
+        settle_at(timestamp_ms(12, 8, 1), version="DPS-20260812-0800", won=True)
+        settle_at(timestamp_ms(12, 9), version="DPS-20260812-0800", won=False)
+        settle_at(timestamp_ms(13, 8), version="DPS-20260812-0800", won=True)
+
+        stats = simulator.stats(
+            now_ms=timestamp_ms(12, 10),
+            profile_period={
+                "version": "DPS-20260812-0800",
+                "effective_from": effective_from,
+                "effective_until": effective_until,
+            },
+        )
+
+        self.assertEqual(
+            stats["profile_period"],
+            {
+                "active": True,
+                "version": "DPS-20260812-0800",
+                "effective_from": effective_from,
+                "effective_until": effective_until,
+                "pnl": -2.0,
+                "settled_orders": 2,
+                "wins": 1,
+                "losses": 1,
+                "win_rate": 0.5,
+                "by_direction_slot": [
+                    {
+                        "key": "LONG_FIRST",
+                        "orders": 2,
+                        "wins": 1,
+                        "losses": 1,
+                        "win_rate": 0.5,
+                        "pnl": -2.0,
+                        "ev": -1.0,
+                    }
+                ],
+            },
+        )
+
+    def test_profile_period_stats_split_direction_and_concurrency_slot(self):
+        version = "DPS-20260812-0800"
+        simulator = AccountSimulator(
+            orders=[
+                SimulatedOrder(
+                    id=1,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="first",
+                    entry_price=100.0,
+                    opened_at=1_000,
+                    expires_at=601_000,
+                    status="SETTLED",
+                    result="WIN",
+                    settled_at=601_000,
+                    pnl=8.0,
+                    daily_profile_version=version,
+                    order_slot="FIRST",
+                ),
+                SimulatedOrder(
+                    id=2,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="second",
+                    entry_price=100.0,
+                    opened_at=121_000,
+                    expires_at=721_000,
+                    status="SETTLED",
+                    result="LOSS",
+                    settled_at=721_000,
+                    pnl=-10.0,
+                    daily_profile_version=version,
+                    order_slot="SECOND",
+                ),
+            ]
+        )
+
+        stats = simulator.stats(
+            now_ms=800_000,
+            profile_period={
+                "version": version,
+                "effective_from": 0,
+                "effective_until": 1_000_000,
+            },
+        )
+
+        groups = {item["key"]: item for item in stats["profile_period"]["by_direction_slot"]}
+        self.assertEqual(groups["LONG_FIRST"]["wins"], 1)
+        self.assertEqual(groups["LONG_SECOND"]["losses"], 1)
+
+    def test_stats_reports_inactive_profile_period_when_no_profile_is_active(self):
+        stats = AccountSimulator().stats(now_ms=0)
+
+        self.assertEqual(
+            stats["profile_period"],
+            {
+                "active": False,
+                "version": "",
+                "effective_from": None,
+                "effective_until": None,
+                "pnl": 0.0,
+                "settled_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "by_direction_slot": [],
             },
         )
 

@@ -40,6 +40,7 @@ class AccountSimulator:
         self.stake = stake
         self.win_return = win_return
         self.orders: list[SimulatedOrder] = list(orders or [])
+        self._restore_order_slots()
         self.enable_stake_progression = enable_stake_progression
         self.stake_progression_max_orders = 2
         self.stake_progression_base_only_segments: set[str] = set()
@@ -87,6 +88,21 @@ class AccountSimulator:
         )
         self.stake_progression_credits = self.stake_progression.credits
 
+    def _restore_order_slots(self) -> None:
+        previous: list[SimulatedOrder] = []
+        for order in sorted(self.orders, key=lambda item: (item.opened_at, item.id)):
+            if order.order_slot not in {"FIRST", "SECOND"}:
+                order.order_slot = (
+                    "SECOND"
+                    if any(
+                        item.opened_at < order.opened_at
+                        and item.expires_at > order.opened_at
+                        for item in previous
+                    )
+                    else "FIRST"
+                )
+            previous.append(order)
+
     def open_order(self, signal: Signal, entry_price: float, opened_at: int) -> SimulatedOrder:
         order, _ = self.open_order_with_credit(signal, entry_price, opened_at)
         return order
@@ -104,6 +120,11 @@ class AccountSimulator:
             raise ValueError("opened_at must be >= 0")
         normalized_timeframe = int(signal.timeframe_minutes)
         expires_at = normalized_opened_at + normalized_timeframe * 60_000
+        order_slot = (
+            "SECOND"
+            if any(order.status == "OPEN" for order in self.orders)
+            else "FIRST"
+        )
         order_fields = {
             "direction": signal.direction,
             "timeframe_minutes": normalized_timeframe,
@@ -127,6 +148,7 @@ class AccountSimulator:
             "profile_key": signal.profile_key,
             "daily_profile_selected": signal.daily_profile_selected,
             "daily_profile_version": signal.daily_profile_version,
+            "order_slot": order_slot,
             "wave_state": signal.wave_state,
             "wave_raw_state": signal.wave_raw_state,
             "wave_window": signal.wave_window,
@@ -141,6 +163,12 @@ class AccountSimulator:
             "wave_guard_reason": signal.wave_guard_reason,
             "profile_degradation_probe": signal.profile_degradation_probe,
             "profile_degradation_triggered_at": signal.profile_degradation_triggered_at,
+            "quality_score": signal.quality_score,
+            "quality_score_version": signal.quality_score_version,
+            "quality_score_mode": signal.quality_score_mode,
+            "quality_score_context": signal.quality_score_context,
+            "quality_score_components": dict(signal.quality_score_components),
+            "quality_score_inputs": dict(signal.quality_score_inputs),
         }
         if allow_progression:
             terms, credit = self.stake_progression.assign(
@@ -276,7 +304,11 @@ class AccountSimulator:
             progression_credit=replace(credit) if credit is not None else None,
         )
 
-    def stats(self, now_ms: int | None = None) -> dict:
+    def stats(
+        self,
+        now_ms: int | None = None,
+        profile_period: dict | None = None,
+    ) -> dict:
         settled = [order for order in self.orders if order.status == "SETTLED"]
         wins = [order for order in settled if order.result == "WIN"]
         losses = [order for order in settled if order.result == "LOSS"]
@@ -293,6 +325,51 @@ class AccountSimulator:
         ]
         today_wins = [order for order in today_settled if order.result == "WIN"]
         today_losses = [order for order in today_settled if order.result == "LOSS"]
+        profile_version = str((profile_period or {}).get("version") or "")
+        profile_effective_from = (profile_period or {}).get("effective_from")
+        profile_effective_until = (profile_period or {}).get("effective_until")
+        profile_active = bool(
+            profile_version
+            and profile_effective_from is not None
+            and profile_effective_until is not None
+            and int(profile_effective_from) < int(profile_effective_until)
+        )
+        profile_settled = []
+        if profile_active:
+            profile_start_ms = int(profile_effective_from)
+            profile_end_ms = int(profile_effective_until)
+            profile_settled = [
+                order
+                for order in settled
+                if order.daily_profile_version == profile_version
+                and order.settled_at is not None
+                and profile_start_ms <= int(order.settled_at) < profile_end_ms
+            ]
+        profile_wins = [order for order in profile_settled if order.result == "WIN"]
+        profile_losses = [order for order in profile_settled if order.result == "LOSS"]
+        profile_direction_slots = []
+        for direction in ("LONG", "SHORT"):
+            for slot in ("FIRST", "SECOND"):
+                rows = [
+                    order
+                    for order in profile_settled
+                    if order.direction == direction and order.order_slot == slot
+                ]
+                if not rows:
+                    continue
+                row_wins = sum(1 for order in rows if order.result == "WIN")
+                row_pnl = round(sum(order.pnl for order in rows), 4)
+                profile_direction_slots.append(
+                    {
+                        "key": f"{direction}_{slot}",
+                        "orders": len(rows),
+                        "wins": row_wins,
+                        "losses": len(rows) - row_wins,
+                        "win_rate": round(row_wins / len(rows), 4),
+                        "pnl": row_pnl,
+                        "ev": round(row_pnl / len(rows), 4),
+                    }
+                )
         progression = self.stake_progression.status()
         stats = {
             "balance": round(self.balance, 4),
@@ -317,6 +394,22 @@ class AccountSimulator:
                     if today_settled
                     else 0.0
                 ),
+            },
+            "profile_period": {
+                "active": profile_active,
+                "version": profile_version if profile_active else "",
+                "effective_from": int(profile_effective_from) if profile_active else None,
+                "effective_until": int(profile_effective_until) if profile_active else None,
+                "pnl": round(sum(order.pnl for order in profile_settled), 4),
+                "settled_orders": len(profile_settled),
+                "wins": len(profile_wins),
+                "losses": len(profile_losses),
+                "win_rate": (
+                    round(len(profile_wins) / len(profile_settled), 4)
+                    if profile_settled
+                    else 0.0
+                ),
+                "by_direction_slot": profile_direction_slots,
             },
         }
         stats.update(progression)

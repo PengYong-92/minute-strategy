@@ -20,6 +20,7 @@ from app.profile_degradation_guard import (
     ProfileDegradationGuardDecision,
     evaluate_profile_degradation_guard,
 )
+from app.quality_score import attach_shadow_quality_score
 from app.result_sequence_guard import (
     ResultSequenceGuardConfig,
     ResultSequenceGuardDecision,
@@ -293,6 +294,10 @@ class MonitorState:
                 self._attach_wave_metadata(signal, wave_state)
                 for signal in observation_signals
             ]
+            new_signals = [self._attach_quality_score(signal) for signal in new_signals]
+            observation_signals = [
+                self._attach_quality_score(signal) for signal in observation_signals
+            ]
             self.signals = new_signals
             selected_signal, daily_profile_required = self._select_daily_profile_signal(
                 selected_signal,
@@ -300,6 +305,7 @@ class MonitorState:
                 latest.close_time,
             )
             selected_signal = self._apply_wave_guard(selected_signal, wave_state)
+            selected_signal = self._attach_quality_score(selected_signal)
             self.selected_signal = selected_signal
             self.order_decision = self._maybe_open_order(
                 selected_signal,
@@ -719,6 +725,9 @@ class MonitorState:
                 self._last_order_opened_at,
                 self._opened_signal_keys,
             )
+        signal = self._attach_quality_score(signal)
+        if promoted_signal is not None:
+            self.selected_signal = signal
         return signal, gate
 
     def _execute_open_order(
@@ -819,6 +828,23 @@ class MonitorState:
             wave_guard_status="PENDING",
             wave_guard_reason="等待波段方向与批次守卫判断",
         )
+
+    def _attach_quality_score(self, signal: Signal) -> Signal:
+        open_order_count = sum(
+            1 for order in self.simulator.orders if order.status == "OPEN"
+        )
+        slotted_signal = replace(
+            signal,
+            order_slot="SECOND" if open_order_count > 0 else "FIRST",
+        )
+        try:
+            return attach_shadow_quality_score(
+                slotted_signal,
+                open_order_count=open_order_count,
+            )
+        except Exception as exc:  # noqa: BLE001 - 影子记录故障不得影响开单主流程。
+            self.record_error(f"影子质量评分失败: {exc}")
+            return slotted_signal
 
     def _flush_pending_settlement_events(self) -> bool:
         while self._pending_settlement_events:
@@ -1108,6 +1134,8 @@ class MonitorState:
         return signal.direction == "SHORT"
 
     def _record_observation(self, signal: Signal, latest: Kline, decision: str) -> None:
+        if not signal.quality_score_version:
+            signal = self._attach_quality_score(signal)
         direction = signal.observe_direction or signal.direction
         if direction not in {"LONG", "SHORT"}:
             return
@@ -1164,6 +1192,15 @@ class MonitorState:
             wave_guard_mode=signal.wave_guard_mode,
             wave_guard_status=signal.wave_guard_status,
             wave_guard_reason=signal.wave_guard_reason,
+            profile_key=signal.profile_key,
+            daily_profile_version=signal.daily_profile_version,
+            order_slot=signal.order_slot,
+            quality_score=signal.quality_score,
+            quality_score_version=signal.quality_score_version,
+            quality_score_mode=signal.quality_score_mode,
+            quality_score_context=signal.quality_score_context,
+            quality_score_components=dict(signal.quality_score_components),
+            quality_score_inputs=dict(signal.quality_score_inputs),
         )
         self.observations.append(observation)
         if self.storage:
@@ -1425,9 +1462,23 @@ class MonitorState:
 
     def _save_signal(self, signal: Signal, decision: str, created_at_ms: int) -> None:
         symbol = self.symbol
+        audit_context = {
+            "rolling_edge": dict(self.rolling_edge),
+            "result_sequence_guard": dict(self.result_sequence_guard),
+            "wave_batch_guard": dict(self.wave_batch_guard),
+            "profile_degradation_guard": dict(self.profile_degradation_guard),
+            "profile_guard": self._profile_guard_config(),
+        }
         self._submit_storage_write(
-            lambda signal=signal, symbol=symbol, decision=decision, created_at_ms=created_at_ms: (
-                self.storage.save_signal(symbol, signal, decision, created_at_ms)
+            lambda signal=signal, symbol=symbol, decision=decision, created_at_ms=created_at_ms,
+            audit_context=audit_context: (
+                self.storage.save_signal(
+                    symbol,
+                    signal,
+                    decision,
+                    created_at_ms,
+                    audit_context=audit_context,
+                )
             )
         )
 
@@ -1817,7 +1868,9 @@ class MonitorState:
                 "signals": [signal.to_dict() for signal in self.signals],
                 "selected_signal": self.selected_signal.to_dict() if self.selected_signal else None,
                 "order_decision": self.order_decision,
-                "stats": self.simulator.stats(),
+                "stats": self.simulator.stats(
+                    profile_period=self.active_daily_profile_selection,
+                ),
                 "orders": [order.to_dict() for order in orders],
                 "observations": [observation.to_dict() for observation in reversed(self.observations[-50:])],
                 "kline_count": len(self.klines),
@@ -1973,3 +2026,16 @@ class MonitorState:
             profile_guard_min_history=self.profile_guard_min_history,
             profile_guard_min_group_size=self.profile_guard_min_group_size,
         )
+
+    def signal_audit_summary(self) -> dict:
+        if not self.storage or not hasattr(self.storage, "signal_audit_summary"):
+            return {
+                "sample_count": 0,
+                "by_decision": [],
+                "by_profile_dps_slot": [],
+                "by_result_sequence_status": [],
+                "by_profile_degradation_status": [],
+                "by_wave_batch_status": [],
+                "by_rolling_edge_status": [],
+            }
+        return self.storage.signal_audit_summary(self.symbol)

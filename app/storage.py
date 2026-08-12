@@ -152,6 +152,46 @@ def summarize_observations(
     }
 
 
+def _summarize_signal_audit(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    def counts(field: str) -> list[dict[str, Any]]:
+        grouped: dict[str, int] = {}
+        for record in records:
+            key = str(record.get(field) or "UNKNOWN")
+            grouped[key] = grouped.get(key, 0) + 1
+        return [
+            {"key": key, "count": count}
+            for key, count in sorted(grouped.items())
+        ]
+
+    contexts: dict[str, dict[str, int]] = {}
+    for record in records:
+        key = str(record.get("profile_context") or "UNKNOWN")
+        group = contexts.setdefault(key, {"signals": 0, "blocked": 0, "opened": 0})
+        group["signals"] += 1
+        decision = str(record.get("decision") or "")
+        if decision == "OPENED":
+            group["opened"] += 1
+        elif decision.endswith("BLOCKED") or decision in {
+            "HOLD_OPEN_ORDER",
+            "COOLDOWN",
+            "DAILY_PROFILE_NOT_SELECTED",
+            "SHORT_OBSERVE_ONLY",
+        }:
+            group["blocked"] += 1
+    return {
+        "sample_count": len(records),
+        "by_decision": counts("decision"),
+        "by_profile_dps_slot": [
+            {"key": key, **values}
+            for key, values in sorted(contexts.items())
+        ],
+        "by_result_sequence_status": counts("result_sequence_status"),
+        "by_profile_degradation_status": counts("profile_degradation_status"),
+        "by_wave_batch_status": counts("wave_batch_status"),
+        "by_rolling_edge_status": counts("rolling_edge_status"),
+    }
+
+
 def _normalize_page_size(page_size: int) -> int:
     try:
         value = int(page_size)
@@ -981,8 +1021,18 @@ class SQLiteMonitorStore:
             profile_guard_min_group_size=profile_guard_min_group_size,
         )
 
-    def save_signal(self, symbol: str, signal: Signal, decision: str, created_at_ms: int) -> None:
-        payload = signal.to_dict()
+    def save_signal(
+        self,
+        symbol: str,
+        signal: Signal,
+        decision: str,
+        created_at_ms: int,
+        audit_context: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            **signal.to_dict(),
+            "audit_context": dict(audit_context or {}),
+        }
         with self._connect() as connection:
             connection.execute(
                 """
@@ -1124,6 +1174,65 @@ class SQLiteMonitorStore:
                 (symbol.upper(), limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def signal_audit_summary(self, symbol: str, limit: int = 5000) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select created_at_ms, decision, direction, timeframe_minutes,
+                       threshold_segment, payload
+                from signal_audit
+                where symbol = ?
+                order by id desc
+                limit ?
+                """,
+                (symbol.upper(), max(1, int(limit))),
+            ).fetchall()
+        records = []
+        for row in reversed(rows):
+            payload = json.loads(row["payload"])
+            audit = payload.get("audit_context") or {}
+            profile_key = str(payload.get("profile_key") or "")
+            if not profile_key:
+                profile_key = "|".join(
+                    [
+                        str(int(row["timeframe_minutes"] or 0)),
+                        str(payload.get("strategy_family") or "unknown"),
+                        str(payload.get("strategy_tag") or "unknown"),
+                        str(row["direction"] or "").upper(),
+                        str(row["threshold_segment"] or "GLOBAL").upper(),
+                    ]
+                )
+            records.append(
+                {
+                    "decision": str(row["decision"] or "UNKNOWN"),
+                    "profile_context": "|".join(
+                        [
+                            profile_key,
+                            str(payload.get("daily_profile_version") or "STATIC"),
+                            str(payload.get("order_slot") or "UNKNOWN"),
+                        ]
+                    ),
+                    "result_sequence_status": str(
+                        (audit.get("result_sequence_guard") or {}).get("status")
+                        or "UNKNOWN"
+                    ),
+                    "profile_degradation_status": str(
+                        (audit.get("profile_degradation_guard") or {}).get("status")
+                        or "UNKNOWN"
+                    ),
+                    "wave_batch_status": str(
+                        (audit.get("wave_batch_guard") or {}).get("status")
+                        or (audit.get("wave_batch_guard") or {}).get("code")
+                        or "UNKNOWN"
+                    ),
+                    "rolling_edge_status": str(
+                        (audit.get("rolling_edge") or {}).get("status")
+                        or "UNKNOWN"
+                    ),
+                }
+            )
+        return _summarize_signal_audit(records)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

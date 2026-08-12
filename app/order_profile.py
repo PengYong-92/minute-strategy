@@ -36,6 +36,11 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     guard_policy = payload.get("profile_guard_selection_policy") or {}
     wave_batch_guard = payload.get("wave_batch_guard") or {}
     reason = str(signal.get("reason") or "")
+    order_slot = str(
+        signal.get("order_slot")
+        or _get(snapshot, "order_slot", "")
+        or ""
+    ).upper()
     return {
         "symbol": _get(snapshot, "symbol", ""),
         "order_id": _get(snapshot, "order_id", 0),
@@ -48,6 +53,7 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "stake_progression_step": int(_get(snapshot, "stake_progression_step", 1) or 1),
         "opened_at": int(_get(snapshot, "opened_at", 0) or 0),
         "settled_at": _get(snapshot, "settled_at"),
+        "expires_at": int(_get(snapshot, "expires_at", 0) or 0),
         "entry_price": _get(snapshot, "entry_price"),
         "exit_price": _get(snapshot, "exit_price"),
         "level": signal.get("level") or "",
@@ -55,6 +61,19 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "reason_setup": reason.split("：", 1)[0].split(";", 1)[0].strip() or "UNKNOWN",
         "score": _float(signal.get("score")),
         "threshold": _float(signal.get("threshold")),
+        "quality_score": _optional_float(signal.get("quality_score")),
+        "quality_score_version": signal.get("quality_score_version") or "",
+        "quality_score_mode": signal.get("quality_score_mode") or "",
+        "quality_score_context": signal.get("quality_score_context") or "UNSCORED",
+        "strategy_family": signal.get("strategy_family") or "unknown",
+        "strategy_tag": signal.get("strategy_tag") or "unknown",
+        "profile_key": signal.get("profile_key") or "",
+        "daily_profile_version": signal.get("daily_profile_version") or "",
+        "order_slot": order_slot,
+        "profile_degradation_probe": bool(signal.get("profile_degradation_probe", False)),
+        "profile_degradation_triggered_at": int(
+            signal.get("profile_degradation_triggered_at", 0) or 0
+        ),
         "edge": _float(_get(snapshot, "edge")),
         "volume_ratio": _float(signal.get("volume_ratio")),
         "volume_threshold": _float(signal.get("volume_threshold")),
@@ -106,29 +125,45 @@ def summarize_order_samples_with_guard(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     guard_group_size = max(1, int(profile_guard_min_group_size or min_group_size))
+    snapshots = [dict(sample) for sample in samples]
+    _attach_reconstructed_order_slots(snapshots)
+    settled = _settled_samples(snapshots)
+    open_orders = sum(1 for sample in snapshots if sample.get("result") not in {"WIN", "LOSS"})
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "sample_count": len(samples),
-        "range": _sample_range(samples),
-        "total": _summary(samples),
-        "by_segment": _group_summaries(samples, "threshold_segment", min_group_size=min_group_size),
-        "by_level": _group_summaries(samples, "level", min_group_size=1),
-        "by_stake_step": _group_summaries(samples, "stake_progression_step", min_group_size=1),
-        "by_regime": _group_summaries(samples, "regime", min_group_size=1),
-        "by_wave_state": _group_summaries(samples, "wave_state", min_group_size=1),
-        "by_wave_guard_mode": _group_summaries(samples, "wave_guard_mode", min_group_size=1),
-        "by_fear_greed_trend": _group_summaries(samples, "fear_greed_trend", min_group_size=1),
-        "by_reason": _group_summaries(samples, "reason_setup", min_group_size=1),
-        "feature_bins": _feature_bins(samples, min_group_size=min_group_size),
-        "risk_hints": _risk_hints(samples),
+        "snapshot_count": len(snapshots),
+        "sample_count": len(settled),
+        "open_orders": open_orders,
+        "range": _sample_range(settled),
+        "total": _summary(settled),
+        "by_segment": _group_summaries(settled, "threshold_segment", min_group_size=min_group_size),
+        "by_level": _group_summaries(settled, "level", min_group_size=1),
+        "by_stake_step": _group_summaries(settled, "stake_progression_step", min_group_size=1),
+        "by_regime": _group_summaries(settled, "regime", min_group_size=1),
+        "by_wave_state": _group_summaries(settled, "wave_state", min_group_size=1),
+        "by_wave_guard_mode": _group_summaries(settled, "wave_guard_mode", min_group_size=1),
+        "by_quality_context": _group_summaries(settled, "quality_score_context", min_group_size=1),
+        "profile_degradation_probes": _summary(
+            [sample for sample in settled if sample.get("profile_degradation_probe")]
+        ),
+        "by_direction_slot": _group_by_composite(settled, ("direction", "order_slot")),
+        "by_profile_slot": _profile_slot_summaries(settled),
+        "by_profile_dps_slot": _group_by_composite(
+            settled,
+            ("profile_key_resolved", "daily_profile_version", "order_slot"),
+        ),
+        "by_fear_greed_trend": _group_summaries(settled, "fear_greed_trend", min_group_size=1),
+        "by_reason": _group_summaries(settled, "reason_setup", min_group_size=1),
+        "feature_bins": _feature_bins(settled, min_group_size=min_group_size),
+        "risk_hints": _risk_hints(settled),
         "profile_guard": evaluate_profile_guard(
-            samples,
+            settled,
             min_history=max(1, int(profile_guard_min_history)),
             min_group_size=guard_group_size,
         ),
-        "profile_guard_shadow": _profile_guard_shadow_summary(samples),
-        "profile_guard_policy": _profile_guard_policy_summary(samples),
-        "profile_guard_shadow_compare": _profile_guard_shadow_compare(samples),
+        "profile_guard_shadow": _profile_guard_shadow_summary(settled),
+        "profile_guard_policy": _profile_guard_policy_summary(settled),
+        "profile_guard_shadow_compare": _profile_guard_shadow_compare(settled),
         "elapsed_seconds": round(time.perf_counter() - started, 4),
     }
 
@@ -152,6 +187,7 @@ def sample_from_signal(signal: Signal) -> dict[str, Any]:
         "stake_progression_step": 1,
         "opened_at": signal.open_time,
         "settled_at": None,
+        "expires_at": signal.open_time + signal.timeframe_minutes * 60_000,
         "entry_price": signal.price,
         "exit_price": None,
         "level": signal.level,
@@ -159,6 +195,17 @@ def sample_from_signal(signal: Signal) -> dict[str, Any]:
         "reason_setup": reason.split("：", 1)[0].split(";", 1)[0].strip() or "UNKNOWN",
         "score": signal.score,
         "threshold": signal.threshold,
+        "quality_score": signal.quality_score if signal.quality_score_version else None,
+        "quality_score_version": signal.quality_score_version,
+        "quality_score_mode": signal.quality_score_mode,
+        "quality_score_context": signal.quality_score_context,
+        "strategy_family": signal.strategy_family,
+        "strategy_tag": signal.strategy_tag,
+        "profile_key": signal.profile_key,
+        "daily_profile_version": signal.daily_profile_version,
+        "order_slot": signal.order_slot,
+        "profile_degradation_probe": signal.profile_degradation_probe,
+        "profile_degradation_triggered_at": signal.profile_degradation_triggered_at,
         "edge": abs(signal.score) - signal.threshold,
         "volume_ratio": signal.volume_ratio,
         "volume_threshold": signal.volume_threshold,
@@ -644,9 +691,10 @@ def sweep_profile_guard_key_subsets(
 
 
 def _summary(samples: Sequence[dict[str, Any]], key: str | None = None) -> dict[str, Any]:
-    orders = len(samples)
-    wins = sum(1 for item in samples if item["result"] == "WIN")
-    pnl = round(sum(float(item["pnl"]) for item in samples), 4)
+    settled = [item for item in samples if item.get("result") in {"WIN", "LOSS"}]
+    orders = len(settled)
+    wins = sum(1 for item in settled if item["result"] == "WIN")
+    pnl = round(sum(float(item["pnl"]) for item in settled), 4)
     return {
         "key": key,
         "orders": orders,
@@ -664,6 +712,73 @@ def _group_summaries(samples: Sequence[dict[str, Any]], field: str, *, min_group
         groups[str(item.get(field) or "UNKNOWN")].append(item)
     summaries = [_summary(rows, key) for key, rows in groups.items() if len(rows) >= min_group_size]
     return sorted(summaries, key=lambda item: (item["ev"], item["win_rate"], -item["orders"]))
+
+
+def _attach_reconstructed_order_slots(samples: list[dict[str, Any]]) -> None:
+    ordered = sorted(
+        samples,
+        key=lambda item: (int(item.get("opened_at") or 0), int(item.get("order_id") or 0)),
+    )
+    previous: list[dict[str, Any]] = []
+    for sample in ordered:
+        opened_at = int(sample.get("opened_at") or 0)
+        slot = str(sample.get("order_slot") or "").upper()
+        if slot not in {"FIRST", "SECOND"}:
+            has_open_order = any(
+                int(item.get("opened_at") or 0) < opened_at
+                and int(item.get("expires_at") or item.get("settled_at") or 0) > opened_at
+                for item in previous
+            )
+            slot = "SECOND" if has_open_order else "FIRST"
+        sample["order_slot"] = slot
+        sample["direction_slot"] = f"{sample.get('direction') or 'UNKNOWN'}_{slot}"
+        profile_key = str(sample.get("profile_key") or "")
+        if not profile_key:
+            profile_key = "|".join(
+                [
+                    str(int(sample.get("timeframe_minutes") or 0)),
+                    str(sample.get("strategy_family") or "unknown"),
+                    str(sample.get("strategy_tag") or "unknown"),
+                    str(sample.get("direction") or "").upper(),
+                    str(sample.get("threshold_segment") or "GLOBAL").upper(),
+                ]
+            )
+        sample["profile_key_resolved"] = profile_key
+        previous.append(sample)
+
+
+def _group_by_composite(
+    samples: Sequence[dict[str, Any]],
+    fields: Sequence[str],
+) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for sample in samples:
+        key = "|".join(str(sample.get(field) or "UNKNOWN") for field in fields)
+        if tuple(fields) == ("direction", "order_slot"):
+            key = "_".join(str(sample.get(field) or "UNKNOWN") for field in fields)
+        groups[key].append(sample)
+    summaries = [_summary(rows, key) for key, rows in groups.items()]
+    return sorted(summaries, key=lambda item: item["key"] or "")
+
+
+def _profile_slot_summaries(samples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for sample in samples:
+        key = f"{sample.get('profile_key_resolved') or 'UNKNOWN'}|{sample.get('order_slot') or 'UNKNOWN'}"
+        groups[key].append(sample)
+    summaries = []
+    for key, rows in groups.items():
+        summary = _summary(rows, key)
+        versions = {
+            str(row.get("daily_profile_version") or "")
+            for row in rows
+            if row.get("daily_profile_version")
+        }
+        summary["dps_count"] = len(versions)
+        summary["sample_state"] = "WATCH" if summary["orders"] >= 10 else "COLLECTING"
+        summary["cross_dps_ready"] = summary["orders"] >= 10 and len(versions) >= 2
+        summaries.append(summary)
+    return sorted(summaries, key=lambda item: item["key"] or "")
 
 
 def _group_by_list_field(samples: Sequence[dict[str, Any]], field: str) -> list[dict[str, Any]]:
@@ -685,6 +800,7 @@ def _feature_bins(samples: Sequence[dict[str, Any]], *, min_group_size: int) -> 
         "mtf_10m_bias": [-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0],
         "mtf_30m_bias": [-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0],
         "edge": [0.0, 10.0, 15.0, 20.0, 25.0, 30.0, 100.0],
+        "quality_score": [0.0, 40.0, 50.0, 60.0, 70.0, 80.0, 100.0],
     }
     return {
         field: _group_by_binner(
@@ -1106,6 +1222,8 @@ def _bin_value(value: Any, cutoffs: Sequence[float]) -> str:
     if value is None:
         return "NA"
     value = float(value)
+    if value < cutoffs[0]:
+        return f"<{cutoffs[0]:g}"
     for start, end in zip(cutoffs, cutoffs[1:]):
         if start <= value < end:
             return f"[{start:g},{end:g})"
@@ -1130,6 +1248,12 @@ def _float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _float(value)
 
 
 def _get(mapping: Mapping[str, Any], key: str, default: Any = None) -> Any:
