@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本文汇总 `minute-strategy` 截至2026-08-12的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
+本文汇总 `minute-strategy` 截至2026-08-13的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
 
 `docs/release-handoff.md` 是项目唯一的发布交接文档。后续发布只更新或追加本文，不再创建带日期、提交号或版本号的交接文档副本。
 
@@ -12,13 +12,13 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `07cfc3f`（Webhook最低延迟异步发送，尚未发布） |
-| 固化标签 | `v2026.08.12-optimization-observability`（指向 `02369bf`） |
-| 当前生产提交 | `02369bf2d2f17372486eb378f3473f3cf154b108` |
-| 当前生产事实 | 第29节 |
-| 本地未部署功能 | 第30节Webhook最低延迟异步发送；第28.6节候选继续只观察，不启用真实准入 |
+| 当前功能基线 | `26241a57df17bab77e2fa2b33c596e4f591f32bb`（LONG/SHORT方向独立订单控制） |
+| 固化标签 | `v2026.08.13-directional-order-controls`（指向 `26241a5`） |
+| 当前生产提交 | `26241a57df17bab77e2fa2b33c596e4f591f32bb` |
+| 当前生产事实 | 第33节 |
+| 本地未部署功能 | 无；第31节LONG第二单综合准入仍是未来设计，不是本地待发布代码 |
 
-第2至28节是历史发布、本地开发或较早分析快照；如与第29节冲突，以第29节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 保留为历史功能分支。第27至28节记录的统计与观察能力已随第29节发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
+第2至32节是历史发布、本地开发或较早分析快照；如与第33节冲突，以第33节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
 
 ## 2. 发布身份
 
@@ -1484,3 +1484,74 @@ exit=0
 但本次不能被表述为解决了近期连亏。ID 359至369形成11笔连续亏损，其中SHORT 7笔、LONG 4笔；新规则只会拦截其中两笔 `LONG_SECOND`，仍会放行9笔。特别是当前SHORT连亏来自 `WD-02` 和 `WD-04`，与历史SHORT整体正收益同时存在，后续必须等待新口径真实样本分析，不能在本次发布中追加临时SHORT收紧规则。
 
 发布计划固定为：从 `main` 创建 `v2026.08.13-directional-order-controls` 标签；生产保留现有SQLite和全部模拟订单；不清库、不改变 `NO_WEBHOOK=1`、评分阈值、画像门槛及既有systemd策略参数；发布后核验服务、预热、订单连续性、方向限额、方向冷却和方向资格状态。
+
+### 33.4 正式发布记录
+
+| 项目 | 发布值 |
+|---|---|
+| 生产提交 | `26241a57df17bab77e2fa2b33c596e4f591f32bb` |
+| 固化标签 | `v2026.08.13-directional-order-controls` |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-26241a5-20260813-154555` |
+| 发布前目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-02369bf-20260812-175520` |
+| 最小包 | `event-contract-monitor-26241a5-20260813-154555.tar.gz` |
+| SHA-256 | `1e7dd8309e470ab291c612d6e75411fd5b18eb8504fed0ea75a12cbd3389bcaf` |
+| 服务重启边界 | `2026-08-13 15:47:03 CST` |
+| systemd服务 | `victory-event-monitor`，`active/running`，`NRestarts=0` |
+| 公网域名 | `https://victory.easy-tx.com`，HTTP 200，SSL校验0 |
+| SQLite | `/opt/victory-event-monitor/shared/data/monitor.sqlite3` |
+
+最小包从发布标签对应提交直接生成，只包含 `app/`、`scripts/run.sh`、`README.md` 和 `.gitignore`，不包含 `data/`、测试、文档、Git元数据、SQLite或密钥。服务器端SHA-256一致，解包后Python编译和关键模块导入通过，再原子切换 `/opt/victory-event-monitor/current` 并重启服务。未修改Nginx、SSL或systemd drop-in。
+
+订单连续性和数据库迁移结果：
+
+```text
+orders rows: 369 -> 369
+max order_id: 369 -> 369
+open orders: 0 -> 0
+stake_progression_credits.direction: present
+```
+
+因此本次没有清空、复制或替换共享SQLite，既有模拟订单完整保留。资格表原地新增 `direction` 列，旧资格按代码中的兼容规则恢复；发布时LONG和SHORT均无待用或在途18U资格。
+
+### 33.5 线上验收结果
+
+服务启动后的首次状态请求发生在预热初始化窗口，随后约15秒内恢复稳定。最终验收为：
+
+```text
+release=/opt/victory-event-monitor/releases/event-contract-monitor-26241a5-20260813-154555
+service=active/running
+NRestarts=0
+warmup.status=READY
+warmup.loaded_klines=149760
+warmup.missing_files=[]
+warmup.errors=[]
+last_error=null
+daily_profile_selection.status=READY
+daily_profile_selection.version=DPS-20260813-0800
+orders=369
+open_orders=0
+max_order_id=369
+max_open_orders=2
+max_open_long_orders=1
+max_open_short_orders=2
+min_order_gap_ms=120000
+stake_progression.max_active_scope=DIRECTION
+stake_progression.max_active_per_direction=1
+webhook.enabled=false
+journal warnings since release=0
+https=200
+ssl_verify_result=0
+```
+
+状态接口已分别返回LONG和SHORT的最近开单时间、下次允许时间、待用资格和在途二级资格。画像与订单统计新增 `by_direction_slot_scope`，发布前369笔全部明确归入 `LEGACY_GLOBAL_V1`；第一笔发布后新订单开始使用 `DIRECTION_V2`，后续效果评估必须按该字段隔离。
+
+服务器本次保留实际启动参数，评分阈值为 `AUTO`，Webhook关闭。画像选择器实际配置为7天、工作日最少20笔、周末最少10笔、新增和退出胜率门槛均为60%、EV不低于0；这不是本次代码发布造成的变化。文档较早章节中的65%服务器门槛是历史快照，当前运行事实以本节60%为准。
+
+### 33.6 发布后观察要求
+
+1. 以服务重启边界后的首笔 `DIRECTION_V2` 订单作为新样本起点，不用旧 `LEGACY_GLOBAL_V1` 并发位置评价本次修改；
+2. 分别统计 `LONG_FIRST`、`SHORT_FIRST`、`SHORT_SECOND` 的订单数、胜率、PnL、EV、最大回撤和最长连亏；第一阶段正常情况下不应出现 `LONG_SECOND|DIRECTION_V2`；
+3. 检查反方向订单是否能够独立通过2分钟冷却，同时验证任意时刻全局仍不超过2笔；
+4. 检查18U资格的来源方向与消费方向一致，不能跨LONG/SHORT转移；
+5. 重点观察近期 `WD-02`、`WD-04` SHORT连亏是否延续，但在新口径样本不足前不追加方向守卫或画像临时黑名单；
+6. 第30节异步Webhook代码已随本次版本部署，但生产 `NO_WEBHOOK=1`，因此实际发送仍关闭。
