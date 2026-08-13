@@ -42,14 +42,15 @@ class TwoStageStakeReplayTest(unittest.TestCase):
 
         repriced = result["trade_rows"]
         self.assertEqual([item["id"] for item in repriced], [1, 2, 3, 4])
-        self.assertEqual([item["stake"] for item in repriced], [10.0, 10.0, 18.0, 10.0])
+        self.assertEqual([item["stake"] for item in repriced], [10.0, 10.0, 18.0, 18.0])
         self.assertEqual([item["result"] for item in repriced], ["WIN", "WIN", "LOSS", "WIN"])
-        self.assertEqual([item["stake_progression_step"] for item in repriced], [1, 1, 2, 1])
+        self.assertEqual([item["stake_progression_step"] for item in repriced], [1, 1, 2, 2])
         self.assertEqual(repriced[2]["stake_progression_source_order_id"], 1)
+        self.assertEqual(repriced[3]["stake_progression_source_order_id"], 2)
         self.assertTrue(all(item["stake_progression_version"] == TWO_STAGE_VERSION for item in repriced))
         self.assertEqual(result["summary"]["orders"], 4)
-        self.assertEqual(result["summary"]["second_stage_orders"], 1)
-        self.assertEqual(result["summary"]["pnl"], 6.0)
+        self.assertEqual(result["summary"]["second_stage_orders"], 2)
+        self.assertEqual(result["summary"]["pnl"], 12.4)
 
     def test_second_stage_win_or_loss_never_creates_a_third_stage(self):
         for second_result in ("WIN", "LOSS"):

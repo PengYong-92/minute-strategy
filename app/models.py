@@ -83,6 +83,7 @@ class Signal:
     daily_profile_selected: bool = False
     daily_profile_version: str = ""
     order_slot: str = field(default="", kw_only=True)
+    order_slot_scope: str = field(default="", kw_only=True)
     wave_state: str = "UNKNOWN"
     wave_raw_state: str = "UNKNOWN"
     wave_window: int = 0
@@ -140,6 +141,7 @@ class SimulatedOrder:
     daily_profile_selected: bool = False
     daily_profile_version: str = ""
     order_slot: str = field(default="", kw_only=True)
+    order_slot_scope: str = field(default="", kw_only=True)
     stake: float = 10.0
     win_return: float = 18.0
     stake_progression_step: int = 1
@@ -215,6 +217,7 @@ class ObservationSignal:
     profile_key: str = ""
     daily_profile_version: str = ""
     order_slot: str = field(default="", kw_only=True)
+    order_slot_scope: str = field(default="", kw_only=True)
     quality_score: float = 0.0
     quality_score_version: str = ""
     quality_score_mode: str = ""

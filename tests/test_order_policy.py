@@ -34,13 +34,13 @@ def signal(direction="LONG", score=82.0, threshold=70.0, segment="WD-12"):
 
 
 class OrderPolicyTest(unittest.TestCase):
-    def test_default_policy_allows_second_open_order_and_blocks_third(self):
+    def test_default_policy_allows_opposite_direction_second_order_and_blocks_third(self):
         policy = OrderPolicy()
         latest = kline(20)
         open_orders = [
             SimulatedOrder(
                 id=idx + 1,
-                direction="LONG",
+                direction="SHORT",
                 timeframe_minutes=10,
                 level="A",
                 reason="open",
@@ -69,6 +69,59 @@ class OrderPolicyTest(unittest.TestCase):
 
         self.assertTrue(second.open_allowed)
         self.assertEqual(third.code, "HOLD_OPEN_ORDER")
+
+    def test_default_policy_blocks_second_long_order_by_direction_limit(self):
+        policy = OrderPolicy()
+        latest = kline(20)
+        open_long = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="open",
+            entry_price=100.0,
+            opened_at=latest.close_time - 120_000,
+            expires_at=latest.close_time + 600_000,
+        )
+
+        gate = policy.evaluate(
+            signal("LONG"),
+            latest,
+            [open_long],
+            {"LONG": latest.close_time - 120_000},
+            set(),
+        )
+
+        self.assertFalse(gate.open_allowed)
+        self.assertEqual(gate.code, "HOLD_LONG_OPEN_ORDER")
+
+    def test_cooldown_only_uses_last_order_from_candidate_direction(self):
+        policy = OrderPolicy(min_order_gap_ms=120_000)
+        latest = kline(20)
+
+        long_gate = policy.evaluate(
+            signal("LONG"),
+            latest,
+            [],
+            {
+                "LONG": latest.close_time - 180_000,
+                "SHORT": latest.close_time - 60_000,
+            },
+            set(),
+        )
+        short_gate = policy.evaluate(
+            signal("SHORT"),
+            latest,
+            [],
+            {
+                "LONG": latest.close_time - 180_000,
+                "SHORT": latest.close_time - 60_000,
+            },
+            set(),
+        )
+
+        self.assertTrue(long_gate.open_allowed)
+        self.assertEqual(short_gate.code, "COOLDOWN")
 
     def test_default_policy_keeps_two_minute_entry_gap(self):
         policy = OrderPolicy()

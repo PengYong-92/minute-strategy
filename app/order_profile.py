@@ -41,6 +41,11 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         or _get(snapshot, "order_slot", "")
         or ""
     ).upper()
+    order_slot_scope = str(
+        signal.get("order_slot_scope")
+        or _get(snapshot, "order_slot_scope", "")
+        or ""
+    ).upper()
     return {
         "symbol": _get(snapshot, "symbol", ""),
         "order_id": _get(snapshot, "order_id", 0),
@@ -70,6 +75,7 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "profile_key": signal.get("profile_key") or "",
         "daily_profile_version": signal.get("daily_profile_version") or "",
         "order_slot": order_slot,
+        "order_slot_scope": order_slot_scope,
         "profile_degradation_probe": bool(signal.get("profile_degradation_probe", False)),
         "profile_degradation_triggered_at": int(
             signal.get("profile_degradation_triggered_at", 0) or 0
@@ -147,6 +153,10 @@ def summarize_order_samples_with_guard(
             [sample for sample in settled if sample.get("profile_degradation_probe")]
         ),
         "by_direction_slot": _group_by_composite(settled, ("direction", "order_slot")),
+        "by_direction_slot_scope": _group_by_composite(
+            settled,
+            ("direction", "order_slot", "order_slot_scope"),
+        ),
         "by_profile_slot": _profile_slot_summaries(settled),
         "by_profile_dps_slot": _group_by_composite(
             settled,
@@ -204,6 +214,7 @@ def sample_from_signal(signal: Signal) -> dict[str, Any]:
         "profile_key": signal.profile_key,
         "daily_profile_version": signal.daily_profile_version,
         "order_slot": signal.order_slot,
+        "order_slot_scope": signal.order_slot_scope,
         "profile_degradation_probe": signal.profile_degradation_probe,
         "profile_degradation_triggered_at": signal.profile_degradation_triggered_at,
         "edge": abs(signal.score) - signal.threshold,
@@ -723,14 +734,20 @@ def _attach_reconstructed_order_slots(samples: list[dict[str, Any]]) -> None:
     for sample in ordered:
         opened_at = int(sample.get("opened_at") or 0)
         slot = str(sample.get("order_slot") or "").upper()
+        scope = str(sample.get("order_slot_scope") or "LEGACY_GLOBAL_V1").upper()
         if slot not in {"FIRST", "SECOND"}:
             has_open_order = any(
                 int(item.get("opened_at") or 0) < opened_at
                 and int(item.get("expires_at") or item.get("settled_at") or 0) > opened_at
+                and (
+                    scope != "DIRECTION_V2"
+                    or item.get("direction") == sample.get("direction")
+                )
                 for item in previous
             )
             slot = "SECOND" if has_open_order else "FIRST"
         sample["order_slot"] = slot
+        sample["order_slot_scope"] = scope
         sample["direction_slot"] = f"{sample.get('direction') or 'UNKNOWN'}_{slot}"
         profile_key = str(sample.get("profile_key") or "")
         if not profile_key:

@@ -1086,6 +1086,50 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "COOLDOWN")
         self.assertEqual(len(state.simulator.orders), 1)
 
+    def test_main_order_path_applies_capacity_and_cooldown_per_direction(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            max_open_orders=2,
+            max_open_long_orders=1,
+            max_open_short_orders=2,
+            min_order_gap_ms=120_000,
+        )
+
+        def candidate(direction: str, opened_at: int) -> Signal:
+            return Signal(
+                direction=direction,
+                timeframe_minutes=10,
+                level="A",
+                reason="direction capacity",
+                price=100.0,
+                open_time=opened_at,
+                score=90.0 if direction == "LONG" else -90.0,
+                threshold=70.0,
+                threshold_segment="WD-08" if direction == "LONG" else "WD-23",
+                session_allowed=True,
+            )
+
+        first_long = state._maybe_open_order(
+            candidate("LONG", 1_000),
+            Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000),
+        )
+        blocked_long = state._maybe_open_order(
+            candidate("LONG", 121_000),
+            Kline(60_000, 100.0, 100.0, 100.0, 100.0, 1.0, 121_000),
+        )
+        opposite_short = state._maybe_open_order(
+            candidate("SHORT", 122_000),
+            Kline(120_000, 100.0, 100.0, 100.0, 100.0, 1.0, 122_000),
+        )
+
+        self.assertEqual(first_long, "OPENED")
+        self.assertEqual(blocked_long, "HOLD_LONG_OPEN_ORDER")
+        self.assertEqual(opposite_short, "OPENED")
+        self.assertEqual(
+            [(order.direction, order.order_slot) for order in state.simulator.orders],
+            [("LONG", "FIRST"), ("SHORT", "FIRST")],
+        )
+
     def test_reset_symbol_restores_minimum_order_gap_from_latest_order(self):
         storage = RecordingStorage()
         storage._persist_order(
@@ -1329,7 +1373,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.simulator.orders[-1].wave_guard_mode, "RECOVERY")
         self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "RECOVERY")
 
-    def test_wave_global_cooldown_refreshes_and_cancels_credit_while_signal_waits(self):
+    def test_wave_global_cooldown_refreshes_without_cancelling_directionless_credit(self):
         state = MonitorState(
             symbol="BTCUSDT",
             result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
@@ -1380,7 +1424,7 @@ class MonitorStateTest(unittest.TestCase):
 
         self.assertEqual(decision, "BELOW_THRESHOLD")
         self.assertEqual(state.snapshot()["wave_batch_guard"]["mode"], "COOLDOWN")
-        self.assertEqual(state.simulator.stake_progression.credits[-1].status, "CANCELLED")
+        self.assertEqual(state.simulator.stake_progression.credits[-1].status, "PENDING")
 
     def test_new_wave_cancels_old_credit_before_opening_base_order(self):
         state = MonitorState(
@@ -1408,7 +1452,11 @@ class MonitorStateTest(unittest.TestCase):
             )
         )
         state.simulator.stake_progression.credits.append(
-            StakeProgressionCredit(source_order_id=1, created_at=600_000)
+            StakeProgressionCredit(
+                source_order_id=1,
+                created_at=600_000,
+                direction="LONG",
+            )
         )
         signal = Signal(
             direction="LONG",
@@ -1464,7 +1512,11 @@ class MonitorStateTest(unittest.TestCase):
             )
         )
         state.simulator.stake_progression.credits.append(
-            StakeProgressionCredit(source_order_id=1, created_at=600_000)
+            StakeProgressionCredit(
+                source_order_id=1,
+                created_at=600_000,
+                direction="LONG",
+            )
         )
         signal = Signal(
             direction="WAIT",
@@ -1488,7 +1540,35 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         self.assertEqual(decision, "BELOW_THRESHOLD")
-        self.assertEqual(state.simulator.stake_progression.credits[0].status, "CANCELLED")
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "PENDING")
+
+    def test_directionless_wait_does_not_cancel_either_direction_credit(self):
+        state = MonitorState(symbol="BTCUSDT", enable_wave_guard=True)
+        state.simulator.stake_progression.credits.extend(
+            [
+                StakeProgressionCredit(1, 100, direction="LONG"),
+                StakeProgressionCredit(2, 100, direction="SHORT"),
+            ]
+        )
+        signal = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="无明确方向",
+            price=100.0,
+            open_time=1_000,
+            wave_guard_mode="DIRECTION_BLOCKED",
+        )
+
+        state._maybe_open_order(
+            signal,
+            Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000),
+        )
+
+        self.assertEqual(
+            [credit.status for credit in state.simulator.stake_progression.credits],
+            ["PENDING", "PENDING"],
+        )
 
     def test_credit_cancellation_failure_keeps_memory_pending_and_blocks_order(self):
         storage = RecordingStorage()
@@ -2186,9 +2266,17 @@ class MonitorStateTest(unittest.TestCase):
 
         self.assertEqual(state.order_policy.max_open_orders, 2)
         self.assertEqual(state.order_policy.min_order_gap_ms, 2 * 60_000)
+        order_policy = state.snapshot()["order_policy"]
+        self.assertEqual(order_policy["max_open_orders"], 2)
+        self.assertEqual(order_policy["max_open_long_orders"], 1)
+        self.assertEqual(order_policy["max_open_short_orders"], 2)
+        self.assertEqual(order_policy["min_order_gap_ms"], 2 * 60_000)
         self.assertEqual(
-            state.snapshot()["order_policy"],
-            {"max_open_orders": 2, "min_order_gap_ms": 2 * 60_000},
+            order_policy["by_direction"],
+            {
+                "LONG": {"last_opened_at": None, "next_allowed_at": None},
+                "SHORT": {"last_opened_at": None, "next_allowed_at": None},
+            },
         )
         self.assertTrue(state.snapshot()["result_sequence_guard"]["enabled"])
         self.assertFalse(state.snapshot()["wave_state"]["enabled"])
@@ -3057,7 +3145,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(snapshot["observations"][0]["strategy_tag"], "normal_down_short_extension_observe")
         self.assertEqual(len(storage.observations), 1)
 
-    def test_wd23_short_can_consume_second_stage_credit_despite_base_only_compat_config(self):
+    def test_wd23_short_cannot_consume_long_progression_credit(self):
         state = MonitorState(
             symbol="BTCUSDT",
             stake_progression_base_only_segments=["WD-23"],
@@ -3099,8 +3187,8 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(first.result, "WIN")
         self.assertEqual(decision, "OPENED")
         self.assertEqual(opened.direction, "SHORT")
-        self.assertEqual(opened.stake, 18.0)
-        self.assertEqual(opened.stake_progression_step, 2)
+        self.assertEqual(opened.stake, 10.0)
+        self.assertEqual(opened.stake_progression_step, 1)
         self.assertNotIn("固定基础金额", opened.reason)
 
     def test_wd02_short_is_live_enabled_by_default(self):
@@ -3611,6 +3699,36 @@ class MonitorStateTest(unittest.TestCase):
             snapshot["observations"][0]["quality_score"],
         )
 
+    def test_wait_observation_quality_slot_uses_observe_direction(self):
+        state = MonitorState(symbol="BTCUSDT")
+        state.simulator.open_order(
+            Signal(
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="open short",
+                price=100.0,
+                open_time=0,
+            ),
+            100.0,
+            0,
+        )
+        wait_short = Signal(
+            direction="WAIT",
+            observe_direction="SHORT",
+            timeframe_minutes=10,
+            level="B",
+            reason="observe short",
+            price=100.0,
+            open_time=60_000,
+        )
+
+        scored = state._attach_quality_score(wait_short)
+
+        self.assertEqual(scored.order_slot, "SECOND")
+        self.assertEqual(scored.order_slot_scope, "DIRECTION_V2")
+        self.assertEqual(scored.quality_score_context, "SHORT_SECOND")
+
     def test_shadow_quality_score_failure_does_not_block_existing_order_path(self):
         state = MonitorState(symbol="BTCUSDT")
         signal = Signal(
@@ -4013,9 +4131,9 @@ class MonitorStateTest(unittest.TestCase):
         storage.entry_snapshots.clear()
 
         second_signal = Signal(
-            direction="SHORT", timeframe_minutes=10, level="A", reason="second",
-            price=101.0, open_time=121_000, score=-80.0, threshold=70.0,
-            threshold_segment="WD-23", session_allowed=True,
+            direction="LONG", timeframe_minutes=10, level="A", reason="second",
+            price=101.0, open_time=121_000, score=80.0, threshold=70.0,
+            threshold_segment="WD-08", session_allowed=True,
         )
         expiry_kline = Kline(120_000, 100.0, 101.0, 100.0, 101.0, 1.0, 121_000)
         with patch("app.state.choose_trade_signal", return_value=second_signal):
@@ -4059,9 +4177,9 @@ class MonitorStateTest(unittest.TestCase):
             )
             state.wait_for_storage_writes()
             second_signal = Signal(
-                direction="SHORT", timeframe_minutes=10, level="A", reason="second",
-                price=101.0, open_time=121_000, score=-80.0, threshold=70.0,
-                threshold_segment="WD-23", session_allowed=True,
+                direction="LONG", timeframe_minutes=10, level="A", reason="second",
+                price=101.0, open_time=121_000, score=80.0, threshold=70.0,
+                threshold_segment="WD-08", session_allowed=True,
             )
             with patch("app.state.choose_trade_signal", return_value=second_signal):
                 state.update_from_klines(
@@ -4259,9 +4377,9 @@ class MonitorStateTest(unittest.TestCase):
         webhook.calls.clear()
         storage.fail_once("save_settled_order_with_credit")
         second_signal = Signal(
-            direction="SHORT", timeframe_minutes=10, level="A", reason="second",
-            price=101.0, open_time=121_000, score=-80.0, threshold=70.0,
-            threshold_segment="WD-23", session_allowed=True,
+            direction="LONG", timeframe_minutes=10, level="A", reason="second",
+            price=101.0, open_time=121_000, score=80.0, threshold=70.0,
+            threshold_segment="WD-08", session_allowed=True,
         )
         expiry_kline = Kline(120_000, 100.0, 101.0, 100.0, 101.0, 1.0, 121_000)
 

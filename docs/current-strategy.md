@@ -50,7 +50,9 @@ bash scripts/run.sh
 | `--stake` | `10` | 基础下单金额 |
 | `--win-return` | `stake * 1.8` | 赢单总返还金额 |
 | `--max-open-orders` | `2` | 最多同时持有的未结订单数 |
-| `--min-order-gap-minutes` | `2` | 两次开单最小间隔分钟数 |
+| `--max-open-long-orders` | `1` | 最多同时持有的LONG未结订单数 |
+| `--max-open-short-orders` | `2` | 最多同时持有的SHORT未结订单数 |
+| `--min-order-gap-minutes` | `2` | 同方向两次开单最小间隔分钟数 |
 | `--stake-progression-max-orders` | `2` | 兼容参数；生产固定为两阶段 |
 | `--stake-progression-max-active` | `1` | 最多并行第二级订单数 |
 | `--stake-progression-base-only-segments` | 空 | 兼容参数；默认所有已入选时段均可参与 |
@@ -1065,7 +1067,7 @@ stake_progression_base_only_segments = ()
 - 第一级订单使用基础 `stake=10U`。
 - 第一级赢后产生一次第二级资格；消费该资格的订单使用 `stake=18U`。
 - 第二级订单无论胜负，结算后都不会产生第三级资格，后续订单回到基础 `stake`。
-- 默认最多并行 1 个第二级订单。
+- 每个方向默认最多并行 1 个第二级订单，且仍共同受全局未结订单上限约束。
 - `stake_progression_base_only_segments` 默认为空，所有已入选时段均可参与两阶段金额叠加。
 - `stake_progression_max_orders` 与 `stake_progression_base_only_segments` 继续作为兼容参数被接受；生产金额状态机固定为 2 级。
 - 若关闭金额叠加，每单固定使用基础 `stake` 和基础 `win_return`。
@@ -1243,7 +1245,7 @@ short_observe_only = True
 
 当前策略只做10分钟事件合约，每日画像是策略来源。原量价和技术指标生成主信号、明确的 `observe_direction`、研究观察候选、动态阈值和完整画像标签；完整画像入选后，可以把主 `WAIT` 的明确观察方向或研究观察候选变为正式候选。`TRADE_SCORE_THRESHOLD` 当前仅保留为审计参数，不独立改变资格。每日画像生效时不使用固定 SHORT 时段白名单；关闭每日画像后才回退静态兼容路径。
 
-当前代码资金管理严格使用 `10U -> 18U -> 重置10U` 两阶段；第一级赢后才产生一次第二级资格，不存在第三级，最多并行第二级订单数默认是1，且所有已入选时段默认均可参与。总未结订单上限为2；批次锁定、全局冷却和普通波段恢复单不消费或生成18U资格，画像退化试探例外。
+当前代码资金管理严格使用 `10U -> 18U -> 重置10U` 两阶段；第一级赢后才为同方向产生一次第二级资格，不存在第三级，每个方向最多并行第二级订单数默认是1，且所有已入选时段默认均可参与。总未结订单上限为2；批次锁定、全局冷却和普通波段恢复单不消费或生成18U资格，画像退化试探例外。
 
 当前策略不是“看到下跌就追空”，而是：
 
@@ -1867,7 +1869,7 @@ timeframe_minutes | strategy_family | strategy_tag | direction | threshold_segme
 
 ### 32.4 并发与波段批次
 
-生产默认总未结订单上限为2，基础单和18U第二级订单共同占用上限。两次开单最小间隔仍为2分钟。
+生产默认总未结订单上限为2，基础单和18U第二级订单共同占用上限。LONG最多1笔、SHORT最多2笔；同方向两次开单最小间隔仍为2分钟，反方向不共用该冷却时间。
 
 波段批次ID：
 
@@ -2026,12 +2028,12 @@ calculated_threshold  原策略计算的动态阈值
 
 ### 34.4 当前风险边界
 
-- 最多同时2笔，最小间隔2分钟。
+- 全局最多同时2笔，LONG最多1笔、SHORT最多2笔；同方向最小间隔2分钟。
 - 同一完整画像键在当前DPS版本内连续3笔真实亏损后，默认冷却60分钟；冷却后只允许一笔10U基础试探，未结算时阻止同画像。
 - 画像退化试探赢恢复正常并可产生下一笔18U资格，即使同时属于波段恢复；试探亏重新冷却。
 - 同方向连续3笔已结算亏损后冷却20分钟，默认启用。
 - 滚动优势守卫默认启用。
-- 两阶段金额仍为第一笔10U，赢后下一笔18U，随后重置；最多一个并行18U资格。
+- 两阶段金额仍为第一笔10U，同方向赢后下一笔18U，随后重置；每个方向最多一个并行18U资格并共同受全局2笔上限约束。
 - 每日画像的60%门槛负责先保证有足够订单，再根据新节点实际样本逐步优化，不以单个波段状态一次性关闭整类信号。
 
 ## 35. 当日与画像周期表现统计
@@ -2081,15 +2083,16 @@ calculated_threshold  原策略计算的动态阈值
       "pnl": -20.0,
       "ev": -10.0
     }
-  ]
+  ],
+  "by_direction_slot_scope": []
 }
 ```
 
-没有已激活画像时，`active=false`，版本为空，生效时间为 `null`，收益、订单数和胜率均为0；页面显示 `-`。画像周期统计用于评价当前DPS版本，不能替代00:00自然日财务统计，也不参与开单、结算、每日画像选择或任何风险守卫。
+没有已激活画像时，`active=false`，版本为空，生效时间为 `null`，收益、订单数和胜率均为0；页面显示 `-`。`by_direction_slot` 保留兼容汇总，`by_direction_slot_scope` 用 `LEGACY_GLOBAL_V1` 和 `DIRECTION_V2` 隔离并发位置口径。画像周期统计用于评价当前DPS版本，不能替代00:00自然日财务统计，也不参与开单、结算、每日画像选择或任何风险守卫。
 
 ## 36. 并发位置、订单画像与守卫审计
 
-每个候选、观察样本、模拟订单和入口快照显式记录 `order_slot=FIRST|SECOND`。该字段按开单前是否存在未到期订单计算，与 `stake_progression_step=1|2` 完全独立：首个并发位置可能使用18U第二阶段金额，第二并发位置也可能使用10U基础金额。恢复旧数据库时，缺失的 `order_slot` 按 `opened_at/expires_at` 重建。
+每个候选、观察样本、模拟订单和入口快照显式记录 `order_slot=FIRST|SECOND`。新口径 `order_slot_scope=DIRECTION_V2` 只检查候选同方向是否已有未结订单：已有SHORT不改变LONG的FIRST/SECOND，反之亦然。该字段与 `stake_progression_step=1|2` 完全独立。旧数据库缺失的槽位仍按历史全局并发口径重建，并标记为 `LEGACY_GLOBAL_V1`，不得与新口径混合评价。
 
 `/api/order-profile` 只使用 `result in {WIN, LOSS}` 的入口快照计算胜率、PnL、EV、分组、特征分箱、风险提示和守卫回放，并返回：
 
@@ -2097,6 +2100,7 @@ calculated_threshold  原策略计算的动态阈值
 - `sample_count`：进入结果统计的已结样本数；
 - `open_orders`：未结入口快照数；
 - `by_direction_slot`：LONG/SHORT与FIRST/SECOND四种上下文；
+- `by_direction_slot_scope`：方向、并发位置和槽位口径版本，用于隔离新旧统计；
 - `by_profile_slot`：完整画像键与并发位置，附DPS数量、10笔观察状态和跨至少2个DPS的就绪状态；
 - `by_profile_dps_slot`：完整画像键、DPS版本和并发位置的精确分组；
 - `profile_degradation_probes`：画像退化试探单的真实结算表现；
@@ -2105,3 +2109,13 @@ calculated_threshold  原策略计算的动态阈值
 `/api/signal-audit-summary`汇总最近5000条信号审计，按决策、完整画像键、DPS版本、并发位置以及方向连亏守卫、画像退化守卫、波段批次守卫和滚动优势状态统计。它用于评价“哪些候选被拦截”，不改变任何守卫参数。
 
 `QS_V1_SHADOW`只记录评分、分项和原始输入。它不参与 `Signal.actionable`、每日画像选择、方向判断、动态阈值、风险守卫、最大并发、开单间隔或10U/18U资格。单一 `画像 × SECOND` 少于10笔标记为 `COLLECTING`；达到10笔仅进入观察；达到10笔且覆盖至少2个DPS才标记跨周期就绪，仍需独立评估后才能改动真实准入。
+
+## 37. LONG/SHORT方向独立订单控制
+
+订单容量采用“方向上限 + 全局上限”两层门禁。默认LONG最多1笔、SHORT最多2笔，同时仍受全局最多2笔约束；因此第一阶段允许 `1 LONG + 1 SHORT` 或 `2 SHORT`，不允许 `1 LONG + 2 SHORT`。反方向订单不占用当前方向自己的名额，但占用全局名额。
+
+开单间隔只读取候选方向最近一次成功开单时间。LONG刚开后可以独立评估SHORT，SHORT刚开不触发LONG的 `COOLDOWN`。服务重启和切换币种时分别从持久化订单恢复LONG/SHORT最后开单时间。`/api/state.order_policy.by_direction` 返回各方向的 `last_opened_at` 和 `next_allowed_at` 供审计。
+
+两阶段金额资格也按方向隔离：LONG基础单盈利只生成LONG资格，SHORT基础单盈利只生成SHORT资格；领取、在途占用、回滚、波段失效和重启恢复均不能跨方向。SQLite资格表持久化 `direction`，旧表启动时自动新增该列；旧资格可从来源订单推断方向。`/api/state.stake_progression.max_active_scope=DIRECTION` 明确兼容字段中的上限口径，`by_direction` 分别展示待用资格、在途第二级订单和下一单金额；页面徽标也分别显示LONG和SHORT状态。
+
+本变更不修改10分钟量价信号、每日画像入选、1分钟波段、方向连亏守卫、画像退化守卫、评分阈值或Webhook逻辑。LONG上限为1期间不会产生新口径 `LONG_SECOND`；未来放开LONG第二单时仍须执行交接文档第31节定义的综合准入评估。

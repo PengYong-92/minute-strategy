@@ -40,7 +40,11 @@ def reprice_trades(
     )
 
     def open_trade(item: dict[str, Any], event_time: int) -> None:
-        terms, _credit = ledger.assign(item["id"], event_time)
+        terms, _credit = ledger.assign(
+            item["id"],
+            event_time,
+            direction=item["direction"],
+        )
         item["stake"] = terms.stake
         item["win_return"] = terms.win_return
         item["stake_progression_step"] = terms.step
@@ -55,6 +59,7 @@ def reprice_trades(
             item["stake_progression_step"],
             item["result"],
             event_time,
+            direction=item["direction"],
         )
 
     _run_timeline(

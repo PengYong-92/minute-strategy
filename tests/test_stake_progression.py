@@ -65,6 +65,65 @@ class TwoStageStakeProgressionTest(unittest.TestCase):
         self.assertEqual(consumed.consumed_order_id, 2)
         self.assertEqual(consumed.consumed_at, 602_000)
 
+    def test_direction_credit_cannot_be_consumed_by_opposite_direction(self):
+        ledger = self.ledger()
+        credit = ledger.settle(
+            1,
+            order_opened_at=1_000,
+            step=1,
+            result="WIN",
+            settled_at=601_000,
+            direction="LONG",
+        )
+
+        short_terms, short_credit = ledger.assign(2, 602_000, direction="SHORT")
+        long_terms, long_credit = ledger.assign(3, 603_000, direction="LONG")
+
+        self.assertEqual(credit.direction, "LONG")
+        self.assertIsNone(short_credit)
+        self.assertEqual(short_terms.step, 1)
+        self.assertIs(long_credit, credit)
+        self.assertEqual(long_terms.step, 2)
+
+    def test_directionless_assignment_only_consumes_legacy_directionless_credit(self):
+        ledger = self.ledger()
+        directional = ledger.settle(
+            1,
+            order_opened_at=1_000,
+            step=1,
+            result="WIN",
+            settled_at=601_000,
+            direction="LONG",
+        )
+
+        terms, consumed = ledger.assign(2, 602_000)
+
+        self.assertEqual(terms.step, 1)
+        self.assertIsNone(consumed)
+        self.assertEqual(directional.status, "PENDING")
+
+    def test_active_capacity_is_independent_per_direction(self):
+        ledger = self.ledger(max_active=1)
+
+        long_credit = ledger.settle(1, 1_000, 1, "WIN", 601_000, direction="LONG")
+        short_credit = ledger.settle(2, 2_000, 1, "WIN", 602_000, direction="SHORT")
+
+        self.assertEqual(long_credit.status, "PENDING")
+        self.assertEqual(short_credit.status, "PENDING")
+        self.assertEqual(len(ledger.pending_credits(direction="LONG")), 1)
+        self.assertEqual(len(ledger.pending_credits(direction="SHORT")), 1)
+
+    def test_cancel_pending_only_cancels_requested_direction(self):
+        ledger = self.ledger(max_active=1)
+        long_credit = ledger.settle(1, 1_000, 1, "WIN", 601_000, direction="LONG")
+        short_credit = ledger.settle(2, 2_000, 1, "WIN", 602_000, direction="SHORT")
+
+        cancelled = ledger.cancel_pending(direction="LONG")
+
+        self.assertEqual(cancelled, [long_credit])
+        self.assertEqual(long_credit.status, "CANCELLED")
+        self.assertEqual(short_credit.status, "PENDING")
+
     def test_first_stage_loss_keeps_next_order_at_10u(self):
         ledger = self.ledger()
 
@@ -682,21 +741,27 @@ class TwoStageStakeProgressionTest(unittest.TestCase):
 
     def test_status_contains_api_fields_and_gross_returns(self):
         ledger = self.ledger(max_active=2)
-        self.win_first_stage(ledger)
+        ledger.settle(1, 1_000, 1, "WIN", 601_000, direction="LONG")
+        ledger.settle(2, 2_000, 1, "WIN", 602_000, direction="SHORT")
 
         status = ledger.status()
 
         self.assertEqual(status["enabled"], True)
         self.assertEqual(status["version"], TWO_STAGE_VERSION)
-        self.assertEqual(status["pending_credits"], 1)
+        self.assertEqual(status["pending_credits"], 2)
         self.assertEqual(status["active_second_stage"], 0)
         self.assertEqual(status["max_active_second_stage"], 2)
+        self.assertEqual(status["max_active_scope"], "DIRECTION")
+        self.assertEqual(status["max_active_per_direction"], 2)
         self.assertEqual(status["base_stake"], 10.0)
         self.assertEqual(status["base_win_return"], 18.0)
         self.assertEqual(status["second_stake"], 18.0)
         self.assertEqual(status["second_win_return"], 32.4)
         self.assertEqual(status["next_stake"], 18.0)
         self.assertEqual(status["next_win_return"], 32.4)
+        self.assertEqual(status["by_direction"]["LONG"]["pending_credits"], 1)
+        self.assertEqual(status["by_direction"]["SHORT"]["pending_credits"], 1)
+        self.assertEqual(status["by_direction"]["LONG"]["next_stake"], 18.0)
 
     def test_credit_and_terms_are_serializable(self):
         ledger = self.ledger()

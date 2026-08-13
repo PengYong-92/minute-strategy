@@ -21,6 +21,8 @@ STAKE="${STAKE:-10}"
 TRADE_SCORE_THRESHOLD="${TRADE_SCORE_THRESHOLD:-auto}"
 WIN_RETURN="${WIN_RETURN:-}"
 MAX_OPEN_ORDERS="${MAX_OPEN_ORDERS:-2}"
+MAX_OPEN_LONG_ORDERS="${MAX_OPEN_LONG_ORDERS:-1}"
+MAX_OPEN_SHORT_ORDERS="${MAX_OPEN_SHORT_ORDERS:-2}"
 MIN_ORDER_GAP_MINUTES="${MIN_ORDER_GAP_MINUTES:-2}"
 STAKE_PROGRESSION="${STAKE_PROGRESSION:-1}"
 ROLLING_EDGE_GUARD="${ROLLING_EDGE_GUARD:-1}"
@@ -84,8 +86,12 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
                          兼容审计参数，不改变开单资格，默认: auto
   --win-return N         赢单返还金额，默认: stake * 1.8
   --max-open-orders N    最多同时持有的未结订单数，默认: 2
+  --max-open-long-orders N
+                         最多同时持有的 LONG 未结订单数，默认: 1
+  --max-open-short-orders N
+                         最多同时持有的 SHORT 未结订单数，默认: 2
   --min-order-gap-minutes N
-                         两次开单最小间隔分钟数，默认: 2
+                         同方向两次开单最小间隔分钟数，默认: 2
   --no-stake-progression 关闭两阶段金额叠加
   --no-rolling-edge-guard
                          关闭滚动优势守卫，仅保留状态观察
@@ -100,7 +106,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --stake-progression-max-orders N
                          兼容参数；两阶段固定为 2 级，默认: 2
   --stake-progression-max-active N
-                         最多并行第二级订单数，默认: 1
+                         每个方向最多并行第二级订单数，默认: 1
   --stake-progression-base-only-segments LIST
                          兼容参数；仅使用基础金额、不继承第二级金额的时段，逗号分隔
                          默认空，生产默认所有已入选时段均可参与
@@ -161,7 +167,8 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   SYMBOL, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
   WEBHOOK_URL, WEBHOOK_TOKEN, WEBHOOK_TIMEOUT,
   WARMUP_MONTHS, WARMUP_TIMEOUT, STAKE, TRADE_SCORE_THRESHOLD, WIN_RETURN,
-  MAX_OPEN_ORDERS, MIN_ORDER_GAP_MINUTES,
+  MAX_OPEN_ORDERS, MAX_OPEN_LONG_ORDERS, MAX_OPEN_SHORT_ORDERS,
+  MIN_ORDER_GAP_MINUTES,
   STAKE_PROGRESSION, ROLLING_EDGE_GUARD, STAKE_PROGRESSION_MAX_ORDERS,
   RESULT_SEQUENCE_GUARD, RESULT_SEQUENCE_LOSS_STREAK,
   RESULT_SEQUENCE_COOLDOWN_MINUTES, RESULT_SEQUENCE_SCOPE,
@@ -340,6 +347,24 @@ while [ "$#" -gt 0 ]; do
       ;;
     --max-open-orders=*)
       MAX_OPEN_ORDERS="${1#*=}"
+      shift
+      ;;
+    --max-open-long-orders)
+      require_value "$1" "${2:-}"
+      MAX_OPEN_LONG_ORDERS="$2"
+      shift 2
+      ;;
+    --max-open-long-orders=*)
+      MAX_OPEN_LONG_ORDERS="${1#*=}"
+      shift
+      ;;
+    --max-open-short-orders)
+      require_value "$1" "${2:-}"
+      MAX_OPEN_SHORT_ORDERS="$2"
+      shift 2
+      ;;
+    --max-open-short-orders=*)
+      MAX_OPEN_SHORT_ORDERS="${1#*=}"
       shift
       ;;
     --min-order-gap-minutes)
@@ -745,6 +770,8 @@ exec "$PYTHON_BIN" -m app.server \
   --trade-score-threshold "$TRADE_SCORE_THRESHOLD" \
   ${WIN_RETURN:+--win-return "$WIN_RETURN"} \
   --max-open-orders "$MAX_OPEN_ORDERS" \
+  --max-open-long-orders "$MAX_OPEN_LONG_ORDERS" \
+  --max-open-short-orders "$MAX_OPEN_SHORT_ORDERS" \
   --min-order-gap-minutes "$MIN_ORDER_GAP_MINUTES" \
   --result-sequence-loss-streak "$RESULT_SEQUENCE_LOSS_STREAK" \
   --result-sequence-cooldown-minutes "$RESULT_SEQUENCE_COOLDOWN_MINUTES" \

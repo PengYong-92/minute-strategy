@@ -288,10 +288,22 @@ def main() -> None:
         help="最多同时持有的未结订单数，默认: 2",
     )
     parser.add_argument(
+        "--max-open-long-orders",
+        type=int,
+        default=int(os.getenv("MAX_OPEN_LONG_ORDERS", "1")),
+        help="最多同时持有的 LONG 未结订单数，默认: 1",
+    )
+    parser.add_argument(
+        "--max-open-short-orders",
+        type=int,
+        default=int(os.getenv("MAX_OPEN_SHORT_ORDERS", "2")),
+        help="最多同时持有的 SHORT 未结订单数，默认: 2",
+    )
+    parser.add_argument(
         "--min-order-gap-minutes",
         type=float,
         default=float(os.getenv("MIN_ORDER_GAP_MINUTES", "2")),
-        help="两次开单最小间隔分钟数，默认: 2",
+        help="同方向两次开单最小间隔分钟数，默认: 2",
     )
     parser.add_argument(
         "--win-return",
@@ -526,6 +538,8 @@ def main() -> None:
     state = MonitorState(
         symbol=args.symbol,
         max_open_orders=args.max_open_orders,
+        max_open_long_orders=args.max_open_long_orders,
+        max_open_short_orders=args.max_open_short_orders,
         min_order_gap_ms=round(args.min_order_gap_minutes * 60_000),
         fear_greed_provider=FearGreedProvider(),
         storage_path=None if args.no_persistence else args.db_path,

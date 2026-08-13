@@ -750,6 +750,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                     source_order_id=3,
                     created_at=30,
                     credit_id="z-pending",
+                    direction="SHORT",
                 ),
                 StakeProgressionCredit(
                     source_order_id=2,
@@ -758,12 +759,14 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                     status="CONSUMED",
                     consumed_order_id=20,
                     consumed_at=40,
+                    direction="LONG",
                 ),
                 StakeProgressionCredit(
                     source_order_id=1,
                     created_at=10,
                     credit_id="a-cancelled",
                     status="CANCELLED",
+                    direction="SHORT",
                 ),
             ]
             for credit in credits:
@@ -779,6 +782,42 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             [credit.to_dict() for credit in restored],
             [credits[2].to_dict(), credits[1].to_dict(), credits[0].to_dict()],
         )
+
+    def test_upgrades_legacy_progression_credit_table_with_direction_column(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    """
+                    create table stake_progression_credits (
+                        symbol text not null,
+                        version text not null,
+                        credit_id text not null,
+                        source_order_id integer not null,
+                        status text not null,
+                        created_at integer not null,
+                        consumed_order_id integer,
+                        consumed_at integer,
+                        primary key(symbol, version, source_order_id),
+                        unique(symbol, version, credit_id),
+                        unique(symbol, version, consumed_order_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    insert into stake_progression_credits(
+                        symbol, version, credit_id, source_order_id, status, created_at
+                    ) values ('BTCUSDT', ?, 'legacy:1', 1, 'PENDING', 1000)
+                    """,
+                    (TWO_STAGE_VERSION,),
+                )
+
+            store = SQLiteMonitorStore(db_path)
+            restored = store.load_stake_progression_credits("BTCUSDT")
+
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0].direction, "")
 
     def test_prepare_runtime_preserves_activation_boundary_across_restart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -994,7 +1033,48 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                     store.save_settled_order_with_credit(order, "BTCUSDT", credit)
 
             self.assertEqual(store.load_orders("BTCUSDT"), [])
-            self.assertEqual(store.load_stake_progression_credits("BTCUSDT"), [])
+
+    def test_atomic_methods_reject_cross_direction_credit_links(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            settled_long = progression_order(1, status="SETTLED")
+            wrong_settlement_credit = StakeProgressionCredit(
+                source_order_id=settled_long.id,
+                created_at=settled_long.settled_at,
+                direction="SHORT",
+            )
+
+            with self.assertRaisesRegex(ValueError, "direction"):
+                store.save_settled_order_with_credit(
+                    settled_long,
+                    "BTCUSDT",
+                    wrong_settlement_credit,
+                )
+
+            pending = StakeProgressionCredit(
+                source_order_id=10,
+                created_at=1_000,
+                direction="LONG",
+            )
+            consumed = replace(
+                pending,
+                status="CONSUMED",
+                consumed_order_id=2,
+                consumed_at=2_000,
+            )
+            short_order = replace(
+                progression_order(2, step=2, source_order_id=10),
+                direction="SHORT",
+            )
+            store.save_stake_progression_credit("BTCUSDT", pending)
+
+            with self.assertRaisesRegex(ValueError, "direction"):
+                store.save_open_order_with_credit(short_order, "BTCUSDT", consumed)
+            restored = store.load_stake_progression_credits("BTCUSDT")
+
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0].status, "PENDING")
+        self.assertEqual(restored[0].direction, "LONG")
 
     def test_settlement_credit_rejects_second_stage_order_without_partial_write(self):
         with tempfile.TemporaryDirectory() as temp_dir:

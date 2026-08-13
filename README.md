@@ -7,9 +7,9 @@
 - 只开10分钟单；动态评分阈值继续计算和展示，但当前只作审计，不独立决定开单资格。30分钟仅保留现有指标偏向，不是订单周期。
 - 10分钟信号严格使用最近10根已收盘1分钟K线分析后10分钟方向。
 - 使用最近8根已闭合1分钟K线计算、持久化并展示因果波段；波段方向否决默认关闭，启用时才只允许与波段一致的方向。不使用4小时或日线趋势投票，30分钟只保留现有指标偏向。
-- 默认最多同时持有2单，两次开单至少间隔2分钟；每次行情更新仍只选择一个最高优先级画像，不会同一分钟批量开单。
-- 使用滚动守卫 + 严格两阶段金额叠加模拟下单：第一单固定 10U，赢后产生一次第二级 18U 资格；第二单结算后回到 10U，不存在第三级。
-- 默认最多并行 1 个第二级订单，且所有已入选时段均可参与；`base-only` 兼容列表默认为空。
+- 默认全局最多同时持有2单，LONG最多1单、SHORT最多2单；2分钟最小开单间隔按方向独立计算。每次行情更新仍只选择一个最高优先级画像，不会同一分钟批量开单。
+- 使用滚动守卫 + 严格两阶段金额叠加模拟下单：第一单固定 10U，同方向赢单只为同方向产生一次第二级 18U 资格；第二单结算后回到 10U，不存在第三级。
+- 每个方向默认最多并行 1 个第二级订单，两个方向的资格互不领取、占用或取消；全局未结订单上限仍是最终风险边界。
 - 独立 Web 页面查看点位、预警、订单、胜负、盈亏和胜率。
 - 页面高亮当前选择信号、时段是否允许、时段胜率/EV、入场和出场时间。
 - Fear & Greed 实盘动态获取并缓存，用作方向风险阈值调节，不直接决定方向。
@@ -58,14 +58,14 @@ bash scripts/run.sh ETHUSDT 8080
 bash scripts/run.sh --symbol BTCUSDT --host 0.0.0.0 --port 8000 --poll-seconds 10 --limit 300
 bash scripts/run.sh --no-warmup
 bash scripts/run.sh --db-path data/monitor.sqlite3
-bash scripts/run.sh --max-open-orders 2 --min-order-gap-minutes 2
+bash scripts/run.sh --max-open-orders 2 --max-open-long-orders 1 --max-open-short-orders 2 --min-order-gap-minutes 2
 PROFILE_DEGRADATION_COOLDOWN_MINUTES=60 bash scripts/run.sh
 RESULT_SEQUENCE_GUARD=1 bash scripts/run.sh --result-sequence-loss-streak 3 --result-sequence-cooldown-minutes 20 --result-sequence-scope DIRECTION
 bash scripts/run.sh --stake-progression-max-orders 2 --stake-progression-max-active 1 --stake-progression-base-only-segments ""
 bash scripts/run.sh --webhook-url https://event.easy-tx.com/api/signals/ingest
 ```
 
-金额叠加默认由 `STAKE_PROGRESSION=1`、`STAKE_PROGRESSION_MAX_ORDERS=2`、`STAKE_PROGRESSION_MAX_ACTIVE=1` 和空的 `STAKE_PROGRESSION_BASE_ONLY_SEGMENTS` 控制。`max-orders` 与 `base-only` 参数继续接受旧部署配置，但生产执行固定为两阶段，默认不排除任何已入选时段。
+金额叠加默认由 `STAKE_PROGRESSION=1`、`STAKE_PROGRESSION_MAX_ORDERS=2`、`STAKE_PROGRESSION_MAX_ACTIVE=1` 和空的 `STAKE_PROGRESSION_BASE_ONLY_SEGMENTS` 控制。`max-active` 按 LONG/SHORT 分别计算，资格只能由同方向订单领取。`max-orders` 与 `base-only` 参数继续接受旧部署配置，但生产执行固定为两阶段，默认不排除任何已入选时段。
 
 实时画像退化只新增 `PROFILE_DEGRADATION_COOLDOWN_MINUTES=60`（命令行对应 `--profile-degradation-cooldown-minutes 60`）一个启动参数，`0` 表示关闭。连续亏损触发数固定为3，不提供额外的启用、最小样本、胜率或EV参数。守卫按“完整画像键 + 当前 DPS 版本”读取已结算真实订单；冷却后只放行一笔10U基础试探，试探未结算时继续阻止同画像。试探赢恢复 `NORMAL`，并可按两阶段金额规则产生下一笔18U资格，即使该单同时属于波段恢复；试探亏则从该单结算时间重新冷却。
 

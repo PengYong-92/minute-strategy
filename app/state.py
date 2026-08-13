@@ -53,6 +53,8 @@ class MonitorState:
         self,
         symbol: str,
         max_open_orders: int = 2,
+        max_open_long_orders: int = 1,
+        max_open_short_orders: int = 2,
         min_order_gap_ms: int = 2 * 60_000,
         fear_greed_provider=None,
         max_klines: int = 140_000,
@@ -90,6 +92,8 @@ class MonitorState:
         self._symbol_generation = 0
         self.order_policy = OrderPolicy(
             max_open_orders=max(1, int(max_open_orders)),
+            max_open_long_orders=max(1, int(max_open_long_orders)),
+            max_open_short_orders=max(1, int(max_open_short_orders)),
             min_order_gap_ms=max(0, int(min_order_gap_ms)),
         )
         self.max_klines = max_klines
@@ -187,7 +191,9 @@ class MonitorState:
         self.last_error: str | None = None
         self.updated_at_ms = 0
         self._opened_signal_keys: set[tuple[int, int, str]] = set()
-        self._last_order_opened_at = self._latest_order_opened_at(restored_orders)
+        self._last_order_opened_at = self._latest_order_opened_at_by_direction(
+            restored_orders
+        )
         self._lock = threading.RLock()
 
     def capture_symbol_context(self) -> tuple[str, int]:
@@ -427,7 +433,9 @@ class MonitorState:
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self._opened_signal_keys.clear()
-            self._last_order_opened_at = self._latest_order_opened_at(restored_orders)
+            self._last_order_opened_at = self._latest_order_opened_at_by_direction(
+                restored_orders
+            )
 
     def _matches_symbol_context(self, expected_context: tuple[str, int] | None) -> bool:
         return expected_context is None or expected_context == (
@@ -436,8 +444,18 @@ class MonitorState:
         )
 
     @staticmethod
-    def _latest_order_opened_at(orders) -> int | None:
-        return max((int(order.opened_at) for order in orders), default=None)
+    def _latest_order_opened_at_by_direction(orders) -> dict[str, int | None]:
+        return {
+            direction: max(
+                (
+                    int(order.opened_at)
+                    for order in orders
+                    if order.direction.upper() == direction
+                ),
+                default=None,
+            )
+            for direction in ("LONG", "SHORT")
+        }
 
     def _build_simulator(self, symbol: str, restored_orders) -> AccountSimulator:
         activated_at = 0
@@ -456,6 +474,16 @@ class MonitorState:
                 self._now_ms(),
             )
             credits = load_credits(symbol, TWO_STAGE_VERSION)
+            orders_by_id = {order.id: order for order in restored_orders}
+            credits = [
+                replace(
+                    credit,
+                    direction=orders_by_id[credit.source_order_id].direction,
+                )
+                if not credit.direction and credit.source_order_id in orders_by_id
+                else credit
+                for credit in credits
+            ]
 
         pending_ids = {
             credit.credit_id for credit in credits if credit.status == "PENDING"
@@ -548,12 +576,18 @@ class MonitorState:
         if batch_decision.blocked or (
             batch_decision.mode == "RECOVERY" and not preserve_progression_credit
         ):
-            if not self._cancel_pending_progression_credits():
+            direction = self._signal_direction(signal)
+            if direction and not self._cancel_pending_progression_credits(
+                direction=direction
+            ):
                 return "STORAGE_ERROR"
             self._wave_bootstrap_cancel_pending = False
         elif batch_decision.mode != "RECOVERY":
             stale_source_ids = self._stale_progression_credit_source_ids(signal)
-            if stale_source_ids and not self._cancel_pending_progression_credits(stale_source_ids):
+            if stale_source_ids and not self._cancel_pending_progression_credits(
+                stale_source_ids,
+                self._signal_direction(signal),
+            ):
                 return "STORAGE_ERROR"
             self._wave_bootstrap_cancel_pending = False
         else:
@@ -756,7 +790,9 @@ class MonitorState:
                 return "STORAGE_ERROR"
         if gate.signal_key:
             self._opened_signal_keys.add(gate.signal_key)
-        self._last_order_opened_at = latest.close_time
+        if not isinstance(self._last_order_opened_at, dict):
+            self._last_order_opened_at = {"LONG": None, "SHORT": None}
+        self._last_order_opened_at[signal.direction] = latest.close_time
         self._send_webhook(signal, order)
         if signal.profile_degradation_probe:
             self._refresh_profile_degradation_guard(signal, latest.close_time)
@@ -828,12 +864,16 @@ class MonitorState:
         )
 
     def _attach_quality_score(self, signal: Signal) -> Signal:
+        direction = self._signal_direction(signal)
         open_order_count = sum(
-            1 for order in self.simulator.orders if order.status == "OPEN"
+            1
+            for order in self.simulator.orders
+            if order.status == "OPEN" and order.direction == direction
         )
         slotted_signal = replace(
             signal,
             order_slot="SECOND" if open_order_count > 0 else "FIRST",
+            order_slot_scope="DIRECTION_V2",
         )
         try:
             return attach_shadow_quality_score(
@@ -1193,6 +1233,7 @@ class MonitorState:
             profile_key=signal.profile_key,
             daily_profile_version=signal.daily_profile_version,
             order_slot=signal.order_slot,
+            order_slot_scope=signal.order_slot_scope,
             quality_score=signal.quality_score,
             quality_score_version=signal.quality_score_version,
             quality_score_mode=signal.quality_score_mode,
@@ -1382,8 +1423,12 @@ class MonitorState:
     def _cancel_pending_progression_credits(
         self,
         source_order_ids: Sequence[int] | set[int] | None = None,
+        direction: str = "",
     ) -> bool:
-        pending = self.simulator.stake_progression.pending_credits(source_order_ids)
+        pending = self.simulator.stake_progression.pending_credits(
+            source_order_ids,
+            direction,
+        )
         if not pending:
             return True
         cancelled_snapshots = [replace(credit, status="CANCELLED") for credit in pending]
@@ -1400,11 +1445,16 @@ class MonitorState:
             except Exception as exc:  # noqa: BLE001 - 未持久化前不得修改内存资格。
                 self._set_storage_error("资格取消持久化失败", exc)
                 return False
-        self.simulator.stake_progression.cancel_pending(source_order_ids)
+        self.simulator.stake_progression.cancel_pending(source_order_ids, direction)
         return True
 
     def _stale_progression_credit_source_ids(self, signal: Signal) -> set[int]:
-        pending = self.simulator.stake_progression.pending_credits()
+        direction = self._signal_direction(signal)
+        if not direction:
+            return set()
+        pending = self.simulator.stake_progression.pending_credits(
+            direction=direction
+        )
         if not pending:
             return set()
         if self._wave_bootstrap_cancel_pending:
@@ -1437,6 +1487,14 @@ class MonitorState:
             ):
                 stale.add(credit.source_order_id)
         return stale
+
+    @staticmethod
+    def _signal_direction(signal: Signal) -> str:
+        for value in (signal.direction, signal.observe_direction):
+            direction = str(value or "").upper()
+            if direction in {"LONG", "SHORT"}:
+                return direction
+        return ""
 
     def _save_settled_order_with_credit(self, order, credit) -> None:
         order_snapshot = replace(order)
@@ -1519,10 +1577,7 @@ class MonitorState:
                 "stake_progression_max_orders": 2,
                 "stake_progression_max_active": progression["max_active"],
             },
-            "order_policy": {
-                "max_open_orders": self.order_policy.max_open_orders,
-                "min_order_gap_ms": self.order_policy.min_order_gap_ms,
-            },
+            "order_policy": self._order_policy_status(),
             "trade_score_threshold": self._trade_score_threshold_status(),
         }
         self._submit_storage_write(
@@ -1608,6 +1663,30 @@ class MonitorState:
         return {
             "mode": "AUTO" if self.trade_score_threshold is None else "AUDIT_ONLY",
             "value": self.trade_score_threshold,
+        }
+
+    def _order_policy_status(self) -> dict:
+        last_opened = (
+            self._last_order_opened_at
+            if isinstance(self._last_order_opened_at, dict)
+            else {"LONG": self._last_order_opened_at, "SHORT": self._last_order_opened_at}
+        )
+        return {
+            "max_open_orders": self.order_policy.max_open_orders,
+            "max_open_long_orders": self.order_policy.max_open_long_orders,
+            "max_open_short_orders": self.order_policy.max_open_short_orders,
+            "min_order_gap_ms": self.order_policy.min_order_gap_ms,
+            "by_direction": {
+                direction: {
+                    "last_opened_at": last_opened.get(direction),
+                    "next_allowed_at": (
+                        int(last_opened[direction]) + self.order_policy.min_order_gap_ms
+                        if last_opened.get(direction) is not None
+                        else None
+                    ),
+                }
+                for direction in ("LONG", "SHORT")
+            },
         }
 
     def _update_order_entry_snapshot_settlement(
@@ -1854,10 +1933,7 @@ class MonitorState:
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),
                 "stake_progression": self._stake_progression_status(),
-                "order_policy": {
-                    "max_open_orders": self.order_policy.max_open_orders,
-                    "min_order_gap_ms": self.order_policy.min_order_gap_ms,
-                },
+                "order_policy": self._order_policy_status(),
                 "trade_score_threshold": self._trade_score_threshold_status(),
                 "webhook": self.webhook.status() if self.webhook else {
                     "enabled": False,

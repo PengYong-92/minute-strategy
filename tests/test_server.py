@@ -301,6 +301,7 @@ class OrdersApiTest(unittest.TestCase):
                 "losses": 0,
                 "win_rate": 0.0,
                 "by_direction_slot": [],
+                "by_direction_slot_scope": [],
             },
         )
         self.assertIn("wave_state", state_payload)

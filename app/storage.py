@@ -173,6 +173,8 @@ def _summarize_signal_audit(records: Sequence[dict[str, Any]]) -> dict[str, Any]
             group["opened"] += 1
         elif decision.endswith("BLOCKED") or decision in {
             "HOLD_OPEN_ORDER",
+            "HOLD_LONG_OPEN_ORDER",
+            "HOLD_SHORT_OPEN_ORDER",
             "COOLDOWN",
             "DAILY_PROFILE_NOT_SELECTED",
             "SHORT_OBSERVE_ONLY",
@@ -505,9 +507,9 @@ class SQLiteMonitorStore:
             """
             insert into stake_progression_credits(
                 symbol, version, credit_id, source_order_id, status, created_at,
-                consumed_order_id, consumed_at
+                consumed_order_id, consumed_at, direction
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(symbol, version, source_order_id) do update set
                 credit_id=case
                     when stake_progression_credits.status = 'PENDING'
@@ -534,6 +536,11 @@ class SQLiteMonitorStore:
                     then excluded.consumed_at
                     else stake_progression_credits.consumed_at
                 end,
+                direction=case
+                    when stake_progression_credits.status = 'PENDING'
+                    then excluded.direction
+                    else stake_progression_credits.direction
+                end,
                 updated_at_ms=strftime('%s','now') * 1000
             """,
             (
@@ -545,6 +552,7 @@ class SQLiteMonitorStore:
                 credit.created_at,
                 credit.consumed_order_id,
                 credit.consumed_at,
+                credit.direction,
             ),
         )
 
@@ -618,7 +626,7 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 """
                 select source_order_id, created_at, credit_id, consumed_at,
-                       consumed_order_id, version, status
+                       consumed_order_id, version, status, direction
                 from stake_progression_credits
                 where symbol = ? and version = ?
                 order by created_at, credit_id
@@ -634,6 +642,7 @@ class SQLiteMonitorStore:
                 consumed_order_id=row["consumed_order_id"],
                 version=row["version"],
                 status=row["status"],
+                direction=row["direction"],
             )
             for row in rows
         ]
@@ -693,6 +702,8 @@ class SQLiteMonitorStore:
             raise ValueError("settlement credit must be PENDING or CANCELLED")
         if credit.version != order.stake_progression_version:
             raise ValueError("settlement credit version must match order version")
+        if credit.direction and credit.direction != order.direction:
+            raise ValueError("settlement credit direction must match order direction")
 
     @staticmethod
     def _validate_open_credit(
@@ -713,6 +724,8 @@ class SQLiteMonitorStore:
             raise ValueError("credit source_order_id must match order source")
         if credit.version != order.stake_progression_version:
             raise ValueError("open-order credit version must match order version")
+        if credit.direction and credit.direction != order.direction:
+            raise ValueError("open-order credit direction must match order direction")
 
     def prepare_stake_progression(
         self,
@@ -1297,6 +1310,7 @@ class SQLiteMonitorStore:
                     created_at integer not null,
                     consumed_order_id integer,
                     consumed_at integer,
+                    direction text not null default '',
                     updated_at_ms integer not null default (strftime('%s','now') * 1000),
                     primary key(symbol, version, source_order_id),
                     unique(symbol, version, credit_id),
@@ -1304,6 +1318,17 @@ class SQLiteMonitorStore:
                 )
                 """
             )
+            credit_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "pragma table_info(stake_progression_credits)"
+                ).fetchall()
+            }
+            if "direction" not in credit_columns:
+                connection.execute(
+                    "alter table stake_progression_credits "
+                    "add column direction text not null default ''"
+                )
             connection.execute(
                 """
                 create table if not exists signal_audit (

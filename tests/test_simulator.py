@@ -49,6 +49,122 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(concurrent.order_slot, "SECOND")
         self.assertEqual(concurrent.stake_progression_step, 1)
 
+    def test_order_slot_is_scoped_to_direction(self):
+        simulator = AccountSimulator()
+
+        first_short = simulator.open_order(signal("SHORT"), 100.0, 0)
+        first_long = simulator.open_order(signal("LONG"), 100.0, 120_000)
+        second_short = simulator.open_order(signal("SHORT"), 100.0, 240_000)
+
+        self.assertEqual(first_short.order_slot, "FIRST")
+        self.assertEqual(first_long.order_slot, "FIRST")
+        self.assertEqual(second_short.order_slot, "SECOND")
+        self.assertEqual(first_short.order_slot_scope, "DIRECTION_V2")
+        self.assertEqual(first_long.order_slot_scope, "DIRECTION_V2")
+
+    def test_restored_orders_without_scope_keep_legacy_global_slot_semantics(self):
+        orders = [
+            SimulatedOrder(
+                id=1,
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="legacy short",
+                entry_price=100.0,
+                opened_at=0,
+                expires_at=600_000,
+            ),
+            SimulatedOrder(
+                id=2,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="legacy long",
+                entry_price=100.0,
+                opened_at=120_000,
+                expires_at=720_000,
+            ),
+        ]
+
+        simulator = AccountSimulator(orders=orders)
+
+        self.assertEqual(
+            [(order.order_slot, order.order_slot_scope) for order in simulator.orders],
+            [
+                ("FIRST", "LEGACY_GLOBAL_V1"),
+                ("SECOND", "LEGACY_GLOBAL_V1"),
+            ],
+        )
+
+    def test_restored_direction_scope_reconstructs_slots_per_direction(self):
+        orders = [
+            SimulatedOrder(
+                id=1,
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="direction short",
+                entry_price=100.0,
+                opened_at=0,
+                expires_at=600_000,
+                order_slot_scope="DIRECTION_V2",
+            ),
+            SimulatedOrder(
+                id=2,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="direction long",
+                entry_price=100.0,
+                opened_at=120_000,
+                expires_at=720_000,
+                order_slot_scope="DIRECTION_V2",
+            ),
+        ]
+
+        simulator = AccountSimulator(orders=orders)
+
+        self.assertEqual([order.order_slot for order in simulator.orders], ["FIRST", "FIRST"])
+
+    def test_progression_credit_is_only_consumed_by_same_direction_order(self):
+        simulator = AccountSimulator(enable_stake_progression=True)
+        long_order = simulator.open_order(signal("LONG"), 100.0, 0)
+        simulator.settle_expired_orders(long_order.expires_at, 101.0)
+
+        short_order = simulator.open_order(signal("SHORT"), 101.0, 601_000)
+        next_long = simulator.open_order(signal("LONG"), 101.0, 602_000)
+
+        self.assertEqual(short_order.stake_progression_step, 1)
+        self.assertEqual(next_long.stake_progression_step, 2)
+        self.assertEqual(next_long.stake_progression_source_order_id, long_order.id)
+
+    def test_restored_legacy_credit_infers_source_order_direction(self):
+        source = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="legacy source",
+            entry_price=100.0,
+            opened_at=0,
+            expires_at=600_000,
+            status="SETTLED",
+            result="WIN",
+            settled_at=600_000,
+            pnl=8.0,
+        )
+        simulator = AccountSimulator(
+            orders=[source],
+            enable_stake_progression=True,
+            stake_progression_credits=[StakeProgressionCredit(1, 600_000)],
+        )
+
+        short_order = simulator.open_order(signal("SHORT"), 100.0, 601_000)
+        long_order = simulator.open_order(signal("LONG"), 100.0, 602_000)
+
+        self.assertEqual(short_order.stake_progression_step, 1)
+        self.assertEqual(long_order.stake_progression_step, 2)
+
     def test_simulated_order_progression_metadata_defaults_are_backward_compatible(self):
         self.assertEqual(
             [field.name for field in fields(SimulatedOrder)][-2:],
@@ -415,14 +531,14 @@ class SimulatorTest(unittest.TestCase):
         simulator = AccountSimulator(enable_stake_progression=True)
         first = simulator.open_order(signal("LONG", timeframe_minutes=1), 100.0, 0)
         simulator.settle_expired_order_events(60_000, 101.0)
-        second, consumed = simulator.open_order_with_credit(signal("SHORT"), 101.0, 60_000)
+        second, consumed = simulator.open_order_with_credit(signal("LONG"), 101.0, 60_000)
 
         simulator.rollback_open_order(second.id)
 
         self.assertEqual(consumed.status, "PENDING")
         self.assertEqual(simulator.stake_progression.credits[0].status, "PENDING")
         self.assertEqual(simulator.stats()["active_second_orders"], 0)
-        retried, retried_credit = simulator.open_order_with_credit(signal("SHORT"), 101.0, 61_000)
+        retried, retried_credit = simulator.open_order_with_credit(signal("LONG"), 101.0, 61_000)
         self.assertEqual(retried.id, second.id)
         self.assertEqual(retried.stake, 18.0)
         self.assertEqual(retried_credit.source_order_id, first.id)
@@ -497,7 +613,7 @@ class SimulatorTest(unittest.TestCase):
         simulator.settle_expired_orders(60_000, 101.0)
 
         first_second = simulator.open_order(signal("LONG", timeframe_minutes=1), 101.0, 60_000)
-        second_second = simulator.open_order(signal("SHORT", timeframe_minutes=1), 101.0, 60_000)
+        second_second = simulator.open_order(signal("LONG", timeframe_minutes=1), 101.0, 60_000)
 
         self.assertEqual([first_second.stake, second_second.stake], [18.0, 18.0])
         self.assertEqual(simulator.stats()["active_second_orders"], 2)
@@ -508,7 +624,7 @@ class SimulatorTest(unittest.TestCase):
         event = simulator.settle_expired_order_events(60_000, 101.0)[0]
 
         _, consumed = simulator.open_order_with_credit(
-            signal("SHORT", timeframe_minutes=1),
+            signal("LONG", timeframe_minutes=1),
             101.0,
             60_000,
         )
@@ -518,7 +634,7 @@ class SimulatorTest(unittest.TestCase):
         self.assertIsNot(event.progression_credit, consumed)
         self.assertEqual(event.progression_credit.credit_id, consumed.credit_id)
 
-    def test_credit_crosses_segments_and_direction_even_with_legacy_base_only_config(self):
+    def test_credit_crosses_segments_but_not_direction_with_legacy_base_only_config(self):
         simulator = AccountSimulator(
             enable_stake_progression=True,
             stake_progression_base_only_segments=["WD-23"],
@@ -531,8 +647,8 @@ class SimulatorTest(unittest.TestCase):
             60_000,
         )
 
-        self.assertEqual((first.stake, short.stake), (10.0, 18.0))
-        self.assertEqual(short.stake_progression_source_order_id, first.id)
+        self.assertEqual((first.stake, short.stake), (10.0, 10.0))
+        self.assertIsNone(short.stake_progression_source_order_id)
 
     def test_activation_boundary_uses_first_stage_open_time_inclusively(self):
         simulator = AccountSimulator(
@@ -844,6 +960,20 @@ class SimulatorTest(unittest.TestCase):
                         "ev": -1.0,
                     }
                 ],
+                "by_direction_slot_scope": [
+                    {
+                        "key": "LONG_FIRST_DIRECTION_V2",
+                        "direction": "LONG",
+                        "order_slot": "FIRST",
+                        "order_slot_scope": "DIRECTION_V2",
+                        "orders": 2,
+                        "wins": 1,
+                        "losses": 1,
+                        "win_rate": 0.5,
+                        "pnl": -2.0,
+                        "ev": -1.0,
+                    }
+                ],
             },
         )
 
@@ -896,8 +1026,14 @@ class SimulatorTest(unittest.TestCase):
         )
 
         groups = {item["key"]: item for item in stats["profile_period"]["by_direction_slot"]}
+        scoped_groups = {
+            item["key"]: item
+            for item in stats["profile_period"]["by_direction_slot_scope"]
+        }
         self.assertEqual(groups["LONG_FIRST"]["wins"], 1)
         self.assertEqual(groups["LONG_SECOND"]["losses"], 1)
+        self.assertEqual(scoped_groups["LONG_FIRST_LEGACY_GLOBAL_V1"]["wins"], 1)
+        self.assertEqual(scoped_groups["LONG_SECOND_LEGACY_GLOBAL_V1"]["losses"], 1)
 
     def test_stats_reports_inactive_profile_period_when_no_profile_is_active(self):
         stats = AccountSimulator().stats(now_ms=0)
@@ -915,6 +1051,7 @@ class SimulatorTest(unittest.TestCase):
                 "losses": 0,
                 "win_rate": 0.0,
                 "by_direction_slot": [],
+                "by_direction_slot_scope": [],
             },
         )
 

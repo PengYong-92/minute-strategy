@@ -139,6 +139,16 @@ function fmtStakeProgression(progression) {
     return "两单叠加 · 状态数据不完整";
   }
   const stakeLabel = Number.isInteger(secondStake) ? secondStake.toFixed(0) : secondStake.toFixed(2);
+  const byDirection = progression.by_direction;
+  if (byDirection && byDirection.LONG && byDirection.SHORT) {
+    const longActive = num(byDirection.LONG.active_second_orders);
+    const shortActive = num(byDirection.SHORT.active_second_orders);
+    const longMax = num(byDirection.LONG.max_active, maxActive);
+    const shortMax = num(byDirection.SHORT.max_active, maxActive);
+    const longPending = num(byDirection.LONG.pending_credits);
+    const shortPending = num(byDirection.SHORT.pending_credits);
+    return `两单叠加 · ${stakeLabel}U在途 L${longActive}/${longMax} S${shortActive}/${shortMax} · 待用 L${longPending} S${shortPending}`;
+  }
   return `两单叠加 · ${stakeLabel}U订单 ${active}/${maxActive} · 待用资格 ${pending}`;
 }
 

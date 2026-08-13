@@ -17,6 +17,7 @@ class StakeProgressionCredit:
     consumed_order_id: int | None = None
     version: str = TWO_STAGE_VERSION
     status: str = "PENDING"
+    direction: str = ""
 
     def __post_init__(self) -> None:
         self.source_order_id = int(self.source_order_id)
@@ -41,6 +42,9 @@ class StakeProgressionCredit:
         self.status = str(self.status).upper()
         if self.status not in _CREDIT_STATUSES:
             raise ValueError(f"unknown credit status: {self.status}")
+        self.direction = str(self.direction).strip().upper()
+        if self.direction not in {"", "LONG", "SHORT"}:
+            raise ValueError(f"unknown credit direction: {self.direction}")
         if self.status in {"PENDING", "CANCELLED"}:
             if self.consumed_order_id is not None or self.consumed_at is not None:
                 raise ValueError(
@@ -156,9 +160,11 @@ class TwoStageStakeProgression:
         self,
         order_id: int,
         opened_at: int,
+        direction: str = "",
     ) -> tuple[OrderTerms, StakeProgressionCredit | None]:
         normalized_order_id = self._positive_order_id(order_id)
         normalized_opened_at = self._non_negative_timestamp(opened_at, "opened_at")
+        normalized_direction = self._normalize_direction(direction)
         existing = next(
             (
                 credit
@@ -169,6 +175,12 @@ class TwoStageStakeProgression:
             None,
         )
         if existing is not None:
+            if (
+                normalized_direction
+                and existing.direction
+                and existing.direction != normalized_direction
+            ):
+                raise ValueError("consumed progression credit direction mismatch")
             return self._second_terms(existing.source_order_id), existing
 
         if not self.enabled:
@@ -180,6 +192,7 @@ class TwoStageStakeProgression:
                 for credit in self.credits
                 if credit.status == "PENDING"
                 and credit.created_at <= normalized_opened_at
+                and credit.direction == normalized_direction
             ),
             key=lambda credit: (credit.created_at, credit.credit_id),
         )
@@ -228,10 +241,12 @@ class TwoStageStakeProgression:
         result: str,
         settled_at: int,
         allow_credit: bool = True,
+        direction: str = "",
     ) -> StakeProgressionCredit | None:
         normalized_step = self._validate_step(step)
         normalized_result = self._validate_result(result)
         normalized_order_id = self._positive_order_id(order_id)
+        normalized_direction = self._normalize_direction(direction)
         normalized_opened_at = self._non_negative_timestamp(
             order_opened_at,
             "order_opened_at",
@@ -278,9 +293,10 @@ class TwoStageStakeProgression:
         credit = StakeProgressionCredit(
             source_order_id=normalized_order_id,
             created_at=normalized_settled_at,
+            direction=normalized_direction,
             status=(
                 "CANCELLED"
-                if self._reserved_count() >= self.max_active
+                if self._reserved_count(normalized_direction) >= self.max_active
                 else "PENDING"
             ),
         )
@@ -297,21 +313,28 @@ class TwoStageStakeProgression:
     def pending_credits(
         self,
         source_order_ids: Iterable[int] | None = None,
+        direction: str = "",
     ) -> list[StakeProgressionCredit]:
         allowed = None if source_order_ids is None else {int(item) for item in source_order_ids}
+        normalized_direction = self._normalize_direction(direction)
         return [
             credit
             for credit in self.credits
             if credit.status == "PENDING"
             and (allowed is None or credit.source_order_id in allowed)
+            and (
+                not normalized_direction
+                or credit.direction == normalized_direction
+            )
         ]
 
     def cancel_pending(
         self,
         source_order_ids: Iterable[int] | None = None,
+        direction: str = "",
     ) -> list[StakeProgressionCredit]:
         cancelled = []
-        for credit in self.pending_credits(source_order_ids):
+        for credit in self.pending_credits(source_order_ids, direction):
             credit.status = "CANCELLED"
             cancelled.append(credit)
         return cancelled
@@ -332,18 +355,26 @@ class TwoStageStakeProgression:
         if not self.enabled:
             return self.cancel_pending()
 
-        pending = sorted(
-            (credit for credit in self.credits if credit.status == "PENDING"),
-            key=lambda credit: (credit.created_at, credit.credit_id),
-            reverse=True,
-        )
-        excess = max(
-            0,
-            len(pending) + self.active_second_orders - self.max_active,
-        )
-        cancelled = pending[:excess]
-        for credit in cancelled:
-            credit.status = "CANCELLED"
+        cancelled = []
+        directions = {credit.direction for credit in self.credits}
+        for direction in directions:
+            pending = sorted(
+                (
+                    credit
+                    for credit in self.credits
+                    if credit.status == "PENDING" and credit.direction == direction
+                ),
+                key=lambda credit: (credit.created_at, credit.credit_id),
+                reverse=True,
+            )
+            excess = max(
+                0,
+                len(pending) + self._active_count(direction) - self.max_active,
+            )
+            direction_cancelled = pending[:excess]
+            for credit in direction_cancelled:
+                credit.status = "CANCELLED"
+            cancelled.extend(direction_cancelled)
         return cancelled
 
     def status(self) -> dict:
@@ -365,6 +396,8 @@ class TwoStageStakeProgression:
                 for order_id in self._active_second_order_ids
                 if order_id > 0
             ),
+            "max_active_scope": "DIRECTION",
+            "max_active_per_direction": self.max_active,
             "max_active_second_stage": self.max_active,
             "max_active": self.max_active,
             "base_stake": round(self.base_stake, 4),
@@ -375,11 +408,63 @@ class TwoStageStakeProgression:
             "next_stake": next_terms.stake,
             "next_win_return": next_terms.win_return,
             "next_step": next_terms.step,
+            "by_direction": {
+                direction: self._direction_status(direction)
+                for direction in ("LONG", "SHORT")
+            },
         }
 
-    def _reserved_count(self) -> int:
-        pending = sum(credit.status == "PENDING" for credit in self.credits)
-        return pending + self.active_second_orders
+    def _direction_status(self, direction: str) -> dict:
+        pending = len(self.pending_credits(direction=direction))
+        active_ids = sorted(
+            credit.consumed_order_id
+            for credit in self.credits
+            if credit.status == "CONSUMED"
+            and credit.direction == direction
+            and credit.consumed_order_id in self._active_second_order_ids
+        )
+        next_terms = (
+            self._second_terms()
+            if self.enabled and pending > 0
+            else self._base_terms()
+        )
+        return {
+            "pending_credits": pending,
+            "active_second_orders": len(active_ids),
+            "active_second_order_ids": active_ids,
+            "max_active": self.max_active,
+            "next_stake": next_terms.stake,
+            "next_win_return": next_terms.win_return,
+            "next_step": next_terms.step,
+        }
+
+    def _reserved_count(self, direction: str = "") -> int:
+        normalized_direction = self._normalize_direction(direction)
+        pending = sum(
+            credit.status == "PENDING"
+            and (
+                credit.direction == normalized_direction
+                if normalized_direction
+                else credit.direction == ""
+            )
+            for credit in self.credits
+        )
+        return pending + self._active_count(normalized_direction)
+
+    def _active_count(self, direction: str) -> int:
+        return sum(
+            credit.status == "CONSUMED"
+            and credit.consumed_order_id in self._active_second_order_ids
+            and credit.direction == direction
+            for credit in self.credits
+        )
+
+    @staticmethod
+    def _normalize_direction(direction: str) -> str:
+        normalized = str(direction or "").strip().upper()
+        if normalized not in {"", "LONG", "SHORT"}:
+            raise ValueError(f"unknown direction: {normalized}")
+        return normalized
 
     def _validate_restored_credits(self) -> None:
         source_keys: set[tuple[str, int]] = set()

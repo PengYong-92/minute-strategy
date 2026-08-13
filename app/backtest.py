@@ -101,6 +101,7 @@ def run_backtest(
                     order["stake_progression_step"],
                     order["result"],
                     order["exit_time"],
+                    direction=order["direction"],
                 )
             open_orders.remove(order)
 
@@ -135,7 +136,11 @@ def run_backtest(
             progression_source_order_id = None
             progression_version = ""
         else:
-            terms, _credit = progression.assign(order_id, current.close_time)
+            terms, _credit = progression.assign(
+                order_id,
+                current.close_time,
+                direction=signal.direction,
+            )
             stake = terms.stake
             win_return = terms.win_return
             progression_step = terms.step
@@ -189,6 +194,7 @@ def run_backtest(
                 order["stake_progression_step"],
                 order["result"],
                 order["exit_time"],
+                direction=order["direction"],
             )
         open_orders.remove(order)
 

@@ -14,6 +14,8 @@ from app.stake_progression import (
 
 
 SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
+DIRECTION_ORDER_SLOT_SCOPE = "DIRECTION_V2"
+LEGACY_ORDER_SLOT_SCOPE = "LEGACY_GLOBAL_V1"
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,16 @@ class AccountSimulator:
         )
         self.balance = round(sum(order.pnl for order in self.orders if order.status == "SETTLED"), 4)
         self._next_id = max([order.id for order in self.orders], default=0) + 1
+        orders_by_id = {order.id: order for order in self.orders}
+        restored_credits = [
+            replace(
+                credit,
+                direction=orders_by_id[credit.source_order_id].direction,
+            )
+            if not credit.direction and credit.source_order_id in orders_by_id
+            else credit
+            for credit in stake_progression_credits
+        ]
 
         restored_open_second_ids = {
             order.id
@@ -83,7 +95,7 @@ class AccountSimulator:
             max_active=stake_progression_max_active,
             max_open_orders=max_open_orders,
             activated_at=stake_progression_activated_at,
-            credits=stake_progression_credits,
+            credits=restored_credits,
             active_second_order_ids=restored_active_ids,
         )
         self.stake_progression_credits = self.stake_progression.credits
@@ -91,12 +103,18 @@ class AccountSimulator:
     def _restore_order_slots(self) -> None:
         previous: list[SimulatedOrder] = []
         for order in sorted(self.orders, key=lambda item: (item.opened_at, item.id)):
+            if not order.order_slot_scope:
+                order.order_slot_scope = LEGACY_ORDER_SLOT_SCOPE
             if order.order_slot not in {"FIRST", "SECOND"}:
                 order.order_slot = (
                     "SECOND"
                     if any(
                         item.opened_at < order.opened_at
                         and item.expires_at > order.opened_at
+                        and (
+                            order.order_slot_scope != DIRECTION_ORDER_SLOT_SCOPE
+                            or item.direction == order.direction
+                        )
                         for item in previous
                     )
                     else "FIRST"
@@ -122,7 +140,10 @@ class AccountSimulator:
         expires_at = normalized_opened_at + normalized_timeframe * 60_000
         order_slot = (
             "SECOND"
-            if any(order.status == "OPEN" for order in self.orders)
+            if any(
+                order.status == "OPEN" and order.direction == signal.direction
+                for order in self.orders
+            )
             else "FIRST"
         )
         order_fields = {
@@ -149,6 +170,7 @@ class AccountSimulator:
             "daily_profile_selected": signal.daily_profile_selected,
             "daily_profile_version": signal.daily_profile_version,
             "order_slot": order_slot,
+            "order_slot_scope": DIRECTION_ORDER_SLOT_SCOPE,
             "wave_state": signal.wave_state,
             "wave_raw_state": signal.wave_raw_state,
             "wave_window": signal.wave_window,
@@ -174,6 +196,7 @@ class AccountSimulator:
             terms, credit = self.stake_progression.assign(
                 self._next_id,
                 normalized_opened_at,
+                signal.direction,
             )
         else:
             terms = OrderTerms(
@@ -291,6 +314,7 @@ class AccountSimulator:
                 order.wave_guard_mode != "RECOVERY"
                 or order.profile_degradation_probe is True
             ),
+            direction=order.direction,
         )
 
         order.status = "SETTLED"
@@ -348,6 +372,7 @@ class AccountSimulator:
         profile_wins = [order for order in profile_settled if order.result == "WIN"]
         profile_losses = [order for order in profile_settled if order.result == "LOSS"]
         profile_direction_slots = []
+        profile_direction_slot_scopes = []
         for direction in ("LONG", "SHORT"):
             for slot in ("FIRST", "SECOND"):
                 rows = [
@@ -370,6 +395,30 @@ class AccountSimulator:
                         "ev": round(row_pnl / len(rows), 4),
                     }
                 )
+                for scope in (LEGACY_ORDER_SLOT_SCOPE, DIRECTION_ORDER_SLOT_SCOPE):
+                    scoped_rows = [
+                        order for order in rows if order.order_slot_scope == scope
+                    ]
+                    if not scoped_rows:
+                        continue
+                    scoped_wins = sum(
+                        1 for order in scoped_rows if order.result == "WIN"
+                    )
+                    scoped_pnl = round(sum(order.pnl for order in scoped_rows), 4)
+                    profile_direction_slot_scopes.append(
+                        {
+                            "key": f"{direction}_{slot}_{scope}",
+                            "direction": direction,
+                            "order_slot": slot,
+                            "order_slot_scope": scope,
+                            "orders": len(scoped_rows),
+                            "wins": scoped_wins,
+                            "losses": len(scoped_rows) - scoped_wins,
+                            "win_rate": round(scoped_wins / len(scoped_rows), 4),
+                            "pnl": scoped_pnl,
+                            "ev": round(scoped_pnl / len(scoped_rows), 4),
+                        }
+                    )
         progression = self.stake_progression.status()
         stats = {
             "balance": round(self.balance, 4),
@@ -410,6 +459,7 @@ class AccountSimulator:
                     else 0.0
                 ),
                 "by_direction_slot": profile_direction_slots,
+                "by_direction_slot_scope": profile_direction_slot_scopes,
             },
         }
         stats.update(progression)

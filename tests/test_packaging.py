@@ -376,6 +376,8 @@ process.stdout.write(JSON.stringify({
                     "STAKE": "20",
                     "WIN_RETURN": "36",
                     "MAX_OPEN_ORDERS": "4",
+                    "MAX_OPEN_LONG_ORDERS": "1",
+                    "MAX_OPEN_SHORT_ORDERS": "3",
                     "MIN_ORDER_GAP_MINUTES": "3",
                     "STAKE_PROGRESSION": "0",
                     "ROLLING_EDGE_GUARD": "0",
@@ -434,6 +436,8 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--win-return", args)
         self.assertEqual(args[args.index("--win-return") + 1], "36")
         self.assertEqual(args[args.index("--max-open-orders") + 1], "4")
+        self.assertEqual(args[args.index("--max-open-long-orders") + 1], "1")
+        self.assertEqual(args[args.index("--max-open-short-orders") + 1], "3")
         self.assertEqual(args[args.index("--min-order-gap-minutes") + 1], "3")
         self.assertIn("--no-stake-progression", args)
         self.assertIn("--no-rolling-edge-guard", args)
@@ -556,6 +560,8 @@ process.stdout.write(JSON.stringify({
             env = os.environ.copy()
             for name in (
                 "MAX_OPEN_ORDERS",
+                "MAX_OPEN_LONG_ORDERS",
+                "MAX_OPEN_SHORT_ORDERS",
                 "TRADE_SCORE_THRESHOLD",
                 "RESULT_SEQUENCE_GUARD",
                 "STAKE_PROGRESSION",
@@ -606,6 +612,8 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("--no-stake-progression", default_args)
         self.assertNotIn("--no-result-sequence-guard", default_args)
         self.assertEqual(default_args[default_args.index("--max-open-orders") + 1], "2")
+        self.assertEqual(default_args[default_args.index("--max-open-long-orders") + 1], "1")
+        self.assertEqual(default_args[default_args.index("--max-open-short-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--trade-score-threshold") + 1], "auto")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--stake-progression-max-active") + 1], "1")
