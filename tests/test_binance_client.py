@@ -1,6 +1,7 @@
+import json
 import unittest
 
-from app.binance_client import BinanceKlineClient
+from app.binance_client import BinanceKlineClient, BinanceSpotStreamEvent
 
 
 class BinanceClientTest(unittest.TestCase):
@@ -41,6 +42,84 @@ class BinanceClientTest(unittest.TestCase):
         result = BinanceKlineClient.filter_closed_klines([closed, unclosed], now_ms=2500)
 
         self.assertEqual(result, [closed])
+
+    def test_parse_spot_stream_event_keeps_live_and_closed_kline_fields(self):
+        payload = json.dumps(
+            {
+                "e": "kline",
+                "E": 1710000060123,
+                "s": "BTCUSDT",
+                "k": {
+                    "t": 1710000000000,
+                    "T": 1710000059999,
+                    "s": "BTCUSDT",
+                    "i": "1m",
+                    "o": "100.00",
+                    "c": "100.80",
+                    "h": "101.50",
+                    "l": "99.50",
+                    "v": "123.456",
+                    "x": False,
+                },
+            }
+        )
+
+        event = BinanceSpotStreamEvent.parse(payload, received_at_ms=1710000060200)
+
+        self.assertEqual(event.symbol, "BTCUSDT")
+        self.assertEqual(event.interval, "1m")
+        self.assertEqual(event.event_time_ms, 1710000060123)
+        self.assertEqual(event.received_at_ms, 1710000060200)
+        self.assertFalse(event.is_closed)
+        self.assertEqual(event.kline.close, 100.8)
+        self.assertEqual(event.kline.close_time, 1710000059999)
+
+    def test_parse_spot_stream_event_rejects_wrong_type_or_interval(self):
+        with self.assertRaises(ValueError):
+            BinanceSpotStreamEvent.parse(json.dumps({"e": "aggTrade"}))
+        with self.assertRaises(ValueError):
+            BinanceSpotStreamEvent.parse(
+                json.dumps(
+                    {
+                        "e": "kline",
+                        "E": 1,
+                        "s": "BTCUSDT",
+                        "k": {
+                            "t": 0,
+                            "T": 59_999,
+                            "i": "5m",
+                            "o": "1",
+                            "c": "1",
+                            "h": "1",
+                            "l": "1",
+                            "v": "1",
+                            "x": True,
+                        },
+                    }
+                )
+            )
+
+    def test_parse_combined_mini_ticker_event_for_realtime_price(self):
+        event = BinanceSpotStreamEvent.parse(
+            json.dumps(
+                {
+                    "stream": "btcusdt@miniTicker",
+                    "data": {
+                        "e": "24hrMiniTicker",
+                        "E": 1710000060123,
+                        "s": "BTCUSDT",
+                        "c": "100.81",
+                    },
+                }
+            ),
+            received_at_ms=1710000060200,
+        )
+
+        self.assertEqual(event.symbol, "BTCUSDT")
+        self.assertEqual(event.event_type, "24hrMiniTicker")
+        self.assertEqual(event.price, 100.81)
+        self.assertIsNone(event.kline)
+        self.assertFalse(event.is_closed)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,83 @@
 import json
 import time
+from dataclasses import dataclass
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from app.models import Kline
+
+
+@dataclass(frozen=True)
+class BinanceSpotStreamEvent:
+    symbol: str
+    event_type: str
+    event_time_ms: int
+    received_at_ms: int
+    price: float
+    interval: str = ""
+    kline: Kline | None = None
+    is_closed: bool = False
+
+    @classmethod
+    def parse(
+        cls,
+        message: str | bytes | dict,
+        *,
+        received_at_ms: int | None = None,
+    ) -> "BinanceSpotStreamEvent":
+        if isinstance(message, bytes):
+            message = message.decode("utf-8")
+        payload = json.loads(message) if isinstance(message, str) else message
+        if not isinstance(payload, dict):
+            raise ValueError("invalid Binance stream payload")
+        data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            raise ValueError("invalid Binance stream data")
+
+        event_type = str(data.get("e", ""))
+        received = int(time.time() * 1000) if received_at_ms is None else int(received_at_ms)
+        if event_type == "24hrMiniTicker":
+            symbol = str(data.get("s", "")).upper()
+            if not symbol:
+                raise ValueError("missing Binance stream symbol")
+            return cls(
+                symbol=symbol,
+                event_type=event_type,
+                event_time_ms=int(data["E"]),
+                received_at_ms=received,
+                price=float(data["c"]),
+            )
+
+        if event_type != "kline":
+            raise ValueError(f"unsupported Binance stream event: {event_type or 'unknown'}")
+        raw_kline = data.get("k")
+        if not isinstance(raw_kline, dict):
+            raise ValueError("missing Binance stream kline")
+        interval = str(raw_kline.get("i", ""))
+        if interval != "1m":
+            raise ValueError(f"unsupported Binance stream interval: {interval or 'unknown'}")
+        symbol = str(data.get("s") or raw_kline.get("s") or "").upper()
+        if not symbol:
+            raise ValueError("missing Binance stream symbol")
+        kline = Kline(
+            open_time=int(raw_kline["t"]),
+            open=float(raw_kline["o"]),
+            high=float(raw_kline["h"]),
+            low=float(raw_kline["l"]),
+            close=float(raw_kline["c"]),
+            volume=float(raw_kline["v"]),
+            close_time=int(raw_kline["T"]),
+        )
+        return cls(
+            symbol=symbol,
+            event_type=event_type,
+            event_time_ms=int(data["E"]),
+            received_at_ms=received,
+            price=kline.close,
+            interval=interval,
+            kline=kline,
+            is_closed=bool(raw_kline.get("x")),
+        )
 
 
 class BinanceKlineClient:

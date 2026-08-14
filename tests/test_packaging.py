@@ -115,6 +115,9 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("/api/orders", app_js)
         self.assertIn("page_size", app_js)
         self.assertIn("loadOrders", app_js)
+        self.assertIn('fetch("/api/price"', app_js)
+        self.assertIn("setInterval(loadPrice, 1000)", app_js)
+        self.assertNotIn("price: (state) => fmtPrice(state.latest_price)", app_js)
         self.assertNotIn("function renderSignals", app_js)
 
     def test_dashboard_formats_two_stage_runtime_states(self):
@@ -335,6 +338,7 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--daily-profile-evaluation-time", result.stdout)
         self.assertIn("--daily-profile-activation-time", result.stdout)
         self.assertIn("--profile-degradation-cooldown-minutes", result.stdout)
+        self.assertIn("--no-websocket", result.stdout)
         self.assertIn(
             "完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60",
             result.stdout,
@@ -372,6 +376,7 @@ process.stdout.write(JSON.stringify({
                     "NO_WARMUP": "0",
                     "NO_PERSISTENCE": "0",
                     "NO_WEBHOOK": "0",
+                    "NO_WEBSOCKET": "1",
                     "WARMUP_CURRENT_MONTH_DAILY": "1",
                     "STAKE": "20",
                     "WIN_RETURN": "36",
@@ -431,6 +436,7 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("--no-warmup", args)
         self.assertNotIn("--no-persistence", args)
         self.assertNotIn("--no-webhook", args)
+        self.assertIn("--no-websocket", args)
         self.assertIn("--stake", args)
         self.assertEqual(args[args.index("--stake") + 1], "20")
         self.assertIn("--win-return", args)
@@ -655,6 +661,7 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(any(name.endswith("/app/webhook.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/static/index.html") for name in names))
                 self.assertTrue(any(name.endswith("/scripts/run.sh") for name in names))
+                self.assertTrue(any(name.endswith("/requirements.txt") for name in names))
                 self.assertTrue(any(name.endswith("/README.md") for name in names))
                 self.assertFalse(any("/.venv/" in name for name in names))
                 self.assertFalse(any("/data/" in name for name in names))

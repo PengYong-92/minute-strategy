@@ -59,6 +59,7 @@ DAILY_PROFILE_ACTIVATION_TIME="${DAILY_PROFILE_ACTIVATION_TIME:-08:00}"
 NO_WARMUP="${NO_WARMUP:-0}"
 NO_PERSISTENCE="${NO_PERSISTENCE:-0}"
 NO_WEBHOOK="${NO_WEBHOOK:-0}"
+NO_WEBSOCKET="${NO_WEBSOCKET:-0}"
 WARMUP_CURRENT_MONTH_DAILY="${WARMUP_CURRENT_MONTH_DAILY:-1}"
 
 usage() {
@@ -160,6 +161,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --no-warmup            关闭本地/远程历史预热
   --no-persistence       关闭 SQLite 订单和信号持久化
   --no-webhook           关闭外部 webhook 信号推送
+  --no-websocket         关闭 WebSocket 实时行情，改用 REST 轮询兜底
   --python PATH          Python 可执行文件，默认: python3 或 PYTHON_BIN
   -h, --help             显示帮助并退出
 
@@ -184,7 +186,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   DAILY_PROFILE_EXIT_WIN_RATE, DAILY_PROFILE_EXIT_EV,
   DAILY_PROFILE_DEGRADED_RUNS, DAILY_PROFILE_MAX_ACTIVE,
   DAILY_PROFILE_EVALUATION_TIME, DAILY_PROFILE_ACTIVATION_TIME,
-  NO_WARMUP, NO_PERSISTENCE, NO_WEBHOOK,
+  NO_WARMUP, NO_PERSISTENCE, NO_WEBHOOK, NO_WEBSOCKET,
   WARMUP_CURRENT_MONTH_DAILY, PYTHON_BIN
 
 示例:
@@ -653,6 +655,10 @@ while [ "$#" -gt 0 ]; do
       NO_WEBHOOK="1"
       shift
       ;;
+    --no-websocket)
+      NO_WEBSOCKET="1"
+      shift
+      ;;
     --python)
       require_value "$1" "${2:-}"
       PYTHON_BIN="$2"
@@ -705,6 +711,11 @@ esac
 case "$NO_WEBHOOK" in
   1|true|TRUE|yes|YES|y|Y|on|ON)
     EXTRA_ARGS+=(--no-webhook)
+    ;;
+esac
+case "$NO_WEBSOCKET" in
+  1|true|TRUE|yes|YES|y|Y|on|ON)
+    EXTRA_ARGS+=(--no-websocket)
     ;;
 esac
 case "$STAKE_PROGRESSION" in

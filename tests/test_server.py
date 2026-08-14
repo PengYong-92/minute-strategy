@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
@@ -15,7 +16,7 @@ from unittest.mock import patch
 import app.server as server_module
 from app.history import WarmupReport
 from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
-from app.server import apply_warmup, make_handler, start_polling
+from app.server import apply_warmup, make_handler
 from app.state import MonitorState
 from app.storage import SQLiteMonitorStore
 
@@ -62,7 +63,7 @@ class OrdersApiTest(unittest.TestCase):
                         "app.server.MonitorState",
                         return_value=SimpleNamespace(symbol="BTCUSDT"),
                     ) as monitor_state,
-                    patch("app.server.start_polling"),
+                    patch("app.server.start_market_data", return_value=SimpleNamespace(stop=lambda: None)),
                     patch("app.server.ThreadingHTTPServer", return_value=fake_server),
                 ):
                     server_module.main()
@@ -98,7 +99,7 @@ class OrdersApiTest(unittest.TestCase):
                         ],
                     ),
                     patch("app.server.MonitorState") as monitor_state,
-                    patch("app.server.start_polling") as start_polling_mock,
+                    patch("app.server.start_market_data") as start_market_data_mock,
                     patch("app.server.ThreadingHTTPServer") as server_mock,
                     redirect_stderr(stderr),
                 ):
@@ -116,7 +117,7 @@ class OrdersApiTest(unittest.TestCase):
                 )
                 self.assertNotIn("Traceback", stderr.getvalue())
                 monitor_state.assert_not_called()
-                start_polling_mock.assert_not_called()
+                start_market_data_mock.assert_not_called()
                 server_mock.assert_not_called()
 
     def test_help_works_with_invalid_profile_degradation_env(self):
@@ -132,7 +133,7 @@ class OrdersApiTest(unittest.TestCase):
                     ),
                     patch.object(sys, "argv", ["app.server", "--help"]),
                     patch("app.server.MonitorState") as monitor_state,
-                    patch("app.server.start_polling") as start_polling_mock,
+                    patch("app.server.start_market_data") as start_market_data_mock,
                     patch("app.server.ThreadingHTTPServer") as server_mock,
                     redirect_stdout(stdout),
                     redirect_stderr(stderr),
@@ -152,7 +153,7 @@ class OrdersApiTest(unittest.TestCase):
                 self.assertIn("完整画像连续亏损3单后的冷却分钟数", stdout.getvalue())
                 self.assertEqual(stderr.getvalue(), "")
                 monitor_state.assert_not_called()
-                start_polling_mock.assert_not_called()
+                start_market_data_mock.assert_not_called()
                 server_mock.assert_not_called()
 
     def test_trade_score_threshold_accepts_auto_and_range(self):
@@ -168,31 +169,82 @@ class OrdersApiTest(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             server_module._trade_score_threshold("invalid")
 
-    def test_polling_discards_response_when_symbol_changes_during_request(self):
-        updated = threading.Event()
+    def test_price_api_returns_only_lightweight_realtime_fields(self):
+        payload = {
+            "symbol": "BTCUSDT",
+            "latest_price": 101.25,
+            "event_time_ms": 100_000,
+            "received_at_ms": 100_010,
+            "stale": False,
+            "stream_status": "CONNECTED",
+        }
+        state = SimpleNamespace(price_snapshot=lambda: payload)
+        handler = make_handler(state)
+        instance = object.__new__(handler)
+        instance.path = "/api/price"
+        captured = []
+        instance._send_json = captured.append
 
-        class NotifyingState(MonitorState):
-            def update_from_klines(self, klines, **kwargs):
-                try:
-                    return super().update_from_klines(klines, **kwargs)
-                finally:
-                    updated.set()
+        instance.do_GET()
 
-        state = NotifyingState(symbol="BTCUSDT")
+        self.assertEqual(captured, [payload])
+        self.assertNotIn("orders", captured[0])
+        self.assertNotIn("stats", captured[0])
 
-        class SwitchingClient:
-            def get_klines(self, symbol, interval, limit):
-                self.requested_symbol = symbol
-                state.reset_symbol("ETHUSDT")
-                return [Kline(0, 100.0, 101.0, 99.0, 100.5, 10.0, 59_999)]
+    def test_concurrent_symbol_switches_serialize_warmup_and_keep_responses_isolated(self):
+        class SwitchingState:
+            def __init__(self):
+                self.symbol = "BTCUSDT"
 
-        client = SwitchingClient()
-        start_polling(state, client, poll_seconds=3_600, limit=100)
+            def reset_symbol(self, symbol):
+                self.symbol = symbol
 
-        self.assertTrue(updated.wait(timeout=2))
-        self.assertEqual(client.requested_symbol, "BTCUSDT")
-        self.assertEqual(state.snapshot()["symbol"], "ETHUSDT")
-        self.assertEqual(state.snapshot()["kline_count"], 0)
+        class MarketData:
+            def pause_updates(self):
+                return None
+
+            def request_symbol_refresh(self):
+                return None
+
+        active_warmups = 0
+        max_active_warmups = 0
+        active_lock = threading.Lock()
+
+        def warmup_loader(_state):
+            nonlocal active_warmups, max_active_warmups
+            with active_lock:
+                active_warmups += 1
+                max_active_warmups = max(max_active_warmups, active_warmups)
+            time.sleep(0.03)
+            with active_lock:
+                active_warmups -= 1
+
+        state = SwitchingState()
+        handler = make_handler(
+            state,
+            warmup_loader=warmup_loader,
+            market_data=MarketData(),
+        )
+        responses = {}
+
+        def switch(symbol):
+            instance = object.__new__(handler)
+            instance.path = f"/api/config?symbol={symbol}"
+            instance._send_json = lambda payload: responses.__setitem__(symbol, payload)
+            instance.do_GET()
+
+        threads = [
+            threading.Thread(target=switch, args=(symbol,))
+            for symbol in ("ETHUSDT", "BTCUSDT")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertEqual(max_active_warmups, 1)
+        self.assertEqual(responses["ETHUSDT"], {"symbol": "ETHUSDT"})
+        self.assertEqual(responses["BTCUSDT"], {"symbol": "BTCUSDT"})
 
     def test_warmup_discards_history_when_symbol_changes_during_download(self):
         state = MonitorState(symbol="BTCUSDT")

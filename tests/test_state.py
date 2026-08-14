@@ -385,6 +385,88 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_realtime_price_update_does_not_enter_strategy_state(self):
+        state = MonitorState(symbol="BTCUSDT", now_ms=lambda: 100_020)
+        context = state.capture_symbol_context()
+        before = state.snapshot()
+
+        accepted = state.update_realtime_price(
+            101.25,
+            event_time_ms=100_000,
+            received_at_ms=100_010,
+            expected_context=context,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(
+            state.price_snapshot(),
+            {
+                "symbol": "BTCUSDT",
+                "latest_price": 101.25,
+                "event_time_ms": 100_000,
+                "received_at_ms": 100_010,
+                "stale": False,
+                "stream_status": "CONNECTED",
+            },
+        )
+        after = state.snapshot()
+        for key in (
+            "latest_kline",
+            "signals",
+            "selected_signal",
+            "order_decision",
+            "orders",
+            "kline_count",
+            "updated_at_ms",
+        ):
+            self.assertEqual(after[key], before[key], key)
+
+    def test_realtime_price_rejects_stale_or_old_symbol_update(self):
+        state = MonitorState(symbol="BTCUSDT")
+        old_context = state.capture_symbol_context()
+        self.assertTrue(
+            state.update_realtime_price(
+                101.0,
+                event_time_ms=200,
+                received_at_ms=210,
+                expected_context=old_context,
+            )
+        )
+        self.assertFalse(
+            state.update_realtime_price(
+                99.0,
+                event_time_ms=199,
+                received_at_ms=220,
+                expected_context=old_context,
+            )
+        )
+        state.reset_symbol("ETHUSDT")
+        self.assertFalse(
+            state.update_realtime_price(
+                1.0,
+                event_time_ms=300,
+                received_at_ms=301,
+                expected_context=old_context,
+            )
+        )
+        self.assertEqual(state.price_snapshot()["symbol"], "ETHUSDT")
+        self.assertIsNone(state.price_snapshot()["latest_price"])
+
+    def test_old_symbol_async_error_does_not_overwrite_current_state(self):
+        state = MonitorState(symbol="BTCUSDT")
+        old_context = state.capture_symbol_context()
+        state.reset_symbol("ETHUSDT")
+        before = state.snapshot()
+
+        accepted = state.record_error(
+            "old BTC stream failed",
+            expected_context=old_context,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(state.snapshot()["last_error"], before["last_error"])
+        self.assertEqual(state.snapshot()["updated_at_ms"], before["updated_at_ms"])
+
     def test_profile_degradation_blocks_selected_profile_after_three_losses(self):
         state = MonitorState(
             symbol="BTCUSDT",

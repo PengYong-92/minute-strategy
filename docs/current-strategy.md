@@ -24,7 +24,7 @@
 LIVE_TRADE_TIMEFRAMES = (10,)
 ```
 
-每次轮询会对合并后的历史K线计算 10分钟候选信号，并从候选中选择最优信号。由于目前只有 10分钟候选，最终选择信号就是当前 10分钟分析结果。
+每次收到已闭合1分钟K线后，会对合并后的历史K线计算 10分钟候选信号，并从候选中选择最优信号。由于目前只有 10分钟候选，最终选择信号就是当前 10分钟分析结果。
 
 ## 2. 数据来源与运行流程
 
@@ -41,8 +41,9 @@ bash scripts/run.sh
 | 参数 | 默认值 | 作用 |
 |---|---:|---|
 | `--symbol` | `BTCUSDT` | 交易对 |
-| `--poll-seconds` | `10` | REST K线轮询间隔，单位秒 |
+| `--poll-seconds` | `10` | REST 启动补齐和断线恢复间隔，单位秒 |
 | `--limit` | `300` | 每次从币安 REST 拉取的 1分钟K线数量 |
+| `--no-websocket` | 关闭参数 | 关闭实时行情流，退回纯 REST 模式 |
 | `--data-dir` | `data` | Binance Vision 历史文件缓存目录 |
 | `--warmup-months` | `3` | 启动时加载的已完成月度文件数量 |
 | `--warmup-timeout` | `20` | 单个预热文件下载超时秒数 |
@@ -107,7 +108,18 @@ https://data.binance.vision/data/spot/daily/klines/{symbol}/1m/{symbol}-1m-YYYY-
 
 ### 2.3 实时K线
 
-实时轮询使用币安 REST：
+主行情使用币安现货组合 WebSocket：
+
+```text
+wss://stream.binance.com:9443/stream?streams={symbol}@kline_1m/{symbol}@miniTicker
+```
+
+- `kline_1m` 的未闭合事件只更新实时点位；仅 `x=true` 的已闭合K线进入原有策略链路。
+- `miniTicker` 约每秒更新页面“当前点位”，不写入K线窗口、不计算信号、不触发开单。
+- WebSocket与REST补偿共用一个串行消费队列，并按 `symbol + generation + open_time` 拒绝旧币种消息和重复闭合K线。
+- 断线时自动启用REST补偿并指数退避重连；币种切换会关闭旧连接并建立新订阅。
+
+REST继续用于启动补齐、缺口恢复和 `--no-websocket` 回退：
 
 ```text
 GET https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}
@@ -129,7 +141,7 @@ GET https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={lim
 kline.close_time <= 当前时间
 ```
 
-实时K线和预热K线按 `open_time` 合并。相同 `open_time` 后来的数据覆盖旧数据。内存最多保留：
+闭合实时K线、REST补偿K线和预热K线按 `open_time` 合并。相同 `open_time` 只处理一次。内存最多保留：
 
 ```text
 max_klines = 140000

@@ -3,7 +3,6 @@ import json
 import mimetypes
 import os
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -12,6 +11,7 @@ from app.binance_client import BinanceKlineClient
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.fear_greed import FearGreedProvider
 from app.history import WarmupConfig, WarmupReport, warmup_history
+from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import MonitorState
@@ -25,28 +25,36 @@ DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS = ""
 DEFAULT_LIVE_SHORT_SEGMENTS = "WD-02,WD-23"
 
 
-def start_polling(state: MonitorState, client: BinanceKlineClient, poll_seconds: int, limit: int) -> threading.Thread:
-    def loop() -> None:
-        while True:
-            try:
-                symbol_context = state.capture_symbol_context()
-                klines = client.get_klines(symbol_context[0], interval="1m", limit=limit)
-                state.update_from_klines(klines, expected_context=symbol_context)
-            except Exception as exc:  # noqa: BLE001 - 临时网络错误不能中断监控循环。
-                state.record_error(str(exc))
-            time.sleep(poll_seconds)
+def start_market_data(
+    state: MonitorState,
+    client: BinanceKlineClient,
+    *,
+    poll_seconds: int,
+    limit: int,
+    enable_websocket: bool,
+) -> MarketDataCoordinator:
+    coordinator = MarketDataCoordinator(
+        state,
+        client,
+        poll_seconds=poll_seconds,
+        rest_limit=limit,
+        enable_websocket=enable_websocket,
+    )
+    coordinator.start()
+    return coordinator
 
-    thread = threading.Thread(target=loop, name="binance-kline-poller", daemon=True)
-    thread.start()
-    return thread
 
+def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
+    symbol_switch_lock = threading.Lock()
 
-def make_handler(state: MonitorState, warmup_loader=None):
     class MonitorHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/api/state":
                 self._send_json(state.snapshot())
+                return
+            if parsed.path == "/api/price":
+                self._send_json(state.price_snapshot())
                 return
             if parsed.path == "/api/orders":
                 query = parse_qs(parsed.query)
@@ -87,11 +95,20 @@ def make_handler(state: MonitorState, warmup_loader=None):
             if parsed.path == "/api/config":
                 query = parse_qs(parsed.query)
                 symbol = query.get("symbol", [None])[0]
+                configured_symbol = state.symbol
                 if symbol:
-                    state.reset_symbol(symbol)
-                    if warmup_loader is not None:
-                        warmup_loader(state)
-                self._send_json({"symbol": state.symbol})
+                    with symbol_switch_lock:
+                        if market_data is not None:
+                            market_data.pause_updates()
+                        try:
+                            state.reset_symbol(symbol)
+                            if warmup_loader is not None:
+                                warmup_loader(state)
+                        finally:
+                            if market_data is not None:
+                                market_data.request_symbol_refresh()
+                        configured_symbol = state.symbol
+                self._send_json({"symbol": configured_symbol})
                 return
             if parsed.path == "/":
                 self._send_file(STATIC_DIR / "index.html")
@@ -109,6 +126,7 @@ def make_handler(state: MonitorState, warmup_loader=None):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -235,6 +253,12 @@ def main() -> None:
         type=int,
         default=int(os.getenv("KLINE_LIMIT", "300")),
         help="每次拉取的 1分钟K线数量，默认: 300",
+    )
+    parser.add_argument(
+        "--no-websocket",
+        action="store_true",
+        default=_env_bool("NO_WEBSOCKET", False),
+        help="关闭币安 WebSocket 实时行情，改用 REST 轮询兜底",
     )
     parser.add_argument(
         "--data-dir",
@@ -606,7 +630,13 @@ def main() -> None:
         )
 
     client = BinanceKlineClient()
-    start_polling(state, client, poll_seconds=args.poll_seconds, limit=args.limit)
+    market_data = start_market_data(
+        state,
+        client,
+        poll_seconds=args.poll_seconds,
+        limit=args.limit,
+        enable_websocket=not args.no_websocket,
+    )
 
     def warmup_loader(target_state: MonitorState) -> None:
         if args.no_warmup:
@@ -628,14 +658,23 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 - 切换币种失败不能阻塞页面响应。
             target_state.record_error(f"warmup failed: {exc}")
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(state, warmup_loader=warmup_loader))
-    print(f"monitor: http://{args.host}:{args.port} symbol={state.symbol} poll={args.poll_seconds}s")
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(
+            state,
+            warmup_loader=warmup_loader,
+            market_data=market_data,
+        ),
+    )
+    source = "REST" if args.no_websocket else "WebSocket+REST"
+    print(f"monitor: http://{args.host}:{args.port} symbol={state.symbol} market={source}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nmonitor stopped")
     finally:
         server.server_close()
+        market_data.stop()
 
 
 if __name__ == "__main__":

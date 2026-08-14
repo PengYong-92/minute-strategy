@@ -46,6 +46,7 @@ from app.wave_batch_guard import (
 
 
 DAY_MS = 86_400_000
+REALTIME_PRICE_STALE_MS = 5_000
 
 
 class MonitorState:
@@ -190,6 +191,10 @@ class MonitorState:
         self.profile_degradation_guard: dict = self._empty_profile_degradation_guard()
         self.last_error: str | None = None
         self.updated_at_ms = 0
+        self._realtime_price: float | None = None
+        self._realtime_price_event_time_ms = 0
+        self._realtime_price_received_at_ms = 0
+        self._market_stream_status = "STARTING"
         self._opened_signal_keys: set[tuple[int, int, str]] = set()
         self._last_order_opened_at = self._latest_order_opened_at_by_direction(
             restored_orders
@@ -200,14 +205,79 @@ class MonitorState:
         with self._lock:
             return self.symbol, self._symbol_generation
 
+    def update_realtime_price(
+        self,
+        price: float,
+        event_time_ms: int,
+        received_at_ms: int,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> bool:
+        with self._lock:
+            if not self._matches_symbol_context(expected_context):
+                return False
+            event_time_ms = int(event_time_ms)
+            if event_time_ms < self._realtime_price_event_time_ms:
+                return False
+            self._realtime_price = float(price)
+            self._realtime_price_event_time_ms = event_time_ms
+            self._realtime_price_received_at_ms = int(received_at_ms)
+            self._market_stream_status = "CONNECTED"
+            return True
+
+    def record_market_stream_status(
+        self,
+        status: str,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> bool:
+        with self._lock:
+            if not self._matches_symbol_context(expected_context):
+                return False
+            self._market_stream_status = str(status).upper()
+            return True
+
+    def latest_kline_open_time(
+        self,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> int | None:
+        with self._lock:
+            if not self._matches_symbol_context(expected_context) or not self.klines:
+                return None
+            return self.klines[-1].open_time
+
+    def price_snapshot(self) -> dict:
+        with self._lock:
+            latest = self.klines[-1] if self.klines else None
+            price = self._realtime_price
+            event_time_ms = self._realtime_price_event_time_ms
+            received_at_ms = self._realtime_price_received_at_ms
+            if price is None and latest is not None:
+                price = latest.close
+                event_time_ms = latest.close_time
+                received_at_ms = self.updated_at_ms
+            stale = bool(
+                received_at_ms
+                and int(self._now_ms()) - received_at_ms > REALTIME_PRICE_STALE_MS
+            )
+            return {
+                "symbol": self.symbol,
+                "latest_price": price,
+                "event_time_ms": event_time_ms or None,
+                "received_at_ms": received_at_ms or None,
+                "stale": stale,
+                "stream_status": self._market_stream_status,
+            }
+
     def update_from_klines(
         self,
         klines: Sequence[Kline],
         *,
         expected_context: tuple[str, int] | None = None,
-    ) -> None:
+    ) -> bool:
         if not klines:
-            return
+            return False
 
         with self._lock:
             operation_context = expected_context or (
@@ -215,7 +285,7 @@ class MonitorState:
                 self._symbol_generation,
             )
             if not self._matches_symbol_context(operation_context):
-                return
+                return False
             existing = list(self.klines)
             previous_wave = self.wave_state
             previous_wave_evaluated_at = self._wave_evaluated_at
@@ -253,7 +323,7 @@ class MonitorState:
 
         with self._lock:
             if not self._matches_symbol_context(operation_context):
-                return
+                return False
             self.fear_greed = fear_greed
             self.klines = merged_klines
             self.wave_state = wave_state
@@ -266,7 +336,7 @@ class MonitorState:
                 and self._wave_bootstrap_cancel_pending
             ):
                 if not self._cancel_pending_progression_credits():
-                    return
+                    return False
                 self._wave_bootstrap_cancel_pending = False
             if self.storage and (
                 not self._wave_runtime_bootstrap_required or bootstrap_ready
@@ -275,17 +345,17 @@ class MonitorState:
                     wave_state,
                     wave_evaluated_at,
                 ):
-                    return
+                    return False
                 self._wave_runtime_bootstrap_required = False
             if self.storage and not self._flush_pending_settlement_events():
-                return
+                return False
             settlement_events = self.simulator.settle_expired_order_events_from_klines(merged_klines)
             if self.storage:
                 self._pending_settlement_events.extend(
                     (self.symbol, event) for event in settlement_events
                 )
                 if not self._flush_pending_settlement_events():
-                    return
+                    return False
             settled_observations = self._settle_observations(latest.close_time, latest.close, merged_klines)
             if self.storage:
                 for observation in settled_observations:
@@ -320,6 +390,7 @@ class MonitorState:
             self._record_observation_candidates(observation_signals, latest)
             if self.storage:
                 self._save_signal(self.selected_signal or selected_signal, self.order_decision, self.updated_at_ms)
+            return self.order_decision != "STORAGE_ERROR"
 
     def seed_klines(
         self,
@@ -374,10 +445,18 @@ class MonitorState:
                 if persisted:
                     self._wave_runtime_bootstrap_required = False
 
-    def record_error(self, message: str) -> None:
+    def record_error(
+        self,
+        message: str,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> bool:
         with self._lock:
+            if not self._matches_symbol_context(expected_context):
+                return False
             self.last_error = message
             self.updated_at_ms = int(time.time() * 1000)
+            return True
 
     def _fear_greed_context(self) -> FearGreedContext:
         if self.fear_greed_provider is None:
@@ -432,6 +511,10 @@ class MonitorState:
             self.profile_degradation_guard = self._empty_profile_degradation_guard()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
+            self._realtime_price = None
+            self._realtime_price_event_time_ms = 0
+            self._realtime_price_received_at_ms = 0
+            self._market_stream_status = "STARTING"
             self._opened_signal_keys.clear()
             self._last_order_opened_at = self._latest_order_opened_at_by_direction(
                 restored_orders

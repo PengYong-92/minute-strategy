@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本文汇总 `minute-strategy` 截至2026-08-13的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
+本文汇总 `minute-strategy` 截至2026-08-14的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
 
 `docs/release-handoff.md` 是项目唯一的发布交接文档。后续发布只更新或追加本文，不再创建带日期、提交号或版本号的交接文档副本。
 
@@ -16,7 +16,7 @@
 | 固化标签 | `v2026.08.13-directional-order-controls`（指向 `26241a5`） |
 | 当前生产提交 | `26241a57df17bab77e2fa2b33c596e4f591f32bb` |
 | 当前生产事实 | 第33节 |
-| 本地未部署功能 | 无；第31节LONG第二单综合准入仍是未来设计，不是本地待发布代码 |
+| 本地未部署功能 | `feature/websocket-low-latency`：WebSocket行情、REST补偿和页面1秒实时点位；不改变开单逻辑 |
 | 下一开发计划 | 第34节10分钟入场价格结构确认；当前只记录设计，尚未实施 |
 
 第2至32节是历史发布、本地开发或较早分析快照；如与第33节冲突，以第33节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
@@ -1775,3 +1775,107 @@ candidate_origin                  # NATIVE_ACTIONABLE / PROFILE_PROMOTED_WAIT / 
 7. 真实准入必须作为单独提交、单独标签和单独生产样本边界发布，不能与画像门槛、连亏守卫、评分系统或订单容量同时修改。
 
 本节是下一开发计划的唯一有效定义。当前仅更新交接文档，不修改代码、不运行回测、不发布服务器、不重启服务，也不改变已经打开或后续模拟订单。
+
+## 35. WebSocket低延迟行情分支（2026-08-14，尚未发布）
+
+### 35.1 目标和边界
+
+本次工作位于 `feature/websocket-low-latency`，基于 `main@bf697ae`。目标是缩短行情到达、闭合K线触发和页面当前点位刷新延迟；当前未合并 `main`、未推送生产、未重启线上服务、未清空或修改模拟订单。
+
+以下开单行为保持不变：
+
+1. 仍只使用已闭合1分钟K线生成10分钟事件信号；
+2. 量价、MACD、RSI、BOLL、Fear & Greed、每日画像、动态评分、方向容量、方向间隔、滚动优势、结算序列守卫、画像退化守卫和两阶段金额规则均未修改；
+3. `MonitorState.update_from_klines()` 仍是唯一策略入口；
+4. 原子订单/资格SQLite提交仍发生在Webhook触发之前，未为追求延迟改变事务语义；
+5. 未闭合K线和 `miniTicker` 只刷新实时点位，绝不进入策略K线窗口、信号计算或开单路径。
+
+### 35.2 行情链路
+
+默认订阅币安现货组合流：
+
+```text
+{symbol}@kline_1m
+{symbol}@miniTicker
+```
+
+闭合K线链路：
+
+```text
+WebSocket kline(x=true)
+ -> symbol/generation校验
+ -> open_time去重和缺口检查
+ -> 单消费者队列
+ -> 原有MonitorState.update_from_klines()
+ -> 原有结算、信号、守卫、订单和Webhook链路
+```
+
+实时点位链路：
+
+```text
+WebSocket miniTicker或未闭合kline
+ -> 仅更新独立realtime price状态
+ -> GET /api/price
+ -> 页面每1秒轻量刷新“当前点位”
+```
+
+REST不再作为正常信号的10秒主轮询，保留以下职责：
+
+- 服务启动时补齐最近闭合K线；
+- WebSocket断线或消息停滞时补偿；
+- 检测到闭合K线缺口时恢复；
+- 使用 `--no-websocket` 或 `NO_WEBSOCKET=1` 时作为纯REST回退。
+
+WebSocket与REST不能并发调用策略状态。所有闭合K线统一进入一个消费线程；相同 `open_time` 只处理一次。币种切换会增加generation、清空实时价、关闭旧连接并重订阅，旧币种迟到消息和旧页面响应均被拒绝；并发切币请求串行执行，不能互相提前解除预热暂停。
+
+消费游标仅在 `update_from_klines()` 明确成功后推进。若SQLite或策略状态处理失败，协调器保留原批次、立即唤醒REST补偿并持续重试；不会因为WebSocket闭合事件只发送一次而永久漏掉该分钟。停机后尚未开始处理的队列任务直接丢弃，不再产生新订单。
+
+### 35.3 页面与接口
+
+新增轻量接口：
+
+```text
+GET /api/price
+```
+
+仅返回 `symbol`、`latest_price`、`event_time_ms`、`received_at_ms`、`stale` 和 `stream_status`，响应设置 `Cache-Control: no-store`。完整 `/api/state` 保持3秒刷新，不再覆盖“当前点位”；价格接口每1秒刷新，并阻止重叠请求和切币后的旧响应覆盖。
+
+### 35.4 依赖和启动
+
+新增锁定依赖：
+
+```text
+websocket-client==1.9.0
+```
+
+部署包继续不包含虚拟环境，发布前必须执行：
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+启动脚本新增 `--no-websocket` 和 `NO_WEBSOCKET`，其他策略启动参数及默认值未变。`--poll-seconds` 现在表示REST补偿/纯REST回退间隔。
+
+### 35.5 验证结果
+
+2026-08-14在隔离工作树完成：
+
+- 完整测试：`485 tests`，全部通过；
+- JavaScript语法：`node --check app/static/app.js` 通过；
+- Binance WebSocket真实握手：HTTP 101成功，收到 `BTCUSDT 24hrMiniTicker`；
+- 本地端到端：`/api/price` 状态为 `CONNECTED`，约1.8秒内价格从 `63493.99` 更新到 `63504.0`；
+- 币种切换：BTC切换ETH后返回 `ETHUSDT 1886.86`，旧BTC流未覆盖新状态；
+- `/api/state` 同时正常返回最新闭合K线和原有策略状态。
+
+本次没有进行回测，因为策略、参数、守卫和开单资格均未改变；验证重点是消息隔离、闭合K线去重、单消费者串行化、接口契约和真实网络链路。
+
+### 35.6 发布核验要求
+
+后续若确认发布，必须在不清订单的前提下：
+
+1. 安装 `requirements.txt`；
+2. 保持现有systemd全部策略环境变量不变，仅默认启用WebSocket；
+3. 重启后检查 `/api/price` 的 `stream_status=CONNECTED` 且 `received_at_ms` 持续更新；
+4. 检查 `/api/state` 的预热、闭合K线数量、画像和守卫状态；
+5. 切换BTC/ETH各验证一次订阅和页面点位；
+6. 若生产网络无法建立WebSocket，临时设置 `NO_WEBSOCKET=1` 回退REST，不调整任何策略阈值。

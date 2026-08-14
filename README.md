@@ -2,7 +2,7 @@
 
 功能：
 
-- 直接拉取币安现货 1分钟K线。
+- 使用币安现货 WebSocket 接收 1分钟K线，REST 负责启动补齐和断线恢复。
 - 按量价关系生成 10分钟候选分析。
 - 只开10分钟单；动态评分阈值继续计算和展示，但当前只作审计，不独立决定开单资格。30分钟仅保留现有指标偏向，不是订单周期。
 - 10分钟信号严格使用最近10根已收盘1分钟K线分析后10分钟方向。
@@ -29,6 +29,7 @@
 ## 启动
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 -m app.server --symbol BTCUSDT --port 8000
 ```
 
@@ -57,6 +58,7 @@ bash scripts/run.sh
 bash scripts/run.sh ETHUSDT 8080
 bash scripts/run.sh --symbol BTCUSDT --host 0.0.0.0 --port 8000 --poll-seconds 10 --limit 300
 bash scripts/run.sh --no-warmup
+bash scripts/run.sh --no-websocket
 bash scripts/run.sh --db-path data/monitor.sqlite3
 bash scripts/run.sh --max-open-orders 2 --max-open-long-orders 1 --max-open-short-orders 2 --min-order-gap-minutes 2
 PROFILE_DEGRADATION_COOLDOWN_MINUTES=60 bash scripts/run.sh
@@ -97,8 +99,10 @@ bash scripts/run.sh \
 运行要求：
 
 - Python `3.10+`
-- 无第三方 Python 依赖，仅使用标准库
-- 运行时需要能访问 Binance 现货 K线接口和 Fear & Greed 接口
+- 安装 `requirements.txt` 中锁定的 `websocket-client`
+- 运行时需要能访问 Binance 现货 WebSocket、REST K线接口和 Fear & Greed 接口
+- WebSocket 只把已闭合1分钟K线送入原有策略；`miniTicker` 仅更新页面当前点位
+- `--poll-seconds` 控制 REST 启动补齐和断线恢复频率；`--no-websocket` 可退回纯 REST 模式
 
 ## SQLite 持久化
 
@@ -177,7 +181,7 @@ bash scripts/run.sh --no-webhook
 - 如果本地没有对应历史文件，会自动从 `https://data.binance.vision/` 下载。
 - 默认下载/读取最近 `3` 个已完成月份的 `1m` K线。
 - 默认额外下载/读取当前月份已完成自然日的 `1m` 日文件，用于避免只有上个月数据导致阈值画像断层。
-- 预热完成后再合并 Binance 实时 REST K线；后续轮询不会覆盖预热历史。
+- 预热完成后先用 REST 补齐，再由 Binance WebSocket 增量接收闭合K线；REST 断线恢复不会覆盖预热历史。
 - 页面顶部会显示：预热状态、预热K线数量、缓存文件数、下载文件数、缺失文件数。
 - 页面顶部会显示当前 regime、风控暂停原因。
 - 动态量能、波动、MACD、RSI、BOLL 指标画像会使用最近最多 `30` 天的已预热/实时K线，而不是只用 REST 接口最近几百根K线。
@@ -222,6 +226,7 @@ bash scripts/package.sh
 ```bash
 tar -xzf dist/event-contract-monitor-*.tar.gz
 cd event-contract-monitor-*
+python3 -m pip install -r requirements.txt
 bash scripts/run.sh --symbol BTCUSDT --port 8000
 ```
 

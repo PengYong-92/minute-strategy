@@ -9,6 +9,9 @@ let observationsTotalPages = 1;
 let lastObservationFilterOptions = null;
 let lastState = null;
 let lastOrderProfile = null;
+let stateRequestInFlight = false;
+let priceRequestInFlight = false;
+let symbolRevision = 0;
 
 function num(value, fallback = 0) {
   const parsed = Number(value);
@@ -503,7 +506,6 @@ const signalFields = [
 
 const summaryFields = {
   symbol: (state) => state.symbol,
-  price: (state) => fmtPrice(state.latest_price),
   balance: (state) => fmtMoney(state.stats.balance),
   "win-rate": (state) => `${(num(state.stats.win_rate) * 100).toFixed(2)}%`,
   "today-balance": (state) => fmtMoney((state.stats.today || {}).pnl),
@@ -976,31 +978,58 @@ async function loadOrderProfile() {
 }
 
 async function loadState() {
-  const response = await fetch("/api/state");
-  const state = await response.json();
-  lastState = state;
-  currentSymbol = state.symbol;
-  Object.entries(summaryFields).forEach(([id, getValue]) => setText(id, getValue(state)));
-  $("symbol-input").value = state.symbol;
-  $("webhook-status").className = webhookClass(state.webhook);
-  $("warmup-status").className = warmupClass(state.warmup);
-  $("rolling-edge-status").className = rollingEdgeClass(state.rolling_edge);
-  $("wave-state-status").className = waveStateClass(state.wave_state);
-  $("wave-batch-guard-status").className = waveBatchGuardClass(state.wave_batch_guard);
-  $("profile-degradation-guard-status").className = profileDegradationGuardClass(state.profile_degradation_guard);
-  $("result-sequence-guard-status").className = resultSequenceGuardClass(state.result_sequence_guard);
-  $("short-extension-status").className = shortExtensionClass(state);
-  setText("stake-progression-badge", fmtStakeProgression(state.stake_progression));
-  renderStrategySummary(state);
-  $("last-error").textContent = state.last_error || "";
-  renderSelectedSignal(state.selected_signal, state.order_decision);
-  renderDailyProfileSelection(state.daily_profile_selection);
-  renderCurrentRiskProfile(state, lastOrderProfile);
-  if (lastFilterOptions === null) {
-    await loadOrders();
+  if (stateRequestInFlight) return;
+  stateRequestInFlight = true;
+  const requestedRevision = symbolRevision;
+  try {
+    const response = await fetch("/api/state", { cache: "no-store" });
+    const state = await response.json();
+    if (requestedRevision !== symbolRevision) return;
+    currentSymbol = state.symbol;
+    lastState = state;
+    Object.entries(summaryFields).forEach(([id, getValue]) => setText(id, getValue(state)));
+    $("symbol-input").value = state.symbol;
+    $("webhook-status").className = webhookClass(state.webhook);
+    $("warmup-status").className = warmupClass(state.warmup);
+    $("rolling-edge-status").className = rollingEdgeClass(state.rolling_edge);
+    $("wave-state-status").className = waveStateClass(state.wave_state);
+    $("wave-batch-guard-status").className = waveBatchGuardClass(state.wave_batch_guard);
+    $("profile-degradation-guard-status").className = profileDegradationGuardClass(state.profile_degradation_guard);
+    $("result-sequence-guard-status").className = resultSequenceGuardClass(state.result_sequence_guard);
+    $("short-extension-status").className = shortExtensionClass(state);
+    setText("stake-progression-badge", fmtStakeProgression(state.stake_progression));
+    renderStrategySummary(state);
+    $("last-error").textContent = state.last_error || "";
+    renderSelectedSignal(state.selected_signal, state.order_decision);
+    renderDailyProfileSelection(state.daily_profile_selection);
+    renderCurrentRiskProfile(state, lastOrderProfile);
+    if (lastFilterOptions === null) {
+      await loadOrders();
+    }
+    if (lastObservationFilterOptions === null) {
+      await loadObservations();
+    }
+  } catch (_error) {
+    return;
+  } finally {
+    stateRequestInFlight = false;
   }
-  if (lastObservationFilterOptions === null) {
-    await loadObservations();
+}
+
+async function loadPrice() {
+  if (priceRequestInFlight) return;
+  priceRequestInFlight = true;
+  const requestedSymbol = currentSymbol;
+  const requestedRevision = symbolRevision;
+  try {
+    const response = await fetch("/api/price", { cache: "no-store" });
+    const price = await response.json();
+    if (requestedRevision !== symbolRevision || price.symbol !== requestedSymbol) return;
+    setText("price", fmtPrice(price.latest_price));
+  } catch (_error) {
+    return;
+  } finally {
+    priceRequestInFlight = false;
   }
 }
 
@@ -1010,11 +1039,13 @@ $("symbol-form").addEventListener("submit", async (event) => {
   if (!symbol) return;
   await fetch(`/api/config?symbol=${encodeURIComponent(symbol)}`);
   currentSymbol = symbol;
+  symbolRevision += 1;
   ordersPage = 1;
   observationsPage = 1;
   lastFilterOptions = null;
   lastObservationFilterOptions = null;
   await loadState();
+  await loadPrice();
   await loadOrders();
   await loadObservations();
   await loadObservationSummary();
@@ -1056,11 +1087,13 @@ $("obs-next-page").addEventListener("click", async () => {
 });
 
 loadState();
+loadPrice();
 loadOrders();
 loadObservations();
 loadObservationSummary();
 loadOrderProfile();
 setInterval(loadState, 3000);
+setInterval(loadPrice, 1000);
 setInterval(loadOrders, 10000);
 setInterval(loadObservations, 10000);
 setInterval(loadObservationSummary, 10000);
