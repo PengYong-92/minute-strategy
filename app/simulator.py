@@ -338,7 +338,9 @@ class AccountSimulator:
         losses = [order for order in settled if order.result == "LOSS"]
         effective_now_ms = int(time() * 1000) if now_ms is None else int(now_ms)
         current_time = datetime.fromtimestamp(effective_now_ms / 1000, SHANGHAI_TIMEZONE)
-        day_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = current_time.replace(hour=8, minute=0, second=0, microsecond=0)
+        if current_time < day_start:
+            day_start -= timedelta(days=1)
         day_start_ms = int(day_start.timestamp() * 1000)
         day_end_ms = day_start_ms + 24 * 60 * 60 * 1000
         today_settled = [
