@@ -15,6 +15,7 @@ from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import MonitorState
+from app.time_period_guard import TimePeriodGuardConfig
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
 
 
@@ -393,6 +394,12 @@ def main() -> None:
         help="关闭同方向连续亏损冷却守卫，默认启用",
     )
     parser.add_argument(
+        "--no-time-period-guard",
+        action="store_true",
+        default=not _env_bool("TIME_PERIOD_GUARD", True),
+        help="关闭北京时间12:00-18:00真实开单暂停；默认启用并保留影子观察",
+    )
+    parser.add_argument(
         "--result-sequence-loss-streak",
         type=int,
         default=int(os.getenv("RESULT_SEQUENCE_LOSS_STREAK", "3")),
@@ -577,6 +584,9 @@ def main() -> None:
             loss_streak=args.result_sequence_loss_streak,
             cooldown_minutes=args.result_sequence_cooldown_minutes,
             scope=args.result_sequence_scope,
+        ),
+        time_period_guard_config=TimePeriodGuardConfig(
+            enabled=not args.no_time_period_guard,
         ),
         enable_stake_progression=not args.no_stake_progression,
         stake_progression_max_orders=args.stake_progression_max_orders,

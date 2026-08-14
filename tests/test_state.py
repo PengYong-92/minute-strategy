@@ -16,6 +16,7 @@ from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
+from app.time_period_guard import TimePeriodGuardConfig
 from app.wave_state import WaveSnapshot, advance_wave, analyze_wave
 from app.wave_batch_guard import WaveBatchGuardConfig
 from app.webhook import WebhookSignalProxy
@@ -3164,6 +3165,69 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(webhook.calls[0][3], state.snapshot()["orders"][0]["reason"])
         self.assertEqual(webhook.calls[0][4], state.snapshot()["orders"][0]["stake"])
         self.assertTrue(state.snapshot()["webhook"]["enabled"])
+
+    def test_time_period_guard_records_shadow_without_real_order_or_webhook(self):
+        webhook = RecordingWebhook()
+        storage = RecordingStorage()
+        state = profile_guard_state(
+            webhook=webhook,
+            storage=storage,
+            time_period_guard_config=TimePeriodGuardConfig(enabled=True),
+        )
+        opened_at = shanghai_timestamp("2026-08-14 12:00:00")
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(opened_at),
+            latest_kline(opened_at),
+        )
+        state.wait_for_storage_writes()
+        snapshot = state.snapshot()
+
+        self.assertEqual(decision, "TIME_PERIOD_SHADOW_ONLY")
+        self.assertEqual(snapshot["stats"]["total_orders"], 0)
+        self.assertEqual(webhook.calls, [])
+        self.assertTrue(snapshot["time_period_guard"]["blocked"])
+        self.assertIn("12:00-18:00", snapshot["risk_pause"])
+        self.assertEqual(len(snapshot["observations"]), 1)
+        self.assertEqual(
+            snapshot["observations"][0]["source_decision"],
+            "TIME_PERIOD_SHADOW_ONLY",
+        )
+        self.assertEqual(len(storage.observations), 1)
+
+        settled = state._settle_observations(opened_at + 10 * MINUTE_MS, 101.0)
+
+        self.assertEqual(len(settled), 1)
+        self.assertEqual(settled[0].result, "WIN")
+
+    def test_time_period_guard_allows_order_at_six_pm_boundary(self):
+        state = profile_guard_state(
+            time_period_guard_config=TimePeriodGuardConfig(enabled=True),
+        )
+        opened_at = shanghai_timestamp("2026-08-14 18:00:00")
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(opened_at),
+            latest_kline(opened_at),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+
+    def test_disabled_time_period_guard_restores_noon_order_path(self):
+        state = profile_guard_state(
+            time_period_guard_config=TimePeriodGuardConfig(enabled=False),
+        )
+        opened_at = shanghai_timestamp("2026-08-14 12:00:00")
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(opened_at),
+            latest_kline(opened_at),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertFalse(state.snapshot()["time_period_guard"]["enabled"])
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
 
     def test_slow_webhook_transport_does_not_block_market_update(self):
         transport_started = threading.Event()

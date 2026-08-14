@@ -22,6 +22,44 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_main_injects_time_period_guard_config(self):
+        cases = (
+            ({}, [], True),
+            ({"TIME_PERIOD_GUARD": "0"}, [], False),
+            ({}, ["--no-time-period-guard"], False),
+        )
+
+        for environment, guard_args, expected in cases:
+            with self.subTest(environment=environment, guard_args=guard_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *guard_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch("app.server.start_market_data", return_value=SimpleNamespace(stop=lambda: None)),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                config = monitor_state.call_args.kwargs["time_period_guard_config"]
+                self.assertEqual(config.enabled, expected)
+
     def test_main_injects_profile_degradation_cooldown_config(self):
         cases = (
             ({}, [], 60, 60),

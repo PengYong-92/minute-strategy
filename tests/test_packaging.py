@@ -304,6 +304,8 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--no-stake-progression", result.stdout)
         self.assertIn("--no-rolling-edge-guard", result.stdout)
         self.assertIn("--no-result-sequence-guard", result.stdout)
+        self.assertIn("--no-time-period-guard", result.stdout)
+        self.assertIn("12:00-18:00", result.stdout)
         self.assertIn("--result-sequence-loss-streak", result.stdout)
         self.assertIn("--result-sequence-cooldown-minutes", result.stdout)
         self.assertIn("--result-sequence-scope", result.stdout)

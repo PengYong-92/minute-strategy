@@ -30,6 +30,10 @@ from app.rolling_edge import RollingEdgeConfig, RollingEdgeSnapshot, rolling_edg
 from app.simulator import AccountSimulator, SettlementEvent
 from app.stake_progression import TWO_STAGE_VERSION
 from app.storage import SQLiteMonitorStore, page_observation_list, page_order_list, summarize_observations
+from app.time_period_guard import (
+    TimePeriodGuardConfig,
+    evaluate_time_period_guard,
+)
 from app.strategy import (
     LIVE_TRADE_TIMEFRAMES,
     analyze_observation_signals,
@@ -88,6 +92,7 @@ class MonitorState:
         wave_batch_guard_config: WaveBatchGuardConfig | None = None,
         now_ms=None,
         profile_degradation_guard_config: ProfileDegradationGuardConfig | None = None,
+        time_period_guard_config: TimePeriodGuardConfig | None = None,
     ):
         self.symbol = symbol.upper()
         self._symbol_generation = 0
@@ -108,6 +113,7 @@ class MonitorState:
         self.profile_degradation_guard_config = (
             profile_degradation_guard_config or ProfileDegradationGuardConfig()
         ).normalized()
+        self.time_period_guard_config = time_period_guard_config or TimePeriodGuardConfig()
         self.stake = stake
         self.win_return = win_return
         self.enable_stake_progression = enable_stake_progression
@@ -189,6 +195,10 @@ class MonitorState:
         self.result_sequence_guard: dict = self._empty_result_sequence_guard()
         self.wave_batch_guard: dict = self._empty_wave_batch_guard()
         self.profile_degradation_guard: dict = self._empty_profile_degradation_guard()
+        self.time_period_guard: dict = evaluate_time_period_guard(
+            self._now_ms(),
+            self.time_period_guard_config,
+        ).to_dict()
         self.last_error: str | None = None
         self.updated_at_ms = 0
         self._realtime_price: float | None = None
@@ -511,6 +521,10 @@ class MonitorState:
             self.profile_degradation_guard = self._empty_profile_degradation_guard()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
+            self.time_period_guard = evaluate_time_period_guard(
+                self.updated_at_ms,
+                self.time_period_guard_config,
+            ).to_dict()
             self._realtime_price = None
             self._realtime_price_event_time_ms = 0
             self._realtime_price_received_at_ms = 0
@@ -639,6 +653,11 @@ class MonitorState:
         daily_profile_required: bool = False,
     ) -> str:
         self.risk_pause = ""
+        time_period_decision = evaluate_time_period_guard(
+            latest.close_time,
+            self.time_period_guard_config,
+        )
+        self.time_period_guard = time_period_decision.to_dict()
         self.rolling_edge = self._rolling_edge_status(signal, latest)
         should_observe = self._should_record_observation(signal)
         batch_decision = evaluate_wave_batch_guard(
@@ -792,6 +811,15 @@ class MonitorState:
                     ),
                     should_observe=should_observe,
                 )
+
+        if time_period_decision.blocked:
+            return self._block_order(
+                signal,
+                latest,
+                time_period_decision.code,
+                time_period_decision.reason,
+                should_observe=True,
+            )
 
         return self._execute_open_order(
             signal,
@@ -2012,6 +2040,7 @@ class MonitorState:
                 "result_sequence_guard": self.result_sequence_guard,
                 "wave_batch_guard": self.wave_batch_guard,
                 "profile_degradation_guard": self.profile_degradation_guard,
+                "time_period_guard": self.time_period_guard,
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),

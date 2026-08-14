@@ -19,6 +19,7 @@
 - 波段批次守卫默认关闭；启用时同一波段最多2单，首亏后不补位，60分钟内两个全亏批次触发60分钟全局冷却，冷却后只允许一笔固定10U恢复单。普通波段恢复单不生成18U资格；同时标记为画像退化试探时按画像试探规则处理。
 - 每根已闭合1分钟K线都会同步持久化波段状态、最后评估时间和原始确认锚点。服务重启先恢复该快照，再增量重放后续预热K线；即使波段起点早于最近300根K线，同一实际波段的批次ID和首亏锁定仍保持不变。首次升级没有快照时从持久化订单保守继承同状态锚点并取消旧18U资格；快照后K线不连续时直接建立新波段身份。转折或新波段会原子取消旧18U资格。
 - 按方向结算序列守卫默认启用：LONG与SHORT分别按连续已结算亏损触发方向冷却，不改变信号方向。
+- 默认在北京时间12:00（含）至18:00（不含）暂停真实开单；原本能通过全部现有门禁的信号仍保存为10分钟影子观察并正常结算，不触发Webhook、不占用订单额度或18U资格。
 - 模拟订单和观察单都按各自到期分钟对应的 K 线结算；轮询中断后不会借用恢复时的更晚价格。重启时恢复8天缓冲，再按固定截止点精确截取7天观察窗口，不受页面500条展示上限影响。
 
 ## 文档
@@ -63,6 +64,7 @@ bash scripts/run.sh --db-path data/monitor.sqlite3
 bash scripts/run.sh --max-open-orders 2 --max-open-long-orders 1 --max-open-short-orders 2 --min-order-gap-minutes 2
 PROFILE_DEGRADATION_COOLDOWN_MINUTES=60 bash scripts/run.sh
 RESULT_SEQUENCE_GUARD=1 bash scripts/run.sh --result-sequence-loss-streak 3 --result-sequence-cooldown-minutes 20 --result-sequence-scope DIRECTION
+bash scripts/run.sh --no-time-period-guard
 bash scripts/run.sh --stake-progression-max-orders 2 --stake-progression-max-active 1 --stake-progression-base-only-segments ""
 bash scripts/run.sh --webhook-url https://event.easy-tx.com/api/signals/ingest
 ```
@@ -95,6 +97,8 @@ bash scripts/run.sh \
 - `--result-sequence-loss-streak`：触发所需连续已结算亏损数，默认 `3`。
 - `--result-sequence-cooldown-minutes`：冷却分钟数，默认 `20`。
 - `--result-sequence-scope`：`DIRECTION` 仅暂停亏损方向，`GLOBAL` 暂停所有方向；默认 `DIRECTION`。
+
+北京时间段影子守卫默认启用。`12:00-18:00` 只暂停最终真实开单，观察候选仍按10分钟到期K线结算；设置 `TIME_PERIOD_GUARD=0` 或传入 `--no-time-period-guard` 可完整恢复原开单路径。
 
 运行要求：
 

@@ -1,7 +1,7 @@
 # 当前策略说明
 
-更新时间：2026-08-10
-代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/profile_degradation_guard.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
+更新时间：2026-08-14
+代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/time_period_guard.py`、`app/profile_degradation_guard.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
 
 ## 1. 策略目标与运行周期
 
@@ -17,6 +17,7 @@
 - LONG/SHORT 候选均持续记录观察结果，主程序每天从最近7天观察画像中选出当日启用策略。
 - 每日画像是当前策略来源；完整键入选后，主信号的明确 `observe_direction` 或研究观察候选可以成为正式候选，`TRADE_SCORE_THRESHOLD` 只作审计。
 - 默认总未结订单上限为2；方向结算序列守卫默认启用，1分钟波段方向否决和波段批次守卫默认关闭。
+- 默认在北京时间12:00-18:00暂停真实订单，原本通过全部其他门禁的候选继续作为影子观察单结算。
 
 当前实盘开单周期：
 
@@ -64,6 +65,7 @@ bash scripts/run.sh
 | `--no-webhook` | 关闭参数 | 关闭 webhook 推送 |
 | `--no-daily-profile-selector` | 关闭参数 | 关闭每日观察画像选策，回退静态主策略 |
 | `--no-result-sequence-guard` | 关闭参数 | 关闭默认启用的按方向结算序列守卫 |
+| `--no-time-period-guard` | 关闭参数 | 关闭默认启用的北京时间12:00-18:00真实开单暂停 |
 | `--profile-degradation-cooldown-minutes` | `60` | 完整画像连续3笔真实亏损后的冷却分钟数；`0` 关闭 |
 | `--daily-profile-lookback-days` | `7` | 每日画像统计窗口 |
 | `--daily-profile-min-samples` | `20` | 新画像入选最小独立样本 |
@@ -915,6 +917,7 @@ GREED_RISING + LONG: +2
 未触发方向结算序列冷却
 未触发滚动守卫 DEGRADED
 若显式启用旧画像特征守卫，未被该守卫阻断
+不在北京时间12:00（含）至18:00（不含）的影子观察暂停窗口
 ```
 
 当前 `Signal.actionable` 定义为：
@@ -945,6 +948,7 @@ and (daily_profile_selected == True or abs(score) >= threshold)
 | `WAVE_BATCH_FULL` | 启用波段批次守卫后，当前批次已达到2单 |
 | `WAVE_GLOBAL_COOLDOWN` | 启用波段批次守卫后，失败批次或恢复单亏损触发全局冷却 |
 | `ROLLING_EDGE_BLOCKED` | 滚动守卫判定该 setup 衰退 |
+| `TIME_PERIOD_SHADOW_ONLY` | 已通过其他门禁，但北京时间12:00-18:00暂停真实开单并保存影子观察 |
 | `OPENED` | 成功开单 |
 
 ## 14. 滚动守卫
@@ -2027,6 +2031,7 @@ calculated_threshold  原策略计算的动态阈值
  -> 同方向连续3亏冷却20分钟
  -> 滚动优势守卫
  -> 画像守卫（默认影子观察）
+ -> 北京时间12:00-18:00真实开单暂停（默认启用）
  -> 10U/18U两阶段金额；退化恢复只放行10U基础试探
  -> 模拟开单、Webhook和入口快照
 ```
@@ -2131,3 +2136,11 @@ calculated_threshold  原策略计算的动态阈值
 两阶段金额资格也按方向隔离：LONG基础单盈利只生成LONG资格，SHORT基础单盈利只生成SHORT资格；领取、在途占用、回滚、波段失效和重启恢复均不能跨方向。SQLite资格表持久化 `direction`，旧表启动时自动新增该列；旧资格可从来源订单推断方向。`/api/state.stake_progression.max_active_scope=DIRECTION` 明确兼容字段中的上限口径，`by_direction` 分别展示待用资格、在途第二级订单和下一单金额；页面徽标也分别显示LONG和SHORT状态。
 
 本变更不修改10分钟量价信号、每日画像入选、1分钟波段、方向连亏守卫、画像退化守卫、评分阈值或Webhook逻辑。LONG上限为1期间不会产生新口径 `LONG_SECOND`；未来放开LONG第二单时仍须执行交接文档第31节定义的综合准入评估。
+
+## 38. 北京时间段真实开单暂停与影子观察
+
+默认启用 `TimePeriodGuardConfig(enabled=True)`：以候选对应已闭合1分钟K线的 `close_time` 转换为北京时间，`12:00:00 <= local_time < 18:00:00` 时返回 `TIME_PERIOD_SHADOW_ONLY`。该检查位于每日画像、订单机械门禁、SHORT兼容限制、波段批次、画像退化、方向结算序列、滚动优势和可选画像守卫之后，只有原逻辑本来会进入真实开单的候选才形成该类影子样本。
+
+命中后不调用模拟器开单，不保存真实订单或入口快照，不发送Webhook，不更新同方向最后开单时间，不占用并发，也不领取10U赢单产生的18U资格。候选通过现有 `ObservationSignal` 路径保存，保留完整画像键、DPS版本、方向、时段、评分、质量评分和 `source_decision=TIME_PERIOD_SHADOW_ONLY`，并在10分钟到期K线出现时正常结算。
+
+启动默认值为 `TIME_PERIOD_GUARD=1`。`TIME_PERIOD_GUARD=0` 或 `--no-time-period-guard` 关闭后，时段守卫返回 `DISABLED`，真实开单完全恢复原链路。当前版本不根据影子胜率自动恢复，也不修改画像、评分、方向、金额、叠加或冷却参数；是否恢复须使用新积累的独立影子样本另行评估。
