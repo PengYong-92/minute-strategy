@@ -1,7 +1,7 @@
 # 当前策略说明
 
 更新时间：2026-08-15
-代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/time_period_guard.py`、`app/profile_degradation_guard.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
+代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/profile_health_guard.py`、`app/time_period_guard.py`、`app/profile_degradation_guard.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
 
 ## 1. 策略目标与运行周期
 
@@ -17,7 +17,7 @@
 - LONG/SHORT 候选均持续记录观察结果，主程序每天从最近7天观察画像中选出当日启用策略。
 - 每日画像是当前策略来源；完整键入选后，主信号的明确 `observe_direction` 或研究观察候选可以成为正式候选，`TRADE_SCORE_THRESHOLD` 只作审计。
 - 默认总未结订单上限为2；方向结算序列守卫默认启用，1分钟波段方向否决和波段批次守卫默认关闭。
-- 默认在北京时间12:00-18:00暂停真实订单，原本通过全部其他门禁的候选继续作为影子观察单结算。
+- 默认启用24小时画像短窗健康守卫，每4小时按方向重评；固定北京时间12:00-18:00时段拦截默认关闭。
 
 当前实盘开单周期：
 
@@ -65,7 +65,8 @@ bash scripts/run.sh
 | `--no-webhook` | 关闭参数 | 关闭 webhook 推送 |
 | `--no-daily-profile-selector` | 关闭参数 | 关闭每日观察画像选策，回退静态主策略 |
 | `--no-result-sequence-guard` | 关闭参数 | 关闭默认启用的按方向结算序列守卫 |
-| `--no-time-period-guard` | 关闭参数 | 关闭默认启用的北京时间12:00-18:00真实开单暂停 |
+| `--no-profile-health-guard` | 关闭参数 | 关闭默认启用的24小时画像健康守卫 |
+| `--no-time-period-guard` | 关闭参数 | 强制关闭北京时间12:00-18:00守卫；该守卫默认已关闭 |
 | `--profile-degradation-cooldown-minutes` | `60` | 完整画像连续3笔真实亏损后的冷却分钟数；`0` 关闭 |
 | `--daily-profile-lookback-days` | `7` | 每日画像统计窗口 |
 | `--daily-profile-min-samples` | `20` | 新画像入选最小独立样本 |
@@ -908,6 +909,7 @@ GREED_RISING + LONG: +2
 主信号已成立为 LONG/SHORT，或主 WAIT 具有明确 observe_direction，或属于研究观察候选
 周期 + 策略族 + 策略标签 + 方向 + WD/WE时段完整画像已入选
 入选后 daily_profile_selected == True，使明确方向候选 actionable
+当前方向24小时画像健康状态不是 DEGRADED
 未结订单数 < 2
 距离上一单 >= 2分钟
 非重复 signal_key
@@ -917,7 +919,8 @@ GREED_RISING + LONG: +2
 未触发方向结算序列冷却
 未触发滚动守卫 DEGRADED
 若显式启用旧画像特征守卫，未被该守卫阻断
-不在北京时间12:00（含）至18:00（不含）的影子观察暂停窗口
+WATCH状态仅允许该方向10U首单，不允许第二席位或18U
+若显式启用固定时段守卫，不在北京时间12:00-18:00影子暂停窗口
 ```
 
 当前 `Signal.actionable` 定义为：
@@ -939,6 +942,8 @@ and (daily_profile_selected == True or abs(score) >= threshold)
 | `OVERHEATED` | edge 超过过热上限 |
 | `WAVE_DIRECTION_BLOCKED` | 启用1分钟波段方向守卫后，波段不允许当前候选方向 |
 | `DAILY_PROFILE_NOT_SELECTED` | 实时信号未进入今日启用画像 |
+| `PROFILE_HEALTH_BLOCKED` | 当前方向24小时画像胜率低于50%，暂停至下一4小时边界 |
+| `PROFILE_HEALTH_SECOND_ORDER_BLOCKED` | 当前方向画像为WATCH，仅允许10U首单 |
 | `HOLD_OPEN_ORDER` | 未结订单已达到2单 |
 | `COOLDOWN` | 距离上一单不足2分钟 |
 | `DUPLICATE_SIGNAL` | 同一信号已开过 |
@@ -1004,6 +1009,7 @@ and (win_rate < min_win_rate or ev <= min_ev)
 | 层级 | 范围 | 触发 | 恢复 |
 |---|---|---|---|
 | 每日画像 | 完整画像/7天观察 | 60%与EV | 次日重评 |
+| 画像短窗健康 | 当前已启用画像/方向/24小时观察 | 12样本、50%/55.56%与EV | 每4小时重评 |
 | 实时画像退化 | 完整画像/当前DPS实单 | 固定连续亏损3单 | 配置冷却+基础试探 |
 | 方向序列 | LONG或SHORT实单 | 连亏阈值 | 方向冷却 |
 | 滚动优势 | 现有滚动key | 胜率/EV退化 | 滚动样本恢复 |
@@ -1278,6 +1284,7 @@ K线窗口
  -> 主信号明确观察方向 + 研究观察候选
  -> 完整画像标签、评分和动态阈值审计
  -> 最近7天每日画像精确匹配并赋予正式资格
+ -> 当前方向24小时画像健康检查（每4小时）
  -> 订单状态 / 冷却 / 重复信号
  -> 1分钟波段方向否决（默认关闭，按配置启用）
  -> 波段批次 / 全局恢复守卫（默认关闭，按配置启用）
@@ -2137,10 +2144,27 @@ calculated_threshold  原策略计算的动态阈值
 
 本变更不修改10分钟量价信号、每日画像入选、1分钟波段、方向连亏守卫、画像退化守卫、评分阈值或Webhook逻辑。LONG上限为1期间不会产生新口径 `LONG_SECOND`；未来放开LONG第二单时仍须执行交接文档第31节定义的综合准入评估。
 
-## 38. 北京时间段真实开单暂停与影子观察
+## 38. 北京时间段真实开单暂停与影子观察（默认关闭）
 
-默认启用 `TimePeriodGuardConfig(enabled=True)`：以候选对应已闭合1分钟K线的 `close_time` 转换为北京时间，`12:00:00 <= local_time < 18:00:00` 时返回 `TIME_PERIOD_SHADOW_ONLY`。该检查位于每日画像、订单机械门禁、SHORT兼容限制、波段批次、画像退化、方向结算序列、滚动优势和可选画像守卫之后，只有原逻辑本来会进入真实开单的候选才形成该类影子样本。
+当前默认使用 `TimePeriodGuardConfig(enabled=False)`，启动脚本默认 `TIME_PERIOD_GUARD=0`。因此北京时间12:00-18:00不再固定暂停真实订单。只有显式设置 `TIME_PERIOD_GUARD=1` 时，旧模块才按候选对应已闭合1分钟K线的 `close_time` 判断 `12:00:00 <= local_time < 18:00:00` 并返回 `TIME_PERIOD_SHADOW_ONLY`。
 
 命中后不调用模拟器开单，不保存真实订单或入口快照，不发送Webhook，不更新同方向最后开单时间，不占用并发，也不领取10U赢单产生的18U资格。候选通过现有 `ObservationSignal` 路径保存，保留完整画像键、DPS版本、方向、时段、评分、质量评分和 `source_decision=TIME_PERIOD_SHADOW_ONLY`，并在10分钟到期K线出现时正常结算。
 
-启动默认值为 `TIME_PERIOD_GUARD=1`。`TIME_PERIOD_GUARD=0` 或 `--no-time-period-guard` 关闭后，时段守卫返回 `DISABLED`，真实开单完全恢复原链路。当前版本不根据影子胜率自动恢复，也不修改画像、评分、方向、金额、叠加或冷却参数；是否恢复须使用新积累的独立影子样本另行评估。
+`TIME_PERIOD_GUARD=0` 或 `--no-time-period-guard` 会强制返回 `DISABLED`。该模块继续保留用于复现实验，不参与当前默认开单逻辑。
+
+## 39. 24小时画像短窗健康守卫
+
+每日画像选择器继续使用最近7天独立观察样本，每天07:50评估、08:00生效，只负责确定当天可用画像池。`ProfileHealthGuard` 是其后的短窗风险层，不改变画像入选、信号方向、评分、动态阈值或候选生成。
+
+评估边界固定为北京时间 `00:00 / 04:00 / 08:00 / 12:00 / 16:00 / 20:00`。每次候选到达时使用最近一个已经到达的边界，向前统计24小时；只读取当前有效每日画像中与候选方向一致的完整画像键，只计 `SETTLED` 且在边界前已经结算的观察记录。每个完整键在上一笔10分钟观察到期前的重叠记录不重复计数，LONG和SHORT独立。
+
+| 状态 | 条件 | 开单行为 |
+|---|---|---|
+| `WARMUP` | 独立样本少于12 | 不改变原开单、第二席位和18U行为 |
+| `HEALTHY` | 胜率至少55.56%且EV不低于0 | 不改变原行为 |
+| `WATCH` | 胜率至少50%但低于55.56%，或EV低于0 | 只允许该方向10U首单，禁止第二席位和18U |
+| `DEGRADED` | 胜率低于50% | 暂停该方向真实订单至下一4小时边界 |
+
+守卫不会启用未入选画像，也不会把LONG转换成SHORT。`/api/state.profile_health_guard` 返回配置、方向、评估边界、下次边界、样本、胜负、胜率、PnL、EV和放行状态。信号、订单与观察记录持久化 `profile_health_status`、`profile_health_sample_size`、`profile_health_win_rate`、`profile_health_ev`、`profile_health_evaluated_at`，旧SQLite记录缺失这些字段时使用默认值。
+
+唯一外部开关是 `PROFILE_HEALTH_GUARD=0` 或 `--no-profile-health-guard`。24小时、4小时、12样本、50%和55.56%均为固定代码常量，避免继续增加生产参数。本层只会维持或收紧现有7日画像，不扩大候选池。

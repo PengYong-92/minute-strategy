@@ -16,10 +16,11 @@
 - 所有 LONG/SHORT 候选继续异步记录观察结果。每天北京时间 07:50 按 `周期 + 策略族 + 策略标签 + 方向 + WD/WE时段` 评估最近7天独立样本，08:00启用全部合格画像并固定运行到次日08:00。
 - 每日画像选择器使用最近7天独立样本，工作日最少20个、周末最少10个，要求胜率至少60%且EV不低于0。完整画像键入选后，主信号的明确 `observe_direction` 或研究观察候选可以成为正式候选；`TRADE_SCORE_THRESHOLD` 当前只作审计，不独立决定资格。
 - 默认启用实时画像退化守卫：同一完整画像键在当前 DPS 版本内连续3笔已结算真实订单亏损后冷却60分钟；冷却结束只允许一笔10U基础试探，试探结算前阻止同画像继续开单。
+- 默认启用画像短窗健康守卫：在北京时间每4小时边界，按LONG/SHORT分别统计当前已启用画像过去24小时的独立观察样本。少于12笔保持原逻辑；胜率50%-55.56%或EV为负时只允许10U首单；胜率低于50%时暂停该方向至下一评估边界。
 - 波段批次守卫默认关闭；启用时同一波段最多2单，首亏后不补位，60分钟内两个全亏批次触发60分钟全局冷却，冷却后只允许一笔固定10U恢复单。普通波段恢复单不生成18U资格；同时标记为画像退化试探时按画像试探规则处理。
 - 每根已闭合1分钟K线都会同步持久化波段状态、最后评估时间和原始确认锚点。服务重启先恢复该快照，再增量重放后续预热K线；即使波段起点早于最近300根K线，同一实际波段的批次ID和首亏锁定仍保持不变。首次升级没有快照时从持久化订单保守继承同状态锚点并取消旧18U资格；快照后K线不连续时直接建立新波段身份。转折或新波段会原子取消旧18U资格。
 - 按方向结算序列守卫默认启用：LONG与SHORT分别按连续已结算亏损触发方向冷却，不改变信号方向。
-- 默认在北京时间12:00（含）至18:00（不含）暂停真实开单；原本能通过全部现有门禁的信号仍保存为10分钟影子观察并正常结算，不触发Webhook、不占用订单额度或18U资格。
+- 北京时间12:00-18:00固定时段守卫保留为可选模块，但默认关闭，不再按固定时段暂停真实开单。
 - 模拟订单和观察单都按各自到期分钟对应的 K 线结算；轮询中断后不会借用恢复时的更晚价格。重启时恢复8天缓冲，再按固定截止点精确截取7天观察窗口，不受页面500条展示上限影响。
 
 ## 文档
@@ -64,7 +65,8 @@ bash scripts/run.sh --db-path data/monitor.sqlite3
 bash scripts/run.sh --max-open-orders 2 --max-open-long-orders 1 --max-open-short-orders 2 --min-order-gap-minutes 2
 PROFILE_DEGRADATION_COOLDOWN_MINUTES=60 bash scripts/run.sh
 RESULT_SEQUENCE_GUARD=1 bash scripts/run.sh --result-sequence-loss-streak 3 --result-sequence-cooldown-minutes 20 --result-sequence-scope DIRECTION
-bash scripts/run.sh --no-time-period-guard
+TIME_PERIOD_GUARD=1 bash scripts/run.sh
+bash scripts/run.sh --no-profile-health-guard
 bash scripts/run.sh --stake-progression-max-orders 2 --stake-progression-max-active 1 --stake-progression-base-only-segments ""
 bash scripts/run.sh --webhook-url https://event.easy-tx.com/api/signals/ingest
 ```
@@ -98,7 +100,9 @@ bash scripts/run.sh \
 - `--result-sequence-cooldown-minutes`：冷却分钟数，默认 `20`。
 - `--result-sequence-scope`：`DIRECTION` 仅暂停亏损方向，`GLOBAL` 暂停所有方向；默认 `DIRECTION`。
 
-北京时间段影子守卫默认启用。`12:00-18:00` 只暂停最终真实开单，观察候选仍按10分钟到期K线结算；设置 `TIME_PERIOD_GUARD=0` 或传入 `--no-time-period-guard` 可完整恢复原开单路径。
+画像短窗健康守卫默认启用。它只读取当前已启用每日画像过去24小时中已结算且互不重叠的观察样本，并在北京时间 `00/04/08/12/16/20` 点固定重评。设置 `PROFILE_HEALTH_GUARD=0` 或传入 `--no-profile-health-guard` 可关闭该层。
+
+北京时间段影子守卫默认关闭，真实开单不再受固定 `12:00-18:00` 时段限制。仅在显式设置 `TIME_PERIOD_GUARD=1` 时恢复旧的时段影子拦截；`--no-time-period-guard` 可强制关闭。
 
 运行要求：
 
