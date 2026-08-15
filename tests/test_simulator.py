@@ -1,5 +1,5 @@
 import unittest
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -32,6 +32,24 @@ def signal(
 
 
 class SimulatorTest(unittest.TestCase):
+    def test_order_copies_profile_health_audit_fields(self):
+        audited = replace(
+            signal(),
+            profile_health_status="HEALTHY",
+            profile_health_sample_size=18,
+            profile_health_win_rate=0.666667,
+            profile_health_ev=2.0,
+            profile_health_evaluated_at=1_723_689_600_000,
+        )
+
+        order = AccountSimulator().open_order(audited, 100.0, 1_000)
+
+        self.assertEqual(order.profile_health_status, "HEALTHY")
+        self.assertEqual(order.profile_health_sample_size, 18)
+        self.assertEqual(order.profile_health_win_rate, 0.666667)
+        self.assertEqual(order.profile_health_ev, 2.0)
+        self.assertEqual(order.profile_health_evaluated_at, 1_723_689_600_000)
+
     def test_order_slot_is_independent_from_stake_progression_step(self):
         simulator = AccountSimulator(
             enable_stake_progression=True,

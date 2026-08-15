@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal, SimulatedOrder
 from app.profile_degradation_guard import MINUTE_MS, ProfileDegradationGuardConfig
+from app.profile_health_guard import ProfileHealthGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
@@ -171,6 +172,52 @@ def profile_guard_state(*, max_open_orders: int = 2, **kwargs) -> "MonitorState"
         result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
         **kwargs,
     )
+
+
+def profile_health_observations(
+    evaluation_at: int,
+    results: str,
+    *,
+    direction: str = "LONG",
+    segment: str = "WD-08",
+) -> list[ObservationSignal]:
+    start = evaluation_at - len(results) * 11 * MINUTE_MS
+    return [
+        settled_observation(
+            index,
+            "WIN" if result == "W" else "LOSS",
+            start + index * 11 * MINUTE_MS,
+            family="drop_reclaim",
+            tag="live_profile",
+            direction=direction,
+            segment=segment,
+        )
+        for index, result in enumerate(results)
+    ]
+
+
+def activate_profile_health_selection(
+    state: "MonitorState",
+    current_time: int,
+    *,
+    direction: str = "LONG",
+    segment: str = "WD-08",
+) -> str:
+    key = f"10|drop_reclaim|live_profile|{direction}|{segment}"
+    state.active_daily_profile_selection = {
+        "version": PROFILE_VERSION,
+        "status": "READY",
+        "effective_from": current_time - 86_400_000,
+        "effective_until": current_time + 86_400_000,
+        "selected_profiles": [
+            {
+                "key": key,
+                "direction": direction,
+                "threshold_segment": segment,
+            }
+        ],
+    }
+    return key
 
 
 class StaticFearGreedProvider:
@@ -3228,6 +3275,132 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "OPENED")
         self.assertFalse(state.snapshot()["time_period_guard"]["enabled"])
         self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+
+    def test_profile_health_degraded_blocks_selected_direction_and_records_audit(self):
+        current_time = shanghai_timestamp("2026-08-15 10:30:00")
+        evaluation_at = shanghai_timestamp("2026-08-15 08:00:00")
+        state = profile_guard_state()
+        activate_profile_health_selection(state, current_time)
+        state.observations = profile_health_observations(
+            evaluation_at,
+            "WWWWWLLLLLLL",
+        )
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+        snapshot = state.snapshot()
+
+        self.assertEqual(decision, "PROFILE_HEALTH_BLOCKED")
+        self.assertEqual(snapshot["stats"]["total_orders"], 0)
+        self.assertEqual(snapshot["profile_health_guard"]["status"], "DEGRADED")
+        self.assertEqual(snapshot["profile_health_guard"]["sample_size"], 12)
+        self.assertTrue(snapshot["profile_health_guard"]["blocked"])
+        self.assertEqual(snapshot["selected_signal"]["profile_health_status"], "DEGRADED")
+        self.assertEqual(snapshot["observations"][0]["profile_health_status"], "DEGRADED")
+
+    def test_profile_health_watch_opens_base_first_order_without_consuming_credit(self):
+        current_time = shanghai_timestamp("2026-08-15 10:30:00")
+        evaluation_at = shanghai_timestamp("2026-08-15 08:00:00")
+        state = profile_guard_state()
+        activate_profile_health_selection(state, current_time)
+        state.observations = profile_health_observations(
+            evaluation_at,
+            "WWWWWWLLLLLL",
+        )
+        source_opened_at = current_time - 20 * MINUTE_MS
+        source = state.simulator.open_order(
+            selected_profile_signal(source_opened_at),
+            entry_price=100.0,
+            opened_at=source_opened_at,
+        )
+        state.simulator.settle_expired_orders(source.expires_at, 101.0)
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "PENDING")
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+        opened = state.simulator.orders[-1]
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(opened.stake, 10.0)
+        self.assertEqual(opened.stake_progression_step, 1)
+        self.assertEqual(opened.profile_health_status, "WATCH")
+        self.assertEqual(state.simulator.stake_progression.credits[0].status, "PENDING")
+
+    def test_profile_health_watch_blocks_same_direction_second_order(self):
+        current_time = shanghai_timestamp("2026-08-15 10:30:00")
+        evaluation_at = shanghai_timestamp("2026-08-15 08:00:00")
+        state = profile_guard_state(max_open_long_orders=2)
+        activate_profile_health_selection(state, current_time)
+        state.observations = profile_health_observations(
+            evaluation_at,
+            "WWWWWWLLLLLL",
+        )
+        state.simulator.open_order(
+            selected_profile_signal(current_time - 2 * MINUTE_MS),
+            entry_price=100.0,
+            opened_at=current_time - 2 * MINUTE_MS,
+        )
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+
+        self.assertEqual(decision, "PROFILE_HEALTH_SECOND_ORDER_BLOCKED")
+        self.assertEqual(len(state.simulator.orders), 1)
+        self.assertEqual(state.snapshot()["selected_signal"]["order_slot"], "SECOND")
+
+    def test_profile_health_healthy_preserves_progression(self):
+        current_time = shanghai_timestamp("2026-08-15 10:30:00")
+        evaluation_at = shanghai_timestamp("2026-08-15 08:00:00")
+        state = profile_guard_state()
+        activate_profile_health_selection(state, current_time)
+        state.observations = profile_health_observations(
+            evaluation_at,
+            "WWWWWWWLLLLL",
+        )
+        source_opened_at = current_time - 20 * MINUTE_MS
+        source = state.simulator.open_order(
+            selected_profile_signal(source_opened_at),
+            entry_price=100.0,
+            opened_at=source_opened_at,
+        )
+        state.simulator.settle_expired_orders(source.expires_at, 101.0)
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+        opened = state.simulator.orders[-1]
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(opened.stake, 18.0)
+        self.assertEqual(opened.stake_progression_step, 2)
+        self.assertEqual(opened.profile_health_status, "HEALTHY")
+
+    def test_disabled_profile_health_guard_preserves_selected_profile_behavior(self):
+        current_time = shanghai_timestamp("2026-08-15 10:30:00")
+        evaluation_at = shanghai_timestamp("2026-08-15 08:00:00")
+        state = profile_guard_state(
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        activate_profile_health_selection(state, current_time)
+        state.observations = profile_health_observations(
+            evaluation_at,
+            "LLLLLLLLLLLL",
+        )
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.snapshot()["profile_health_guard"]["status"], "DISABLED")
 
     def test_slow_webhook_transport_does_not_block_market_update(self):
         transport_started = threading.Event()

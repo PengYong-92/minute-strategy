@@ -20,6 +20,16 @@ from app.profile_degradation_guard import (
     ProfileDegradationGuardDecision,
     evaluate_profile_degradation_guard,
 )
+from app.profile_health_guard import (
+    EVALUATION_INTERVAL_HOURS,
+    HEALTHY_MIN_WIN_RATE,
+    LOOKBACK_HOURS,
+    MIN_SAMPLES,
+    WATCH_MIN_WIN_RATE,
+    ProfileHealthGuardConfig,
+    ProfileHealthGuardDecision,
+    evaluate_profile_health_guard,
+)
 from app.quality_score import attach_shadow_quality_score
 from app.result_sequence_guard import (
     ResultSequenceGuardConfig,
@@ -93,6 +103,7 @@ class MonitorState:
         now_ms=None,
         profile_degradation_guard_config: ProfileDegradationGuardConfig | None = None,
         time_period_guard_config: TimePeriodGuardConfig | None = None,
+        profile_health_guard_config: ProfileHealthGuardConfig | None = None,
     ):
         self.symbol = symbol.upper()
         self._symbol_generation = 0
@@ -114,6 +125,9 @@ class MonitorState:
             profile_degradation_guard_config or ProfileDegradationGuardConfig()
         ).normalized()
         self.time_period_guard_config = time_period_guard_config or TimePeriodGuardConfig()
+        self.profile_health_guard_config = (
+            profile_health_guard_config or ProfileHealthGuardConfig()
+        )
         self.stake = stake
         self.win_return = win_return
         self.enable_stake_progression = enable_stake_progression
@@ -195,6 +209,7 @@ class MonitorState:
         self.result_sequence_guard: dict = self._empty_result_sequence_guard()
         self.wave_batch_guard: dict = self._empty_wave_batch_guard()
         self.profile_degradation_guard: dict = self._empty_profile_degradation_guard()
+        self.profile_health_guard: dict = self._empty_profile_health_guard()
         self.time_period_guard: dict = evaluate_time_period_guard(
             self._now_ms(),
             self.time_period_guard_config,
@@ -519,6 +534,7 @@ class MonitorState:
             self.result_sequence_guard = self._empty_result_sequence_guard()
             self.wave_batch_guard = self._empty_wave_batch_guard()
             self.profile_degradation_guard = self._empty_profile_degradation_guard()
+            self.profile_health_guard = self._empty_profile_health_guard()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self.time_period_guard = evaluate_time_period_guard(
@@ -711,6 +727,28 @@ class MonitorState:
                 should_observe=should_observe,
             )
 
+        health_decision = self._refresh_profile_health_guard(
+            signal,
+            latest.close_time,
+        )
+        signal = replace(
+            signal,
+            profile_health_status=health_decision.status,
+            profile_health_sample_size=health_decision.sample_size,
+            profile_health_win_rate=health_decision.win_rate,
+            profile_health_ev=health_decision.ev,
+            profile_health_evaluated_at=health_decision.evaluated_at,
+        )
+        self.selected_signal = signal
+        if health_decision.blocked:
+            return self._block_order(
+                signal,
+                latest,
+                "PROFILE_HEALTH_BLOCKED",
+                health_decision.reason,
+                should_observe=should_observe,
+            )
+
         signal, gate = self._admit_order_candidate(signal, latest)
         if not gate.open_allowed:
             if should_observe:
@@ -821,6 +859,15 @@ class MonitorState:
                 should_observe=True,
             )
 
+        if signal.order_slot == "SECOND" and not health_decision.allow_second_order:
+            return self._block_order(
+                signal,
+                latest,
+                "PROFILE_HEALTH_SECOND_ORDER_BLOCKED",
+                health_decision.reason,
+                should_observe=should_observe,
+            )
+
         return self._execute_open_order(
             signal,
             latest,
@@ -829,6 +876,7 @@ class MonitorState:
             allow_progression=(
                 batch_decision.allow_progression
                 and profile_decision.allow_progression
+                and health_decision.allow_progression
             ),
         )
 
@@ -1351,6 +1399,11 @@ class MonitorState:
             quality_score_context=signal.quality_score_context,
             quality_score_components=dict(signal.quality_score_components),
             quality_score_inputs=dict(signal.quality_score_inputs),
+            profile_health_status=signal.profile_health_status,
+            profile_health_sample_size=signal.profile_health_sample_size,
+            profile_health_win_rate=signal.profile_health_win_rate,
+            profile_health_ev=signal.profile_health_ev,
+            profile_health_evaluated_at=signal.profile_health_evaluated_at,
         )
         self.observations.append(observation)
         if self.storage:
@@ -1634,6 +1687,7 @@ class MonitorState:
             "result_sequence_guard": dict(self.result_sequence_guard),
             "wave_batch_guard": dict(self.wave_batch_guard),
             "profile_degradation_guard": dict(self.profile_degradation_guard),
+            "profile_health_guard": dict(self.profile_health_guard),
             "profile_guard": self._profile_guard_config(),
         }
         self._submit_storage_write(
@@ -1898,6 +1952,68 @@ class MonitorState:
             "reason": "",
         }
 
+    def _empty_profile_health_guard(self) -> dict:
+        enabled = self.profile_health_guard_config.enabled
+        return {
+            "enabled": enabled,
+            "status": "NOT_APPLICABLE" if enabled else "DISABLED",
+            "direction": "",
+            "evaluated_at": 0,
+            "next_evaluation_at": 0,
+            "lookback_start": 0,
+            "lookback_end": 0,
+            "sample_size": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "pnl": 0.0,
+            "ev": 0.0,
+            "blocked": False,
+            "allow_second_order": True,
+            "allow_progression": True,
+            "lookback_hours": LOOKBACK_HOURS,
+            "evaluation_interval_hours": EVALUATION_INTERVAL_HOURS,
+            "min_samples": MIN_SAMPLES,
+            "watch_min_win_rate": WATCH_MIN_WIN_RATE,
+            "healthy_min_win_rate": HEALTHY_MIN_WIN_RATE,
+            "reason": (
+                "等待已启用每日画像候选"
+                if enabled
+                else "画像短窗健康守卫已关闭"
+            ),
+        }
+
+    def _profile_health_guard_to_dict(
+        self,
+        decision: ProfileHealthGuardDecision,
+    ) -> dict:
+        return {
+            **self._empty_profile_health_guard(),
+            **decision.to_dict(),
+        }
+
+    def _refresh_profile_health_guard(
+        self,
+        signal: Signal,
+        current_time: int,
+    ) -> ProfileHealthGuardDecision:
+        decision = evaluate_profile_health_guard(
+            self.observations,
+            current_time=current_time,
+            direction=self._signal_direction(signal),
+            selected_profiles=(
+                (self.active_daily_profile_selection or {}).get(
+                    "selected_profiles",
+                    [],
+                )
+                if signal.daily_profile_selected
+                else []
+            ),
+            config=self.profile_health_guard_config,
+        )
+        self.profile_health_guard = self._profile_health_guard_to_dict(decision)
+        return decision
+
     def _profile_degradation_guard_to_dict(
         self,
         decision: ProfileDegradationGuardDecision,
@@ -2040,6 +2156,7 @@ class MonitorState:
                 "result_sequence_guard": self.result_sequence_guard,
                 "wave_batch_guard": self.wave_batch_guard,
                 "profile_degradation_guard": self.profile_degradation_guard,
+                "profile_health_guard": self.profile_health_guard,
                 "time_period_guard": self.time_period_guard,
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
