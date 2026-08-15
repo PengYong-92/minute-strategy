@@ -220,6 +220,39 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored_observation.quality_score_context, "SHORT_SECOND")
         self.assertEqual(restored_observation.quality_score_inputs["slot"], "SECOND")
 
+    def test_persists_and_restores_profile_health_audit_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            audited_signal = replace(
+                signal(),
+                profile_health_status="WATCH",
+                profile_health_sample_size=12,
+                profile_health_win_rate=0.5,
+                profile_health_ev=-1.0,
+                profile_health_evaluated_at=1_723_689_600_000,
+            )
+            order = AccountSimulator().open_order(audited_signal, 100.0, 1_000)
+            audited_observation = replace(
+                observation("profile-health"),
+                profile_health_status="DEGRADED",
+                profile_health_sample_size=15,
+                profile_health_win_rate=0.466667,
+                profile_health_ev=-1.6,
+                profile_health_evaluated_at=1_723_689_600_000,
+            )
+
+            store.save_order(order, "BTCUSDT")
+            store.save_observation(audited_observation, "BTCUSDT")
+            restored_order = store.load_orders("BTCUSDT")[0]
+            restored_observation = store.load_observations("BTCUSDT")[0]
+
+        self.assertEqual(restored_order.profile_health_status, "WATCH")
+        self.assertEqual(restored_order.profile_health_sample_size, 12)
+        self.assertEqual(restored_order.profile_health_ev, -1.0)
+        self.assertEqual(restored_observation.profile_health_status, "DEGRADED")
+        self.assertEqual(restored_observation.profile_health_sample_size, 15)
+        self.assertEqual(restored_observation.profile_health_win_rate, 0.466667)
+
     def test_cancels_multiple_pending_credits_atomically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")

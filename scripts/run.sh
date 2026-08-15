@@ -27,7 +27,8 @@ MIN_ORDER_GAP_MINUTES="${MIN_ORDER_GAP_MINUTES:-2}"
 STAKE_PROGRESSION="${STAKE_PROGRESSION:-1}"
 ROLLING_EDGE_GUARD="${ROLLING_EDGE_GUARD:-1}"
 RESULT_SEQUENCE_GUARD="${RESULT_SEQUENCE_GUARD:-1}"
-TIME_PERIOD_GUARD="${TIME_PERIOD_GUARD:-1}"
+TIME_PERIOD_GUARD="${TIME_PERIOD_GUARD:-0}"
+PROFILE_HEALTH_GUARD="${PROFILE_HEALTH_GUARD:-1}"
 RESULT_SEQUENCE_LOSS_STREAK="${RESULT_SEQUENCE_LOSS_STREAK:-3}"
 RESULT_SEQUENCE_COOLDOWN_MINUTES="${RESULT_SEQUENCE_COOLDOWN_MINUTES:-20}"
 RESULT_SEQUENCE_SCOPE="${RESULT_SEQUENCE_SCOPE:-DIRECTION}"
@@ -99,7 +100,9 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
                          关闭滚动优势守卫，仅保留状态观察
   --no-result-sequence-guard
                          关闭同方向连续亏损冷却守卫，默认启用
-  --no-time-period-guard 关闭北京时间12:00-18:00真实开单暂停，默认启用影子观察
+  --no-time-period-guard 关闭北京时间12:00-18:00真实开单暂停，默认已关闭
+  --no-profile-health-guard
+                         关闭24小时画像健康守卫，默认每4小时按方向评估一次
   --result-sequence-loss-streak N
                          同方向连续已结算亏损触发笔数，默认: 3
   --result-sequence-cooldown-minutes N
@@ -176,7 +179,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   STAKE_PROGRESSION, ROLLING_EDGE_GUARD, STAKE_PROGRESSION_MAX_ORDERS,
   RESULT_SEQUENCE_GUARD, RESULT_SEQUENCE_LOSS_STREAK,
   RESULT_SEQUENCE_COOLDOWN_MINUTES, RESULT_SEQUENCE_SCOPE,
-  TIME_PERIOD_GUARD,
+  TIME_PERIOD_GUARD, PROFILE_HEALTH_GUARD,
   STAKE_PROGRESSION_MAX_ACTIVE, STAKE_PROGRESSION_BASE_ONLY_SEGMENTS,
   PROFILE_GUARD, PROFILE_GUARD_MIN_HISTORY, PROFILE_GUARD_MIN_GROUP_SIZE,
   PROFILE_DEGRADATION_COOLDOWN_MINUTES,
@@ -425,6 +428,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-time-period-guard)
       TIME_PERIOD_GUARD="0"
+      shift
+      ;;
+    --no-profile-health-guard)
+      PROFILE_HEALTH_GUARD="0"
       shift
       ;;
     --result-sequence-loss-streak)
@@ -743,6 +750,11 @@ esac
 case "$TIME_PERIOD_GUARD" in
   0|false|FALSE|no|NO|n|N|off|OFF)
     EXTRA_ARGS+=(--no-time-period-guard)
+    ;;
+esac
+case "$PROFILE_HEALTH_GUARD" in
+  0|false|FALSE|no|NO|n|N|off|OFF)
+    EXTRA_ARGS+=(--no-profile-health-guard)
     ;;
 esac
 case "$PROFILE_GUARD" in

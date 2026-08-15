@@ -103,6 +103,11 @@ class Signal:
     quality_score_context: str = ""
     quality_score_components: dict[str, float] = field(default_factory=dict)
     quality_score_inputs: dict[str, object] = field(default_factory=dict)
+    profile_health_status: str = ""
+    profile_health_sample_size: int = 0
+    profile_health_win_rate: float = 0.0
+    profile_health_ev: float = 0.0
+    profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
 
@@ -171,6 +176,11 @@ class SimulatedOrder:
     quality_score_context: str = ""
     quality_score_components: dict[str, float] = field(default_factory=dict)
     quality_score_inputs: dict[str, object] = field(default_factory=dict)
+    profile_health_status: str = ""
+    profile_health_sample_size: int = 0
+    profile_health_win_rate: float = 0.0
+    profile_health_ev: float = 0.0
+    profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
 
@@ -224,6 +234,11 @@ class ObservationSignal:
     quality_score_context: str = ""
     quality_score_components: dict[str, float] = field(default_factory=dict)
     quality_score_inputs: dict[str, object] = field(default_factory=dict)
+    profile_health_status: str = ""
+    profile_health_sample_size: int = 0
+    profile_health_win_rate: float = 0.0
+    profile_health_ev: float = 0.0
+    profile_health_evaluated_at: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
