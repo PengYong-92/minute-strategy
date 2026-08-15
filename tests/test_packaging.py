@@ -306,6 +306,8 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--no-result-sequence-guard", result.stdout)
         self.assertIn("--no-time-period-guard", result.stdout)
         self.assertIn("12:00-18:00", result.stdout)
+        self.assertIn("--no-profile-health-guard", result.stdout)
+        self.assertIn("24小时画像健康守卫", result.stdout)
         self.assertIn("--result-sequence-loss-streak", result.stdout)
         self.assertIn("--result-sequence-cooldown-minutes", result.stdout)
         self.assertIn("--result-sequence-scope", result.stdout)
@@ -392,6 +394,8 @@ process.stdout.write(JSON.stringify({
                     "RESULT_SEQUENCE_LOSS_STREAK": "4",
                     "RESULT_SEQUENCE_COOLDOWN_MINUTES": "30",
                     "RESULT_SEQUENCE_SCOPE": "GLOBAL",
+                    "TIME_PERIOD_GUARD": "0",
+                    "PROFILE_HEALTH_GUARD": "0",
                     "STAKE_PROGRESSION_MAX_ORDERS": "5",
                     "STAKE_PROGRESSION_MAX_ACTIVE": "3",
                     "STAKE_PROGRESSION_BASE_ONLY_SEGMENTS": "WD-08,WD-12",
@@ -450,6 +454,8 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--no-stake-progression", args)
         self.assertIn("--no-rolling-edge-guard", args)
         self.assertIn("--no-result-sequence-guard", args)
+        self.assertIn("--no-time-period-guard", args)
+        self.assertIn("--no-profile-health-guard", args)
         self.assertEqual(args[args.index("--result-sequence-loss-streak") + 1], "4")
         self.assertEqual(args[args.index("--result-sequence-cooldown-minutes") + 1], "30")
         self.assertEqual(args[args.index("--result-sequence-scope") + 1], "GLOBAL")
@@ -576,6 +582,8 @@ process.stdout.write(JSON.stringify({
                 "STAKE_PROGRESSION_MAX_ORDERS",
                 "STAKE_PROGRESSION_MAX_ACTIVE",
                 "STAKE_PROGRESSION_BASE_ONLY_SEGMENTS",
+                "TIME_PERIOD_GUARD",
+                "PROFILE_HEALTH_GUARD",
             ):
                 env.pop(name, None)
             env.update(
@@ -619,6 +627,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
         self.assertNotIn("--no-stake-progression", default_args)
         self.assertNotIn("--no-result-sequence-guard", default_args)
+        self.assertIn("--no-time-period-guard", default_args)
+        self.assertNotIn("--no-profile-health-guard", default_args)
         self.assertEqual(default_args[default_args.index("--max-open-orders") + 1], "2")
         self.assertEqual(default_args[default_args.index("--max-open-long-orders") + 1], "1")
         self.assertEqual(default_args[default_args.index("--max-open-short-orders") + 1], "2")

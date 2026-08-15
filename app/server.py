@@ -13,6 +13,7 @@ from app.fear_greed import FearGreedProvider
 from app.history import WarmupConfig, WarmupReport, warmup_history
 from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
+from app.profile_health_guard import ProfileHealthGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import MonitorState
 from app.time_period_guard import TimePeriodGuardConfig
@@ -396,8 +397,14 @@ def main() -> None:
     parser.add_argument(
         "--no-time-period-guard",
         action="store_true",
-        default=not _env_bool("TIME_PERIOD_GUARD", True),
-        help="关闭北京时间12:00-18:00真实开单暂停；默认启用并保留影子观察",
+        default=not _env_bool("TIME_PERIOD_GUARD", False),
+        help="关闭北京时间12:00-18:00真实开单暂停；默认关闭，可用环境变量显式启用",
+    )
+    parser.add_argument(
+        "--no-profile-health-guard",
+        action="store_true",
+        default=not _env_bool("PROFILE_HEALTH_GUARD", True),
+        help="关闭24小时画像健康守卫；默认每4小时按方向评估一次",
     )
     parser.add_argument(
         "--result-sequence-loss-streak",
@@ -587,6 +594,9 @@ def main() -> None:
         ),
         time_period_guard_config=TimePeriodGuardConfig(
             enabled=not args.no_time_period_guard,
+        ),
+        profile_health_guard_config=ProfileHealthGuardConfig(
+            enabled=not args.no_profile_health_guard,
         ),
         enable_stake_progression=not args.no_stake_progression,
         stake_progression_max_orders=args.stake_progression_max_orders,

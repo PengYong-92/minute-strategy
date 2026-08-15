@@ -13,6 +13,15 @@ def timestamp_ms(text: str) -> int:
 
 
 class TimePeriodGuardTests(unittest.TestCase):
+    def test_guard_config_defaults_to_disabled(self):
+        decision = evaluate_time_period_guard(
+            timestamp_ms("2026-08-14 15:00:00"),
+            TimePeriodGuardConfig(),
+        )
+
+        self.assertFalse(decision.enabled)
+        self.assertFalse(decision.blocked)
+
     def test_blocks_from_noon_until_six_pm_in_shanghai(self):
         config = TimePeriodGuardConfig(enabled=True)
 
