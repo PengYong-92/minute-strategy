@@ -129,6 +129,25 @@ class DirectionPulseShadowTests(unittest.TestCase):
         self.assertEqual(second["windows"]["12"]["status"], "WATCH")
         self.assertEqual(second["order_slot"], "SECOND")
 
+    def test_malformed_historical_rows_are_ignored(self):
+        malformed = {
+            "observation_key": "malformed",
+            "status": "SETTLED",
+            "result": "WIN",
+            "direction": "SHORT",
+            "opened_at": "not-a-timestamp",
+            "expires_at": None,
+            "settled_at": "invalid",
+            "pnl": "invalid",
+        }
+
+        snapshot = evaluate_direction_pulse_shadow(
+            [*rows("WWWWWWLLLLLL"), malformed],
+            current_time=10**12,
+        )
+
+        self.assertEqual(snapshot["directions"]["SHORT"]["12"]["sample_size"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

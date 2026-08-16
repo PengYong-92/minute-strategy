@@ -824,46 +824,58 @@ class SQLiteMonitorStore:
         return orders
 
     def save_observation(self, observation: ObservationSignal, symbol: str) -> None:
-        payload = observation.to_dict()
+        self.save_observations((observation,), symbol)
+
+    def save_observations(
+        self,
+        observations: Sequence[ObservationSignal],
+        symbol: str,
+    ) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                insert into observation_signals(
-                    symbol, observation_key, status, result, direction,
-                    strategy_family, strategy_tag, timeframe_minutes,
-                    threshold_segment, opened_at, expires_at, settled_at, payload
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(symbol, observation_key) do update set
-                    status=excluded.status,
-                    result=excluded.result,
-                    direction=excluded.direction,
-                    strategy_family=excluded.strategy_family,
-                    strategy_tag=excluded.strategy_tag,
-                    timeframe_minutes=excluded.timeframe_minutes,
-                    threshold_segment=excluded.threshold_segment,
-                    opened_at=excluded.opened_at,
-                    expires_at=excluded.expires_at,
-                    settled_at=excluded.settled_at,
-                    payload=excluded.payload,
-                    updated_at_ms=strftime('%s','now') * 1000
-                """,
-                (
-                    symbol.upper(),
-                    observation.observation_key,
-                    observation.status,
-                    observation.result,
-                    observation.direction,
-                    observation.strategy_family,
-                    observation.strategy_tag,
-                    observation.timeframe_minutes,
-                    observation.threshold_segment,
-                    observation.opened_at,
-                    observation.expires_at,
-                    observation.settled_at,
-                    json.dumps(payload, ensure_ascii=False),
-                ),
+            for observation in observations:
+                self._upsert_observation(connection, observation, symbol)
+
+    @staticmethod
+    def _upsert_observation(connection, observation: ObservationSignal, symbol: str) -> None:
+        payload = observation.to_dict()
+        connection.execute(
+            """
+            insert into observation_signals(
+                symbol, observation_key, status, result, direction,
+                strategy_family, strategy_tag, timeframe_minutes,
+                threshold_segment, opened_at, expires_at, settled_at, payload
             )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(symbol, observation_key) do update set
+                status=excluded.status,
+                result=excluded.result,
+                direction=excluded.direction,
+                strategy_family=excluded.strategy_family,
+                strategy_tag=excluded.strategy_tag,
+                timeframe_minutes=excluded.timeframe_minutes,
+                threshold_segment=excluded.threshold_segment,
+                opened_at=excluded.opened_at,
+                expires_at=excluded.expires_at,
+                settled_at=excluded.settled_at,
+                payload=excluded.payload,
+                updated_at_ms=strftime('%s','now') * 1000
+            """,
+            (
+                symbol.upper(),
+                observation.observation_key,
+                observation.status,
+                observation.result,
+                observation.direction,
+                observation.strategy_family,
+                observation.strategy_tag,
+                observation.timeframe_minutes,
+                observation.threshold_segment,
+                observation.opened_at,
+                observation.expires_at,
+                observation.settled_at,
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
 
     def load_observations(self, symbol: str, limit: int = 500) -> list[ObservationSignal]:
         accepted = {field.name for field in fields(ObservationSignal)}

@@ -14,6 +14,7 @@ from app.daily_profile_selector import (
 )
 from app.direction_pulse_shadow import (
     attach_candidate_shadow,
+    empty_direction_pulse_shadow,
     evaluate_direction_pulse_shadow,
 )
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal
@@ -205,10 +206,9 @@ class MonitorState:
         )
         self.signals: list[Signal] = []
         self.observations: list[ObservationSignal] = list(reversed(restored_observations))
-        self.direction_pulse_shadow = evaluate_direction_pulse_shadow(
-            self.observations,
-            current_time=self._now_ms(),
-        )
+        self._direction_pulse_history = self._load_direction_pulse_history(restored_observations)
+        self.direction_pulse_shadow = empty_direction_pulse_shadow(current_time=self._now_ms())
+        self._refresh_direction_pulse_shadow(self._now_ms(), report_error=False)
         self.daily_profile_selection = self._load_latest_daily_profile_selection()
         self.active_daily_profile_selection: dict | None = None
         self.selected_signal: Signal | None = None
@@ -389,10 +389,7 @@ class MonitorState:
                 )
                 if not self._flush_pending_settlement_events():
                     return False
-            settled_observations = self._settle_observations(latest.close_time, latest.close, merged_klines)
-            if self.storage:
-                for observation in settled_observations:
-                    self._save_observation(observation)
+            self._settle_observations(latest.close_time, latest.close, merged_klines)
 
             self._refresh_daily_profile_selection(latest.close_time)
             new_signals = [
@@ -402,9 +399,13 @@ class MonitorState:
                 self._attach_wave_metadata(signal, wave_state)
                 for signal in observation_signals
             ]
-            new_signals = [self._attach_quality_score(signal) for signal in new_signals]
+            new_signals = [
+                self._attach_quality_score(signal, current_time=latest.close_time)
+                for signal in new_signals
+            ]
             observation_signals = [
-                self._attach_quality_score(signal) for signal in observation_signals
+                self._attach_quality_score(signal, current_time=latest.close_time)
+                for signal in observation_signals
             ]
             self.signals = new_signals
             selected_signal, daily_profile_required = self._select_daily_profile_signal(
@@ -413,7 +414,10 @@ class MonitorState:
                 latest.close_time,
             )
             selected_signal = self._apply_wave_guard(selected_signal, wave_state)
-            selected_signal = self._attach_quality_score(selected_signal)
+            selected_signal = self._attach_quality_score(
+                selected_signal,
+                current_time=latest.close_time,
+            )
             self.selected_signal = selected_signal
             self.order_decision = self._maybe_open_order(
                 selected_signal,
@@ -534,10 +538,9 @@ class MonitorState:
             )
             self.signals = []
             self.observations = list(reversed(restored_observations))
-            self.direction_pulse_shadow = evaluate_direction_pulse_shadow(
-                self.observations,
-                current_time=self._now_ms(),
-            )
+            self._direction_pulse_history = self._load_direction_pulse_history(restored_observations)
+            self.direction_pulse_shadow = empty_direction_pulse_shadow(current_time=self._now_ms())
+            self._refresh_direction_pulse_shadow(self._now_ms(), report_error=False)
             self.daily_profile_selection = self._load_latest_daily_profile_selection()
             self.active_daily_profile_selection = None
             self.selected_signal = None
@@ -681,7 +684,7 @@ class MonitorState:
         daily_profile_required: bool = False,
     ) -> str:
         self.risk_pause = ""
-        signal = self._attach_direction_pulse_shadow(signal)
+        signal = self._attach_direction_pulse_shadow(signal, current_time=latest.close_time)
         self.selected_signal = signal
         time_period_decision = evaluate_time_period_guard(
             latest.close_time,
@@ -930,7 +933,7 @@ class MonitorState:
                 self._last_order_opened_at,
                 self._opened_signal_keys,
             )
-        signal = self._attach_quality_score(signal)
+        signal = self._attach_quality_score(signal, current_time=latest.close_time)
         if promoted_signal is not None:
             self.selected_signal = signal
         return signal, gate
@@ -1036,7 +1039,12 @@ class MonitorState:
             wave_guard_reason="等待波段方向与批次守卫判断",
         )
 
-    def _attach_quality_score(self, signal: Signal) -> Signal:
+    def _attach_quality_score(
+        self,
+        signal: Signal,
+        *,
+        current_time: int | None = None,
+    ) -> Signal:
         direction = self._signal_direction(signal)
         open_order_count = sum(
             1
@@ -1056,9 +1064,17 @@ class MonitorState:
         except Exception as exc:  # noqa: BLE001 - 影子记录故障不得影响开单主流程。
             self.record_error(f"影子质量评分失败: {exc}")
             scored_signal = slotted_signal
-        return self._attach_direction_pulse_shadow(scored_signal)
+        return self._attach_direction_pulse_shadow(
+            scored_signal,
+            current_time=current_time,
+        )
 
-    def _attach_direction_pulse_shadow(self, signal: Signal) -> Signal:
+    def _attach_direction_pulse_shadow(
+        self,
+        signal: Signal,
+        *,
+        current_time: int | None = None,
+    ) -> Signal:
         direction = self._signal_direction(signal)
         open_order_count = sum(
             1
@@ -1066,22 +1082,50 @@ class MonitorState:
             if order.status == "OPEN" and order.direction == direction
         )
         order_slot = "SECOND" if open_order_count > 0 else "FIRST"
+        try:
+            snapshot = self.direction_pulse_shadow
+            evaluated_at = int(snapshot.get("evaluated_at", 0) or 0)
+            if current_time is not None and evaluated_at > int(current_time):
+                snapshot = evaluate_direction_pulse_shadow(
+                    self._direction_pulse_source_observations(),
+                    current_time=int(current_time),
+                )
+            candidate_shadow = attach_candidate_shadow(
+                snapshot,
+                direction=direction,
+                order_slot=order_slot,
+            )
+        except Exception as exc:  # noqa: BLE001 - 影子故障不得中断真实开单。
+            self.record_error(f"方向脉冲影子附加失败: {exc}")
+            candidate_shadow = (
+                dict(signal.direction_pulse_shadow)
+                if isinstance(signal.direction_pulse_shadow, dict)
+                else {}
+            )
         return replace(
             signal,
             order_slot=order_slot,
             order_slot_scope="DIRECTION_V2",
-            direction_pulse_shadow=attach_candidate_shadow(
-                self.direction_pulse_shadow,
-                direction=direction,
-                order_slot=order_slot,
-            ),
+            direction_pulse_shadow=candidate_shadow,
         )
 
-    def _refresh_direction_pulse_shadow(self, current_time: int) -> None:
-        self.direction_pulse_shadow = evaluate_direction_pulse_shadow(
-            self.observations,
-            current_time=current_time,
-        )
+    def _refresh_direction_pulse_shadow(
+        self,
+        current_time: int,
+        *,
+        report_error: bool = True,
+    ) -> bool:
+        try:
+            snapshot = evaluate_direction_pulse_shadow(
+                self._direction_pulse_source_observations(),
+                current_time=current_time,
+            )
+        except Exception as exc:  # noqa: BLE001 - 影子故障不得中断真实行情处理。
+            if report_error:
+                self.record_error(f"方向脉冲影子刷新失败: {exc}")
+            return False
+        self.direction_pulse_shadow = snapshot
+        return True
 
     def _flush_pending_settlement_events(self) -> bool:
         while self._pending_settlement_events:
@@ -1372,7 +1416,7 @@ class MonitorState:
 
     def _record_observation(self, signal: Signal, latest: Kline, decision: str) -> None:
         if not signal.quality_score_version:
-            signal = self._attach_quality_score(signal)
+            signal = self._attach_quality_score(signal, current_time=latest.close_time)
         direction = signal.observe_direction or signal.direction
         if direction not in {"LONG", "SHORT"}:
             return
@@ -1502,7 +1546,20 @@ class MonitorState:
             observation.pnl = 8.0 if won else -10.0
             settled.append(observation)
         if settled:
-            self._refresh_direction_pulse_shadow(current_time)
+            persisted = True
+            if self.storage:
+                try:
+                    save_many = getattr(self.storage, "save_observations", None)
+                    if save_many is not None:
+                        save_many([replace(item) for item in settled], self.symbol)
+                    else:
+                        for item in settled:
+                            self.storage.save_observation(replace(item), self.symbol)
+                except Exception as exc:  # noqa: BLE001 - 影子持久化失败不阻断开单。
+                    self.record_error(f"方向脉冲观察结算持久化失败: {exc}")
+                    persisted = False
+            if persisted:
+                self._refresh_direction_pulse_shadow(current_time)
         return settled
 
     def _load_restored_observations(self) -> list[ObservationSignal]:
@@ -1518,6 +1575,32 @@ class MonitorState:
                 ),
             )
         return self.storage.load_observations(self.symbol)
+
+    def _load_direction_pulse_history(
+        self,
+        fallback: Sequence[ObservationSignal],
+    ) -> list[ObservationSignal]:
+        if not self.storage:
+            return list(fallback)
+        loader = getattr(self.storage, "load_observations", None)
+        if loader is None:
+            return list(fallback)
+        try:
+            try:
+                return loader(self.symbol, limit=5000)
+            except TypeError:
+                return loader(self.symbol)
+        except Exception:  # noqa: BLE001 - 失败时退回正式画像已经加载的观察历史。
+            return list(fallback)
+
+    def _direction_pulse_source_observations(self) -> list[ObservationSignal]:
+        merged: dict[str, ObservationSignal] = {}
+        for index, observation in enumerate(
+            [*self._direction_pulse_history, *self.observations]
+        ):
+            key = str(getattr(observation, "observation_key", "") or f"row-{index}")
+            merged[key] = observation
+        return list(merged.values())
 
     def _load_wave_runtime(self) -> dict | None:
         loader = getattr(self.storage, "load_wave_runtime", None) if self.storage else None

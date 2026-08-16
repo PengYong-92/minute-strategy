@@ -2035,7 +2035,7 @@ python3 -m pip install -r requirements.txt
 
 ### 41.1 发布目标
 
-现有每日画像和24小时画像健康守卫对短时方向切换的反应粒度不同。新增 `DIRECTION_PULSE_V1_SHADOW`，分别计算LONG/SHORT最近12和16个方向级独立观察结果。N12/N16少样本为`WARMUP`，胜率不低于50%为`NORMAL`，40%-50%为`WATCH`，低于40%为`DEGRADED`。
+现有每日画像和24小时画像健康守卫对短时方向切换的反应粒度不同。新增 `DIRECTION_PULSE_V1_SHADOW`，分别计算LONG/SHORT最近12和16个方向级独立观察结果。N12/N16少样本为`WARMUP`，胜率不低于50%为`NORMAL`，胜率不低于40%且低于50%为`WATCH`，低于40%为`DEGRADED`。
 
 该功能只做前向观测：`WATCH`推演关闭同方向第二席位，`DEGRADED`推演暂停该方向，但两者均不进入真实开单门禁。现有每日画像60%门槛、LONG并发1、SHORT并发2、总并发2、2分钟同方向间隔、10U/18U金额、所有既有守卫及Webhook状态均保持不变。
 

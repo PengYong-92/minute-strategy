@@ -167,6 +167,20 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored_order.direction_pulse_shadow, shadow)
         self.assertEqual(restored_observation.direction_pulse_shadow, shadow)
 
+    def test_saves_observation_settlements_in_one_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            observations = [observation(f"batch-{index}") for index in range(3)]
+
+            store.save_observations(observations, "BTCUSDT")
+            restored = store.load_observations("BTCUSDT")
+
+        self.assertEqual({item.observation_key for item in restored}, {
+            "batch-0",
+            "batch-1",
+            "batch-2",
+        })
+
     def test_persists_and_restores_wave_batch_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
