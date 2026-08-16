@@ -2049,6 +2049,15 @@ python3 -m pip install -r requirements.txt
 
 代码中没有任何订单门禁读取`direction_pulse_shadow`或`would_block`。专项测试覆盖`DEGRADED + would_block=true`仍按原路径成功开单，证明该字段只沿信号审计、订单和观察持久化链传播。24小时`ProfileHealthGuard`继续保持原4小时正式评估边界，本次没有暗改其参数或行为。
 
+发布前代码审查额外修复四个隔离边界：影子计算异常全部在影子层捕获，不能终止行情更新或真实开单；重启单独恢复最近5000条观察供N16去重，避免稀疏方向退回`WARMUP`；延迟或回放候选按自身K线时点剔除未来结算；同批结算观察先用一个SQLite事务持久化，再发布新脉冲快照。上述改动只增强影子审计一致性，不把影子状态接入真实开单判断。
+
 ### 41.4 发布记录
 
-生产发布完成后在本节补充提交、标签、发布目录、重启边界和线上验收结果，不创建新的交接文档。
+1. 功能提交为`2664412`，安全隔离修复为`0973c0c`，`main`非快进发布提交为`6474dd8`；GitHub `main`已经推送。
+2. 发布标签为`v2026.08.16-direction-pulse-shadow`，标签解引用后严格指向`6474dd81b005ca8c1d011a739bca71335f26b1e6`。
+3. 精简发布包只包含`.gitignore`、`README.md`、`requirements.txt`、`app/`和`scripts/`，大小180805字节，SHA-256为`b0a1511203d5b402258d730ef5453935c80843527a291f68a4f01cc426f5a670`。
+4. 生产目录为`/opt/victory-event-monitor/releases/event-contract-monitor-6474dd8-20260816-143053`，`current`已原子切换；服务于2026-08-16 14:32:53 CST重启，`active`、`NRestarts=0`，启动参数未变化。
+5. 发布未清空或迁移SQLite。发布前后均为529笔订单、最新ID 529、0笔在途订单、总PnL `-22.4U`、胜率55.39%；并发仍为总2、LONG 1、SHORT 2，同方向间隔仍为120000毫秒。
+6. 预热为`READY`、154080根，`last_error=null`。页面和`/api/state.direction_pulse_shadow`均已上线；恢复结果为LONG N12/N16均50.00%，SHORT N12 58.33%，SHORT N16 43.75%/`WATCH`，但真实订单口径未被收紧。
+7. 合并后的完整测试为523项通过；Python编译、`node --check app/static/app.js`、`bash -n scripts/run.sh`及`git diff --check`通过。生产发布目录也通过Python编译和模块导入检查。
+8. 生产事件证据已确认结算即更新：服务启动快照`evaluated_at=1786861974285`；下一笔LONG独立观察于2026-08-16 14:34:59 CST结算后，`evaluated_at`和LONG `last_settled_at`均立即推进到`1786862099999`，未等待下一4小时边界，`last_error`仍为空。该证据作为标签后的文档提交，不移动发布标签。
