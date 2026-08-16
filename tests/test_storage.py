@@ -144,6 +144,29 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored[0].pnl, 8.0)
         self.assertEqual(restored[0].calculated_threshold, 81.5)
 
+    def test_persists_direction_pulse_shadow_on_orders_and_observations(self):
+        shadow = {
+            "version": "DIRECTION_PULSE_V1_SHADOW",
+            "mode": "SHADOW_ONLY",
+            "direction": "SHORT",
+            "order_slot": "SECOND",
+            "windows": {"12": {"status": "WATCH", "would_block": True}},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            saved_order = progression_order(1)
+            saved_order.direction_pulse_shadow = shadow
+            saved_observation = observation("pulse-shadow")
+            saved_observation.direction_pulse_shadow = shadow
+
+            store.save_order(saved_order, "BTCUSDT")
+            store.save_observation(saved_observation, "BTCUSDT")
+            restored_order = store.load_orders("BTCUSDT")[0]
+            restored_observation = store.load_observations("BTCUSDT")[0]
+
+        self.assertEqual(restored_order.direction_pulse_shadow, shadow)
+        self.assertEqual(restored_observation.direction_pulse_shadow, shadow)
+
     def test_persists_and_restores_wave_batch_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")

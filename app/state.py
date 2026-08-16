@@ -12,6 +12,10 @@ from app.daily_profile_selector import (
     profile_key as daily_profile_key,
     selection_window,
 )
+from app.direction_pulse_shadow import (
+    attach_candidate_shadow,
+    evaluate_direction_pulse_shadow,
+)
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal
 from app.order_policy import OrderGate, OrderPolicy
 from app.order_profile import profile_guard_shadow, summarize_order_samples_with_guard
@@ -201,6 +205,10 @@ class MonitorState:
         )
         self.signals: list[Signal] = []
         self.observations: list[ObservationSignal] = list(reversed(restored_observations))
+        self.direction_pulse_shadow = evaluate_direction_pulse_shadow(
+            self.observations,
+            current_time=self._now_ms(),
+        )
         self.daily_profile_selection = self._load_latest_daily_profile_selection()
         self.active_daily_profile_selection: dict | None = None
         self.selected_signal: Signal | None = None
@@ -526,6 +534,10 @@ class MonitorState:
             )
             self.signals = []
             self.observations = list(reversed(restored_observations))
+            self.direction_pulse_shadow = evaluate_direction_pulse_shadow(
+                self.observations,
+                current_time=self._now_ms(),
+            )
             self.daily_profile_selection = self._load_latest_daily_profile_selection()
             self.active_daily_profile_selection = None
             self.selected_signal = None
@@ -669,6 +681,8 @@ class MonitorState:
         daily_profile_required: bool = False,
     ) -> str:
         self.risk_pause = ""
+        signal = self._attach_direction_pulse_shadow(signal)
+        self.selected_signal = signal
         time_period_decision = evaluate_time_period_guard(
             latest.close_time,
             self.time_period_guard_config,
@@ -1035,13 +1049,39 @@ class MonitorState:
             order_slot_scope="DIRECTION_V2",
         )
         try:
-            return attach_shadow_quality_score(
+            scored_signal = attach_shadow_quality_score(
                 slotted_signal,
                 open_order_count=open_order_count,
             )
         except Exception as exc:  # noqa: BLE001 - 影子记录故障不得影响开单主流程。
             self.record_error(f"影子质量评分失败: {exc}")
-            return slotted_signal
+            scored_signal = slotted_signal
+        return self._attach_direction_pulse_shadow(scored_signal)
+
+    def _attach_direction_pulse_shadow(self, signal: Signal) -> Signal:
+        direction = self._signal_direction(signal)
+        open_order_count = sum(
+            1
+            for order in self.simulator.orders
+            if order.status == "OPEN" and order.direction == direction
+        )
+        order_slot = "SECOND" if open_order_count > 0 else "FIRST"
+        return replace(
+            signal,
+            order_slot=order_slot,
+            order_slot_scope="DIRECTION_V2",
+            direction_pulse_shadow=attach_candidate_shadow(
+                self.direction_pulse_shadow,
+                direction=direction,
+                order_slot=order_slot,
+            ),
+        )
+
+    def _refresh_direction_pulse_shadow(self, current_time: int) -> None:
+        self.direction_pulse_shadow = evaluate_direction_pulse_shadow(
+            self.observations,
+            current_time=current_time,
+        )
 
     def _flush_pending_settlement_events(self) -> bool:
         while self._pending_settlement_events:
@@ -1399,6 +1439,7 @@ class MonitorState:
             quality_score_context=signal.quality_score_context,
             quality_score_components=dict(signal.quality_score_components),
             quality_score_inputs=dict(signal.quality_score_inputs),
+            direction_pulse_shadow=dict(signal.direction_pulse_shadow),
             profile_health_status=signal.profile_health_status,
             profile_health_sample_size=signal.profile_health_sample_size,
             profile_health_win_rate=signal.profile_health_win_rate,
@@ -1460,6 +1501,8 @@ class MonitorState:
             observation.settled_at = settled_at
             observation.pnl = 8.0 if won else -10.0
             settled.append(observation)
+        if settled:
+            self._refresh_direction_pulse_shadow(current_time)
         return settled
 
     def _load_restored_observations(self) -> list[ObservationSignal]:
@@ -1688,6 +1731,7 @@ class MonitorState:
             "wave_batch_guard": dict(self.wave_batch_guard),
             "profile_degradation_guard": dict(self.profile_degradation_guard),
             "profile_health_guard": dict(self.profile_health_guard),
+            "direction_pulse_shadow": self.direction_pulse_shadow,
             "profile_guard": self._profile_guard_config(),
         }
         self._submit_storage_write(
@@ -2157,6 +2201,7 @@ class MonitorState:
                 "wave_batch_guard": self.wave_batch_guard,
                 "profile_degradation_guard": self.profile_degradation_guard,
                 "profile_health_guard": self.profile_health_guard,
+                "direction_pulse_shadow": self.direction_pulse_shadow,
                 "time_period_guard": self.time_period_guard,
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),

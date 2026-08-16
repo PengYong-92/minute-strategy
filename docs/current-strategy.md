@@ -2168,3 +2168,22 @@ calculated_threshold  原策略计算的动态阈值
 守卫不会启用未入选画像，也不会把LONG转换成SHORT。`/api/state.profile_health_guard` 返回配置、方向、评估边界、下次边界、样本、胜负、胜率、PnL、EV和放行状态。信号、订单与观察记录持久化 `profile_health_status`、`profile_health_sample_size`、`profile_health_win_rate`、`profile_health_ev`、`profile_health_evaluated_at`，旧SQLite记录缺失这些字段时使用默认值。
 
 唯一外部开关是 `PROFILE_HEALTH_GUARD=0` 或 `--no-profile-health-guard`。24小时、4小时、12样本、50%和55.56%均为固定代码常量，避免继续增加生产参数。本层只会维持或收紧现有7日画像，不扩大候选池。
+
+## 40. 方向脉冲影子观察
+
+`DirectionPulseShadow` 是独立于24小时画像健康守卫的纯观察层。它不按画像完整键分组，而是分别汇总 LONG 和 SHORT 最近的方向级独立观察结果，用于判断整个方向是否发生短时分布切换。
+
+独立样本只接受在当前候选产生前已经 `SETTLED` 且结果为 `WIN/LOSS` 的10分钟观察记录。同方向多个画像在同一10分钟结果区间内重叠时只保留一个，避免一次价格变化被重复计票；LONG和SHORT互不混用。系统同时维护最近12笔和16笔两个候选窗口：
+
+| 状态 | 条件 | 仅用于影子推演的动作 |
+|---|---|---|
+| `WARMUP` | 独立样本少于窗口长度 | `ALLOW` |
+| `NORMAL` | 胜率不低于50% | `ALLOW` |
+| `WATCH` | 胜率不低于40%但低于50% | `BLOCK_SECOND` |
+| `DEGRADED` | 胜率低于40% | `BLOCK_DIRECTION` |
+
+每次观察结算后立即重算两个方向的N12/N16窗口，不使用00/04/08/12/16/20点边界，也不等待4小时。重启或切换币种时从SQLite最近观察历史恢复当前快照。`/api/state.direction_pulse_shadow`和页面“方向脉冲影子”卡展示当前状态、样本、胜负、胜率、PnL、EV及最后结算时间。
+
+候选信号产生时会固化 `direction_pulse_shadow`：包括方向、FIRST/SECOND席位、两个窗口状态、假设动作和 `would_block`。该上下文随信号审计、模拟订单、观察记录和订单入口快照持久化；订单或观察结算后，其真实 `result/pnl` 可直接用于评估影子规则。
+
+本版本固定为 `DIRECTION_PULSE_V1_SHADOW / SHADOW_ONLY`。任何 `would_block=true` 都不会参与 `Signal.actionable`、订单容量、每日画像、24小时画像健康守卫、方向连亏、滚动优势、金额叠加或Webhook判断，也不会返回新的阻止决策码。N12/N16必须积累发布后的前向样本并单独验收，才能讨论启用SHORT第二席位降级。

@@ -2030,3 +2030,25 @@ python3 -m pip install -r requirements.txt
 6. 发布前完整测试为508项通过；Python编译、`bash -n scripts/run.sh`、`node --check app/static/app.js` 和 `git diff --check` 均通过。
 
 标签严格对应服务器运行代码。上述生产证据作为标签之后的文档提交继续写入 `main`，不移动或重建发布标签。
+
+## 41. 2026-08-16方向脉冲影子与结算即更新
+
+### 41.1 发布目标
+
+现有每日画像和24小时画像健康守卫对短时方向切换的反应粒度不同。新增 `DIRECTION_PULSE_V1_SHADOW`，分别计算LONG/SHORT最近12和16个方向级独立观察结果。N12/N16少样本为`WARMUP`，胜率不低于50%为`NORMAL`，40%-50%为`WATCH`，低于40%为`DEGRADED`。
+
+该功能只做前向观测：`WATCH`推演关闭同方向第二席位，`DEGRADED`推演暂停该方向，但两者均不进入真实开单门禁。现有每日画像60%门槛、LONG并发1、SHORT并发2、总并发2、2分钟同方向间隔、10U/18U金额、所有既有守卫及Webhook状态均保持不变。
+
+### 41.2 即时刷新与审计
+
+方向脉冲不使用4小时边界。每批闭合K线完成观察结算后，只要有新观察变为`SETTLED`，运行态立即按当前已经结算的方向级独立样本重算LONG/SHORT的N12/N16；同方向重叠的10分钟观察只计一次。重启和币种切换从SQLite观察历史恢复，不需要等待新4小时边界。
+
+`/api/state.direction_pulse_shadow`和页面状态卡展示两个方向的窗口状态。每个信号、模拟订单和观察记录固化开单前的窗口指标、FIRST/SECOND席位、假设动作与`would_block`，结算后可直接关联真实胜负。SQLite继续使用JSON载荷，不新增表、不迁移数据库、不清空订单。
+
+### 41.3 安全边界
+
+代码中没有任何订单门禁读取`direction_pulse_shadow`或`would_block`。专项测试覆盖`DEGRADED + would_block=true`仍按原路径成功开单，证明该字段只沿信号审计、订单和观察持久化链传播。24小时`ProfileHealthGuard`继续保持原4小时正式评估边界，本次没有暗改其参数或行为。
+
+### 41.4 发布记录
+
+生产发布完成后在本节补充提交、标签、发布目录、重启边界和线上验收结果，不创建新的交接文档。

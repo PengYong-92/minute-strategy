@@ -103,6 +103,7 @@ class Signal:
     quality_score_context: str = ""
     quality_score_components: dict[str, float] = field(default_factory=dict)
     quality_score_inputs: dict[str, object] = field(default_factory=dict)
+    direction_pulse_shadow: dict[str, object] = field(default_factory=dict)
     profile_health_status: str = ""
     profile_health_sample_size: int = 0
     profile_health_win_rate: float = 0.0
@@ -176,6 +177,7 @@ class SimulatedOrder:
     quality_score_context: str = ""
     quality_score_components: dict[str, float] = field(default_factory=dict)
     quality_score_inputs: dict[str, object] = field(default_factory=dict)
+    direction_pulse_shadow: dict[str, object] = field(default_factory=dict)
     profile_health_status: str = ""
     profile_health_sample_size: int = 0
     profile_health_win_rate: float = 0.0
@@ -234,6 +236,7 @@ class ObservationSignal:
     quality_score_context: str = ""
     quality_score_components: dict[str, float] = field(default_factory=dict)
     quality_score_inputs: dict[str, object] = field(default_factory=dict)
+    direction_pulse_shadow: dict[str, object] = field(default_factory=dict)
     profile_health_status: str = ""
     profile_health_sample_size: int = 0
     profile_health_win_rate: float = 0.0

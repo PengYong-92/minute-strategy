@@ -3402,6 +3402,84 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "OPENED")
         self.assertEqual(state.snapshot()["profile_health_guard"]["status"], "DISABLED")
 
+    def test_direction_pulse_shadow_refreshes_on_each_observation_settlement(self):
+        state = profile_guard_state(
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        settled = [
+            settled_observation(
+                index,
+                "WIN",
+                index * 11 * MINUTE_MS,
+                direction="SHORT",
+            )
+            for index in range(11)
+        ]
+        opened_at = 11 * 11 * MINUTE_MS
+        pending = ObservationSignal(
+            observation_key="direction-pulse-pending",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="B",
+            reason="pending pulse sample",
+            entry_price=100.0,
+            opened_at=opened_at,
+            expires_at=opened_at + 10 * MINUTE_MS,
+        )
+        state.observations = [*settled, pending]
+        state._refresh_direction_pulse_shadow(opened_at)
+        self.assertEqual(
+            state.snapshot()["direction_pulse_shadow"]["directions"]["SHORT"]["12"]["status"],
+            "WARMUP",
+        )
+
+        result = state._settle_observations(pending.expires_at, 99.0)
+        pulse = state.snapshot()["direction_pulse_shadow"]
+
+        self.assertEqual(result, [pending])
+        self.assertEqual(pulse["evaluated_at"], pending.expires_at)
+        self.assertEqual(pulse["directions"]["SHORT"]["12"]["sample_size"], 12)
+        self.assertEqual(pulse["directions"]["SHORT"]["12"]["status"], "NORMAL")
+
+    def test_direction_pulse_shadow_never_blocks_live_order_path(self):
+        current_time = 20 * 11 * MINUTE_MS
+        state = profile_guard_state(
+            max_open_short_orders=2,
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        state.observations = [
+            settled_observation(
+                index,
+                "WIN" if index < 4 else "LOSS",
+                index * 11 * MINUTE_MS,
+                family="short_observe",
+                tag="generic_short_observe",
+                direction="SHORT",
+                segment="WD-08",
+            )
+            for index in range(12)
+        ]
+        state._refresh_direction_pulse_shadow(current_time)
+        signal = replace(
+            selected_profile_signal(current_time),
+            direction="SHORT",
+            observe_direction="SHORT",
+            score=-90.0,
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            profile_key="10|short_observe|generic_short_observe|SHORT|WD-08",
+        )
+
+        decision = state._maybe_open_order(signal, latest_kline(current_time))
+        opened = state.simulator.orders[-1]
+
+        self.assertEqual(decision, "OPENED")
+        self.assertTrue(opened.direction_pulse_shadow["windows"]["12"]["would_block"])
+        self.assertEqual(opened.direction_pulse_shadow["mode"], "SHADOW_ONLY")
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+
     def test_slow_webhook_transport_does_not_block_market_update(self):
         transport_started = threading.Event()
         release_transport = threading.Event()
