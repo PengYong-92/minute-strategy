@@ -196,6 +196,7 @@ class AccountSimulator:
             "quality_score_context": signal.quality_score_context,
             "quality_score_components": dict(signal.quality_score_components),
             "quality_score_inputs": dict(signal.quality_score_inputs),
+            "direction_pulse_shadow": dict(signal.direction_pulse_shadow),
         }
         if allow_progression:
             terms, credit = self.stake_progression.assign(

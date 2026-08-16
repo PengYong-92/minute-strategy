@@ -3402,6 +3402,193 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(decision, "OPENED")
         self.assertEqual(state.snapshot()["profile_health_guard"]["status"], "DISABLED")
 
+    def test_direction_pulse_shadow_refreshes_on_each_observation_settlement(self):
+        state = profile_guard_state(
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        settled = [
+            settled_observation(
+                index,
+                "WIN",
+                index * 11 * MINUTE_MS,
+                direction="SHORT",
+            )
+            for index in range(11)
+        ]
+        opened_at = 11 * 11 * MINUTE_MS
+        pending = ObservationSignal(
+            observation_key="direction-pulse-pending",
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="B",
+            reason="pending pulse sample",
+            entry_price=100.0,
+            opened_at=opened_at,
+            expires_at=opened_at + 10 * MINUTE_MS,
+        )
+        state.observations = [*settled, pending]
+        state._refresh_direction_pulse_shadow(opened_at)
+        self.assertEqual(
+            state.snapshot()["direction_pulse_shadow"]["directions"]["SHORT"]["12"]["status"],
+            "WARMUP",
+        )
+
+        result = state._settle_observations(pending.expires_at, 99.0)
+        pulse = state.snapshot()["direction_pulse_shadow"]
+
+        self.assertEqual(result, [pending])
+        self.assertEqual(pulse["evaluated_at"], pending.expires_at)
+        self.assertEqual(pulse["directions"]["SHORT"]["12"]["sample_size"], 12)
+        self.assertEqual(pulse["directions"]["SHORT"]["12"]["status"], "NORMAL")
+
+    def test_direction_pulse_shadow_never_blocks_live_order_path(self):
+        current_time = 20 * 11 * MINUTE_MS
+        state = profile_guard_state(
+            max_open_short_orders=2,
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        state.observations = [
+            settled_observation(
+                index,
+                "WIN" if index < 4 else "LOSS",
+                index * 11 * MINUTE_MS,
+                family="short_observe",
+                tag="generic_short_observe",
+                direction="SHORT",
+                segment="WD-08",
+            )
+            for index in range(12)
+        ]
+        state._refresh_direction_pulse_shadow(current_time)
+        signal = replace(
+            selected_profile_signal(current_time),
+            direction="SHORT",
+            observe_direction="SHORT",
+            score=-90.0,
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            profile_key="10|short_observe|generic_short_observe|SHORT|WD-08",
+        )
+
+        decision = state._maybe_open_order(signal, latest_kline(current_time))
+        opened = state.simulator.orders[-1]
+
+        self.assertEqual(decision, "OPENED")
+        self.assertTrue(opened.direction_pulse_shadow["windows"]["12"]["would_block"])
+        self.assertEqual(opened.direction_pulse_shadow["mode"], "SHADOW_ONLY")
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+
+    def test_direction_pulse_shadow_failure_never_blocks_live_order_path(self):
+        current_time = 20 * 11 * MINUTE_MS
+        state = profile_guard_state(
+            max_open_short_orders=2,
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        signal = replace(
+            selected_profile_signal(current_time),
+            direction="SHORT",
+            observe_direction="SHORT",
+            score=-90.0,
+            strategy_family="short_observe",
+            strategy_tag="generic_short_observe",
+            profile_key="10|short_observe|generic_short_observe|SHORT|WD-08",
+        )
+
+        with patch("app.state.attach_candidate_shadow", side_effect=ValueError("bad shadow")):
+            decision = state._maybe_open_order(signal, latest_kline(current_time))
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(state.snapshot()["stats"]["total_orders"], 1)
+
+    def test_direction_pulse_candidate_excludes_future_settlements(self):
+        current_time = 20 * 11 * MINUTE_MS
+        state = profile_guard_state(
+            profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        )
+        samples = [
+            settled_observation(
+                index,
+                "LOSS",
+                index * 11 * MINUTE_MS,
+                family="short_observe",
+                tag="generic_short_observe",
+                direction="SHORT",
+                segment="WD-08",
+            )
+            for index in range(12)
+        ]
+        state.observations = samples
+        state._refresh_direction_pulse_shadow(current_time)
+        candidate_time = samples[-1].settled_at - 1
+
+        audited = state._attach_direction_pulse_shadow(
+            replace(
+                selected_profile_signal(candidate_time),
+                direction="SHORT",
+                observe_direction="SHORT",
+            ),
+            current_time=candidate_time,
+        )
+
+        self.assertEqual(audited.direction_pulse_shadow["evaluated_at"], candidate_time)
+        self.assertEqual(audited.direction_pulse_shadow["windows"]["12"]["sample_size"], 11)
+        self.assertEqual(audited.direction_pulse_shadow["windows"]["12"]["status"], "WARMUP")
+
+    def test_direction_pulse_restart_restores_n16_beyond_profile_lookback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            for index in range(16):
+                store.save_observation(
+                    settled_observation(
+                        index,
+                        "WIN",
+                        index * 24 * 60 * MINUTE_MS,
+                        family="short_observe",
+                        tag="generic_short_observe",
+                        direction="SHORT",
+                        segment="WD-08",
+                    ),
+                    "BTCUSDT",
+                )
+
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            pulse = state.snapshot()["direction_pulse_shadow"]["directions"]["SHORT"]["16"]
+
+        self.assertEqual(pulse["sample_size"], 16)
+        self.assertEqual(pulse["status"], "NORMAL")
+
+    def test_direction_pulse_settlement_is_persisted_before_snapshot_refresh(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            opened_at = 20 * 11 * MINUTE_MS
+            pending = ObservationSignal(
+                observation_key="persist-before-pulse",
+                strategy_family="short_observe",
+                strategy_tag="generic_short_observe",
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="B",
+                reason="pending pulse sample",
+                entry_price=100.0,
+                opened_at=opened_at,
+                expires_at=opened_at + 10 * MINUTE_MS,
+            )
+            state.observations = [pending]
+            store.save_observation(pending, "BTCUSDT")
+
+            state._settle_observations(pending.expires_at, 99.0)
+            restored = store.load_observations("BTCUSDT")[0]
+
+        self.assertEqual(restored.status, "SETTLED")
+        self.assertEqual(restored.result, "WIN")
+        self.assertEqual(
+            state.snapshot()["direction_pulse_shadow"]["evaluated_at"],
+            pending.expires_at,
+        )
+
     def test_slow_webhook_transport_does_not_block_market_update(self):
         transport_started = threading.Event()
         release_transport = threading.Event()

@@ -32,6 +32,21 @@ def signal(
 
 
 class SimulatorTest(unittest.TestCase):
+    def test_order_copies_direction_pulse_shadow_context(self):
+        context = {
+            "version": "DIRECTION_PULSE_V1_SHADOW",
+            "mode": "SHADOW_ONLY",
+            "direction": "LONG",
+            "order_slot": "FIRST",
+            "windows": {"12": {"status": "WATCH", "would_block": False}},
+        }
+        audited = replace(signal(), direction_pulse_shadow=context)
+
+        order = AccountSimulator().open_order(audited, 100.0, 1_000)
+
+        self.assertEqual(order.direction_pulse_shadow, context)
+        self.assertIsNot(order.direction_pulse_shadow, context)
+
     def test_order_copies_profile_health_audit_fields(self):
         audited = replace(
             signal(),

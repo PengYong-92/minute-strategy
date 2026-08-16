@@ -125,6 +125,31 @@ function fmtProfileDegradationGuard(guard) {
   return DASH;
 }
 
+function fmtDirectionPulseShadow(shadow) {
+  if (!shadow || shadow.mode !== "SHADOW_ONLY") return DASH;
+  const directions = shadow.directions || {};
+  const formatDirection = (direction, label) => {
+    const windows = directions[direction] || {};
+    const formatWindow = (size) => {
+      const item = windows[String(size)] || {};
+      return `N${size} ${item.status || "WARMUP"} ${fmtPct(item.win_rate)}`;
+    };
+    return `${label} ${formatWindow(12)} / ${formatWindow(16)}`;
+  };
+  return `${formatDirection("LONG", "L")} · ${formatDirection("SHORT", "S")} · 结算即更新`;
+}
+
+function directionPulseShadowClass(shadow) {
+  const directions = shadow && shadow.directions ? shadow.directions : {};
+  const statuses = ["LONG", "SHORT"].flatMap((direction) =>
+    ["12", "16"].map((window) => ((directions[direction] || {})[window] || {}).status),
+  );
+  if (statuses.includes("DEGRADED")) return "status-risk";
+  if (statuses.includes("WATCH")) return "status-warn";
+  if (statuses.some((status) => status === "NORMAL")) return "status-good";
+  return "status-muted";
+}
+
 function fmtStakeProgression(progression) {
   if (!progression) return "两单叠加 · 状态数据不完整";
   const secondStake = optionalNum(progression.second_stake);
@@ -528,6 +553,7 @@ const summaryFields = {
   "wave-state-status": (state) => fmtWaveState(state.wave_state),
   "wave-batch-guard-status": (state) => fmtWaveBatchGuard(state.wave_batch_guard),
   "profile-degradation-guard-status": (state) => fmtProfileDegradationGuard(state.profile_degradation_guard),
+  "direction-pulse-shadow-status": (state) => fmtDirectionPulseShadow(state.direction_pulse_shadow),
   "result-sequence-guard-status": (state) => fmtResultSequenceGuard(state.result_sequence_guard),
   "webhook-status": (state) => fmtWebhook(state.webhook),
   "order-decision": (state) => state.order_decision || DASH,
@@ -995,6 +1021,7 @@ async function loadState() {
     $("wave-state-status").className = waveStateClass(state.wave_state);
     $("wave-batch-guard-status").className = waveBatchGuardClass(state.wave_batch_guard);
     $("profile-degradation-guard-status").className = profileDegradationGuardClass(state.profile_degradation_guard);
+    $("direction-pulse-shadow-status").className = directionPulseShadowClass(state.direction_pulse_shadow);
     $("result-sequence-guard-status").className = resultSequenceGuardClass(state.result_sequence_guard);
     $("short-extension-status").className = shortExtensionClass(state);
     setText("stake-progression-badge", fmtStakeProgression(state.stake_progression));
