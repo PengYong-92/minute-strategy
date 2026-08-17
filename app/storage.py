@@ -16,6 +16,11 @@ from app.decision_context import (
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
+from app.storage_capacity import (
+    StorageCapacity,
+    capacity_from_connection,
+    configure_max_page_count,
+)
 from app.storage_schema import migrate
 from app.wave_state import WAVE_RUNTIME_VERSION, WaveSnapshot
 
@@ -637,6 +642,10 @@ class SQLiteMonitorStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+
+    def storage_capacity(self) -> StorageCapacity:
+        with self._connect() as connection:
+            return capacity_from_connection(connection)
 
     def save_runtime_config_snapshot(
         self,
@@ -1697,8 +1706,9 @@ class SQLiteMonitorStore:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
         try:
+            configure_max_page_count(connection)
+            connection.row_factory = sqlite3.Row
             yield connection
             connection.commit()
         except Exception:
