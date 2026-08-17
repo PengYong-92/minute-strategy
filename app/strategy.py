@@ -408,16 +408,16 @@ def analyze_volume_price(
         "indicators": {
             "macd_line": technical.macd_line,
             "macd_signal_line": technical.macd_signal_line,
-            "macd_histogram": round(technical.macd_histogram, 6),
-            "macd_histogram_delta": round(technical.macd_histogram_delta, 6),
+            "macd_histogram": technical.macd_histogram,
+            "macd_histogram_delta": technical.macd_histogram_delta,
             "atr": technical.atr,
             "macd_histogram_atr": technical.macd_histogram_atr,
             "macd_delta_atr": technical.macd_delta_atr,
-            "rsi": round(technical.rsi, 2),
-            "bollinger_position": round(technical.bollinger_position, 4),
-            "bollinger_width": round(technical.bollinger_width, 4),
-            "mtf_10m_bias": round(mtf_10m_bias, 4),
-            "mtf_30m_bias": round(mtf_30m_bias, 4),
+            "rsi": technical.rsi,
+            "bollinger_position": technical.bollinger_position,
+            "bollinger_width": technical.bollinger_width,
+            "mtf_10m_bias": mtf_10m_bias,
+            "mtf_30m_bias": mtf_30m_bias,
             "indicator_profile_segment": indicator_profile.segment,
             "indicator_profile_sample_size": indicator_profile.sample_size,
             "rsi_lower_threshold": indicator_profile.rsi_lower,
@@ -460,7 +460,7 @@ def analyze_volume_price(
             "pre_override_threshold": pre_override_threshold,
             "normal_down_short_override_applied": normal_down_short_override_reason is not None,
             "normal_down_short_threshold_adjustment": normal_down_short_threshold_adjustment,
-            "calculated_threshold": round(threshold, 1),
+            "calculated_threshold": threshold,
             "session_edge_min": session_edge_min,
             "max_trade_edge": max_trade_edge,
             "session_sample_size": session_sample_size,
@@ -474,7 +474,7 @@ def analyze_volume_price(
         "score": {
             "raw_direction": raw_direction,
             "raw_score": raw_score,
-            "signed_score": round(score, 1),
+            "signed_score": score,
             "score_abs": score_abs,
             "edge": edge,
             "final_direction": final_direction,
@@ -639,21 +639,22 @@ def _score_setup(
             )
         indicator_points = short_indicator_points(technical, mtf_10m_bias, mtf_30m_bias)
         close_points = (1.0 - close_strength) * 8.0
-        score = -(30.0 + volume_points + move_points + max(-trend_score, 0.0) * 10.0 + close_points + indicator_points)
+        score_components = components(
+            "high_position_high_volume_down_short",
+            -1.0,
+            base_points=30.0,
+            applied_volume_points=volume_points,
+            applied_move_points=move_points,
+            applied_trend_points=max(-trend_score, 0.0) * 10.0,
+            close_points=close_points,
+            indicator_points=indicator_points,
+        )
+        score = float(score_components["reconstructed_raw_score"])
         return (
             "SHORT",
             score,
             "高位放量下跌：MACD/RSI/BOLL确认卖压，动态评分偏空",
-            components(
-                "high_position_high_volume_down_short",
-                -1.0,
-                base_points=30.0,
-                applied_volume_points=volume_points,
-                applied_move_points=move_points,
-                applied_trend_points=max(-trend_score, 0.0) * 10.0,
-                close_points=close_points,
-                indicator_points=indicator_points,
-            ),
+            score_components,
         )
 
     if position == "HIGH" and volume_state == "HIGH" and (has_upper_rejection or direction == "FLAT"):
@@ -690,7 +691,6 @@ def _score_setup(
 
     if volume_state == "HIGH" and direction == "DOWN":
         close_points = (1.0 - close_strength) * 6.0
-        score = 34.0 + volume_points + move_points + max(-trend_score, 0.0) * 10.0 + close_points
         strict_rebound_risk = _trend_strict_rebound_risk(
             timeframe_minutes,
             position,
@@ -722,36 +722,40 @@ def _score_setup(
                 components("high_volume_down_strict_wait"),
             )
         if broad_rebound_risk:
-            return (
-                "SHORT",
-                -score,
-                "趋势候选顺势SHORT：BROAD_ONLY，双周期反弹中破位或BOLL未跌透，放弃急跌反抽LONG并顺势试空",
-                components(
-                    "high_volume_down_broad_short",
-                    -1.0,
-                    base_points=34.0,
-                    applied_volume_points=volume_points,
-                    applied_move_points=move_points,
-                    applied_trend_points=max(-trend_score, 0.0) * 10.0,
-                    close_points=close_points,
-                ),
-            )
-        reason = "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多"
-        if short_observe:
-            reason += "；SHORT观察：恐慌下行中位急跌且RSI/BOLL未过冷，仅记录不阻断"
-        return (
-            "LONG",
-            score,
-            reason,
-            components(
-                "high_volume_down_rebound_long",
-                1.0,
+            score_components = components(
+                "high_volume_down_broad_short",
+                -1.0,
                 base_points=34.0,
                 applied_volume_points=volume_points,
                 applied_move_points=move_points,
                 applied_trend_points=max(-trend_score, 0.0) * 10.0,
                 close_points=close_points,
-            ),
+            )
+            score = float(score_components["reconstructed_raw_score"])
+            return (
+                "SHORT",
+                score,
+                "趋势候选顺势SHORT：BROAD_ONLY，双周期反弹中破位或BOLL未跌透，放弃急跌反抽LONG并顺势试空",
+                score_components,
+            )
+        reason = "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多"
+        if short_observe:
+            reason += "；SHORT观察：恐慌下行中位急跌且RSI/BOLL未过冷，仅记录不阻断"
+        score_components = components(
+            "high_volume_down_rebound_long",
+            1.0,
+            base_points=34.0,
+            applied_volume_points=volume_points,
+            applied_move_points=move_points,
+            applied_trend_points=max(-trend_score, 0.0) * 10.0,
+            close_points=close_points,
+        )
+        score = float(score_components["reconstructed_raw_score"])
+        return (
+            "LONG",
+            score,
+            reason,
+            score_components,
         )
 
     if volume_state == "HIGH" and direction == "FLAT" and position != "LOW":
@@ -763,18 +767,19 @@ def _score_setup(
         )
 
     if volume_state == "NORMAL" and direction == "UP":
-        score = 20.0 + move_points * 0.8 + max(trend_score, 0.0) * 8.0
+        score_components = components(
+            "normal_volume_up_long",
+            1.0,
+            base_points=20.0,
+            applied_move_points=move_points * 0.8,
+            applied_trend_points=max(trend_score, 0.0) * 8.0,
+        )
+        score = float(score_components["reconstructed_raw_score"])
         return (
             "LONG",
             score,
             "量平价升：趋势延续但量能未放大",
-            components(
-                "normal_volume_up_long",
-                1.0,
-                base_points=20.0,
-                applied_move_points=move_points * 0.8,
-                applied_trend_points=max(trend_score, 0.0) * 8.0,
-            ),
+            score_components,
         )
 
     if volume_state == "NORMAL" and direction == "DOWN":
@@ -793,19 +798,20 @@ def _score_setup(
                 components("normal_volume_down_unconfirmed_wait"),
             )
         indicator_points = short_indicator_points(technical, mtf_10m_bias, mtf_30m_bias)
-        score = -(18.0 + move_points * 0.8 + max(-trend_score, 0.0) * 8.0 + indicator_points)
+        score_components = components(
+            "normal_volume_down_short",
+            -1.0,
+            base_points=18.0,
+            applied_move_points=move_points * 0.8,
+            applied_trend_points=max(-trend_score, 0.0) * 8.0,
+            indicator_points=indicator_points,
+        )
+        score = float(score_components["reconstructed_raw_score"])
         return (
             "SHORT",
             score,
             "量平价跌：MACD/RSI确认弱势延续，动态评分偏空",
-            components(
-                "normal_volume_down_short",
-                -1.0,
-                base_points=18.0,
-                applied_move_points=move_points * 0.8,
-                applied_trend_points=max(-trend_score, 0.0) * 8.0,
-                indicator_points=indicator_points,
-            ),
+            score_components,
         )
 
     return (

@@ -1,7 +1,8 @@
 import json
 import unittest
+from unittest.mock import patch
 
-from app.indicators import build_technical_context
+from app.indicators import TechnicalContext, build_technical_context
 from app.models import FearGreedContext, Kline, Signal
 from app.strategy import (
     _failed_breakout_observation,
@@ -218,6 +219,50 @@ class StrategyTest(unittest.TestCase):
                 self.assertEqual(context.atr, 0.0)
                 self.assertEqual(context.macd_histogram_atr, 0.0)
                 self.assertEqual(context.macd_delta_atr, 0.0)
+
+    def test_threshold_near_decision_inputs_preserve_raw_indicator_and_bias_precision(self):
+        technical = TechnicalContext(
+            macd_histogram=-0.00000049,
+            macd_histogram_delta=-0.00000051,
+            rsi=44.999999,
+            bollinger_position=0.34999999,
+            bollinger_width=0.001999999,
+            macd_line=0.123456789123,
+            macd_signal_line=0.123457279123,
+            atr=0.987654321987,
+            macd_histogram_atr=-0.00000049 / 0.987654321987,
+            macd_delta_atr=-0.00000051 / 0.987654321987,
+        )
+        mtf_10m_bias = 0.999949999
+        mtf_30m_bias = -0.999949999
+
+        with (
+            patch("app.strategy.build_technical_context", return_value=technical),
+            patch("app.strategy.trend_bias", side_effect=(mtf_10m_bias, mtf_30m_bias)),
+        ):
+            signal = analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10)
+
+        indicators = signal.decision_inputs["indicators"]
+        expected = {
+            "macd_line": technical.macd_line,
+            "macd_signal_line": technical.macd_signal_line,
+            "macd_histogram": technical.macd_histogram,
+            "macd_histogram_delta": technical.macd_histogram_delta,
+            "atr": technical.atr,
+            "macd_histogram_atr": technical.macd_histogram_atr,
+            "macd_delta_atr": technical.macd_delta_atr,
+            "rsi": technical.rsi,
+            "bollinger_position": technical.bollinger_position,
+            "bollinger_width": technical.bollinger_width,
+            "mtf_10m_bias": mtf_10m_bias,
+            "mtf_30m_bias": mtf_30m_bias,
+        }
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(indicators[key], value)
+        self.assertNotEqual(signal.rsi, indicators["rsi"])
+        self.assertNotEqual(signal.bollinger_position, indicators["bollinger_position"])
+        json.dumps(signal.to_dict(), allow_nan=False)
 
     def test_generic_short_profile_identity_is_stable(self):
         klines = neutral_mid_klines()
@@ -780,14 +825,11 @@ class StrategyTest(unittest.TestCase):
                 0.0273,
             ),
         )
-        indicators = signal.decision_inputs["indicators"]
-        self.assertEqual(indicators["macd_histogram"], signal.macd_histogram)
-        self.assertEqual(indicators["macd_histogram_delta"], signal.macd_histogram_delta)
-        self.assertEqual(indicators["rsi"], signal.rsi)
-        self.assertEqual(indicators["bollinger_position"], signal.bollinger_position)
-        self.assertEqual(indicators["bollinger_width"], signal.bollinger_width)
-        self.assertEqual(signal.decision_inputs["score"]["signed_score"], signal.score)
         score_inputs = signal.decision_inputs["score"]
+        self.assertEqual(
+            score_inputs["signed_score"],
+            max(-100.0, min(100.0, score_inputs["raw_score"])),
+        )
         self.assertEqual(score_inputs["branch"], "high_volume_down_rebound_long")
         self.assertEqual(score_inputs["direction_multiplier"], 1.0)
         self.assertEqual(score_inputs["base_points"], 34.0)
@@ -807,6 +849,29 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(
             signal.decision_inputs["thresholds"]["calculated_threshold"],
             signal.threshold,
+        )
+
+    def test_scoring_branch_derives_raw_score_from_applied_components(self):
+        from app import strategy as strategy_module
+
+        original = strategy_module._applied_score_components
+
+        def shifted_normal_short_components(branch, direction_multiplier=0.0, **kwargs):
+            if branch == "normal_volume_down_short":
+                kwargs["base_points"] += 0.125
+            return original(branch, direction_multiplier, **kwargs)
+
+        with patch.object(
+            strategy_module,
+            "_applied_score_components",
+            side_effect=shifted_normal_short_components,
+        ):
+            signal = analyze_volume_price(normal_volume_short_klines(), timeframe_minutes=10)
+
+        score_inputs = signal.decision_inputs["score"]
+        self.assertAlmostEqual(
+            score_inputs["raw_score"],
+            score_inputs["reconstructed_raw_score"],
         )
 
     def test_normal_volume_short_score_components_use_exact_weighted_terms(self):
@@ -832,6 +897,8 @@ class StrategyTest(unittest.TestCase):
         )
         self.assertAlmostEqual(reconstructed, score_inputs["reconstructed_raw_score"])
         self.assertAlmostEqual(reconstructed, score_inputs["raw_score"])
+        self.assertEqual(score_inputs["signed_score"], score_inputs["raw_score"])
+        self.assertNotEqual(score_inputs["signed_score"], signal.score)
 
     def test_wait_score_components_record_no_applied_points(self):
         signal = analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10)

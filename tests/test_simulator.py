@@ -8,6 +8,57 @@ from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 
 
+LEGACY_SIGNAL_FIELD_NAMES = tuple(
+    """
+    direction timeframe_minutes level reason price open_time volume_ratio price_position
+    price_change_pct score threshold volume_threshold move_threshold_pct close_strength
+    analysis_window_minutes threshold_window_minutes threshold_segment mtf_10m_bias mtf_30m_bias
+    macd_histogram macd_histogram_delta rsi bollinger_position bollinger_width
+    indicator_profile_segment indicator_profile_sample_size rsi_lower_threshold rsi_upper_threshold
+    bollinger_lower_threshold bollinger_upper_threshold macd_histogram_threshold macd_delta_threshold
+    fear_greed_value fear_greed_classification fear_greed_trend fear_greed_average_30d
+    fear_greed_adjustment session_allowed session_sample_size session_win_rate session_ev
+    session_edge_min regime risk_flags strategy_family strategy_tag observe_direction observe_only
+    profile_key daily_profile_selected daily_profile_version order_slot order_slot_scope wave_state
+    wave_raw_state wave_window wave_efficiency wave_direction_ratio wave_atr_strength
+    wave_confirmations wave_confirmed_at wave_batch_id wave_guard_mode wave_guard_status
+    wave_guard_reason calculated_threshold quality_score quality_score_version quality_score_mode
+    quality_score_context quality_score_components quality_score_inputs direction_pulse_shadow
+    profile_health_status profile_health_sample_size profile_health_win_rate profile_health_ev
+    profile_health_evaluated_at profile_degradation_probe profile_degradation_triggered_at
+    """.split()
+)
+
+LEGACY_SIMULATED_ORDER_FIELD_NAMES = tuple(
+    """
+    id direction timeframe_minutes level reason entry_price opened_at expires_at threshold_segment
+    score threshold session_allowed session_sample_size session_win_rate session_ev session_edge_min
+    regime strategy_family strategy_tag profile_key daily_profile_selected daily_profile_version
+    order_slot order_slot_scope stake win_return stake_progression_step status result exit_price
+    settled_at pnl stake_progression_source_order_id stake_progression_version wave_state wave_raw_state
+    wave_window wave_efficiency wave_direction_ratio wave_atr_strength wave_confirmations
+    wave_confirmed_at wave_batch_id wave_guard_mode wave_guard_status wave_guard_reason
+    calculated_threshold quality_score quality_score_version quality_score_mode quality_score_context
+    quality_score_components quality_score_inputs direction_pulse_shadow profile_health_status
+    profile_health_sample_size profile_health_win_rate profile_health_ev profile_health_evaluated_at
+    profile_degradation_probe profile_degradation_triggered_at
+    """.split()
+)
+
+DECISION_CONTEXT_FIELD_NAMES = {
+    "decision_id",
+    "context_version",
+    "runtime_config_hash",
+    "strategy_build_id",
+    "candidate_origin",
+    "decision_inputs",
+    "decision_trace",
+    "first_decisive_block",
+    "adaptive_profile_state",
+    "entry_structure_shadow",
+}
+
+
 def signal(
     direction="LONG",
     timeframe_minutes=10,
@@ -259,23 +310,12 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(long_order.stake_progression_step, 2)
 
     def test_simulated_order_progression_metadata_defaults_are_backward_compatible(self):
-        compatibility_fields = [
-            "decision_id",
-            "context_version",
-            "runtime_config_hash",
-            "strategy_build_id",
-            "candidate_origin",
-            "decision_inputs",
-            "decision_trace",
-            "first_decisive_block",
-            "adaptive_profile_state",
-            "entry_structure_shadow",
-        ]
+        field_names = tuple(field.name for field in fields(SimulatedOrder))
         self.assertEqual(
-            [field.name for field in fields(SimulatedOrder)][-12:-10],
-            ["profile_degradation_probe", "profile_degradation_triggered_at"],
+            field_names[: len(LEGACY_SIMULATED_ORDER_FIELD_NAMES)],
+            LEGACY_SIMULATED_ORDER_FIELD_NAMES,
         )
-        self.assertEqual([field.name for field in fields(SimulatedOrder)][-10:], compatibility_fields)
+        self.assertTrue(DECISION_CONTEXT_FIELD_NAMES.issubset(field_names))
         order = SimulatedOrder(
             id=1,
             direction="LONG",
@@ -294,23 +334,12 @@ class SimulatorTest(unittest.TestCase):
         self.assertIn("stake_progression_source_order_id", order.to_dict())
 
     def test_signal_probe_metadata_defaults_preserve_legacy_positional_arguments(self):
-        compatibility_fields = [
-            "decision_id",
-            "context_version",
-            "runtime_config_hash",
-            "strategy_build_id",
-            "candidate_origin",
-            "decision_inputs",
-            "decision_trace",
-            "first_decisive_block",
-            "adaptive_profile_state",
-            "entry_structure_shadow",
-        ]
+        field_names = tuple(field.name for field in fields(Signal))
         self.assertEqual(
-            [field.name for field in fields(Signal)][-12:-10],
-            ["profile_degradation_probe", "profile_degradation_triggered_at"],
+            field_names[: len(LEGACY_SIGNAL_FIELD_NAMES)],
+            LEGACY_SIGNAL_FIELD_NAMES,
         )
-        self.assertEqual([field.name for field in fields(Signal)][-10:], compatibility_fields)
+        self.assertTrue(DECISION_CONTEXT_FIELD_NAMES.issubset(field_names))
         legacy = Signal("LONG", 1, "A", "legacy", 100.0, 0, 2.5)
 
         self.assertEqual(legacy.volume_ratio, 2.5)
