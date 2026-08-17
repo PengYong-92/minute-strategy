@@ -1334,6 +1334,41 @@ class SQLiteMonitorStore:
             raise ValueError("stored decision context metadata does not match its payload")
         return restored_context.to_dict()
 
+    def load_decision_context_for_candidate(
+        self,
+        symbol: str,
+        *,
+        closed_kline_at_ms: int,
+        candidate_origin: str,
+        profile_key: str,
+        runtime_config_hash: str,
+        strategy_build_id: str,
+    ) -> dict[str, Any] | None:
+        normalized_symbol = _require_string(symbol, "symbol", non_empty=True).upper()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select decision_id
+                from decision_contexts
+                where symbol = ? and closed_kline_at_ms = ?
+                  and candidate_origin = ? and profile_key = ?
+                  and runtime_config_hash = ? and strategy_build_id = ?
+                """,
+                (
+                    normalized_symbol,
+                    int(closed_kline_at_ms),
+                    str(candidate_origin),
+                    str(profile_key),
+                    str(runtime_config_hash),
+                    str(strategy_build_id),
+                ),
+            ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("candidate identity maps to multiple decision contexts")
+        return self.load_decision_context(normalized_symbol, rows[0]["decision_id"])
+
     def save_order(self, order: SimulatedOrder, symbol: str) -> None:
         with self._connect() as connection:
             self._upsert_order(connection, order, symbol)
@@ -1454,6 +1489,16 @@ class SQLiteMonitorStore:
     ) -> None:
         normalized_symbol = symbol.upper()
         payload = json.dumps(order.to_dict(), ensure_ascii=False)
+        bound_order = connection.execute(
+            """
+            select order_id
+            from orders
+            where symbol = ? and decision_id = ?
+            """,
+            (normalized_symbol, order.decision_id),
+        ).fetchone()
+        if bound_order is not None and bound_order["order_id"] != order.id:
+            raise ValueError("decision is already bound to a different order")
         connection.execute(
             """
             insert or ignore into orders(
@@ -1658,7 +1703,7 @@ class SQLiteMonitorStore:
                     capacity_from_connection(connection),
                     StorageWriteClass.CORE,
                 )
-                self._upsert_order(connection, order, symbol)
+                self._update_settled_order(connection, order, symbol)
                 if credit is not None:
                     self._upsert_progression_credit(connection, symbol, credit)
                 self._update_order_entry_snapshot_settlement(
@@ -1668,6 +1713,90 @@ class SQLiteMonitorStore:
                 )
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+
+    @staticmethod
+    def _update_settled_order(
+        connection: sqlite3.Connection,
+        order: SimulatedOrder,
+        symbol: str,
+    ) -> None:
+        if order.status != "SETTLED" or order.result not in {"WIN", "LOSS"}:
+            raise ValueError("settlement requires a settled WIN or LOSS order")
+        normalized_symbol = symbol.upper()
+        row = connection.execute(
+            """
+            select status, result, settled_at, payload, decision_id,
+                   runtime_config_hash
+            from orders
+            where symbol = ? and order_id = ?
+            """,
+            (normalized_symbol, order.id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("settlement requires an existing open order")
+        try:
+            stored_payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("stored order payload is malformed") from error
+        accepted = {field.name for field in fields(SimulatedOrder)}
+        stored_values = {
+            key: value for key, value in stored_payload.items() if key in accepted
+        }
+        if "calculated_threshold" not in stored_values:
+            stored_values["calculated_threshold"] = float(
+                stored_values.get("threshold", 0.0)
+            )
+        try:
+            stored_order = SimulatedOrder(**stored_values)
+        except (TypeError, ValueError) as error:
+            raise ValueError("stored order payload is malformed") from error
+
+        mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
+        stored_frozen = {
+            key: value
+            for key, value in stored_order.to_dict().items()
+            if key not in mutable_fields
+        }
+        requested_frozen = {
+            key: value
+            for key, value in order.to_dict().items()
+            if key not in mutable_fields
+        }
+        if stored_frozen != requested_frozen:
+            raise ValueError("settlement conflicts with frozen order identity")
+        if (
+            row["decision_id"] != (order.decision_id or None)
+            or row["runtime_config_hash"] != (order.runtime_config_hash or None)
+        ):
+            raise ValueError("settlement conflicts with frozen order identity")
+
+        expected_payload = json.dumps(order.to_dict(), ensure_ascii=False)
+        if row["status"] == "SETTLED":
+            if (
+                row["result"] != order.result
+                or row["settled_at"] != order.settled_at
+                or row["payload"] != expected_payload
+            ):
+                raise ValueError("settlement conflicts with terminal order state")
+            return
+        if row["status"] != "OPEN":
+            raise ValueError("only an open order can be settled")
+        connection.execute(
+            """
+            update orders
+            set status = ?, result = ?, settled_at = ?, payload = ?,
+                updated_at_ms = strftime('%s','now') * 1000
+            where symbol = ? and order_id = ? and status = 'OPEN'
+            """,
+            (
+                order.status,
+                order.result,
+                order.settled_at,
+                expected_payload,
+                normalized_symbol,
+                order.id,
+            ),
+        )
 
     def save_open_order_with_credit(
         self,
@@ -2518,7 +2647,7 @@ class SQLiteMonitorStore:
         entry_snapshot: Mapping[str, Any],
         audit: DecisionAudit,
         observation: ObservationSignal | None = None,
-    ) -> None:
+    ) -> bool:
         self._validate_bundle_references(
             config,
             context,
@@ -2538,6 +2667,13 @@ class SQLiteMonitorStore:
                     capacity_from_connection(connection),
                     StorageWriteClass.CORE,
                 )
+                existing_order = connection.execute(
+                    """
+                    select order_id from orders
+                    where symbol = ? and decision_id = ?
+                    """,
+                    (context.symbol, context.decision_id),
+                ).fetchone()
                 self._insert_runtime_config(connection, config)
                 self._after_bundle_step("config")
                 self._insert_decision_context(connection, context)
@@ -2568,6 +2704,7 @@ class SQLiteMonitorStore:
                 self._after_bundle_step("observation")
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+        return existing_order is None
 
     def save_decision_bundle(
         self,
@@ -2576,7 +2713,7 @@ class SQLiteMonitorStore:
         context: DecisionContext,
         audit: DecisionAudit,
         observation: ObservationSignal | None = None,
-    ) -> None:
+    ) -> bool:
         self._validate_bundle_references(
             config,
             context,
@@ -2592,6 +2729,13 @@ class SQLiteMonitorStore:
                     capacity_from_connection(connection),
                     StorageWriteClass.CORE,
                 )
+                existing_context = connection.execute(
+                    """
+                    select 1 from decision_contexts
+                    where symbol = ? and decision_id = ?
+                    """,
+                    (context.symbol, context.decision_id),
+                ).fetchone()
                 self._insert_runtime_config(connection, config)
                 self._after_bundle_step("config")
                 self._insert_decision_context(connection, context)
@@ -2611,6 +2755,7 @@ class SQLiteMonitorStore:
                 self._after_bundle_step("observation")
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+        return existing_context is None
 
     def save_signal(
         self,
@@ -3283,3 +3428,25 @@ class SQLiteMonitorStore:
                 "create index if not exists idx_order_entry_snapshots_symbol_result on order_entry_snapshots(symbol, result)"
             )
             migrate(connection)
+            duplicates = connection.execute(
+                """
+                select symbol, decision_id, count(*) as total
+                from orders
+                where decision_id is not null
+                group by symbol, decision_id
+                having count(*) > 1
+                limit 1
+                """
+            ).fetchone()
+            if duplicates is not None:
+                raise ValueError(
+                    "legacy orders contain duplicate decision identities; "
+                    "repair is required before migration"
+                )
+            connection.execute(
+                """
+                create unique index if not exists ux_orders_symbol_decision_id
+                on orders(symbol, decision_id)
+                where decision_id is not null
+                """
+            )

@@ -2441,6 +2441,17 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                 source_order_id=order.id,
                 created_at=order.settled_at,
             )
+            store.save_order(
+                replace(
+                    order,
+                    status="OPEN",
+                    result=None,
+                    settled_at=None,
+                    exit_price=None,
+                    pnl=0.0,
+                ),
+                "BTCUSDT",
+            )
 
             store.save_settled_order_with_credit(order, "BTCUSDT", credit)
             store.save_settled_order_with_credit(order, "BTCUSDT", credit)
@@ -2542,6 +2553,15 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
             order = progression_order(1, status="SETTLED")
             credit = StakeProgressionCredit(source_order_id=1, created_at=601_000)
+            open_order = replace(
+                order,
+                status="OPEN",
+                result=None,
+                settled_at=None,
+                exit_price=None,
+                pnl=0.0,
+            )
+            store.save_order(open_order, "BTCUSDT")
 
             with mock.patch.object(
                 store,
@@ -2552,7 +2572,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "credit write failed"):
                     store.save_settled_order_with_credit(order, "BTCUSDT", credit)
 
-            self.assertEqual(store.load_orders("BTCUSDT"), [])
+            self.assertEqual(store.load_orders("BTCUSDT"), [open_order])
 
     def test_atomic_methods_reject_cross_direction_credit_links(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2715,9 +2735,21 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                 source_order_id=1,
                 created_at=601_000,
             )
+            settled_order = progression_order(1, status="SETTLED")
+            store.save_order(
+                replace(
+                    settled_order,
+                    status="OPEN",
+                    result=None,
+                    settled_at=None,
+                    exit_price=None,
+                    pnl=0.0,
+                ),
+                "BTCUSDT",
+            )
 
             store.save_settled_order_with_credit(
-                progression_order(1, status="SETTLED"),
+                settled_order,
                 "BTCUSDT",
                 late_pending,
             )
@@ -2778,6 +2810,85 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
 
 
 class AtomicDecisionBundleTest(unittest.TestCase):
+    def test_orders_schema_has_unique_non_null_decision_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            SQLiteMonitorStore(db_path)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                indexes = connection.execute("pragma index_list(orders)").fetchall()
+                matching = [
+                    row for row in indexes
+                    if row[1] == "ux_orders_symbol_decision_id"
+                ]
+                sql = connection.execute(
+                    "select sql from sqlite_master where type = 'index' and name = ?",
+                    ("ux_orders_symbol_decision_id",),
+                ).fetchone()
+
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0][2], 1)
+            self.assertIn("where decision_id is not null", sql[0].lower())
+
+    def test_legacy_database_without_decision_index_is_upgraded_in_place(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            SQLiteMonitorStore(db_path)
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute("drop index ux_orders_symbol_decision_id")
+                connection.commit()
+
+            SQLiteMonitorStore(db_path)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                index = connection.execute(
+                    "select sql from sqlite_master where type = 'index' and name = ?",
+                    ("ux_orders_symbol_decision_id",),
+                ).fetchone()
+            self.assertIsNotNone(index)
+            self.assertIn("where decision_id is not null", index[0].lower())
+
+    def test_legacy_duplicate_decision_bindings_require_explicit_repair(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            SQLiteMonitorStore(db_path)
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute("drop index ux_orders_symbol_decision_id")
+                for order_id in (1, 2):
+                    connection.execute(
+                        """
+                        insert into orders(
+                            symbol, order_id, status, opened_at, payload,
+                            decision_id, runtime_config_hash
+                        ) values (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "BTCUSDT",
+                            order_id,
+                            "OPEN",
+                            1_000,
+                            "{}",
+                            "duplicate-decision",
+                            "config-hash",
+                        ),
+                    )
+                connection.commit()
+
+            with self.assertRaisesRegex(ValueError, "duplicate decision identities"):
+                SQLiteMonitorStore(db_path)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                count = connection.execute(
+                    "select count(*) from orders where decision_id = ?",
+                    ("duplicate-decision",),
+                ).fetchone()[0]
+                index = connection.execute(
+                    "select 1 from sqlite_master where type = 'index' and name = ?",
+                    ("ux_orders_symbol_decision_id",),
+                ).fetchone()
+            self.assertEqual(count, 2)
+            self.assertIsNone(index)
+
     def test_open_bundle_commits_all_members_with_matching_references(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
@@ -2889,6 +3000,137 @@ class AtomicDecisionBundleTest(unittest.TestCase):
 
             self.assertEqual(atomic_bundle_counts(db_path), unchanged)
             self.assertEqual(unchanged["signal_audit"], 1)
+
+    def test_open_bundle_rejects_same_decision_for_a_different_order_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            arguments = {
+                "config": config,
+                "context": context,
+                "order": order,
+                "credit": None,
+                "entry_snapshot": entry_snapshot,
+                "audit": audit,
+                "observation": observed,
+            }
+            store.save_open_order_decision(**arguments)
+
+            with self.assertRaisesRegex(ValueError, "decision.*order"):
+                store.save_open_order_decision(
+                    **{**arguments, "order": replace(order, id=order.id + 1)}
+                )
+
+            counts = atomic_bundle_counts(db_path)
+            self.assertEqual(counts["orders"], 1)
+            self.assertEqual(counts["order_entry_snapshots"], 1)
+            self.assertEqual(counts["signal_audit"], 1)
+            self.assertEqual(counts["observation_signals"], 1)
+
+    def test_concurrent_different_orders_and_audits_for_one_decision_commit_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            stores = (SQLiteMonitorStore(db_path), SQLiteMonitorStore(db_path))
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            attempts = (
+                (order, audit),
+                (
+                    replace(order, id=order.id + 1),
+                    replace(audit, signal=replace(audit.signal)),
+                ),
+            )
+            barrier = threading.Barrier(2)
+            errors = []
+
+            def save(store, attempted_order, attempted_audit):
+                try:
+                    barrier.wait(timeout=5)
+                    store.save_open_order_decision(
+                        config=config,
+                        context=context,
+                        order=attempted_order,
+                        credit=None,
+                        entry_snapshot=entry_snapshot,
+                        audit=attempted_audit,
+                        observation=observed,
+                    )
+                except Exception as error:  # noqa: BLE001 - captures competing writer.
+                    errors.append(error)
+
+            threads = [
+                threading.Thread(target=save, args=(store, *attempt))
+                for store, attempt in zip(stores, attempts)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ValueError)
+            self.assertRegex(str(errors[0]), "decision.*order")
+            counts = atomic_bundle_counts(db_path)
+            self.assertEqual(counts["decision_contexts"], 1)
+            self.assertEqual(counts["orders"], 1)
+            self.assertEqual(counts["order_entry_snapshots"], 1)
+            self.assertEqual(counts["signal_audit"], 1)
+            self.assertEqual(counts["observation_signals"], 1)
+
+    def test_open_bundle_retry_does_not_repeat_credit_consumption_or_members(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            source_id = 99
+            pending = StakeProgressionCredit(
+                source_order_id=source_id,
+                created_at=100,
+                direction=order.direction,
+            )
+            consumed = StakeProgressionCredit(
+                source_order_id=source_id,
+                created_at=100,
+                consumed_order_id=order.id,
+                consumed_at=order.opened_at,
+                status="CONSUMED",
+                direction=order.direction,
+            )
+            order = replace(
+                order,
+                stake_progression_step=2,
+                stake_progression_source_order_id=source_id,
+                stake_progression_version=TWO_STAGE_VERSION,
+            )
+            store.save_stake_progression_credit(context.symbol, pending)
+            arguments = {
+                "config": config,
+                "context": context,
+                "order": order,
+                "credit": consumed,
+                "entry_snapshot": entry_snapshot,
+                "audit": audit,
+                "observation": observed,
+            }
+
+            store.save_open_order_decision(**arguments)
+            store.save_open_order_decision(**arguments)
+
+            credits = store.load_stake_progression_credits(context.symbol)
+            counts = atomic_bundle_counts(db_path)
+            self.assertEqual(len(credits), 1)
+            self.assertEqual(credits[0].status, "CONSUMED")
+            self.assertEqual(credits[0].consumed_order_id, order.id)
+            self.assertEqual(counts["orders"], 1)
+            self.assertEqual(counts["order_entry_snapshots"], 1)
+            self.assertEqual(counts["signal_audit"], 1)
+            self.assertEqual(counts["observation_signals"], 1)
 
     def test_open_bundle_rejects_frozen_redundant_column_collisions(self):
         cases = (
@@ -3285,6 +3527,51 @@ class AtomicDecisionBundleTest(unittest.TestCase):
             restored = store.load_orders(context.symbol)[0]
             self.assertEqual(restored.status, "OPEN")
             self.assertEqual(store.load_stake_progression_credits(context.symbol), [])
+
+    def test_settlement_rejects_changes_to_frozen_order_identity(self):
+        mutations = {
+            "entry_price": lambda order: replace(order, entry_price=order.entry_price + 1),
+            "opened_at": lambda order: replace(order, opened_at=order.opened_at + 1),
+            "decision_id": lambda order: replace(order, decision_id="different-decision"),
+            "direction": lambda order: replace(order, direction="SHORT"),
+            "timeframe": lambda order: replace(order, timeframe_minutes=1),
+            "strategy": lambda order: replace(order, strategy_family="different"),
+            "profile": lambda order: replace(order, profile_key="different-profile"),
+            "stake": lambda order: replace(order, stake=order.stake + 1),
+            "expires_at": lambda order: replace(order, expires_at=order.expires_at + 1),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, _observed = (
+                    atomic_bundle_fixture(include_observation=False)
+                )
+                store.save_open_order_decision(
+                    config=config,
+                    context=context,
+                    order=order,
+                    credit=None,
+                    entry_snapshot=entry_snapshot,
+                    audit=audit,
+                )
+                settled = replace(
+                    order,
+                    status="SETTLED",
+                    result="WIN",
+                    settled_at=order.expires_at,
+                    exit_price=101.0,
+                    pnl=8.0,
+                )
+
+                with self.assertRaisesRegex(ValueError, "frozen order"):
+                    store.save_settled_order_with_credit(
+                        mutate(settled),
+                        context.symbol,
+                        None,
+                    )
+
+                self.assertEqual(store.load_orders(context.symbol)[0], order)
 
 
 if __name__ == "__main__":

@@ -76,6 +76,7 @@ from app.wave_batch_guard import (
 DAY_MS = 86_400_000
 REALTIME_PRICE_STALE_MS = 5_000
 TRANSITIONAL_DECISION_BUILD_ID = "TASK7_TRANSITIONAL_V1"
+DEFAULT_STRATEGY_BUILD_ID = "minute-strategy-unversioned"
 
 
 class MonitorState:
@@ -119,6 +120,7 @@ class MonitorState:
         profile_degradation_guard_config: ProfileDegradationGuardConfig | None = None,
         time_period_guard_config: TimePeriodGuardConfig | None = None,
         profile_health_guard_config: ProfileHealthGuardConfig | None = None,
+        strategy_build_id: str = DEFAULT_STRATEGY_BUILD_ID,
     ):
         self.symbol = symbol.upper()
         self._symbol_generation = 0
@@ -130,6 +132,9 @@ class MonitorState:
         )
         self.max_klines = max_klines
         self.storage = storage or (SQLiteMonitorStore(storage_path) if storage_path else None)
+        self.strategy_build_id = str(strategy_build_id).strip()
+        if not self.strategy_build_id:
+            raise ValueError("strategy_build_id must not be empty")
         self.webhook = webhook
         self.rolling_edge_config = rolling_edge_config or RollingEdgeConfig()
         self.enable_rolling_edge_guard = enable_rolling_edge_guard
@@ -193,6 +198,8 @@ class MonitorState:
         self._bundled_decision_ids: set[str] = set()
         self._decision_storage_failed = False
         self._decision_runtime_config_cache = None
+        self._profile_source_cached = False
+        self._cached_profile_source = None
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
         self.simulator = self._build_simulator(self.symbol, restored_orders)
@@ -433,6 +440,13 @@ class MonitorState:
                     observation_signals,
                     latest.close_time,
                 )
+                if not selected_signal.candidate_origin:
+                    selected_signal = replace(
+                        selected_signal,
+                        candidate_origin=self._origin_before_profile_promotion(
+                            selected_signal
+                        ),
+                    )
                 has_formal_candidate = bool(selected_signal.actionable)
                 selected_signal = self._apply_wave_guard(selected_signal, wave_state)
                 selected_signal = self._attach_quality_score(
@@ -445,11 +459,12 @@ class MonitorState:
                     latest,
                     daily_profile_required=daily_profile_required,
                 )
-                self._record_observation_candidates(observation_signals, latest)
+                if not self._decision_storage_failed:
+                    self._record_observation_candidates(observation_signals, latest)
                 observation_audits = tuple(self._observation_audit_collector)
             finally:
                 self._observation_audit_collector = None
-            if self.storage:
+            if self.storage and not self._decision_storage_failed:
                 final_signal = self.selected_signal or selected_signal
                 if final_signal.decision_id not in self._bundled_decision_ids:
                     self._save_signal(
@@ -717,6 +732,17 @@ class MonitorState:
     def _decision_runtime_config(self):
         if self._decision_runtime_config_cache is None:
             config = {
+                "strategy_build_id": self.strategy_build_id,
+                "data_windows": {
+                    "max_klines": self.max_klines,
+                    "live_trade_timeframes": list(LIVE_TRADE_TIMEFRAMES),
+                    "observation_profile_lookback_days": (
+                        self.observation_profile_lookback_days
+                    ),
+                    "daily_profile_lookback_days": (
+                        self.daily_profile_selector_config.lookback_days
+                    ),
+                },
                 "order_policy": asdict(self.order_policy),
                 "stake": {
                     "amount": self.stake,
@@ -768,9 +794,124 @@ class MonitorState:
             }
             self._decision_runtime_config_cache = runtime_config_snapshot(
                 config,
-                strategy_build_id=TRANSITIONAL_DECISION_BUILD_ID,
+                strategy_build_id=self.strategy_build_id,
             )
         return self._decision_runtime_config_cache
+
+    @staticmethod
+    def _origin_before_profile_promotion(signal: Signal) -> str:
+        if signal.candidate_origin in {
+            "NATIVE_ACTIONABLE",
+            "PROFILE_PROMOTED_WAIT",
+        }:
+            return signal.candidate_origin
+        direction = str(signal.direction or "").upper()
+        if direction in {"LONG", "SHORT"} and abs(signal.score) >= signal.threshold:
+            return "NATIVE_ACTIONABLE"
+        return "PROFILE_PROMOTED_WAIT"
+
+    def _formal_candidate_origin(self, signal: Signal) -> str:
+        return self._origin_before_profile_promotion(signal)
+
+    def _reuse_committed_decision(
+        self,
+        signal: Signal,
+        latest: Kline,
+    ) -> str | None:
+        if not self.storage:
+            return None
+        loader = getattr(
+            self.storage,
+            "load_decision_context_for_candidate",
+            None,
+        )
+        if loader is None:
+            return None
+        config = self._decision_runtime_config()
+        candidate_origin = self._formal_candidate_origin(signal)
+        try:
+            context = loader(
+                self.symbol,
+                closed_kline_at_ms=int(latest.close_time),
+                candidate_origin=candidate_origin,
+                profile_key=str(signal.profile_key or ""),
+                runtime_config_hash=config.hash,
+                strategy_build_id=config.strategy_build_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - 决策身份读取失败必须阻断本轮。
+            self._decision_storage_failed = True
+            self._set_storage_error("已提交决策读取失败", exc)
+            return "STORAGE_ERROR"
+        if context is None:
+            return None
+        final_decision = str(context["final_decision"])
+        if final_decision == "OPENED":
+            try:
+                persisted_orders = self.storage.load_orders(self.symbol)
+            except Exception as exc:  # noqa: BLE001 - 已提交订单必须可恢复。
+                self._decision_storage_failed = True
+                self._set_storage_error("已提交订单读取失败", exc)
+                return "STORAGE_ERROR"
+            matching_orders = [
+                order
+                for order in persisted_orders
+                if order.decision_id == context["decision_id"]
+            ]
+            if len(matching_orders) != 1:
+                self._decision_storage_failed = True
+                self._set_storage_error(
+                    "已提交订单读取失败",
+                    ValueError("OPENED decision must map to exactly one order"),
+                )
+                return "STORAGE_ERROR"
+            if not any(
+                order.decision_id == context["decision_id"]
+                for order in self.simulator.orders
+            ):
+                self.simulator = self._build_simulator(
+                    self.symbol,
+                    persisted_orders,
+                )
+                self._last_order_opened_at = (
+                    self._latest_order_opened_at_by_direction(persisted_orders)
+                )
+                restored = matching_orders[0]
+                self._opened_signal_keys.add(
+                    (
+                        int(signal.open_time),
+                        restored.timeframe_minutes,
+                        restored.direction,
+                    )
+                )
+        enriched_signal = replace(
+            signal,
+            decision_id=str(context["decision_id"]),
+            context_version=str(context["context_version"]),
+            runtime_config_hash=str(context["runtime_config_hash"]),
+            strategy_build_id=str(context["strategy_build_id"]),
+            candidate_origin=str(context["candidate_origin"]),
+            decision_inputs=deepcopy(context["inputs"]),
+            decision_trace=deepcopy(context["decision_trace"]),
+            first_decisive_block=str(context["first_decisive_block"]),
+        )
+        audit_snapshot = context["inputs"].get("audit_snapshot", {})
+        if isinstance(audit_snapshot, dict):
+            restored_guards = (
+                ("rolling_edge", "rolling_edge"),
+                ("result_sequence_guard", "result_sequence_guard"),
+                ("wave_batch_guard", "wave_batch_guard"),
+                ("profile_degradation_guard", "profile_degradation_guard"),
+                ("profile_health_guard", "profile_health_guard"),
+                ("time_period_guard", "time_period_guard"),
+                ("profile_guard", "profile_guard_audit"),
+            )
+            for source_key, attribute_name in restored_guards:
+                value = audit_snapshot.get(source_key)
+                if isinstance(value, dict):
+                    setattr(self, attribute_name, deepcopy(value))
+        self.selected_signal = enriched_signal
+        self._bundled_decision_ids.add(enriched_signal.decision_id)
+        return final_decision
 
     def _decision_artifacts(
         self,
@@ -848,7 +989,7 @@ class MonitorState:
         audit = DecisionAudit(
             signal=enriched_signal,
             decision=normalized_decision,
-            created_at_ms=int(self.updated_at_ms or latest.close_time),
+            created_at_ms=int(latest.close_time),
             audit_context=deepcopy(audit_context),
             event_kind=event_kind,
         )
@@ -876,10 +1017,18 @@ class MonitorState:
         daily_profile_required: bool = False,
     ) -> str:
         self._decision_storage_failed = False
+        self._profile_source_cached = False
+        self._cached_profile_source = None
         self.risk_pause = ""
         self.profile_guard_audit = self._empty_profile_guard_audit()
         signal = self._attach_direction_pulse_shadow(signal, current_time=latest.close_time)
+        candidate_origin = self._formal_candidate_origin(signal)
+        if signal.candidate_origin != candidate_origin:
+            signal = replace(signal, candidate_origin=candidate_origin)
         self.selected_signal = signal
+        reused_decision = self._reuse_committed_decision(signal, latest)
+        if reused_decision is not None:
+            return reused_decision
         time_period_decision = evaluate_time_period_guard(
             latest.close_time,
             self.time_period_guard_config,
@@ -1146,7 +1295,7 @@ class MonitorState:
                 signal,
                 latest,
                 code,
-                candidate_origin="NATIVE_ACTIONABLE",
+                candidate_origin=self._formal_candidate_origin(signal),
                 candidate_ordinal=0,
                 primary_decision=True,
                 final_reason=reason,
@@ -1163,7 +1312,7 @@ class MonitorState:
             latest,
             code,
             final_reason=reason,
-            candidate_origin="NATIVE_ACTIONABLE",
+            candidate_origin=self._formal_candidate_origin(signal),
             candidate_ordinal=0,
             observation_allowed=should_observe,
             audit_context=audit_context,
@@ -1230,7 +1379,7 @@ class MonitorState:
             latest,
             "OPENED",
             final_reason=signal.reason,
-            candidate_origin="NATIVE_ACTIONABLE",
+            candidate_origin=self._formal_candidate_origin(signal),
             candidate_ordinal=0,
             observation_allowed=pending_observation is not None,
             audit_context=audit_context,
@@ -1267,7 +1416,7 @@ class MonitorState:
                 captured_entry_context,
             )
             try:
-                self.storage.save_open_order_decision(
+                created = self.storage.save_open_order_decision(
                     config=config,
                     context=context,
                     order=replace(order),
@@ -1284,13 +1433,17 @@ class MonitorState:
                         else None
                     ),
                 )
+                created = created is not False
             except Exception as exc:  # noqa: BLE001 - 原子写失败必须回滚内存开单。
                 self.simulator.rollback_open_order(order.id)
                 if pending_observation is not None:
                     self.observations.remove(pending_observation)
+                self._decision_storage_failed = True
                 self._set_storage_error("开单持久化失败", exc)
                 return "STORAGE_ERROR"
             self._bundled_decision_ids.add(context.decision_id)
+        else:
+            created = True
         if (
             pending_observation is not None
             and self._observation_audit_collector is not None
@@ -1308,7 +1461,8 @@ class MonitorState:
         if not isinstance(self._last_order_opened_at, dict):
             self._last_order_opened_at = {"LONG": None, "SHORT": None}
         self._last_order_opened_at[signal.direction] = latest.close_time
-        self._send_webhook(signal, order)
+        if created:
+            self._send_webhook(signal, order)
         if signal.profile_degradation_probe:
             self._refresh_profile_degradation_guard(signal, latest.close_time)
         return gate.code
@@ -1549,19 +1703,24 @@ class MonitorState:
         if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
             return primary_signal, False
 
-        candidates: list[tuple[Signal, str]] = [
+        candidates: list[tuple[Signal, str, str]] = [
             (
                 primary_signal,
                 (primary_signal.observe_direction or primary_signal.direction).upper(),
+                self._origin_before_profile_promotion(primary_signal),
             )
         ]
         candidates.extend(
-            (signal, (signal.observe_direction or signal.direction).upper())
+            (
+                signal,
+                (signal.observe_direction or signal.direction).upper(),
+                self._origin_before_profile_promotion(signal),
+            )
             for signal in observation_candidates
         )
         for selected_profile in snapshot.get("selected_profiles", []):
             selected_key = str(selected_profile.get("key", ""))
-            for signal, direction in candidates:
+            for signal, direction, candidate_origin in candidates:
                 if direction not in {"LONG", "SHORT"}:
                     continue
                 key = daily_profile_key(
@@ -1599,6 +1758,7 @@ class MonitorState:
                         profile_key=key,
                         daily_profile_selected=True,
                         daily_profile_version=str(snapshot.get("version", "")),
+                        candidate_origin=candidate_origin,
                     ),
                     True,
                 )
@@ -1707,6 +1867,7 @@ class MonitorState:
             session_edge_min=self.observation_profile_min_edge,
             observe_only=False,
             profile_key=profile_key,
+            candidate_origin="PROFILE_PROMOTED_WAIT",
         )
 
     def _observation_profile(self, signal: Signal, direction: str, current_time: int) -> dict:
@@ -1762,10 +1923,6 @@ class MonitorState:
         key = self._observation_key(signal, direction)
         existing = next((item for item in self.observations if item.observation_key == key), None)
         if existing is not None:
-            if decision and existing.source_decision != decision:
-                existing.source_decision = decision
-                if self.storage and self._observation_audit_collector is None:
-                    self._save_observation(existing)
             return None
         overlapping = next(
             (
@@ -2441,15 +2598,21 @@ class MonitorState:
         )
 
     def _profile_guard_shadow_source(self) -> dict | None:
+        if self._profile_source_cached:
+            return self._cached_profile_source
+        self._profile_source_cached = True
         if not self.storage or not hasattr(self.storage, "order_profile_summary"):
+            self._cached_profile_source = None
             return None
         try:
-            return self.storage.order_profile_summary(
+            self._cached_profile_source = self.storage.order_profile_summary(
                 self.symbol,
                 profile_guard_min_history=self.profile_guard_min_history,
                 profile_guard_min_group_size=self.profile_guard_min_group_size,
             )
+            return self._cached_profile_source
         except Exception:  # noqa: BLE001 - 画像守卫仅用于复盘，不能影响开单保存。
+            self._cached_profile_source = None
             return None
 
     def _profile_guard_config(self) -> dict:
