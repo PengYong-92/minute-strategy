@@ -590,6 +590,181 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             0,
         )
 
+    def test_release_failure_rolls_back_and_allows_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "locked.sqlite3"
+            with sqlite3.connect(db_path) as setup:
+                self.assertEqual(
+                    setup.execute("pragma journal_mode = delete").fetchone()[0],
+                    "delete",
+                )
+                _create_legacy_schema(setup)
+                _insert_legacy_sentinels(setup)
+                setup.execute("pragma user_version = 1")
+            with sqlite3.connect(db_path) as baseline:
+                before_schema = _schema_snapshot(baseline)
+                before_payloads = _legacy_payload_snapshot(baseline)
+
+            writer = sqlite3.connect(db_path, timeout=0.0)
+            blocker = sqlite3.connect(db_path, timeout=0.0)
+            try:
+                writer.execute("pragma busy_timeout = 0")
+                blocker.execute("pragma busy_timeout = 0")
+                blocker.execute("begin")
+                blocker.execute("select payload from orders").fetchone()
+
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "database is locked",
+                ):
+                    self._migrate(writer)
+
+                writer_version = writer.execute(
+                    "pragma user_version"
+                ).fetchone()[0]
+                writer_tables = {
+                    row[0]
+                    for row in writer.execute(
+                        "select name from sqlite_master where type = 'table'"
+                    )
+                }
+                self.assertFalse(
+                    writer.in_transaction,
+                    (
+                        "failed release left the writer transaction open: "
+                        f"user_version={writer_version}, tables={sorted(writer_tables)}"
+                    ),
+                )
+                self.assertEqual(writer_version, 1)
+                self.assertEqual(_schema_snapshot(writer), before_schema)
+                self.assertEqual(_legacy_payload_snapshot(writer), before_payloads)
+                self.assertNotIn("decision_id", _column_details(writer, "orders"))
+                self.assertNotIn("runtime_config_snapshots", writer_tables)
+                self.assertNotIn("decision_contexts", writer_tables)
+
+                with sqlite3.connect(db_path, timeout=0.0) as fresh:
+                    self.assertEqual(
+                        fresh.execute("pragma user_version").fetchone()[0],
+                        1,
+                    )
+                    self.assertEqual(_schema_snapshot(fresh), before_schema)
+                    self.assertEqual(
+                        _legacy_payload_snapshot(fresh),
+                        before_payloads,
+                    )
+
+                blocker.rollback()
+                self._migrate(writer)
+                self.assertFalse(writer.in_transaction)
+                self.assertEqual(
+                    writer.execute("pragma user_version").fetchone()[0],
+                    2,
+                )
+                self.assertIn("decision_id", _column_details(writer, "orders"))
+                self.assertEqual(_legacy_payload_snapshot(writer), before_payloads)
+                with sqlite3.connect(db_path) as fresh:
+                    self.assertEqual(
+                        fresh.execute("pragma user_version").fetchone()[0],
+                        2,
+                    )
+                    self.assertIn(
+                        "runtime_config_snapshots",
+                        {
+                            row[0]
+                            for row in fresh.execute(
+                                """
+                                select name from sqlite_master
+                                where type = 'table'
+                                """
+                            )
+                        },
+                    )
+            finally:
+                if blocker.in_transaction:
+                    blocker.rollback()
+                blocker.close()
+                writer.close()
+
+    def test_failure_inside_caller_savepoint_preserves_caller_work(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute("pragma user_version = 1")
+        connection.commit()
+        connection.execute("savepoint caller_work")
+        connection.execute(
+            """
+            insert into orders(
+                symbol, order_id, status, result, opened_at, settled_at, payload
+            ) values ('BTCUSDT', 99, 'OPEN', null, 1000, null, ?)
+            """,
+            (ORDER_PAYLOAD,),
+        )
+
+        def deny_v2_index(action, arg1, _arg2, _database, _trigger):
+            if (
+                action == sqlite3.SQLITE_CREATE_INDEX
+                and arg1 == "idx_decision_contexts_symbol_closed_kline"
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(deny_v2_index)
+        with self.assertRaises(sqlite3.DatabaseError):
+            self._migrate(connection)
+        connection.set_authorizer(None)
+
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(
+            connection.execute(
+                "select payload from orders where order_id = 99"
+            ).fetchone()[0],
+            ORDER_PAYLOAD,
+        )
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 1)
+        self.assertNotIn("decision_id", _column_details(connection, "orders"))
+        connection.execute("release savepoint caller_work")
+        self.assertFalse(connection.in_transaction)
+        self.assertEqual(
+            connection.execute(
+                "select count(*) from orders where order_id = 99"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_success_inside_caller_savepoint_does_not_commit_caller_work(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute("pragma user_version = 1")
+        connection.commit()
+        connection.execute("savepoint caller_work")
+        connection.execute(
+            """
+            insert into orders(
+                symbol, order_id, status, result, opened_at, settled_at, payload
+            ) values ('BTCUSDT', 99, 'OPEN', null, 1000, null, ?)
+            """,
+            (ORDER_PAYLOAD,),
+        )
+
+        self._migrate(connection)
+
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertIn("decision_id", _column_details(connection, "orders"))
+        connection.execute("rollback to savepoint caller_work")
+        connection.execute("release savepoint caller_work")
+        self.assertFalse(connection.in_transaction)
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 1)
+        self.assertNotIn("decision_id", _column_details(connection, "orders"))
+        self.assertEqual(
+            connection.execute(
+                "select count(*) from orders where order_id = 99"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_existing_v2_column_does_not_cause_duplicate_column_failure(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

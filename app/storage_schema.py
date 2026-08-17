@@ -28,11 +28,32 @@ def _add_columns_if_absent(
         existing.add(name)
 
 
+def _rollback_migration(
+    connection: sqlite3.Connection,
+    *,
+    caller_in_transaction: bool,
+) -> None:
+    try:
+        connection.execute(f"rollback to savepoint {_MIGRATION_SAVEPOINT}")
+        connection.execute(f"release savepoint {_MIGRATION_SAVEPOINT}")
+    except Exception as cleanup_error:
+        if not caller_in_transaction and connection.in_transaction:
+            try:
+                connection.rollback()
+            except Exception as close_error:
+                raise cleanup_error from close_error
+        raise
+
+    if not caller_in_transaction and connection.in_transaction:
+        connection.rollback()
+
+
 def migrate(connection: sqlite3.Connection) -> None:
     version = int(connection.execute("pragma user_version").fetchone()[0])
     if version >= SCHEMA_VERSION:
         return
 
+    caller_in_transaction = connection.in_transaction
     connection.execute(f"savepoint {_MIGRATION_SAVEPOINT}")
     try:
         connection.execute(
@@ -160,9 +181,13 @@ def migrate(connection: sqlite3.Connection) -> None:
             """
         )
         connection.execute(f"pragma user_version = {SCHEMA_VERSION}")
-    except Exception:
-        connection.execute(f"rollback to savepoint {_MIGRATION_SAVEPOINT}")
         connection.execute(f"release savepoint {_MIGRATION_SAVEPOINT}")
+    except Exception as migration_error:
+        try:
+            _rollback_migration(
+                connection,
+                caller_in_transaction=caller_in_transaction,
+            )
+        except Exception as cleanup_error:
+            raise migration_error from cleanup_error
         raise
-    else:
-        connection.execute(f"release savepoint {_MIGRATION_SAVEPOINT}")
