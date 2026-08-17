@@ -19,6 +19,7 @@ class _ColumnSpec:
     not_null: int = 0
     default: str | None = None
     primary_key: int = 0
+    hidden: int = 0
 
 
 @dataclass(frozen=True)
@@ -29,11 +30,19 @@ class _TableSpec:
 
 
 @dataclass(frozen=True)
+class _IndexTermSpec:
+    name: str
+    descending: int = 0
+    collation: str = "BINARY"
+    key: int = 1
+
+
+@dataclass(frozen=True)
 class _IndexSpec:
     name: str
     table: str
     create_sql: str
-    columns: tuple[str, ...]
+    terms: tuple[_IndexTermSpec, ...]
     unique: int = 0
     partial: int = 0
     where: str | None = None
@@ -161,7 +170,10 @@ _INDEX_SPECS = (
                 idx_decision_contexts_symbol_closed_kline
             on decision_contexts(symbol, closed_kline_at_ms)
         """,
-        columns=("symbol", "closed_kline_at_ms"),
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("closed_kline_at_ms"),
+        ),
     ),
     _IndexSpec(
         name="idx_decision_contexts_symbol_profile_closed_kline",
@@ -171,7 +183,11 @@ _INDEX_SPECS = (
                 idx_decision_contexts_symbol_profile_closed_kline
             on decision_contexts(symbol, profile_key, closed_kline_at_ms)
         """,
-        columns=("symbol", "profile_key", "closed_kline_at_ms"),
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("profile_key"),
+            _IndexTermSpec("closed_kline_at_ms"),
+        ),
     ),
     _IndexSpec(
         name="idx_observation_signals_symbol_candidate_origin_opened",
@@ -181,7 +197,11 @@ _INDEX_SPECS = (
                 idx_observation_signals_symbol_candidate_origin_opened
             on observation_signals(symbol, candidate_origin, opened_at)
         """,
-        columns=("symbol", "candidate_origin", "opened_at"),
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("candidate_origin"),
+            _IndexTermSpec("opened_at"),
+        ),
     ),
     _IndexSpec(
         name="idx_observation_signals_symbol_adaptive_state_opened",
@@ -191,7 +211,11 @@ _INDEX_SPECS = (
                 idx_observation_signals_symbol_adaptive_state_opened
             on observation_signals(symbol, adaptive_state, opened_at)
         """,
-        columns=("symbol", "adaptive_state", "opened_at"),
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("adaptive_state"),
+            _IndexTermSpec("opened_at"),
+        ),
     ),
     _IndexSpec(
         name="idx_observation_signals_symbol_entry_structure_bias_opened",
@@ -201,7 +225,11 @@ _INDEX_SPECS = (
                 idx_observation_signals_symbol_entry_structure_bias_opened
             on observation_signals(symbol, entry_structure_bias, opened_at)
         """,
-        columns=("symbol", "entry_structure_bias", "opened_at"),
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("entry_structure_bias"),
+            _IndexTermSpec("opened_at"),
+        ),
     ),
     _IndexSpec(
         name="ux_signal_audit_symbol_aggregation_key",
@@ -212,7 +240,10 @@ _INDEX_SPECS = (
             on signal_audit(symbol, aggregation_key)
             where aggregation_key is not null
         """,
-        columns=("symbol", "aggregation_key"),
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("aggregation_key"),
+        ),
         unique=1,
         partial=1,
         where="AGGREGATION_KEY IS NOT NULL",
@@ -251,7 +282,7 @@ def _normalized_default(value: object) -> str | None:
     return " ".join(str(value).strip().split())
 
 
-def _column_rows(
+def _column_rows_by_name(
     connection: sqlite3.Connection,
     table: str,
 ) -> dict[str, tuple]:
@@ -259,28 +290,57 @@ def _column_rows(
     return {
         str(row[1]).casefold(): row
         for row in connection.execute(
-            f"pragma table_info({quoted_table})"
+            f"pragma table_xinfo({quoted_table})"
         ).fetchall()
     }
 
 
-def _column_signature(row: tuple) -> tuple[str, int, str | None, int]:
+def _ordered_column_rows(
+    connection: sqlite3.Connection,
+    table: str,
+) -> tuple[tuple, ...]:
+    quoted_table = _quote_identifier(table)
+    return tuple(connection.execute(f"pragma table_xinfo({quoted_table})"))
+
+
+def _column_signature(row: tuple) -> tuple[str, int, str | None, int, int]:
     return (
         _normalized_type(row[2]),
         int(row[3]),
         _normalized_default(row[4]),
         int(row[5]),
+        int(row[6]),
     )
 
 
 def _expected_column_signature(
     spec: _ColumnSpec,
-) -> tuple[str, int, str | None, int]:
+) -> tuple[str, int, str | None, int, int]:
     return (
         spec.data_type,
         spec.not_null,
         spec.default,
         spec.primary_key,
+        spec.hidden,
+    )
+
+
+def _ordered_column_signature(row: tuple) -> tuple:
+    return (
+        int(row[0]),
+        str(row[1]).casefold(),
+        *_column_signature(row),
+    )
+
+
+def _expected_ordered_column_signature(
+    position: int,
+    spec: _ColumnSpec,
+) -> tuple:
+    return (
+        position,
+        spec.name.casefold(),
+        *_expected_column_signature(spec),
     )
 
 
@@ -315,17 +375,19 @@ def _validate_table(
     spec: _TableSpec,
 ) -> None:
     _require_table(connection, spec.name)
-    actual = _column_rows(connection, spec.name)
-    expected = {column.name.casefold(): column for column in spec.columns}
-    if actual.keys() != expected.keys():
-        missing = sorted(expected.keys() - actual.keys())
-        extra = sorted(actual.keys() - expected.keys())
+    actual = tuple(
+        _ordered_column_signature(row)
+        for row in _ordered_column_rows(connection, spec.name)
+    )
+    expected = tuple(
+        _expected_ordered_column_signature(position, column)
+        for position, column in enumerate(spec.columns)
+    )
+    if actual != expected:
         raise SchemaConflictError(
             f"SQLite schema conflict for {spec.name}: "
-            f"missing columns={missing}, extra columns={extra}"
+            f"expected ordered table_xinfo={expected}, found {actual}"
         )
-    for name, column_spec in expected.items():
-        _validate_column(spec.name, column_spec, actual[name])
 
 
 def _ensure_added_columns(
@@ -334,7 +396,7 @@ def _ensure_added_columns(
     columns: tuple[_ColumnSpec, ...],
 ) -> None:
     _require_table(connection, table)
-    existing = _column_rows(connection, table)
+    existing = _column_rows_by_name(connection, table)
     for spec in columns:
         key = spec.name.casefold()
         row = existing.get(key)
@@ -345,7 +407,7 @@ def _ensure_added_columns(
             f"alter table {_quote_identifier(table)} "
             f"add column {_quote_identifier(spec.name)} {spec.declaration}"
         )
-        existing = _column_rows(connection, table)
+        existing = _column_rows_by_name(connection, table)
         _validate_column(table, spec, existing[key])
 
 
@@ -375,6 +437,22 @@ def _normalized_where(sql: str | None) -> str | None:
         return None
     expression = " ".join(match.group(1).strip().split())
     return _strip_outer_parentheses(expression).upper()
+
+
+def _index_term_signature(row: tuple) -> tuple[str | None, int, str, int]:
+    name = None if row[2] is None else str(row[2]).casefold()
+    return (name, int(row[3]), str(row[4] or "").upper(), int(row[5]))
+
+
+def _expected_index_term_signature(
+    spec: _IndexTermSpec,
+) -> tuple[str, int, str, int]:
+    return (
+        spec.name.casefold(),
+        spec.descending,
+        spec.collation.upper(),
+        spec.key,
+    )
 
 
 def _validate_index(
@@ -407,13 +485,16 @@ def _validate_index(
             f"SQLite schema conflict for {spec.name}: index metadata is missing"
         )
     quoted_index = _quote_identifier(spec.name)
-    columns = tuple(
-        str(row[2]).casefold()
-        for row in connection.execute(f"pragma index_info({quoted_index})")
+    key_terms = tuple(
+        _index_term_signature(row)
+        for row in connection.execute(f"pragma index_xinfo({quoted_index})")
+        if int(row[5]) == 1
     )
-    expected_columns = tuple(column.casefold() for column in spec.columns)
-    actual = (int(index_row[2]), columns, int(index_row[4]), _normalized_where(sql))
-    expected = (spec.unique, expected_columns, spec.partial, spec.where)
+    expected_terms = tuple(
+        _expected_index_term_signature(term) for term in spec.terms
+    )
+    actual = (int(index_row[2]), key_terms, int(index_row[4]), _normalized_where(sql))
+    expected = (spec.unique, expected_terms, spec.partial, spec.where)
     if actual != expected:
         raise SchemaConflictError(
             f"SQLite schema conflict for {spec.name}: "
@@ -426,7 +507,7 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
         _validate_table(connection, table_spec)
     for table, column_specs in _ADDED_COLUMN_SPECS.items():
         _require_table(connection, table)
-        actual = _column_rows(connection, table)
+        actual = _column_rows_by_name(connection, table)
         for column_spec in column_specs:
             row = actual.get(column_spec.name.casefold())
             if row is None:

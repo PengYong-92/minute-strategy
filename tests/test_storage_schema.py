@@ -579,6 +579,53 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             "runtime_config_snapshots",
         )
 
+    def test_reordered_v2_owned_table_columns_are_rejected(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute(
+            """
+            create table runtime_config_snapshots (
+                context_version text not null,
+                runtime_config_hash text primary key,
+                strategy_build_id text not null,
+                canonical_payload text not null,
+                payload_bytes integer not null,
+                created_at_ms integer not null
+            )
+            """
+        )
+        connection.execute("pragma user_version = 1")
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "runtime_config_snapshots",
+        )
+
+    def test_generated_column_on_v2_owned_table_is_rejected(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute(
+            """
+            create table runtime_config_snapshots (
+                runtime_config_hash text primary key,
+                context_version text not null,
+                strategy_build_id text not null,
+                canonical_payload text not null,
+                payload_bytes integer not null,
+                created_at_ms integer not null,
+                payload_copy text generated always as (canonical_payload) virtual
+            )
+            """
+        )
+        connection.execute("pragma user_version = 1")
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "runtime_config_snapshots",
+        )
+
     def test_incompatible_existing_v2_column_rolls_back_without_certification(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -600,12 +647,18 @@ class StorageSchemaMigrationTest(unittest.TestCase):
     def test_unrelated_legacy_extension_column_is_not_over_validated(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
-        _create_legacy_schema(connection)
+        _create_legacy_schema(
+            connection,
+            order_decision_id_declaration="text",
+        )
         connection.execute(
             """
             alter table orders
             add column legacy_extension blob not null default x''
             """
+        )
+        connection.execute(
+            "create index idx_orders_legacy_status on orders(status)"
         )
 
         self._migrate(connection)
@@ -614,6 +667,14 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         columns = _column_details(connection, "orders")
         self.assertIn("legacy_extension", columns)
         self.assertIn("decision_id", columns)
+        self.assertIsNotNone(
+            connection.execute(
+                """
+                select 1 from sqlite_master
+                where type = 'index' and name = 'idx_orders_legacy_status'
+                """
+            ).fetchone()
+        )
 
     def test_same_named_wrong_index_rolls_back_without_certification(self):
         cases = (
@@ -643,6 +704,57 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                     self._assert_schema_conflict_preserves_database(
                         connection,
                         "idx_decision_contexts_symbol_closed_kline",
+                    )
+                finally:
+                    connection.close()
+
+    def test_required_index_key_metadata_conflicts_are_rejected(self):
+        cases = (
+            (
+                "partial nocase collation",
+                "ux_signal_audit_symbol_aggregation_key",
+                "create unique index ux_signal_audit_symbol_aggregation_key "
+                "on signal_audit(symbol collate nocase, aggregation_key) "
+                "where aggregation_key is not null",
+            ),
+            (
+                "normal descending term",
+                "idx_decision_contexts_symbol_closed_kline",
+                "create index idx_decision_contexts_symbol_closed_kline "
+                "on decision_contexts(symbol, closed_kline_at_ms desc)",
+            ),
+            (
+                "expression term",
+                "idx_decision_contexts_symbol_closed_kline",
+                "create index idx_decision_contexts_symbol_closed_kline "
+                "on decision_contexts(symbol, (closed_kline_at_ms + 0))",
+            ),
+            (
+                "extra key term",
+                "idx_decision_contexts_symbol_closed_kline",
+                "create index idx_decision_contexts_symbol_closed_kline "
+                "on decision_contexts(symbol, closed_kline_at_ms, profile_key)",
+            ),
+            (
+                "wrong key order",
+                "idx_decision_contexts_symbol_closed_kline",
+                "create index idx_decision_contexts_symbol_closed_kline "
+                "on decision_contexts(closed_kline_at_ms, symbol)",
+            ),
+        )
+        for label, index_name, create_index in cases:
+            with self.subTest(label=label):
+                connection = sqlite3.connect(":memory:")
+                try:
+                    _create_legacy_schema(connection)
+                    self._migrate(connection)
+                    connection.execute(f"drop index {index_name}")
+                    connection.execute(create_index)
+                    connection.execute("pragma user_version = 1")
+
+                    self._assert_schema_conflict_preserves_database(
+                        connection,
+                        index_name,
                     )
                 finally:
                     connection.close()
