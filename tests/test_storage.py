@@ -1544,7 +1544,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "monitor.sqlite3"
             store = SQLiteMonitorStore(path)
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection:
                 page_count = connection.execute("pragma page_count").fetchone()[0]
             page_limit = page_count + 1
 
@@ -1571,7 +1571,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                         created_at_ms=attempts * 600_000,
                     )
 
-                with sqlite3.connect(path) as connection:
+                with closing(sqlite3.connect(path)) as connection:
                     rows_before_core = connection.execute(
                         "select count(*) from signal_audit"
                     ).fetchone()[0]
@@ -1583,7 +1583,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                         created_at_ms=(attempts + 1) * 600_000,
                         force_independent=True,
                     )
-                with sqlite3.connect(path) as connection:
+                with closing(sqlite3.connect(path)) as connection:
                     rows_after_core = connection.execute(
                         "select count(*) from signal_audit"
                     ).fetchone()[0]
