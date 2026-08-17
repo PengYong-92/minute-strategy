@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from dataclasses import fields, replace
@@ -294,7 +295,13 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
 
             first_store.save_runtime_config_snapshot(first)
             second_store.save_runtime_config_snapshot(second)
+            second_build_context = decision_context(second)
+            second_store.save_decision_context(second_build_context)
             restored = second_store.load_runtime_config_snapshot(first.hash)
+            restored_context = second_store.load_decision_context(
+                second_build_context.symbol,
+                second_build_context.decision_id,
+            )
             with closing(sqlite3.connect(db_path)) as connection:
                 count = connection.execute(
                     "select count(*) from runtime_config_snapshots"
@@ -303,6 +310,62 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(first.hash, second.hash)
         self.assertEqual(count, 1)
         self.assertEqual(restored["strategy_build_id"], "build-a")
+        self.assertEqual(restored_context, second_build_context.to_dict())
+        self.assertEqual(restored_context["strategy_build_id"], "build-b")
+
+    def test_runtime_config_rejects_exact_credential_keys_recursively(self):
+        credential_payloads = {
+            "root api key": {"api_key": "plaintext"},
+            "nested api secret": {"service": {"api_secret": "plaintext"}},
+            "list webhook token": {
+                "services": [{"enabled": True}, {"webhook_token": "plaintext"}]
+            },
+            "deep webhook url": {
+                "services": [{"notifications": [{"webhook_url": "https://secret"}]}]
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+
+            for label, payload in credential_payloads.items():
+                with self.subTest(label=label):
+                    canonical_payload = json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    snapshot = snapshot_with_payload(canonical_payload)
+
+                    with self.assertRaises(ValueError):
+                        store.save_runtime_config_snapshot(snapshot)
+
+                    self.assertEqual(decision_storage_rows(db_path), ([], []))
+
+    def test_runtime_config_credential_boundary_uses_exact_key_semantics(self):
+        payload = {
+            "apiKey": "allowed",
+            "api_key_name": "allowed",
+            "notes": [
+                "api_secret",
+                {"webhook_url_enabled": True},
+                {"description": "webhook_token"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            snapshot = snapshot_with_payload(json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ))
+
+            store.save_runtime_config_snapshot(snapshot)
+            restored = store.load_runtime_config_snapshot(snapshot.hash)
+
+        self.assertEqual(restored["canonical_payload"], snapshot.canonical_payload)
 
     def test_runtime_config_rejects_malformed_hash_or_payload_without_writing(self):
         payloads = {
@@ -676,6 +739,92 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                     "select count(*) from decision_contexts"
                 ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_decision_context_post_insert_mismatch_rolls_back_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            snapshot = runtime_config_snapshot({"threshold": 81.5})
+            context = decision_context(snapshot)
+            store.save_runtime_config_snapshot(snapshot)
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    """
+                    create trigger mutate_decision_after_insert
+                    after insert on decision_contexts
+                    begin
+                        update decision_contexts
+                        set candidate_origin = 'trigger-mutated'
+                        where symbol = new.symbol and decision_id = new.decision_id;
+                    end
+                    """
+                )
+                connection.commit()
+
+            try:
+                with self.assertRaises(ValueError):
+                    store.save_decision_context(context)
+                runtime_rows, decision_rows = decision_storage_rows(db_path)
+            finally:
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.execute("drop trigger mutate_decision_after_insert")
+                    connection.commit()
+
+        self.assertEqual(len(runtime_rows), 1)
+        self.assertEqual(decision_rows, [])
+
+    def test_two_store_instances_save_snapshot_and_context_concurrently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            first_store = SQLiteMonitorStore(db_path)
+            second_store = SQLiteMonitorStore(db_path)
+            first_snapshot = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-a",
+            )
+            second_snapshot = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-b",
+            )
+            context = decision_context(second_snapshot)
+            barrier = threading.Barrier(3)
+            errors = []
+            error_lock = threading.Lock()
+
+            def persist(store, snapshot):
+                try:
+                    barrier.wait(timeout=5)
+                    store.save_runtime_config_snapshot(snapshot)
+                    store.save_decision_context(context)
+                except BaseException as error:
+                    with error_lock:
+                        errors.append(error)
+
+            threads = [
+                threading.Thread(target=persist, args=(first_store, first_snapshot)),
+                threading.Thread(target=persist, args=(second_store, second_snapshot)),
+            ]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=10)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            restored_snapshot = first_store.load_runtime_config_snapshot(
+                first_snapshot.hash
+            )
+            restored_context = second_store.load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            runtime_rows, decision_rows = decision_storage_rows(db_path)
+
+        self.assertEqual(len(runtime_rows), 1)
+        self.assertEqual(len(decision_rows), 1)
+        self.assertIn(restored_snapshot["strategy_build_id"], {"build-a", "build-b"})
+        self.assertEqual(restored_context, context.to_dict())
 
     def test_two_store_instances_persist_decision_context_deterministically(self):
         with tempfile.TemporaryDirectory() as temp_dir:

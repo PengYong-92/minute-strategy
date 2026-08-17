@@ -7,7 +7,12 @@ from pathlib import Path
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
-from app.decision_context import CONTEXT_VERSION, DecisionContext, RuntimeConfigSnapshot
+from app.decision_context import (
+    CONTEXT_VERSION,
+    DecisionContext,
+    RuntimeConfigSnapshot,
+    _CREDENTIAL_KEYS as DECISION_CONTEXT_CREDENTIAL_KEYS,
+)
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
@@ -82,6 +87,25 @@ def _parse_canonical_json(payload: object, name: str) -> object:
     return value
 
 
+def _parse_runtime_config_payload(payload: object) -> object:
+    value = _parse_canonical_json(payload, "canonical_payload")
+
+    def reject_credentials(item: object) -> None:
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if key in DECISION_CONTEXT_CREDENTIAL_KEYS:
+                    raise ValueError(
+                        f"canonical_payload contains credential key: {key}"
+                    )
+                reject_credentials(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                reject_credentials(nested)
+
+    reject_credentials(value)
+    return value
+
+
 def _require_string(
     value: object,
     name: str,
@@ -117,7 +141,7 @@ def _runtime_snapshot_values(
         "strategy_build_id",
         non_empty=True,
     )
-    _parse_canonical_json(canonical_payload, "canonical_payload")
+    _parse_runtime_config_payload(canonical_payload)
     actual_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
     if actual_hash != runtime_config_hash:
         raise ValueError("runtime_config_hash does not match canonical_payload")
@@ -147,7 +171,7 @@ def _runtime_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         raise ValueError("stored runtime configuration metadata is malformed") from error
     if context_version != CONTEXT_VERSION:
         raise ValueError("stored runtime configuration context version is unsupported")
-    _parse_canonical_json(canonical_payload, "canonical_payload")
+    _parse_runtime_config_payload(canonical_payload)
     if hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest() != runtime_config_hash:
         raise ValueError("stored runtime configuration hash does not match its payload")
     payload_bytes = snapshot.get("payload_bytes")
@@ -623,6 +647,7 @@ class SQLiteMonitorStore:
         )
         with self._connect() as connection:
             connection.execute("begin immediate")
+            # Build ID is first-seen config provenance; each decision stores its actual build.
             connection.execute(
                 """
                 insert or ignore into runtime_config_snapshots(
