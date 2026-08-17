@@ -395,7 +395,8 @@ class RecordingStorage:
         audit_context=None,
         *,
         has_formal_candidate=False,
-        has_observation_candidate=False,
+        force_independent=False,
+        event_kind=None,
     ):
         self._wait_for_write_gate()
         self.signals.append(
@@ -406,7 +407,8 @@ class RecordingStorage:
                 created_at_ms,
                 audit_context,
                 has_formal_candidate,
-                has_observation_candidate,
+                force_independent,
+                event_kind,
             )
         )
 
@@ -451,31 +453,110 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
-    def test_signal_audit_call_explicitly_marks_observation_candidate(self):
+    def test_opened_main_and_actual_observations_write_distinct_signal_audits(self):
         storage = RecordingStorage()
-        state = MonitorState(symbol="BTCUSDT", storage=storage)
-        candidate = Signal(
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_rolling_edge_guard=False,
+            enable_observation_profile_promotion=False,
+        )
+        selected = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="main long",
+            price=100.0,
+            open_time=60_000,
+            score=90.0,
+            threshold=70.0,
+            threshold_segment="WD-01",
+            strategy_family="main_family",
+            strategy_tag="main_tag",
+            profile_key="main-profile",
+        )
+        first_observation = replace(
+            selected,
+            direction="WAIT",
+            observe_direction="SHORT",
+            observe_only=True,
+            score=-65.0,
+            strategy_family="observe_short",
+            strategy_tag="observe_short_tag",
+            profile_key="short-profile",
+        )
+        second_observation = replace(
+            selected,
+            direction="WAIT",
+            observe_direction="LONG",
+            observe_only=True,
+            score=66.0,
+            threshold_segment="WD-02",
+            strategy_family="observe_long",
+            strategy_tag="observe_long_tag",
+            profile_key="long-profile",
+        )
+        overlapping_attempt = replace(
+            first_observation,
+            strategy_tag="overlap_same_profile",
+            profile_key="short-overlap",
+        )
+
+        with patch("app.state.analyze_volume_price", return_value=selected), patch(
+            "app.state.analyze_observation_signals",
+            return_value=[first_observation, second_observation, overlapping_attempt],
+        ), patch("app.state.choose_trade_signal", return_value=selected):
+            self.assertTrue(state.update_from_klines([kline(1, 100.0, 100.0)]))
+        state.wait_for_storage_writes()
+
+        self.assertEqual(len(storage.signals), 3)
+        main = storage.signals[0]
+        observations = storage.signals[1:]
+        self.assertEqual(main[2], "OPENED")
+        self.assertEqual(main[7], "ORDER_OPENED")
+        self.assertTrue(main[5])
+        self.assertTrue(main[6])
+        self.assertIn("time_period_guard", main[4])
+        self.assertEqual(
+            main[4]["profile_guard"],
+            {
+                "status": "NOT_EVALUATED",
+                "code": "PROFILE_GUARD_NOT_EVALUATED",
+                "enabled": False,
+                "observe_only": True,
+                "blocked": False,
+                "hit_keys": [],
+            },
+        )
+        self.assertNotIn("min_history", main[4]["profile_guard"])
+        self.assertEqual([item[2] for item in observations], ["RESEARCH_OBSERVE", "RESEARCH_OBSERVE"])
+        self.assertEqual([item[7] for item in observations], ["OBSERVATION_CANDIDATE"] * 2)
+        self.assertEqual([item[1]["direction"] for item in observations], ["SHORT", "LONG"])
+        self.assertEqual(
+            [item[1]["profile_key"] for item in observations],
+            ["short-profile", "long-profile"],
+        )
+        self.assertEqual(len(storage.observations), 2)
+
+    def test_observation_audit_collector_is_cleared_after_update_exception(self):
+        state = MonitorState(symbol="BTCUSDT")
+        selected = Signal(
             direction="WAIT",
             timeframe_minutes=10,
             level="B",
-            reason="below threshold",
+            reason="wait",
             price=100.0,
-            open_time=1_000,
-            score=0.0,
-            threshold=70.0,
+            open_time=60_000,
         )
+        with patch("app.state.analyze_volume_price", return_value=selected), patch(
+            "app.state.analyze_observation_signals", return_value=[]
+        ), patch("app.state.choose_trade_signal", return_value=selected), patch.object(
+            state, "_maybe_open_order", side_effect=RuntimeError("decision failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "decision failed"):
+                state.update_from_klines([kline(1, 100.0, 100.0)])
 
-        state._save_signal(
-            candidate,
-            "BELOW_THRESHOLD",
-            1_000,
-            has_observation_candidate=True,
-        )
-        state.wait_for_storage_writes()
-
-        self.assertEqual(len(storage.signals), 1)
-        self.assertFalse(storage.signals[0][5])
-        self.assertTrue(storage.signals[0][6])
+        self.assertIsNone(state._observation_audit_collector)
 
     def test_realtime_price_update_does_not_enter_strategy_state(self):
         state = MonitorState(symbol="BTCUSDT", now_ms=lambda: 100_020)

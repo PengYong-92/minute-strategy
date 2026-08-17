@@ -177,6 +177,7 @@ class MonitorState:
         self._storage_futures: list[Future] = []
         self._storage_futures_condition = threading.Condition()
         self._storage_write_failures: list[Exception] = []
+        self._observation_audit_collector: list[tuple[Signal, str]] | None = None
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
         self.simulator = self._build_simulator(self.symbol, restored_orders)
@@ -218,6 +219,7 @@ class MonitorState:
         self.wave_batch_guard: dict = self._empty_wave_batch_guard()
         self.profile_degradation_guard: dict = self._empty_profile_degradation_guard()
         self.profile_health_guard: dict = self._empty_profile_health_guard()
+        self.profile_guard_audit: dict = self._empty_profile_guard_audit()
         self.time_period_guard: dict = evaluate_time_period_guard(
             self._now_ms(),
             self.time_period_guard_config,
@@ -408,35 +410,48 @@ class MonitorState:
                 for signal in observation_signals
             ]
             self.signals = new_signals
-            selected_signal, daily_profile_required = self._select_daily_profile_signal(
-                selected_signal,
-                observation_signals,
-                latest.close_time,
-            )
-            has_formal_candidate = bool(selected_signal.actionable)
-            has_observation_candidate = bool(observation_signals) or (
-                self._should_record_observation(selected_signal)
-            )
-            selected_signal = self._apply_wave_guard(selected_signal, wave_state)
-            selected_signal = self._attach_quality_score(
-                selected_signal,
-                current_time=latest.close_time,
-            )
-            self.selected_signal = selected_signal
-            self.order_decision = self._maybe_open_order(
-                selected_signal,
-                latest,
-                daily_profile_required=daily_profile_required,
-            )
-            self._record_observation_candidates(observation_signals, latest)
+            self._observation_audit_collector = []
+            try:
+                selected_signal, daily_profile_required = self._select_daily_profile_signal(
+                    selected_signal,
+                    observation_signals,
+                    latest.close_time,
+                )
+                has_formal_candidate = bool(selected_signal.actionable)
+                selected_signal = self._apply_wave_guard(selected_signal, wave_state)
+                selected_signal = self._attach_quality_score(
+                    selected_signal,
+                    current_time=latest.close_time,
+                )
+                self.selected_signal = selected_signal
+                self.order_decision = self._maybe_open_order(
+                    selected_signal,
+                    latest,
+                    daily_profile_required=daily_profile_required,
+                )
+                self._record_observation_candidates(observation_signals, latest)
+                observation_audits = tuple(self._observation_audit_collector)
+            finally:
+                self._observation_audit_collector = None
             if self.storage:
                 self._save_signal(
                     self.selected_signal or selected_signal,
                     self.order_decision,
                     self.updated_at_ms,
                     has_formal_candidate=has_formal_candidate,
-                    has_observation_candidate=has_observation_candidate,
+                    force_independent=bool(observation_audits),
+                    event_kind=(
+                        "ORDER_OPENED" if self.order_decision == "OPENED" else None
+                    ),
                 )
+                for observation_signal, source_decision in observation_audits:
+                    self._save_signal(
+                        observation_signal,
+                        source_decision,
+                        self.updated_at_ms,
+                        force_independent=True,
+                        event_kind="OBSERVATION_CANDIDATE",
+                    )
             return self.order_decision != "STORAGE_ERROR"
 
     def seed_klines(
@@ -560,6 +575,7 @@ class MonitorState:
             self.wave_batch_guard = self._empty_wave_batch_guard()
             self.profile_degradation_guard = self._empty_profile_degradation_guard()
             self.profile_health_guard = self._empty_profile_health_guard()
+            self.profile_guard_audit = self._empty_profile_guard_audit()
             self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self.time_period_guard = evaluate_time_period_guard(
@@ -694,6 +710,7 @@ class MonitorState:
         daily_profile_required: bool = False,
     ) -> str:
         self.risk_pause = ""
+        self.profile_guard_audit = self._empty_profile_guard_audit()
         signal = self._attach_direction_pulse_shadow(signal, current_time=latest.close_time)
         self.selected_signal = signal
         time_period_decision = evaluate_time_period_guard(
@@ -863,6 +880,19 @@ class MonitorState:
             )
         if self.enable_profile_guard:
             profile_guard = self._profile_guard_shadow(signal)
+            profile_guard_blocked = profile_guard["status"] == "WOULD_BLOCK"
+            self.profile_guard_audit = {
+                "status": str(profile_guard.get("status") or "NOT_EVALUATED"),
+                "code": (
+                    "PROFILE_GUARD_BLOCKED"
+                    if profile_guard_blocked
+                    else "PROFILE_GUARD_PASS"
+                ),
+                "enabled": True,
+                "observe_only": False,
+                "blocked": profile_guard_blocked,
+                "hit_keys": list(profile_guard.get("hit_keys") or []),
+            }
             if profile_guard["status"] == "WOULD_BLOCK":
                 return self._block_order(
                     signal,
@@ -1424,12 +1454,12 @@ class MonitorState:
             return True
         return signal.direction == "SHORT"
 
-    def _record_observation(self, signal: Signal, latest: Kline, decision: str) -> None:
+    def _record_observation(self, signal: Signal, latest: Kline, decision: str) -> bool:
         if not signal.quality_score_version:
             signal = self._attach_quality_score(signal, current_time=latest.close_time)
         direction = signal.observe_direction or signal.direction
         if direction not in {"LONG", "SHORT"}:
-            return
+            return False
         key = self._observation_key(signal, direction)
         existing = next((item for item in self.observations if item.observation_key == key), None)
         if existing is not None:
@@ -1437,7 +1467,7 @@ class MonitorState:
                 existing.source_decision = decision
                 if self.storage:
                     self._save_observation(existing)
-            return
+            return False
         overlapping = next(
             (
                 item
@@ -1452,7 +1482,7 @@ class MonitorState:
             None,
         )
         if overlapping is not None:
-            return
+            return False
         observation = ObservationSignal(
             observation_key=key,
             strategy_family=signal.strategy_family,
@@ -1501,8 +1531,13 @@ class MonitorState:
             profile_health_evaluated_at=signal.profile_health_evaluated_at,
         )
         self.observations.append(observation)
+        if self._observation_audit_collector is not None:
+            self._observation_audit_collector.append(
+                (replace(signal, direction=direction), str(decision or "RESEARCH_OBSERVE"))
+            )
         if self.storage:
             self._save_observation(observation)
+        return True
 
     def _record_observation_candidates(self, signals: Sequence[Signal], latest: Kline) -> None:
         for signal in signals:
@@ -1699,11 +1734,17 @@ class MonitorState:
         degraded = should_degrade(snapshot, self.rolling_edge_config)
         return self._rolling_edge_to_dict(snapshot, degraded, self.enable_rolling_edge_guard)
 
-    @staticmethod
-    def _rolling_edge_to_dict(snapshot: RollingEdgeSnapshot, degraded: bool, guard_enabled: bool) -> dict:
+    def _rolling_edge_to_dict(
+        self,
+        snapshot: RollingEdgeSnapshot,
+        degraded: bool,
+        guard_enabled: bool,
+    ) -> dict:
         return {
             "observe_only": not guard_enabled,
             "status": "DEGRADED" if degraded else "NORMAL",
+            "code": "ROLLING_EDGE_BLOCKED" if degraded else "ROLLING_EDGE_NORMAL",
+            "blocked": bool(guard_enabled and degraded),
             "key": snapshot.key,
             "sample_size": snapshot.sample_size,
             "wins": snapshot.wins,
@@ -1711,6 +1752,8 @@ class MonitorState:
             "win_rate": snapshot.win_rate,
             "pnl": snapshot.pnl,
             "ev": snapshot.ev,
+            "edge": snapshot.ev,
+            "threshold": self.rolling_edge_config.min_ev,
         }
 
     def _save_order(self, order) -> None:
@@ -1823,7 +1866,8 @@ class MonitorState:
         created_at_ms: int,
         *,
         has_formal_candidate: bool = False,
-        has_observation_candidate: bool = False,
+        force_independent: bool = False,
+        event_kind: str | None = None,
     ) -> None:
         symbol = self.symbol
         audit_context = {
@@ -1832,8 +1876,8 @@ class MonitorState:
             "wave_batch_guard": dict(self.wave_batch_guard),
             "profile_degradation_guard": dict(self.profile_degradation_guard),
             "profile_health_guard": dict(self.profile_health_guard),
-            "direction_pulse_shadow": self.direction_pulse_shadow,
-            "profile_guard": self._profile_guard_config(),
+            "time_period_guard": dict(self.time_period_guard),
+            "profile_guard": dict(self.profile_guard_audit),
         }
         self._submit_storage_write(
             lambda signal=signal, symbol=symbol, decision=decision, created_at_ms=created_at_ms,
@@ -1845,7 +1889,8 @@ class MonitorState:
                     created_at_ms,
                     audit_context=audit_context,
                     has_formal_candidate=has_formal_candidate,
-                    has_observation_candidate=has_observation_candidate,
+                    force_independent=force_independent,
+                    event_kind=event_kind,
                 )
             )
         )
@@ -2056,6 +2101,8 @@ class MonitorState:
         return {
             "observe_only": not self.enable_rolling_edge_guard,
             "status": "UNKNOWN",
+            "code": "ROLLING_EDGE_UNKNOWN",
+            "blocked": False,
             "key": "",
             "sample_size": 0,
             "wins": 0,
@@ -2063,6 +2110,8 @@ class MonitorState:
             "win_rate": 0.0,
             "pnl": 0.0,
             "ev": 0.0,
+            "edge": 0.0,
+            "threshold": self.rolling_edge_config.min_ev,
         }
 
     def _empty_result_sequence_guard(self) -> dict:
@@ -2070,6 +2119,8 @@ class MonitorState:
         return {
             "enabled": config.enabled,
             "status": "NORMAL" if config.enabled else "DISABLED",
+            "code": "RESULT_SEQUENCE_NORMAL" if config.enabled else "DISABLED",
+            "blocked": False,
             "scope": config.scope,
             "loss_streak": config.loss_streak,
             "cooldown_minutes": config.cooldown_minutes,
@@ -2086,6 +2137,11 @@ class MonitorState:
         return {
             "enabled": config.cooldown_minutes > 0,
             "status": "NORMAL" if config.cooldown_minutes > 0 else "DISABLED",
+            "code": (
+                "PROFILE_DEGRADATION_NORMAL"
+                if config.cooldown_minutes > 0
+                else "DISABLED"
+            ),
             "blocked": False,
             "cooldown_minutes": config.cooldown_minutes,
             "profile_key": "",
@@ -2104,6 +2160,7 @@ class MonitorState:
         return {
             "enabled": enabled,
             "status": "NOT_APPLICABLE" if enabled else "DISABLED",
+            "code": "PROFILE_HEALTH_NOT_APPLICABLE" if enabled else "DISABLED",
             "direction": "",
             "evaluated_at": 0,
             "next_evaluation_at": 0,
@@ -2137,6 +2194,11 @@ class MonitorState:
         return {
             **self._empty_profile_health_guard(),
             **decision.to_dict(),
+            "code": (
+                "PROFILE_HEALTH_BLOCKED"
+                if decision.blocked
+                else f"PROFILE_HEALTH_{decision.status}"
+            ),
         }
 
     def _refresh_profile_health_guard(
@@ -2168,6 +2230,11 @@ class MonitorState:
         return {
             **self._empty_profile_degradation_guard(),
             "status": decision.status,
+            "code": (
+                "PROFILE_DEGRADATION_BLOCKED"
+                if decision.blocked
+                else f"PROFILE_DEGRADATION_{decision.status}"
+            ),
             "blocked": decision.blocked,
             "profile_key": decision.profile_key,
             "daily_profile_version": decision.daily_profile_version,
@@ -2224,6 +2291,7 @@ class MonitorState:
         return {
             "enabled": config.enabled,
             "code": "WAVE_BATCH_GUARD_PENDING",
+            "status": "PENDING" if config.enabled else "DISABLED",
             "mode": "PENDING" if config.enabled else "DISABLED",
             "blocked": False,
             "allow_progression": True,
@@ -2246,6 +2314,7 @@ class MonitorState:
         return {
             **self._empty_wave_batch_guard(),
             "code": decision.code,
+            "status": decision.mode,
             "mode": decision.mode,
             "blocked": decision.blocked,
             "allow_progression": decision.allow_progression,
@@ -2266,6 +2335,14 @@ class MonitorState:
         return {
             "enabled": config.enabled,
             "status": "PAUSED" if decision.blocked else "NORMAL" if config.enabled else "DISABLED",
+            "code": (
+                "RESULT_SEQUENCE_GUARD_BLOCKED"
+                if decision.blocked
+                else "RESULT_SEQUENCE_NORMAL"
+                if config.enabled
+                else "DISABLED"
+            ),
+            "blocked": decision.blocked,
             "scope": config.scope,
             "loss_streak": config.loss_streak,
             "cooldown_minutes": config.cooldown_minutes,
@@ -2275,6 +2352,16 @@ class MonitorState:
             "pause_until": decision.pause_until,
             "paused_directions": [decision.direction] if decision.blocked else [],
             "reason": decision.reason,
+        }
+
+    def _empty_profile_guard_audit(self) -> dict:
+        return {
+            "status": "NOT_EVALUATED",
+            "code": "PROFILE_GUARD_NOT_EVALUATED",
+            "enabled": self.enable_profile_guard,
+            "observe_only": not self.enable_profile_guard,
+            "blocked": False,
+            "hit_keys": [],
         }
 
     def _send_webhook(self, signal: Signal, order=None) -> None:

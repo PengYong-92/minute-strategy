@@ -100,26 +100,169 @@ def _profile_key_for_signal(signal: Signal) -> str:
     )
 
 
-def _compact_guard(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        return {}
-    retained = (
-        "status",
-        "code",
-        "mode",
-        "blocked",
-        "allow_progression",
-        "sample_size",
-        "wins",
-        "losses",
-        "win_rate",
-        "pnl",
-        "ev",
-        "key",
-        "triggered_at",
-        "remaining_ms",
+def _compact_result_sequence_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in (
+            "status",
+            "code",
+            "blocked",
+            "scope",
+            "direction",
+            "consecutive_losses",
+            "last_settled_at",
+            "pause_until",
+        )
+        if key in source
+    }
+
+
+def _compact_wave_batch_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in (
+            "status",
+            "code",
+            "mode",
+            "blocked",
+            "allow_progression",
+            "current_batch_id",
+            "batch_orders",
+            "batch_wins",
+            "batch_losses",
+            "failed_batches",
+            "pause_until",
+        )
+        if key in source
+    }
+
+
+def _compact_profile_degradation_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in (
+            "status",
+            "code",
+            "blocked",
+            "allow_progression",
+            "profile_key",
+            "daily_profile_version",
+            "consecutive_losses",
+            "last_loss_settled_at",
+            "pause_until",
+            "probe_order_id",
+            "triggered_at",
+        )
+        if key in source
+    }
+
+
+def _compact_profile_health_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in (
+            "status",
+            "code",
+            "blocked",
+            "direction",
+            "evaluated_at",
+            "next_evaluation_at",
+            "sample_size",
+            "wins",
+            "losses",
+            "win_rate",
+            "pnl",
+            "ev",
+            "allow_second_order",
+            "allow_progression",
+        )
+        if key in source
+    }
+
+
+def _compact_rolling_edge_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in (
+            "status",
+            "code",
+            "sample_size",
+            "wins",
+            "losses",
+            "win_rate",
+            "pnl",
+            "ev",
+            "blocked",
+            "edge",
+            "threshold",
+        )
+        if key in source
+    }
+
+
+def _compact_time_period_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in ("enabled", "blocked", "code", "local_hour", "window")
+        if key in source
+    }
+
+
+def _compact_profile_guard(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        key: source[key]
+        for key in (
+            "status",
+            "code",
+            "enabled",
+            "observe_only",
+            "blocked",
+            "hit_keys",
+        )
+        if key in source
+    }
+
+
+def _compact_direction_pulse(signal: Signal) -> dict[str, object]:
+    source = (
+        signal.direction_pulse_shadow
+        if isinstance(signal.direction_pulse_shadow, Mapping)
+        else {}
     )
-    return {key: value[key] for key in retained if key in value}
+    windows = source.get("windows")
+    windows = windows if isinstance(windows, Mapping) else {}
+    status_rank = {"UNKNOWN": 0, "WARMUP": 1, "NORMAL": 2, "WATCH": 3, "DEGRADED": 4}
+    action_rank = {"ALLOW": 0, "BLOCK_SECOND": 1, "BLOCK_DIRECTION": 2}
+    status = "UNKNOWN"
+    code = "ALLOW"
+    for item in windows.values():
+        if not isinstance(item, Mapping):
+            continue
+        candidate_status = str(item.get("status") or "UNKNOWN").upper()
+        candidate_code = str(
+            item.get("code") or item.get("hypothetical_action") or "ALLOW"
+        ).upper()
+        if status_rank.get(candidate_status, 0) > status_rank.get(status, 0):
+            status = candidate_status
+        if action_rank.get(candidate_code, 0) > action_rank.get(code, 0):
+            code = candidate_code
+    return {
+        "version": str(source.get("version") or ""),
+        "mode": str(source.get("mode") or ""),
+        "direction": str(source.get("direction") or signal.direction or "").upper(),
+        "order_slot": str(source.get("order_slot") or signal.order_slot or ""),
+        "evaluated_at": int(source.get("evaluated_at") or 0),
+        "status": status,
+        "code": code,
+        "bias": code,
+    }
 
 
 def _signal_audit_guard_states(
@@ -127,20 +270,29 @@ def _signal_audit_guard_states(
     audit_context: Mapping[str, object],
 ) -> dict[str, object]:
     return {
-        "rolling_edge": _compact_guard(audit_context.get("rolling_edge")),
-        "result_sequence": _compact_guard(
+        "rolling_edge": _compact_rolling_edge_guard(
+            audit_context.get("rolling_edge")
+        ),
+        "result_sequence": _compact_result_sequence_guard(
             audit_context.get("result_sequence_guard")
         ),
-        "wave_batch": _compact_guard(audit_context.get("wave_batch_guard")),
-        "profile_degradation": _compact_guard(
+        "wave_batch": _compact_wave_batch_guard(
+            audit_context.get("wave_batch_guard")
+        ),
+        "profile_degradation": _compact_profile_degradation_guard(
             audit_context.get("profile_degradation_guard")
         ),
-        "profile_health": _compact_guard(
+        "profile_health": _compact_profile_health_guard(
             audit_context.get("profile_health_guard")
         ),
-        "wave": {
+        "time_period": _compact_time_period_guard(
+            audit_context.get("time_period_guard")
+        ),
+        "profile_guard": _compact_profile_guard(audit_context.get("profile_guard")),
+        "wave_signal": {
             "mode": str(signal.wave_guard_mode or ""),
-            "status": str(signal.wave_guard_status or ""),
+            "status": str(signal.wave_guard_status or "UNKNOWN"),
+            "code": str(signal.wave_guard_reason or signal.wave_guard_status or "UNKNOWN"),
         },
     }
 
@@ -151,8 +303,14 @@ def _signal_audit_state_code(
 ) -> dict[str, object]:
     adaptive = signal.adaptive_profile_state
     structure = signal.entry_structure_shadow
+    guards = _signal_audit_guard_states(signal, audit_context)
+    pulse = _compact_direction_pulse(signal)
     return {
-        "guards": _signal_audit_guard_states(signal, audit_context),
+        "guard_state_hash": hashlib.sha256(
+            _compact_json({"guards": guards, "direction_pulse": pulse}).encode("utf-8")
+        ).hexdigest(),
+        "regime": str(signal.regime or ""),
+        "risk_flags": str(signal.risk_flags or ""),
         "daily_profile_selected": bool(signal.daily_profile_selected),
         "daily_profile_version": str(signal.daily_profile_version or ""),
         "order_slot": str(signal.order_slot or ""),
@@ -273,6 +431,7 @@ def _signal_audit_payload(
         },
         "structure": compact_structure,
         "guards": _signal_audit_guard_states(signal, audit_context),
+        "direction_pulse": _compact_direction_pulse(signal),
         "state_code": _signal_audit_state_code(signal, audit_context),
         "decision": {
             "final": str(decision),
@@ -1804,9 +1963,9 @@ class SQLiteMonitorStore:
     def observation_summary(
         self,
         symbol: str,
-        window: str | int = "14d",
         limit: int | None = None,
         *,
+        window: str = "14d",
         group_limit: int = 50,
     ) -> dict[str, Any]:
         del limit  # Legacy row limits are accepted but no longer truncate statistics.
@@ -1968,7 +2127,8 @@ class SQLiteMonitorStore:
         audit_context: dict[str, Any] | None = None,
         *,
         has_formal_candidate: bool = False,
-        has_observation_candidate: bool = False,
+        force_independent: bool = False,
+        event_kind: str | None = None,
     ) -> bool:
         normalized_symbol = symbol.upper()
         normalized_decision = str(decision or "UNKNOWN").upper()
@@ -1976,7 +2136,7 @@ class SQLiteMonitorStore:
         ordinary_heartbeat = (
             normalized_decision in _ORDINARY_SIGNAL_DECISIONS
             and not bool(has_formal_candidate)
-            and not bool(has_observation_candidate)
+            and not bool(force_independent)
         )
         reason_code = str(
             normalized_audit.get("reason_code")
@@ -1995,16 +2155,17 @@ class SQLiteMonitorStore:
             if ordinary_heartbeat
             else None
         )
-        if has_observation_candidate:
-            event_kind = "OBSERVATION_CANDIDATE"
+        normalized_event_kind = str(event_kind or "").strip().upper()
+        if normalized_event_kind:
+            resolved_event_kind = normalized_event_kind
         elif normalized_decision == "OPENED":
-            event_kind = "ORDER_OPENED"
+            resolved_event_kind = "ORDER_OPENED"
         elif ordinary_heartbeat:
-            event_kind = "HEARTBEAT"
+            resolved_event_kind = "HEARTBEAT"
         elif normalized_decision.endswith("BLOCKED"):
-            event_kind = "DECISIVE_BLOCK"
+            resolved_event_kind = "DECISIVE_BLOCK"
         else:
-            event_kind = "DECISION"
+            resolved_event_kind = "DECISION"
         payload = _signal_audit_payload(
             signal,
             normalized_decision,
@@ -2042,7 +2203,7 @@ class SQLiteMonitorStore:
                         ):
                             ordinary_heartbeat = False
                             aggregation_key = None
-                            event_kind = "STATE_CHANGE"
+                            resolved_event_kind = "STATE_CHANGE"
                             write_class = StorageWriteClass.CORE
                 capacity = capacity_from_connection(connection)
                 if ordinary_heartbeat and not capacity.ordinary_audit_allowed:
@@ -2096,7 +2257,7 @@ class SQLiteMonitorStore:
                         SIGNAL_AUDIT_VERSION,
                         signal.decision_id or None,
                         signal.runtime_config_hash or None,
-                        event_kind,
+                        resolved_event_kind,
                         int(created_at_ms),
                         int(created_at_ms),
                         signal.score,
