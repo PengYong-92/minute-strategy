@@ -134,7 +134,7 @@ class DecisionContextTest(unittest.TestCase):
             ["quality", "session"],
         )
         self.assertEqual(context.decision_trace[0]["decisive_values"]["observed"], (7,))
-        self.assertIsNone(context.first_decisive_block)
+        self.assertEqual(context.first_decisive_block, "")
         with self.assertRaises(TypeError):
             context.inputs["features"]["score"] = 0
         with self.assertRaises(FrozenInstanceError):
@@ -149,9 +149,12 @@ class DecisionContextTest(unittest.TestCase):
 
         context = builder.finish("BLOCK", "risk high", False, True)
 
-        self.assertEqual(context.first_decisive_block["stage"], "risk")
-        self.assertEqual(context.first_decisive_block["reason_code"], "RISK_HIGH")
-        self.assertIs(context.first_decisive_block, context.decision_trace[1])
+        self.assertEqual(context.first_decisive_block, "risk")
+        self.assertEqual(context.decision_trace[1]["reason_code"], "RISK_HIGH")
+        self.assertEqual(
+            context.decision_trace[1]["decisive_values"],
+            {"risk": "high"},
+        )
 
     def test_builder_lifecycle_rejects_invalid_calls(self):
         builder = self.new_builder()
@@ -208,6 +211,7 @@ class DecisionContextTest(unittest.TestCase):
         json.dumps(snapshot_dict, allow_nan=False)
         json.dumps(context_dict, allow_nan=False)
 
+        self.assertEqual(context_dict["first_decisive_block"], "risk")
         context_dict["inputs"]["features"]["score"] = -1
         context_dict["decision_trace"][0]["decisive_values"]["flags"].append("volume")
         self.assertEqual(context.inputs["features"]["score"], 7)

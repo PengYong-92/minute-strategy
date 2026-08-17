@@ -3,7 +3,6 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from types import MappingProxyType
-from typing import Optional
 
 
 CONTEXT_VERSION = "DECISION_CONTEXT_V2"
@@ -102,7 +101,7 @@ class DecisionContext:
     candidate_origin: str
     inputs: Mapping[str, object]
     decision_trace: tuple[Mapping[str, object], ...]
-    first_decisive_block: Optional[Mapping[str, object]]
+    first_decisive_block: str
     final_decision: str
     final_reason: str
     open_allowed: bool
@@ -119,7 +118,7 @@ class DecisionContext:
             "candidate_origin": self.candidate_origin,
             "inputs": _thaw(self.inputs),
             "decision_trace": _thaw(self.decision_trace),
-            "first_decisive_block": _thaw(self.first_decisive_block),
+            "first_decisive_block": self.first_decisive_block,
             "final_decision": self.final_decision,
             "final_reason": self.final_reason,
             "open_allowed": self.open_allowed,
@@ -162,7 +161,7 @@ class DecisionContextBuilder:
         self._strategy_build_id = strategy_build_id
         self._inputs = None
         self._decision_trace = []
-        self._first_decisive_block = None
+        self._first_decisive_block = ""
         self._finished = False
 
     @classmethod
@@ -224,8 +223,8 @@ class DecisionContextBuilder:
             }
         )
         self._decision_trace.append(record)
-        if result == "BLOCK" and self._first_decisive_block is None:
-            self._first_decisive_block = record
+        if result == "BLOCK" and not self._first_decisive_block:
+            self._first_decisive_block = stage
 
     def finish(
         self,
