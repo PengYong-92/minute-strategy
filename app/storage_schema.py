@@ -1,4 +1,3 @@
-import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -8,6 +7,10 @@ _MIGRATION_SAVEPOINT = "storage_schema_v2"
 
 
 class SchemaConflictError(RuntimeError):
+    pass
+
+
+class UnsupportedSchemaVersionError(RuntimeError):
     pass
 
 
@@ -45,7 +48,7 @@ class _IndexSpec:
     terms: tuple[_IndexTermSpec, ...]
     unique: int = 0
     partial: int = 0
-    where: str | None = None
+    predicate: tuple[str, str] | None = None
 
 
 _TABLE_SPECS = (
@@ -246,8 +249,37 @@ _INDEX_SPECS = (
         ),
         unique=1,
         partial=1,
-        where="AGGREGATION_KEY IS NOT NULL",
+        predicate=("aggregation_key", "notnull"),
     ),
+)
+
+
+_SQL_KEYWORDS = frozenset(
+    """
+    abort action add after all alter analyze and as asc attach autoincrement
+    before begin between binary blob by cascade case cast check collate column
+    commit conflict constraint create cross current current_date current_time
+    current_timestamp database default deferrable deferred delete desc detach
+    distinct do drop each else end escape except exclude exclusive exists
+    explain fail filter first following foreign from full generated glob group
+    groups having if ignore immediate in index indexed initially inner insert
+    instead integer intersect into is isnull join key last left like limit
+    match materialized natural no not nothing notnull null nulls of offset on
+    or order others outer over partition plan pragma preceding primary query
+    raise range real recursive references regexp reindex release rename replace
+    restrict returning right rollback row rows savepoint select set strict
+    table temp temporary text then ties to transaction trigger unbounded union
+    unique update using vacuum values view virtual when where window with without
+    """.split()
+)
+_CREATE_TABLE_PREFIX = (
+    ("keyword", "create"),
+    ("keyword", "table"),
+)
+_IF_NOT_EXISTS = (
+    ("keyword", "if"),
+    ("keyword", "not"),
+    ("keyword", "exists"),
 )
 
 
@@ -280,6 +312,113 @@ def _normalized_default(value: object) -> str | None:
     if value is None:
         return None
     return " ".join(str(value).strip().split())
+
+
+def _sql_tokens(sql: str) -> tuple[tuple[str, str], ...]:
+    tokens = []
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if character.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = len(sql) if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated SQL comment")
+            index = end + 2
+            continue
+        if character == "'":
+            value = []
+            index += 1
+            while index < len(sql):
+                if sql[index] == "'":
+                    if index + 1 < len(sql) and sql[index + 1] == "'":
+                        value.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                value.append(sql[index])
+                index += 1
+            else:
+                raise ValueError("unterminated SQL string literal")
+            tokens.append(("literal", "".join(value)))
+            continue
+        if character in ('"', "`", "["):
+            close = "]" if character == "[" else character
+            value = []
+            index += 1
+            while index < len(sql):
+                if sql[index] == close:
+                    if index + 1 < len(sql) and sql[index + 1] == close:
+                        value.append(close)
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                value.append(sql[index])
+                index += 1
+            else:
+                raise ValueError("unterminated quoted SQL identifier")
+            tokens.append(("identifier", "".join(value).casefold()))
+            continue
+        if character.isalpha() or character == "_":
+            end = index + 1
+            while end < len(sql) and (
+                sql[end].isalnum() or sql[end] in ("_", "$")
+            ):
+                end += 1
+            value = sql[index:end].casefold()
+            kind = "keyword" if value in _SQL_KEYWORDS else "identifier"
+            tokens.append((kind, value))
+            index = end
+            continue
+        if character.isdigit():
+            end = index + 1
+            while end < len(sql) and (
+                sql[end].isalnum() or sql[end] in (".", "_", "+", "-")
+            ):
+                end += 1
+            tokens.append(("number", sql[index:end].casefold()))
+            index = end
+            continue
+        tokens.append(("symbol", character))
+        index += 1
+    return tuple(tokens)
+
+
+def _without_optional_semicolon(
+    tokens: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    if tokens and tokens[-1] == ("symbol", ";"):
+        return tokens[:-1]
+    return tokens
+
+
+def _canonical_create_table_sql(sql: str) -> tuple[tuple[str, str], ...]:
+    tokens = list(_without_optional_semicolon(_sql_tokens(sql)))
+    if tuple(tokens[:2]) == _CREATE_TABLE_PREFIX:
+        if tuple(tokens[2:5]) == _IF_NOT_EXISTS:
+            del tokens[2:5]
+
+    canonical = []
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index] == ("keyword", "collate")
+            and index + 1 < len(tokens)
+            and tokens[index + 1][1] == "binary"
+        ):
+            index += 2
+            continue
+        canonical.append(tokens[index])
+        index += 1
+    return tuple(canonical)
 
 
 def _column_rows_by_name(
@@ -370,11 +509,48 @@ def _require_table(connection: sqlite3.Connection, table: str) -> None:
         )
 
 
+def _owned_table_triggers(
+    connection: sqlite3.Connection,
+    table: str,
+) -> tuple[str, ...]:
+    return tuple(
+        str(row[0])
+        for row in connection.execute(
+            """
+            select name from sqlite_master
+            where type = 'trigger' and tbl_name = ? collate nocase
+            union all
+            select name from sqlite_temp_master
+            where type = 'trigger' and tbl_name = ? collate nocase
+            order by name
+            """,
+            (table, table),
+        )
+    )
+
+
 def _validate_table(
     connection: sqlite3.Connection,
     spec: _TableSpec,
 ) -> None:
     _require_table(connection, spec.name)
+    schema_object = _schema_object(connection, spec.name)
+    create_sql = None if schema_object is None else schema_object[2]
+    try:
+        actual_create_sql = (
+            None if create_sql is None else _canonical_create_table_sql(create_sql)
+        )
+        expected_create_sql = _canonical_create_table_sql(spec.create_sql)
+    except ValueError as error:
+        raise SchemaConflictError(
+            f"SQLite schema conflict for {spec.name}: invalid CREATE TABLE SQL"
+        ) from error
+    if actual_create_sql != expected_create_sql:
+        raise SchemaConflictError(
+            f"SQLite schema conflict for {spec.name}: "
+            "CREATE TABLE SQL does not match the V2 definition"
+        )
+
     actual = tuple(
         _ordered_column_signature(row)
         for row in _ordered_column_rows(connection, spec.name)
@@ -387,6 +563,12 @@ def _validate_table(
         raise SchemaConflictError(
             f"SQLite schema conflict for {spec.name}: "
             f"expected ordered table_xinfo={expected}, found {actual}"
+        )
+    triggers = _owned_table_triggers(connection, spec.name)
+    if triggers:
+        raise SchemaConflictError(
+            f"SQLite schema conflict for {spec.name}: "
+            f"owned table has triggers={triggers}"
         )
 
 
@@ -411,32 +593,63 @@ def _ensure_added_columns(
         _validate_column(table, spec, existing[key])
 
 
-def _strip_outer_parentheses(value: str) -> str:
-    while value.startswith("(") and value.endswith(")"):
+def _strip_outer_token_parentheses(
+    tokens: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    while (
+        len(tokens) >= 2
+        and tokens[0] == ("symbol", "(")
+        and tokens[-1] == ("symbol", ")")
+    ):
         depth = 0
         wraps_entire_value = True
-        for index, character in enumerate(value):
-            if character == "(":
+        for index, token in enumerate(tokens):
+            if token == ("symbol", "("):
                 depth += 1
-            elif character == ")":
+            elif token == ("symbol", ")"):
                 depth -= 1
-                if depth == 0 and index != len(value) - 1:
+                if depth == 0 and index != len(tokens) - 1:
                     wraps_entire_value = False
                     break
         if not wraps_entire_value or depth != 0:
             break
-        value = value[1:-1].strip()
-    return value
+        tokens = tokens[1:-1]
+    return tokens
 
 
-def _normalized_where(sql: str | None) -> str | None:
+def _canonical_partial_predicate(sql: str | None) -> tuple[str, str] | None:
     if not sql:
         return None
-    match = re.search(r"\bwhere\b(.*)\Z", sql.strip().rstrip(";"), re.IGNORECASE | re.DOTALL)
-    if match is None:
+    tokens = _without_optional_semicolon(_sql_tokens(sql))
+    where_positions = [
+        index
+        for index, token in enumerate(tokens)
+        if token == ("keyword", "where")
+    ]
+    if len(where_positions) != 1:
         return None
-    expression = " ".join(match.group(1).strip().split())
-    return _strip_outer_parentheses(expression).upper()
+    expression = _strip_outer_token_parentheses(
+        tokens[where_positions[0] + 1 :]
+    )
+    operators = (
+        (("keyword", "notnull"),),
+        (
+            ("keyword", "is"),
+            ("keyword", "not"),
+            ("keyword", "null"),
+        ),
+    )
+    for operator in operators:
+        if len(expression) <= len(operator):
+            continue
+        if expression[-len(operator) :] != operator:
+            continue
+        column = _strip_outer_token_parentheses(
+            expression[: -len(operator)]
+        )
+        if column == (("identifier", "aggregation_key"),):
+            return ("aggregation_key", "notnull")
+    return None
 
 
 def _index_term_signature(row: tuple) -> tuple[str | None, int, str, int]:
@@ -452,6 +665,18 @@ def _expected_index_term_signature(
         spec.descending,
         spec.collation.upper(),
         spec.key,
+    )
+
+
+def _index_key_terms(
+    connection: sqlite3.Connection,
+    index: str,
+) -> tuple[tuple[str | None, int, str, int], ...]:
+    quoted_index = _quote_identifier(index)
+    return tuple(
+        _index_term_signature(row)
+        for row in connection.execute(f"pragma index_xinfo({quoted_index})")
+        if int(row[5]) == 1
     )
 
 
@@ -484,21 +709,87 @@ def _validate_index(
         raise SchemaConflictError(
             f"SQLite schema conflict for {spec.name}: index metadata is missing"
         )
-    quoted_index = _quote_identifier(spec.name)
-    key_terms = tuple(
-        _index_term_signature(row)
-        for row in connection.execute(f"pragma index_xinfo({quoted_index})")
-        if int(row[5]) == 1
-    )
+    key_terms = _index_key_terms(connection, spec.name)
     expected_terms = tuple(
         _expected_index_term_signature(term) for term in spec.terms
     )
-    actual = (int(index_row[2]), key_terms, int(index_row[4]), _normalized_where(sql))
-    expected = (spec.unique, expected_terms, spec.partial, spec.where)
+    actual = (
+        int(index_row[2]),
+        key_terms,
+        int(index_row[4]),
+        _canonical_partial_predicate(sql),
+    )
+    expected = (spec.unique, expected_terms, spec.partial, spec.predicate)
     if actual != expected:
         raise SchemaConflictError(
             f"SQLite schema conflict for {spec.name}: "
             f"expected {expected}, found {actual}"
+        )
+
+
+def _validate_owned_table_index_inventory(
+    connection: sqlite3.Connection,
+    table_spec: _TableSpec,
+) -> None:
+    quoted_table = _quote_identifier(table_spec.name)
+    rows = tuple(connection.execute(f"pragma index_list({quoted_table})"))
+    required = {
+        spec.name.casefold(): spec
+        for spec in _INDEX_SPECS
+        if spec.table.casefold() == table_spec.name.casefold()
+    }
+    found_required = set()
+    primary_key_rows = []
+    unexpected = []
+    for row in rows:
+        name = str(row[1])
+        origin = str(row[3]).casefold()
+        if origin == "pk":
+            primary_key_rows.append(row)
+        elif name.casefold() in required and origin == "c":
+            found_required.add(name.casefold())
+        else:
+            unexpected.append((name, origin))
+
+    missing = sorted(required.keys() - found_required)
+    if missing or unexpected:
+        raise SchemaConflictError(
+            f"SQLite schema conflict for {table_spec.name}: "
+            f"index inventory missing={missing}, unexpected={unexpected}"
+        )
+
+    primary_key_columns = tuple(
+        column
+        for column in sorted(
+            (column for column in table_spec.columns if column.primary_key),
+            key=lambda column: column.primary_key,
+        )
+    )
+    if len(primary_key_rows) != 1:
+        raise SchemaConflictError(
+            f"SQLite schema conflict for {table_spec.name}: "
+            f"expected one primary-key autoindex, found {len(primary_key_rows)}"
+        )
+    primary_key_row = primary_key_rows[0]
+    actual_primary_key = (
+        int(primary_key_row[2]),
+        str(primary_key_row[3]).casefold(),
+        int(primary_key_row[4]),
+        _index_key_terms(connection, str(primary_key_row[1])),
+    )
+    expected_primary_key = (
+        1,
+        "pk",
+        0,
+        tuple(
+            _expected_index_term_signature(_IndexTermSpec(column.name))
+            for column in primary_key_columns
+        ),
+    )
+    if actual_primary_key != expected_primary_key:
+        raise SchemaConflictError(
+            f"SQLite schema conflict for {table_spec.name}: "
+            f"expected PK index {expected_primary_key}, found {actual_primary_key}"
         )
 
 
@@ -518,6 +809,8 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
             _validate_column(table, column_spec, row)
     for index_spec in _INDEX_SPECS:
         _validate_index(connection, index_spec)
+    for table_spec in _TABLE_SPECS:
+        _validate_owned_table_index_inventory(connection, table_spec)
 
 
 def _rollback_migration(
@@ -542,7 +835,12 @@ def _rollback_migration(
 
 def migrate(connection: sqlite3.Connection) -> None:
     version = int(connection.execute("pragma user_version").fetchone()[0])
-    if version >= SCHEMA_VERSION:
+    if version > SCHEMA_VERSION:
+        raise UnsupportedSchemaVersionError(
+            f"Unsupported SQLite schema version {version}; "
+            f"maximum supported version is {SCHEMA_VERSION}"
+        )
+    if version == SCHEMA_VERSION:
         _validate_v2_schema(connection)
         return
 

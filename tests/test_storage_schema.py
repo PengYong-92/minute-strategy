@@ -109,6 +109,31 @@ def _create_legacy_schema(
     )
 
 
+def _create_runtime_config_snapshots(
+    connection: sqlite3.Connection,
+    *,
+    hash_declaration: str = "runtime_config_hash text primary key",
+    context_declaration: str = "context_version text not null",
+    table_constraint: str | None = None,
+    table_options: str = "",
+) -> None:
+    columns = [
+        hash_declaration,
+        context_declaration,
+        "strategy_build_id text not null",
+        "canonical_payload text not null",
+        "payload_bytes integer not null",
+        "created_at_ms integer not null",
+    ]
+    if table_constraint is not None:
+        columns.append(table_constraint)
+    connection.execute(
+        "create table runtime_config_snapshots ("
+        + ", ".join(columns)
+        + f") {table_options}"
+    )
+
+
 def _insert_legacy_sentinels(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -626,6 +651,135 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             "runtime_config_snapshots",
         )
 
+    def test_owned_table_create_sql_conflicts_are_rejected(self):
+        cases = (
+            (
+                "check constraint",
+                {
+                    "context_declaration": (
+                        "context_version text not null "
+                        "check(context_version = 'BROKEN')"
+                    )
+                },
+            ),
+            (
+                "nocase primary key",
+                {
+                    "hash_declaration": (
+                        "runtime_config_hash text collate nocase primary key"
+                    )
+                },
+            ),
+            (
+                "changed primary key formulation",
+                {
+                    "hash_declaration": "runtime_config_hash text",
+                    "table_constraint": "primary key(runtime_config_hash)",
+                },
+            ),
+            ("strict table", {"table_options": "strict"}),
+            ("without rowid", {"table_options": "without rowid"}),
+            (
+                "extra unique constraint",
+                {"table_constraint": "unique(context_version)"},
+            ),
+        )
+        for label, options in cases:
+            with self.subTest(label=label):
+                connection = sqlite3.connect(":memory:")
+                try:
+                    _create_legacy_schema(connection)
+                    _create_runtime_config_snapshots(connection, **options)
+                    connection.execute("pragma user_version = 1")
+
+                    self._assert_schema_conflict_preserves_database(
+                        connection,
+                        "runtime_config_snapshots",
+                    )
+                finally:
+                    connection.close()
+
+    def test_trigger_on_v2_owned_table_is_rejected(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        _create_runtime_config_snapshots(connection)
+        connection.execute(
+            """
+            create trigger abort_runtime_config_insert
+            before insert on runtime_config_snapshots
+            begin
+                select raise(abort, 'blocked');
+            end
+            """
+        )
+        connection.execute("pragma user_version = 1")
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "runtime_config_snapshots",
+        )
+
+    def test_extra_indexes_on_v2_owned_table_are_rejected(self):
+        for unique in (False, True):
+            with self.subTest(unique=unique):
+                connection = sqlite3.connect(":memory:")
+                try:
+                    _create_legacy_schema(connection)
+                    _create_runtime_config_snapshots(connection)
+                    qualifier = "unique " if unique else ""
+                    connection.execute(
+                        f"create {qualifier}index extra_runtime_context "
+                        "on runtime_config_snapshots(context_version)"
+                    )
+                    connection.execute("pragma user_version = 1")
+
+                    self._assert_schema_conflict_preserves_database(
+                        connection,
+                        "runtime_config_snapshots",
+                    )
+                finally:
+                    connection.close()
+
+    def test_harmless_owned_table_sql_variations_are_accepted(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.executescript(
+            """
+            CREATE TABLE "runtime_config_snapshots"(
+                "runtime_config_hash" TEXT COLLATE BINARY PRIMARY KEY,
+                "context_version" TEXT NOT NULL,
+                "strategy_build_id" TEXT NOT NULL,
+                "canonical_payload" TEXT NOT NULL,
+                "payload_bytes" INTEGER NOT NULL,
+                "created_at_ms" INTEGER NOT NULL
+            );
+            CREATE TABLE `decision_contexts`(
+                `symbol` TEXT NOT NULL,
+                `decision_id` TEXT NOT NULL,
+                `context_version` TEXT NOT NULL,
+                `runtime_config_hash` TEXT NOT NULL,
+                `strategy_build_id` TEXT NOT NULL,
+                `created_at_ms` INTEGER NOT NULL,
+                `closed_kline_at_ms` INTEGER NOT NULL,
+                `direction` TEXT NOT NULL DEFAULT '',
+                `profile_key` TEXT NOT NULL DEFAULT '',
+                `candidate_origin` TEXT NOT NULL DEFAULT '',
+                `input_payload` TEXT NOT NULL,
+                `outcome_payload` TEXT NOT NULL,
+                PRIMARY KEY(`symbol`, `decision_id`)
+            );
+            """
+        )
+
+        self._migrate(connection)
+        before = _schema_snapshot(connection)
+        self._migrate(connection)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertEqual(_schema_snapshot(connection), before)
+
     def test_incompatible_existing_v2_column_rolls_back_without_certification(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -791,6 +945,91 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                     )
                 finally:
                     connection.close()
+
+    def test_equivalent_partial_audit_predicates_are_accepted(self):
+        predicates = (
+            '"aggregation_key" IS NOT NULL',
+            "(aggregation_key) is not null",
+            "aggregation_key NOTNULL",
+            '((("aggregation_key"))) NotNull',
+            "((aggregation_key IS NOT NULL))",
+        )
+        for predicate in predicates:
+            with self.subTest(predicate=predicate):
+                connection = sqlite3.connect(":memory:")
+                try:
+                    _create_legacy_schema(connection)
+                    self._migrate(connection)
+                    connection.execute(
+                        "drop index ux_signal_audit_symbol_aggregation_key"
+                    )
+                    connection.execute(
+                        "create unique index "
+                        "ux_signal_audit_symbol_aggregation_key "
+                        "on signal_audit(symbol, aggregation_key) "
+                        f"where {predicate}"
+                    )
+                    before = _schema_snapshot(connection)
+                    changes_before = connection.total_changes
+
+                    self._migrate(connection)
+
+                    self.assertEqual(_schema_snapshot(connection), before)
+                    self.assertEqual(connection.total_changes, changes_before)
+                    self.assertEqual(
+                        connection.execute("pragma user_version").fetchone()[0],
+                        2,
+                    )
+                finally:
+                    connection.close()
+
+    def test_different_partial_audit_predicate_is_rejected(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        self._migrate(connection)
+        connection.execute("drop index ux_signal_audit_symbol_aggregation_key")
+        connection.execute(
+            """
+            create unique index ux_signal_audit_symbol_aggregation_key
+            on signal_audit(symbol, aggregation_key)
+            where aggregation_key is not null and symbol is not null
+            """
+        )
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "ux_signal_audit_symbol_aggregation_key",
+        )
+
+    def test_future_schema_version_is_rejected_without_mutation(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        self._migrate(connection)
+        connection.execute(
+            "alter table runtime_config_snapshots add column future_note text"
+        )
+        connection.execute("create table future_v3_state(value text)")
+        connection.execute("pragma user_version = 3")
+        before_schema = _schema_snapshot(connection)
+        changes_before = connection.total_changes
+        transaction_before = connection.in_transaction
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"(?i)unsupported.*schema version.*3",
+        ) as raised:
+            self._migrate(connection)
+
+        self.assertEqual(
+            type(raised.exception).__name__,
+            "UnsupportedSchemaVersionError",
+        )
+        self.assertEqual(connection.in_transaction, transaction_before)
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 3)
+        self.assertEqual(_schema_snapshot(connection), before_schema)
+        self.assertEqual(connection.total_changes, changes_before)
 
     def test_fresh_store_is_v2_and_existing_order_behavior_still_works(self):
         with tempfile.TemporaryDirectory() as temp_dir:
