@@ -3,9 +3,11 @@ import time
 from bisect import bisect_left
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Sequence
+
+from app.decision_context import DecisionContextBuilder, runtime_config_snapshot
 
 from app.daily_profile_selector import (
     DailyProfileSelectorConfig,
@@ -45,7 +47,13 @@ from app.result_sequence_guard import (
 from app.rolling_edge import RollingEdgeConfig, RollingEdgeSnapshot, rolling_edge_snapshot, should_degrade
 from app.simulator import AccountSimulator, SettlementEvent
 from app.stake_progression import TWO_STAGE_VERSION
-from app.storage import SQLiteMonitorStore, page_observation_list, page_order_list, summarize_observations
+from app.storage import (
+    DecisionAudit,
+    SQLiteMonitorStore,
+    page_observation_list,
+    page_order_list,
+    summarize_observations,
+)
 from app.time_period_guard import (
     TimePeriodGuardConfig,
     evaluate_time_period_guard,
@@ -67,6 +75,7 @@ from app.wave_batch_guard import (
 
 DAY_MS = 86_400_000
 REALTIME_PRICE_STALE_MS = 5_000
+TRANSITIONAL_DECISION_BUILD_ID = "TASK7_TRANSITIONAL_V1"
 
 
 class MonitorState:
@@ -178,7 +187,12 @@ class MonitorState:
         self._storage_futures: list[Future] = []
         self._storage_futures_condition = threading.Condition()
         self._storage_write_failures: list[Exception] = []
-        self._observation_audit_collector: list[tuple[Signal, str, dict]] | None = None
+        self._observation_audit_collector: list[
+            tuple[Signal, ObservationSignal, str, dict]
+        ] | None = None
+        self._bundled_decision_ids: set[str] = set()
+        self._decision_storage_failed = False
+        self._decision_runtime_config_cache = None
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
         self.simulator = self._build_simulator(self.symbol, restored_orders)
@@ -411,6 +425,7 @@ class MonitorState:
                 for signal in observation_signals
             ]
             self.signals = new_signals
+            self._bundled_decision_ids = set()
             self._observation_audit_collector = []
             try:
                 selected_signal, daily_profile_required = self._select_daily_profile_signal(
@@ -435,17 +450,26 @@ class MonitorState:
             finally:
                 self._observation_audit_collector = None
             if self.storage:
-                self._save_signal(
-                    self.selected_signal or selected_signal,
-                    self.order_decision,
-                    self.updated_at_ms,
-                    has_formal_candidate=has_formal_candidate,
-                    force_independent=bool(observation_audits),
-                    event_kind=(
-                        "ORDER_OPENED" if self.order_decision == "OPENED" else None
-                    ),
-                )
-                for observation_signal, source_decision, audit_context in observation_audits:
+                final_signal = self.selected_signal or selected_signal
+                if final_signal.decision_id not in self._bundled_decision_ids:
+                    self._save_signal(
+                        final_signal,
+                        self.order_decision,
+                        self.updated_at_ms,
+                        has_formal_candidate=has_formal_candidate,
+                        force_independent=bool(observation_audits),
+                        event_kind=(
+                            "ORDER_OPENED" if self.order_decision == "OPENED" else None
+                        ),
+                    )
+                for (
+                    observation_signal,
+                    _observation,
+                    source_decision,
+                    audit_context,
+                ) in observation_audits:
+                    if observation_signal.decision_id in self._bundled_decision_ids:
+                        continue
                     self._save_signal(
                         observation_signal,
                         source_decision,
@@ -690,6 +714,146 @@ class MonitorState:
             return ordered[-self.max_klines :]
         return ordered
 
+    def _decision_runtime_config(self):
+        if self._decision_runtime_config_cache is None:
+            config = {
+                "order_policy": asdict(self.order_policy),
+                "stake": {
+                    "amount": self.stake,
+                    "win_return": self.win_return,
+                    "progression_enabled": self.enable_stake_progression,
+                    "progression_max_orders": self.stake_progression_max_orders,
+                    "progression_max_active": self.stake_progression_max_active,
+                    "progression_base_only_segments": list(
+                        self.stake_progression_base_only_segments
+                    ),
+                },
+                "guards": {
+                    "rolling_edge_enabled": self.enable_rolling_edge_guard,
+                    "rolling_edge": asdict(self.rolling_edge_config),
+                    "result_sequence": asdict(self.result_sequence_guard_config),
+                    "profile_degradation": asdict(
+                        self.profile_degradation_guard_config
+                    ),
+                    "profile_health": asdict(self.profile_health_guard_config),
+                    "time_period": asdict(self.time_period_guard_config),
+                    "wave_enabled": self.enable_wave_guard,
+                    "wave_batch": asdict(self.wave_batch_guard_config),
+                    "profile_enabled": self.enable_profile_guard,
+                    "profile_min_history": self.profile_guard_min_history,
+                    "profile_min_group_size": self.profile_guard_min_group_size,
+                },
+                "profiles": {
+                    "daily_selector_enabled": self.enable_daily_profile_selector,
+                    "daily_selector": asdict(self.daily_profile_selector_config),
+                    "observation_promotion_enabled": (
+                        self.enable_observation_profile_promotion
+                    ),
+                    "observation_lookback_days": (
+                        self.observation_profile_lookback_days
+                    ),
+                    "observation_min_samples": self.observation_profile_min_samples,
+                    "observation_min_win_rate": (
+                        self.observation_profile_min_win_rate
+                    ),
+                    "observation_min_ev": self.observation_profile_min_ev,
+                    "observation_min_edge": self.observation_profile_min_edge,
+                    "live_short_segments": sorted(self.live_short_segments),
+                },
+                "trade_score_threshold": self.trade_score_threshold,
+                "module_versions": {
+                    "decision_context": "DECISION_CONTEXT_V2",
+                    "transitional_trace": TRANSITIONAL_DECISION_BUILD_ID,
+                },
+            }
+            self._decision_runtime_config_cache = runtime_config_snapshot(
+                config,
+                strategy_build_id=TRANSITIONAL_DECISION_BUILD_ID,
+            )
+        return self._decision_runtime_config_cache
+
+    def _decision_artifacts(
+        self,
+        signal: Signal,
+        latest: Kline,
+        decision: str,
+        *,
+        final_reason: str,
+        candidate_origin: str,
+        candidate_ordinal: int,
+        observation_allowed: bool,
+        audit_context: dict,
+        event_kind: str,
+    ):
+        config = self._decision_runtime_config()
+        direction = self._signal_direction(signal)
+        profile_key = str(signal.profile_key or "")
+        builder = DecisionContextBuilder.new(
+            self.symbol,
+            int(latest.close_time),
+            candidate_origin,
+            config.hash,
+            strategy_build_id=config.strategy_build_id,
+            profile_key=profile_key,
+            candidate_ordinal=int(candidate_ordinal),
+        )
+        builder.capture_inputs(
+            {
+                "identity": {
+                    "direction": direction,
+                    "profile_key": profile_key,
+                    "strategy_family": signal.strategy_family,
+                    "strategy_tag": signal.strategy_tag,
+                    "threshold_segment": signal.threshold_segment,
+                    "candidate_origin": candidate_origin,
+                    "candidate_ordinal": int(candidate_ordinal),
+                },
+                "market": {"latest_closed_kline": latest.to_dict()},
+                "strategy_inputs": deepcopy(signal.decision_inputs),
+                "audit_snapshot": deepcopy(audit_context),
+                "transition": {
+                    "version": TRANSITIONAL_DECISION_BUILD_ID,
+                    "complete_gate_trace": False,
+                },
+            }
+        )
+        normalized_decision = str(decision or "UNKNOWN").upper()
+        open_allowed = normalized_decision == "OPENED"
+        is_block = not open_allowed and normalized_decision != "RESEARCH_OBSERVE"
+        builder.trace(
+            "TRANSITIONAL_OUTCOME",
+            "BLOCK" if is_block else "PASS",
+            {"final_decision": normalized_decision},
+            normalized_decision,
+        )
+        context = builder.finish(
+            normalized_decision,
+            str(final_reason or ""),
+            open_allowed,
+            bool(observation_allowed),
+        )
+        context_payload = context.to_dict()
+        enriched_signal = replace(
+            signal,
+            direction=direction or signal.direction,
+            decision_id=context.decision_id,
+            context_version=context.context_version,
+            runtime_config_hash=context.runtime_config_hash,
+            strategy_build_id=context.strategy_build_id,
+            candidate_origin=context.candidate_origin,
+            decision_inputs=context_payload["inputs"],
+            decision_trace=context_payload["decision_trace"],
+            first_decisive_block=context.first_decisive_block,
+        )
+        audit = DecisionAudit(
+            signal=enriched_signal,
+            decision=normalized_decision,
+            created_at_ms=int(self.updated_at_ms or latest.close_time),
+            audit_context=deepcopy(audit_context),
+            event_kind=event_kind,
+        )
+        return config, context, enriched_signal, audit
+
     def _maybe_open_order(
         self,
         signal: Signal,
@@ -711,6 +875,7 @@ class MonitorState:
         *,
         daily_profile_required: bool = False,
     ) -> str:
+        self._decision_storage_failed = False
         self.risk_pause = ""
         self.profile_guard_audit = self._empty_profile_guard_audit()
         signal = self._attach_direction_pulse_shadow(signal, current_time=latest.close_time)
@@ -797,8 +962,14 @@ class MonitorState:
 
         signal, gate = self._admit_order_candidate(signal, latest)
         if not gate.open_allowed:
-            if should_observe:
-                self._record_observation(signal, latest, gate.code)
+            if not self._persist_blocked_decision(
+                signal,
+                latest,
+                gate.code,
+                signal.reason,
+                should_observe=should_observe,
+            ):
+                return "STORAGE_ERROR"
             return gate.code
         if (
             signal.direction == "SHORT"
@@ -948,10 +1119,69 @@ class MonitorState:
         *,
         should_observe: bool,
     ) -> str:
-        if should_observe:
-            self._record_observation(signal, latest, code)
+        if not self._persist_blocked_decision(
+            signal,
+            latest,
+            code,
+            reason,
+            should_observe=should_observe,
+        ):
+            return "STORAGE_ERROR"
         self.risk_pause = reason
         return code
+
+    def _persist_blocked_decision(
+        self,
+        signal: Signal,
+        latest: Kline,
+        code: str,
+        reason: str,
+        *,
+        should_observe: bool,
+    ) -> bool:
+        if not signal.actionable and not should_observe:
+            return True
+        if should_observe:
+            recorded = self._record_observation(
+                signal,
+                latest,
+                code,
+                candidate_origin="NATIVE_ACTIONABLE",
+                candidate_ordinal=0,
+                primary_decision=True,
+                final_reason=reason,
+            )
+            if self._decision_storage_failed:
+                return False
+            if recorded:
+                return True
+        if not self.storage:
+            return True
+        audit_context = self._current_signal_audit_context()
+        config, context, enriched_signal, audit = self._decision_artifacts(
+            signal,
+            latest,
+            code,
+            final_reason=reason,
+            candidate_origin="NATIVE_ACTIONABLE",
+            candidate_ordinal=0,
+            observation_allowed=should_observe,
+            audit_context=audit_context,
+            event_kind="DECISIVE_BLOCK",
+        )
+        try:
+            self.storage.save_decision_bundle(
+                config=config,
+                context=context,
+                audit=audit,
+            )
+        except Exception as exc:  # noqa: BLE001 - 核心决策包失败必须阻断本轮。
+            self._decision_storage_failed = True
+            self._set_storage_error("决策持久化失败", exc)
+            return False
+        self._bundled_decision_ids.add(context.decision_id)
+        self.selected_signal = enriched_signal
+        return True
 
     def _admit_order_candidate(self, signal: Signal, latest: Kline) -> tuple[Signal, OrderGate]:
         gate = self.order_policy.evaluate(
@@ -989,23 +1219,90 @@ class MonitorState:
         should_observe: bool,
         allow_progression: bool,
     ) -> str:
+        audit_context = self._current_signal_audit_context()
+        pending_observation = (
+            self._new_observation(signal, latest, "OPENED")
+            if should_observe
+            else None
+        )
+        config, context, signal, audit = self._decision_artifacts(
+            signal,
+            latest,
+            "OPENED",
+            final_reason=signal.reason,
+            candidate_origin="NATIVE_ACTIONABLE",
+            candidate_ordinal=0,
+            observation_allowed=pending_observation is not None,
+            audit_context=audit_context,
+            event_kind="ORDER_OPENED",
+        )
+        self.selected_signal = signal
+        if pending_observation is not None:
+            context_payload = context.to_dict()
+            pending_observation = replace(
+                pending_observation,
+                decision_id=context.decision_id,
+                context_version=context.context_version,
+                runtime_config_hash=context.runtime_config_hash,
+                strategy_build_id=context.strategy_build_id,
+                candidate_origin=context.candidate_origin,
+                decision_inputs=context_payload["inputs"],
+                decision_trace=context_payload["decision_trace"],
+                first_decisive_block=context.first_decisive_block,
+            )
         order, consumed_credit = self.simulator.open_order_with_credit(
             signal,
             entry_price=latest.close,
             opened_at=latest.close_time,
             allow_progression=allow_progression,
         )
+        if pending_observation is not None:
+            self.observations.append(pending_observation)
         if self.storage:
+            captured_entry_context = self._capture_entry_snapshot_context(signal)
+            entry_snapshot = self._build_order_entry_snapshot(
+                replace(order),
+                signal,
+                latest,
+                captured_entry_context,
+            )
             try:
-                self.storage.save_open_order_with_credit(
-                    replace(order),
-                    self.symbol,
-                    replace(consumed_credit) if consumed_credit is not None else None,
+                self.storage.save_open_order_decision(
+                    config=config,
+                    context=context,
+                    order=replace(order),
+                    credit=(
+                        replace(consumed_credit)
+                        if consumed_credit is not None
+                        else None
+                    ),
+                    entry_snapshot=entry_snapshot,
+                    audit=audit,
+                    observation=(
+                        replace(pending_observation)
+                        if pending_observation is not None
+                        else None
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - 原子写失败必须回滚内存开单。
                 self.simulator.rollback_open_order(order.id)
+                if pending_observation is not None:
+                    self.observations.remove(pending_observation)
                 self._set_storage_error("开单持久化失败", exc)
                 return "STORAGE_ERROR"
+            self._bundled_decision_ids.add(context.decision_id)
+        if (
+            pending_observation is not None
+            and self._observation_audit_collector is not None
+        ):
+            self._observation_audit_collector.append(
+                (
+                    signal,
+                    pending_observation,
+                    "OPENED",
+                    audit_context,
+                )
+            )
         if gate.signal_key:
             self._opened_signal_keys.add(gate.signal_key)
         if not isinstance(self._last_order_opened_at, dict):
@@ -1014,10 +1311,6 @@ class MonitorState:
         self._send_webhook(signal, order)
         if signal.profile_degradation_probe:
             self._refresh_profile_degradation_guard(signal, latest.close_time)
-        if should_observe:
-            self._record_observation(signal, latest, "OPENED")
-        if self.storage:
-            self._save_order_entry_snapshot(order, signal, latest)
         return gate.code
 
     def _apply_wave_guard(self, signal: Signal, wave: WaveSnapshot) -> Signal:
@@ -1184,7 +1477,6 @@ class MonitorState:
                 self._set_storage_error("结算持久化失败", exc)
                 return False
             self._pending_settlement_events.pop(0)
-            self._update_order_entry_snapshot_settlement(event.order, symbol=symbol)
         return True
 
     def _set_storage_error(self, operation: str, error: Exception) -> None:
@@ -1456,20 +1748,25 @@ class MonitorState:
             return True
         return signal.direction == "SHORT"
 
-    def _record_observation(self, signal: Signal, latest: Kline, decision: str) -> bool:
+    def _new_observation(
+        self,
+        signal: Signal,
+        latest: Kline,
+        decision: str,
+    ) -> ObservationSignal | None:
         if not signal.quality_score_version:
             signal = self._attach_quality_score(signal, current_time=latest.close_time)
         direction = signal.observe_direction or signal.direction
         if direction not in {"LONG", "SHORT"}:
-            return False
+            return None
         key = self._observation_key(signal, direction)
         existing = next((item for item in self.observations if item.observation_key == key), None)
         if existing is not None:
             if decision and existing.source_decision != decision:
                 existing.source_decision = decision
-                if self.storage:
+                if self.storage and self._observation_audit_collector is None:
                     self._save_observation(existing)
-            return False
+            return None
         overlapping = next(
             (
                 item
@@ -1484,8 +1781,8 @@ class MonitorState:
             None,
         )
         if overlapping is not None:
-            return False
-        observation = ObservationSignal(
+            return None
+        return ObservationSignal(
             observation_key=key,
             strategy_family=signal.strategy_family,
             strategy_tag=signal.strategy_tag,
@@ -1532,24 +1829,90 @@ class MonitorState:
             profile_health_ev=signal.profile_health_ev,
             profile_health_evaluated_at=signal.profile_health_evaluated_at,
         )
+
+    def _record_observation(
+        self,
+        signal: Signal,
+        latest: Kline,
+        decision: str,
+        *,
+        candidate_origin: str = "RESEARCH_OBSERVATION",
+        candidate_ordinal: int = 1,
+        primary_decision: bool = False,
+        final_reason: str | None = None,
+    ) -> bool:
+        observation = self._new_observation(signal, latest, decision)
+        if observation is None:
+            return False
+        direction = observation.direction
+        audit_context = (
+            self._current_signal_audit_context()
+            if primary_decision
+            else self._observation_signal_audit_context(signal, direction)
+        )
+        event_kind = "DECISIVE_BLOCK" if primary_decision else "OBSERVATION_CANDIDATE"
+        config, context, enriched_signal, audit = self._decision_artifacts(
+            replace(signal, direction=direction),
+            latest,
+            decision,
+            final_reason=signal.reason if final_reason is None else final_reason,
+            candidate_origin=candidate_origin,
+            candidate_ordinal=candidate_ordinal,
+            observation_allowed=True,
+            audit_context=audit_context,
+            event_kind=event_kind,
+        )
+        context_payload = context.to_dict()
+        observation = replace(
+            observation,
+            decision_id=context.decision_id,
+            context_version=context.context_version,
+            runtime_config_hash=context.runtime_config_hash,
+            strategy_build_id=context.strategy_build_id,
+            candidate_origin=context.candidate_origin,
+            decision_inputs=context_payload["inputs"],
+            decision_trace=context_payload["decision_trace"],
+            first_decisive_block=context.first_decisive_block,
+        )
         self.observations.append(observation)
+        if self.storage:
+            try:
+                self.storage.save_decision_bundle(
+                    config=config,
+                    context=context,
+                    audit=audit,
+                    observation=replace(observation),
+                )
+            except Exception as exc:  # noqa: BLE001 - 核心决策包失败必须回滚观察。
+                self.observations.remove(observation)
+                self._decision_storage_failed = True
+                self._set_storage_error("决策持久化失败", exc)
+                return False
+            self._bundled_decision_ids.add(context.decision_id)
+        if primary_decision:
+            self.selected_signal = enriched_signal
         if self._observation_audit_collector is not None:
             self._observation_audit_collector.append(
                 (
-                    replace(signal, direction=direction),
+                    enriched_signal,
+                    observation,
                     str(decision or "RESEARCH_OBSERVE"),
-                    self._observation_signal_audit_context(signal, direction),
+                    audit_context,
                 )
             )
-        if self.storage:
-            self._save_observation(observation)
         return True
 
     def _record_observation_candidates(self, signals: Sequence[Signal], latest: Kline) -> None:
-        for signal in signals:
+        for candidate_ordinal, signal in enumerate(signals, start=1):
             if self._has_open_research_observation(signal, latest):
                 continue
-            self._record_observation(signal, latest, "RESEARCH_OBSERVE")
+            self._record_observation(
+                signal,
+                latest,
+                "RESEARCH_OBSERVE",
+                candidate_origin="RESEARCH_OBSERVATION",
+                candidate_ordinal=candidate_ordinal,
+            )
 
     def _has_open_research_observation(self, signal: Signal, latest: Kline) -> bool:
         direction = signal.observe_direction or signal.direction
@@ -1573,6 +1936,7 @@ class MonitorState:
         ordered_klines = sorted(klines or [], key=lambda item: item.close_time)
         close_times = [item.close_time for item in ordered_klines]
         settled = []
+        previous_states = []
         for observation in self.observations:
             if observation.status != "OPEN" or current_time < observation.expires_at:
                 continue
@@ -1589,6 +1953,7 @@ class MonitorState:
                 exit_price = exit_kline.close
             elif current_time != observation.expires_at:
                 continue
+            previous_states.append((observation, deepcopy(observation.__dict__)))
             won = self._is_observation_win(observation.direction, observation.entry_price, exit_price)
             observation.status = "SETTLED"
             observation.result = "WIN" if won else "LOSS"
@@ -1611,6 +1976,11 @@ class MonitorState:
                     persisted = False
             if persisted:
                 self._refresh_direction_pulse_shadow(current_time)
+            else:
+                for observation, previous_state in previous_states:
+                    observation.__dict__.clear()
+                    observation.__dict__.update(previous_state)
+                settled = []
         return settled
 
     def _load_restored_observations(self) -> list[ObservationSignal]:
@@ -1987,14 +2357,20 @@ class MonitorState:
             )
         )
 
-    def _save_order_entry_snapshot(self, order, signal: Signal, latest: Kline) -> None:
-        order_snapshot = replace(order)
-        symbol = self.symbol
-        profile_guard = self._profile_guard_shadow(signal)
-        profile_guard_default = self._profile_guard_default_shadow(signal)
+    def _capture_entry_snapshot_context(self, signal: Signal) -> dict:
+        profile_source = self._profile_guard_shadow_source()
+        profile_guard = profile_guard_shadow(
+            signal,
+            profile_source,
+            use_recommended=True,
+        )
+        profile_guard_default = profile_guard_shadow(
+            signal,
+            profile_source,
+            use_recommended=False,
+        )
         progression = self._stake_progression_status()
-        entry_snapshot = {
-            "signal": signal.to_dict(),
+        return {
             "rolling_edge": dict(self.rolling_edge),
             "result_sequence_guard": dict(self.result_sequence_guard),
             "wave_batch_guard": dict(self.wave_batch_guard),
@@ -2005,11 +2381,8 @@ class MonitorState:
             "profile_guard_config": self._profile_guard_config(),
             "observation_profile_promotion": self._observation_profile_promotion_config(),
             "daily_profile_selection": self._daily_profile_selector_status(),
-            "latest_kline": latest.to_dict(),
             "fear_greed": self.fear_greed.to_dict() if self.fear_greed else None,
             "stake_progression": progression,
-            "stake_progression_source_order_id": order_snapshot.stake_progression_source_order_id,
-            "stake_progression_version": order_snapshot.stake_progression_version,
             "stake_config": {
                 "stake": self.stake,
                 "win_return": self.win_return,
@@ -2020,6 +2393,33 @@ class MonitorState:
             "order_policy": self._order_policy_status(),
             "trade_score_threshold": self._trade_score_threshold_status(),
         }
+
+    def _build_order_entry_snapshot(
+        self,
+        order,
+        signal: Signal,
+        latest: Kline,
+        captured: dict,
+    ) -> dict:
+        snapshot = deepcopy(captured)
+        snapshot["signal"] = signal.to_dict()
+        snapshot["latest_kline"] = latest.to_dict()
+        snapshot["stake_progression_source_order_id"] = (
+            order.stake_progression_source_order_id
+        )
+        snapshot["stake_progression_version"] = order.stake_progression_version
+        return snapshot
+
+    def _save_order_entry_snapshot(self, order, signal: Signal, latest: Kline) -> None:
+        order_snapshot = replace(order)
+        symbol = self.symbol
+        captured = self._capture_entry_snapshot_context(signal)
+        entry_snapshot = self._build_order_entry_snapshot(
+            order_snapshot,
+            signal,
+            latest,
+            captured,
+        )
         self._submit_storage_write(
             lambda order=order_snapshot, symbol=symbol, snapshot=entry_snapshot: (
                 self.storage.save_order_entry_snapshot(order, symbol, snapshot)

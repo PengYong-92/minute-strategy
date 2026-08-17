@@ -262,6 +262,9 @@ class RecordingStorage:
         self.order_profile = None
         self.daily_profile_selections = []
         self.wave_runtime = {}
+        self.decision_bundles = []
+        self.runtime_configs = {}
+        self.decision_contexts = {}
 
     def load_orders(self, symbol):
         return [replace(order) for order in self.persisted_orders.get(symbol.upper(), {}).values()]
@@ -350,6 +353,7 @@ class RecordingStorage:
         self._persist_order(order_snapshot, symbol)
         if credit_snapshot is not None:
             self._persist_credit(credit_snapshot, symbol)
+        self.settlements.append((symbol, order_snapshot.to_dict()))
 
     def save_open_order_with_credit(self, order, symbol, credit):
         self._maybe_fail("save_open_order_with_credit")
@@ -366,6 +370,89 @@ class RecordingStorage:
         self._persist_order(order_snapshot, symbol)
         if credit_snapshot is not None:
             self._persist_credit(credit_snapshot, symbol)
+
+    def save_open_order_decision(
+        self,
+        *,
+        config,
+        context,
+        order,
+        credit,
+        entry_snapshot,
+        audit,
+        observation=None,
+    ):
+        self._maybe_fail("save_open_order_decision")
+        order_snapshot = replace(order)
+        credit_snapshot = replace(credit) if credit is not None else None
+        observation_snapshot = replace(observation) if observation is not None else None
+        self.runtime_configs[config.hash] = config
+        self.decision_contexts[(context.symbol, context.decision_id)] = context
+        self.decision_bundles.append(
+            (
+                "open",
+                context,
+                audit,
+                order_snapshot,
+                observation_snapshot,
+                entry_snapshot,
+            )
+        )
+        self.atomic_calls.append(
+            (
+                "open",
+                context.symbol,
+                order_snapshot.to_dict(),
+                credit_snapshot.to_dict() if credit_snapshot is not None else None,
+            )
+        )
+        self._persist_order(order_snapshot, context.symbol)
+        if credit_snapshot is not None:
+            self._persist_credit(credit_snapshot, context.symbol)
+        self.entry_snapshots.append(
+            (context.symbol, order_snapshot.to_dict(), entry_snapshot)
+        )
+        if observation_snapshot is not None:
+            self.observations.append(
+                (context.symbol, observation_snapshot.to_dict())
+            )
+        self.signals.append(
+            (
+                context.symbol,
+                audit.signal.to_dict(),
+                audit.decision,
+                audit.created_at_ms,
+                audit.audit_context,
+                True,
+                True,
+                audit.event_kind,
+            )
+        )
+
+    def save_decision_bundle(self, *, config, context, audit, observation=None):
+        self._maybe_fail("save_decision_bundle")
+        observation_snapshot = replace(observation) if observation is not None else None
+        self.runtime_configs[config.hash] = config
+        self.decision_contexts[(context.symbol, context.decision_id)] = context
+        self.decision_bundles.append(
+            ("decision", context, audit, None, observation_snapshot, None)
+        )
+        if observation_snapshot is not None:
+            self.observations.append(
+                (context.symbol, observation_snapshot.to_dict())
+            )
+        self.signals.append(
+            (
+                context.symbol,
+                audit.signal.to_dict(),
+                audit.decision,
+                audit.created_at_ms,
+                audit.audit_context,
+                bool(audit.signal.actionable),
+                True,
+                audit.event_kind,
+            )
+        )
 
     def _persist_order(self, order, symbol):
         self.persisted_orders.setdefault(symbol.upper(), {})[order.id] = replace(order)
@@ -931,7 +1018,7 @@ class MonitorStateTest(unittest.TestCase):
         storage = RecordingStorage()
         state = profile_guard_state(storage=storage, now_ms=lambda: 0)
         settle_profile_losses(state)
-        storage.fail_once("save_open_order_with_credit")
+        storage.fail_once("save_open_order_decision")
         boundary = 92 * MINUTE_MS
 
         decision = state._maybe_open_order(
@@ -1195,14 +1282,14 @@ class MonitorStateTest(unittest.TestCase):
                 self.state = None
                 self.atomic_boundary = None
 
-            def save_open_order_with_credit(self, order, symbol, credit):
-                super().save_open_order_with_credit(order, symbol, credit)
+            def save_open_order_decision(self, **kwargs):
                 self.atomic_boundary = {
                     "orders": len(self.state.simulator.orders),
                     "observations": len(self.state.observations),
                     "entry_snapshots": len(self.entry_snapshots),
                     "webhooks": len(webhook.calls),
                 }
+                super().save_open_order_decision(**kwargs)
 
         storage = BoundaryRecordingStorage()
         state = MonitorState(
@@ -1237,7 +1324,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual([call[0] for call in storage.atomic_calls], ["open"])
         self.assertEqual(
             storage.atomic_boundary,
-            {"orders": 1, "observations": 0, "entry_snapshots": 0, "webhooks": 0},
+            {"orders": 1, "observations": 1, "entry_snapshots": 0, "webhooks": 0},
         )
         self.assertEqual(len(snapshot["orders"]), 1)
         self.assertEqual(len(snapshot["observations"]), 1)
@@ -1245,7 +1332,225 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(len(storage.entry_snapshots), 1)
         self.assertEqual(len(webhook.calls), 1)
 
-    def test_webhook_triggers_before_entry_snapshot_profile_summary(self):
+    def test_open_bundle_failure_rolls_back_order_observation_keys_and_webhook(self):
+        storage = RecordingStorage()
+        storage.fail_once("save_open_order_decision")
+        webhook = RecordingWebhook()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            webhook=webhook,
+            now_ms=lambda: 1_000,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="atomic failure",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+        latest = Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000)
+
+        decision = state._maybe_open_order(signal, latest)
+
+        self.assertEqual(decision, "STORAGE_ERROR")
+        self.assertEqual(state.simulator.orders, [])
+        self.assertEqual(state.simulator.stake_progression.pending_credits(), [])
+        self.assertEqual(state.observations, [])
+        self.assertEqual(state._opened_signal_keys, set())
+        self.assertEqual(
+            state._last_order_opened_at,
+            {"LONG": None, "SHORT": None},
+        )
+        self.assertEqual(storage.decision_bundles, [])
+        self.assertEqual(storage.entry_snapshots, [])
+        self.assertEqual(webhook.calls, [])
+
+    def test_successful_open_bundle_shares_one_decision_identity_before_webhook(self):
+        events = []
+
+        class OrderingStorage(RecordingStorage):
+            def save_open_order_decision(self, **kwargs):
+                events.append("bundle")
+                super().save_open_order_decision(**kwargs)
+
+        class OrderingWebhook(RecordingWebhook):
+            def send_signal(self, symbol, signal, message=None, amount=None):
+                events.append("webhook")
+                super().send_signal(symbol, signal, message=message, amount=amount)
+
+        storage = OrderingStorage()
+        webhook = OrderingWebhook()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            webhook=webhook,
+            now_ms=lambda: 1_000,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="atomic success",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        decision = state._maybe_open_order(
+            signal,
+            Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000),
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(events, ["bundle", "webhook"])
+        self.assertEqual(len(storage.decision_bundles), 1)
+        _kind, context, audit, order, observed, entry_snapshot = (
+            storage.decision_bundles[0]
+        )
+        identities = {
+            context.decision_id,
+            audit.signal.decision_id,
+            order.decision_id,
+            observed.decision_id,
+            entry_snapshot["signal"]["decision_id"],
+        }
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(context.final_decision, "OPENED")
+        self.assertTrue(context.open_allowed)
+        self.assertEqual(audit.event_kind, "ORDER_OPENED")
+
+    def test_formal_candidate_and_two_observations_persist_three_unique_contexts(self):
+        storage = RecordingStorage()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_rolling_edge_guard=False,
+            enable_observation_profile_promotion=False,
+            min_order_gap_ms=0,
+        )
+        now = 119_999
+        selected = selected_profile_signal(now, reason="formal")
+        first_observation = replace(
+            selected,
+            direction="WAIT",
+            observe_direction="SHORT",
+            observe_only=True,
+            strategy_family="observe_short",
+            strategy_tag="observe_short_tag",
+            profile_key="short-profile",
+            threshold_segment="WD-02",
+            score=-66.0,
+        )
+        second_observation = replace(
+            selected,
+            direction="WAIT",
+            observe_direction="LONG",
+            observe_only=True,
+            strategy_family="observe_long",
+            strategy_tag="observe_long_tag",
+            profile_key="long-profile",
+            threshold_segment="WD-15",
+            score=66.0,
+        )
+
+        with patch("app.state.analyze_volume_price", return_value=selected), patch(
+            "app.state.analyze_observation_signals",
+            return_value=[first_observation, second_observation],
+        ), patch("app.state.choose_trade_signal", return_value=selected):
+            self.assertTrue(state.update_from_klines([kline(1, 100.0, 100.0)]))
+
+        contexts = [item[1] for item in storage.decision_bundles]
+        audits = [item[2] for item in storage.decision_bundles]
+        self.assertEqual(len(contexts), 3)
+        self.assertEqual(len({item.decision_id for item in contexts}), 3)
+        self.assertEqual(
+            {item.decision_id for item in contexts},
+            {item.signal.decision_id for item in audits},
+        )
+        self.assertEqual(
+            sorted(item.candidate_origin for item in contexts),
+            ["NATIVE_ACTIONABLE", "RESEARCH_OBSERVATION", "RESEARCH_OBSERVATION"],
+        )
+
+    def test_primary_observation_uses_decisive_block_audit_for_hold_decision(self):
+        storage = RecordingStorage()
+        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="capacity occupied",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+
+        recorded = state._record_observation(
+            signal,
+            Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000),
+            "HOLD_OPEN_ORDER",
+            candidate_origin="NATIVE_ACTIONABLE",
+            candidate_ordinal=0,
+            primary_decision=True,
+        )
+
+        self.assertTrue(recorded)
+        self.assertEqual(storage.decision_bundles[0][2].event_kind, "DECISIVE_BLOCK")
+
+    def test_observation_settlement_failure_restores_open_state_for_retry(self):
+        class RetryStorage(RecordingStorage):
+            def __init__(self):
+                super().__init__()
+                self.fail_settlement = True
+
+            def save_observations(self, observations, symbol):
+                if self.fail_settlement:
+                    self.fail_settlement = False
+                    raise OSError("settlement unavailable")
+                for item in observations:
+                    self.save_observation(item, symbol)
+
+        storage = RetryStorage()
+        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        pending = ObservationSignal(
+            observation_key="retry-observation",
+            strategy_family="observe",
+            strategy_tag="retry",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="retry settlement",
+            entry_price=100.0,
+            opened_at=1_000,
+            expires_at=601_000,
+        )
+        state.observations = [pending]
+
+        first = state._settle_observations(601_000, 101.0)
+        second = state._settle_observations(601_000, 101.0)
+
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(pending.status, "SETTLED")
+        self.assertEqual(pending.result, "WIN")
+        self.assertEqual(len(storage.observations), 1)
+
+    def test_entry_snapshot_profile_context_is_captured_before_webhook(self):
         events = []
 
         class OrderingStorage(RecordingStorage):
@@ -1284,7 +1589,7 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         self.assertEqual(decision, "OPENED")
-        self.assertEqual(events[0], "webhook")
+        self.assertEqual(events, ["profile_summary", "webhook"])
 
     def test_webhook_dispatch_failure_does_not_interrupt_committed_order(self):
         class FailingWebhook(RecordingWebhook):
@@ -4996,7 +5301,7 @@ class MonitorStateTest(unittest.TestCase):
             enable_wave_guard=False,
             now_ms=lambda: 1_000,
         )
-        storage.fail_once("save_open_order_with_credit")
+        storage.fail_once("save_open_order_decision")
         signal = Signal(
             direction="LONG", timeframe_minutes=10, level="A", reason="base",
             price=100.0, open_time=1_000, score=80.0, threshold=70.0,
@@ -5016,7 +5321,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(webhook.calls, [])
         self.assertEqual(storage.entry_snapshots, [])
         self.assertEqual(state.observations, [])
-        self.assertIn("save_open_order_with_credit failed", state.last_error)
+        self.assertIn("save_open_order_decision failed", state.last_error)
 
     def test_open_storage_failure_rolls_back_18u_order_and_restores_credit(self):
         storage = RecordingStorage()
@@ -5033,7 +5338,7 @@ class MonitorStateTest(unittest.TestCase):
             0,
         )
         state.simulator.settle_expired_order_events(60_000, 101.0)
-        storage.fail_once("save_open_order_with_credit")
+        storage.fail_once("save_open_order_decision")
         signal = Signal(
             direction="LONG", timeframe_minutes=10, level="A", reason="second",
             price=101.0, open_time=120_000, score=80.0, threshold=70.0,
@@ -5110,14 +5415,14 @@ class MonitorStateTest(unittest.TestCase):
         release = threading.Event()
         open_done = threading.Event()
         snapshot_done = threading.Event()
-        original_save = storage.save_open_order_with_credit
+        original_save = storage.save_open_order_decision
 
-        def blocking_save(order, symbol, credit):
+        def blocking_save(**kwargs):
             started.set()
             release.wait(timeout=5)
-            original_save(order, symbol, credit)
+            original_save(**kwargs)
 
-        storage.save_open_order_with_credit = blocking_save
+        storage.save_open_order_decision = blocking_save
         signal = Signal(
             direction="LONG", timeframe_minutes=10, level="A", reason="locked",
             price=100.0, open_time=1_000, score=80.0, threshold=70.0,

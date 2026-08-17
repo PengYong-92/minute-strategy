@@ -2,7 +2,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
@@ -73,6 +73,15 @@ _DECISION_CONTEXT_COLUMNS = (
     "input_payload",
     "outcome_payload",
 )
+
+
+@dataclass(frozen=True)
+class DecisionAudit:
+    signal: Signal
+    decision: str
+    created_at_ms: int
+    audit_context: Mapping[str, Any] | None = None
+    event_kind: str = ""
 
 
 def _compact_json(value: object) -> str:
@@ -1035,50 +1044,194 @@ class SQLiteMonitorStore:
         with self._connect() as connection:
             return capacity_from_connection(connection)
 
-    def save_runtime_config_snapshot(
+    @staticmethod
+    def _after_bundle_step(_step: str) -> None:
+        return None
+
+    def _insert_runtime_config(
         self,
+        connection: sqlite3.Connection,
         snapshot: RuntimeConfigSnapshot,
     ) -> None:
         runtime_config_hash, canonical_payload, payload_bytes = (
             _runtime_snapshot_values(snapshot)
         )
+        # Build ID is first-seen config provenance; each decision stores its actual build.
+        connection.execute(
+            """
+            insert or ignore into runtime_config_snapshots(
+                runtime_config_hash, context_version, strategy_build_id,
+                canonical_payload, payload_bytes, created_at_ms
+            )
+            values (?, ?, ?, ?, ?, strftime('%s','now') * 1000)
+            """,
+            (
+                runtime_config_hash,
+                CONTEXT_VERSION,
+                snapshot.strategy_build_id,
+                canonical_payload,
+                payload_bytes,
+            ),
+        )
+        row = connection.execute(
+            """
+            select runtime_config_hash, context_version, strategy_build_id,
+                   canonical_payload, payload_bytes, created_at_ms
+            from runtime_config_snapshots
+            where runtime_config_hash = ?
+            """,
+            (runtime_config_hash,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("runtime configuration snapshot was not persisted")
+        stored = _runtime_row_to_dict(row)
+        if (
+            stored["context_version"] != CONTEXT_VERSION
+            or stored["canonical_payload"] != canonical_payload
+            or stored["payload_bytes"] != payload_bytes
+        ):
+            raise ValueError("runtime configuration hash collides with stored data")
+
+    def _insert_decision_context(
+        self,
+        connection: sqlite3.Connection,
+        context: DecisionContext,
+    ) -> None:
+        values = _decision_context_values(context)
+        runtime_row = connection.execute(
+            """
+            select runtime_config_hash, context_version, strategy_build_id,
+                   canonical_payload, payload_bytes, created_at_ms
+            from runtime_config_snapshots
+            where runtime_config_hash = ?
+            """,
+            (values["runtime_config_hash"],),
+        ).fetchone()
+        if runtime_row is None:
+            raise ValueError(
+                "decision context requires a persisted V2 runtime configuration"
+            )
+        _runtime_row_to_dict(runtime_row)
+        connection.execute(
+            """
+            insert or ignore into decision_contexts(
+                symbol, decision_id, context_version, runtime_config_hash,
+                strategy_build_id, created_at_ms, closed_kline_at_ms,
+                direction, profile_key, candidate_origin, input_payload,
+                outcome_payload
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(values[column] for column in _DECISION_CONTEXT_COLUMNS),
+        )
+        row = connection.execute(
+            """
+            select symbol, decision_id, context_version, runtime_config_hash,
+                   strategy_build_id, created_at_ms, closed_kline_at_ms,
+                   direction, profile_key, candidate_origin, input_payload,
+                   outcome_payload
+            from decision_contexts
+            where symbol = ? and decision_id = ?
+            """,
+            (values["symbol"], values["decision_id"]),
+        ).fetchone()
+        if row is None or any(
+            row[column] != values[column]
+            for column in _DECISION_CONTEXT_COLUMNS
+        ):
+            raise ValueError("decision context conflicts with frozen stored data")
+
+    @staticmethod
+    def _validate_decision_metadata(
+        item: object,
+        context: DecisionContext,
+        name: str,
+    ) -> None:
+        expected = {
+            "decision_id": context.decision_id,
+            "context_version": context.context_version,
+            "runtime_config_hash": context.runtime_config_hash,
+            "strategy_build_id": context.strategy_build_id,
+            "candidate_origin": context.candidate_origin,
+        }
+        for field_name, expected_value in expected.items():
+            if getattr(item, field_name, None) != expected_value:
+                raise ValueError(
+                    f"{name} {field_name} must match decision context"
+                )
+
+    @staticmethod
+    def _validate_bundle_references(
+        config: RuntimeConfigSnapshot,
+        context: DecisionContext,
+        audit: DecisionAudit,
+        *,
+        order: SimulatedOrder | None = None,
+        entry_snapshot: Mapping[str, Any] | None = None,
+        observation: ObservationSignal | None = None,
+    ) -> None:
+        if not isinstance(config, RuntimeConfigSnapshot):
+            raise TypeError("config must be a RuntimeConfigSnapshot")
+        if not isinstance(context, DecisionContext):
+            raise TypeError("context must be a DecisionContext")
+        if not isinstance(audit, DecisionAudit):
+            raise TypeError("audit must be a DecisionAudit")
+        if config.hash != context.runtime_config_hash:
+            raise ValueError("config hash must match decision context")
+        if config.strategy_build_id != context.strategy_build_id:
+            raise ValueError("config build must match decision context")
+        if context.symbol != context.symbol.upper():
+            raise ValueError("decision context symbol must be uppercase")
+        if not isinstance(audit.signal, Signal):
+            raise TypeError("audit signal must be a Signal")
+        SQLiteMonitorStore._validate_decision_metadata(
+            audit.signal, context, "audit signal"
+        )
+        if str(audit.decision or "").upper() != context.final_decision.upper():
+            raise ValueError("audit decision must match final decision")
+        if type(audit.created_at_ms) is not int or audit.created_at_ms < 0:
+            raise ValueError("audit created_at_ms must be a non-negative integer")
+        if order is not None:
+            if not isinstance(order, SimulatedOrder):
+                raise TypeError("order must be a SimulatedOrder")
+            SQLiteMonitorStore._validate_decision_metadata(order, context, "order")
+            if order.status != "OPEN":
+                raise ValueError("open decision bundle requires an OPEN order")
+            if order.direction != audit.signal.direction:
+                raise ValueError("order direction must match audit signal")
+        if observation is not None:
+            if not isinstance(observation, ObservationSignal):
+                raise TypeError("observation must be an ObservationSignal")
+            SQLiteMonitorStore._validate_decision_metadata(
+                observation, context, "observation"
+            )
+            if observation.direction != audit.signal.direction:
+                raise ValueError("observation direction must match audit signal")
+        if entry_snapshot is not None:
+            if not isinstance(entry_snapshot, Mapping):
+                raise TypeError("entry_snapshot must be a mapping")
+            snapshot_signal = entry_snapshot.get("signal")
+            if not isinstance(snapshot_signal, Mapping):
+                raise ValueError("entry_snapshot must contain signal metadata")
+            for field_name in (
+                "decision_id",
+                "context_version",
+                "runtime_config_hash",
+                "strategy_build_id",
+                "candidate_origin",
+            ):
+                if snapshot_signal.get(field_name) != getattr(context, field_name):
+                    raise ValueError(
+                        f"entry_snapshot signal {field_name} must match decision context"
+                    )
+
+    def save_runtime_config_snapshot(
+        self,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> None:
         with self._connect() as connection:
             connection.execute("begin immediate")
-            # Build ID is first-seen config provenance; each decision stores its actual build.
-            connection.execute(
-                """
-                insert or ignore into runtime_config_snapshots(
-                    runtime_config_hash, context_version, strategy_build_id,
-                    canonical_payload, payload_bytes, created_at_ms
-                )
-                values (?, ?, ?, ?, ?, strftime('%s','now') * 1000)
-                """,
-                (
-                    runtime_config_hash,
-                    CONTEXT_VERSION,
-                    snapshot.strategy_build_id,
-                    canonical_payload,
-                    payload_bytes,
-                ),
-            )
-            row = connection.execute(
-                """
-                select runtime_config_hash, context_version, strategy_build_id,
-                       canonical_payload, payload_bytes, created_at_ms
-                from runtime_config_snapshots
-                where runtime_config_hash = ?
-                """,
-                (runtime_config_hash,),
-            ).fetchone()
-            if row is None:
-                raise ValueError("runtime configuration snapshot was not persisted")
-            stored = _runtime_row_to_dict(row)
-            if (
-                stored["context_version"] != CONTEXT_VERSION
-                or stored["canonical_payload"] != canonical_payload
-                or stored["payload_bytes"] != payload_bytes
-            ):
-                raise ValueError("runtime configuration hash collides with stored data")
+            self._insert_runtime_config(connection, snapshot)
 
     def load_runtime_config_snapshot(
         self,
@@ -1100,52 +1253,9 @@ class SQLiteMonitorStore:
         return _runtime_row_to_dict(row)
 
     def save_decision_context(self, context: DecisionContext) -> None:
-        values = _decision_context_values(context)
         with self._connect() as connection:
             connection.execute("begin immediate")
-            runtime_row = connection.execute(
-                """
-                select runtime_config_hash, context_version, strategy_build_id,
-                       canonical_payload, payload_bytes, created_at_ms
-                from runtime_config_snapshots
-                where runtime_config_hash = ?
-                """,
-                (values["runtime_config_hash"],),
-            ).fetchone()
-            if runtime_row is None:
-                raise ValueError(
-                    "decision context requires a persisted V2 runtime configuration"
-                )
-            _runtime_row_to_dict(runtime_row)
-
-            connection.execute(
-                """
-                insert or ignore into decision_contexts(
-                    symbol, decision_id, context_version, runtime_config_hash,
-                    strategy_build_id, created_at_ms, closed_kline_at_ms,
-                    direction, profile_key, candidate_origin, input_payload,
-                    outcome_payload
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(values[column] for column in _DECISION_CONTEXT_COLUMNS),
-            )
-            row = connection.execute(
-                """
-                select symbol, decision_id, context_version, runtime_config_hash,
-                       strategy_build_id, created_at_ms, closed_kline_at_ms,
-                       direction, profile_key, candidate_origin, input_payload,
-                       outcome_payload
-                from decision_contexts
-                where symbol = ? and decision_id = ?
-                """,
-                (values["symbol"], values["decision_id"]),
-            ).fetchone()
-            if row is None or any(
-                row[column] != values[column]
-                for column in _DECISION_CONTEXT_COLUMNS
-            ):
-                raise ValueError("decision context conflicts with frozen stored data")
+            self._insert_decision_context(connection, context)
 
     def load_decision_context(
         self,
@@ -1308,14 +1418,19 @@ class SQLiteMonitorStore:
     ) -> None:
         connection.execute(
             """
-            insert into orders(symbol, order_id, status, result, opened_at, settled_at, payload)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into orders(
+                symbol, order_id, status, result, opened_at, settled_at, payload,
+                decision_id, runtime_config_hash
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(symbol, order_id) do update set
                 status=excluded.status,
                 result=excluded.result,
                 opened_at=excluded.opened_at,
                 settled_at=excluded.settled_at,
                 payload=excluded.payload,
+                decision_id=excluded.decision_id,
+                runtime_config_hash=excluded.runtime_config_hash,
                 updated_at_ms=strftime('%s','now') * 1000
             """,
             (
@@ -1326,8 +1441,58 @@ class SQLiteMonitorStore:
                 order.opened_at,
                 order.settled_at,
                 json.dumps(order.to_dict(), ensure_ascii=False),
+                order.decision_id or None,
+                order.runtime_config_hash or None,
             ),
         )
+
+    def _insert_open_order(
+        self,
+        connection: sqlite3.Connection,
+        order: SimulatedOrder,
+        symbol: str,
+    ) -> None:
+        normalized_symbol = symbol.upper()
+        payload = json.dumps(order.to_dict(), ensure_ascii=False)
+        connection.execute(
+            """
+            insert or ignore into orders(
+                symbol, order_id, status, result, opened_at, settled_at, payload,
+                decision_id, runtime_config_hash
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_symbol,
+                order.id,
+                order.status,
+                order.result,
+                order.opened_at,
+                order.settled_at,
+                payload,
+                order.decision_id,
+                order.runtime_config_hash,
+            ),
+        )
+        row = connection.execute(
+            """
+            select status, result, opened_at, settled_at, payload,
+                   decision_id, runtime_config_hash
+            from orders where symbol = ? and order_id = ?
+            """,
+            (normalized_symbol, order.id),
+        ).fetchone()
+        expected = (
+            order.status,
+            order.result,
+            order.opened_at,
+            order.settled_at,
+            payload,
+            order.decision_id,
+            order.runtime_config_hash,
+        )
+        if row is None or tuple(row) != expected:
+            raise ValueError("order id collides with different frozen decision data")
 
     def _upsert_progression_credit(
         self,
@@ -1486,10 +1651,23 @@ class SQLiteMonitorStore:
         credit: StakeProgressionCredit | None,
     ) -> None:
         self._validate_settlement_credit(order, credit)
-        with self._connect() as connection:
-            self._upsert_order(connection, order, symbol)
-            if credit is not None:
-                self._upsert_progression_credit(connection, symbol, credit)
+        try:
+            with self._connect() as connection:
+                connection.execute("begin immediate")
+                ensure_write_allowed(
+                    capacity_from_connection(connection),
+                    StorageWriteClass.CORE,
+                )
+                self._upsert_order(connection, order, symbol)
+                if credit is not None:
+                    self._upsert_progression_credit(connection, symbol, credit)
+                self._update_order_entry_snapshot_settlement(
+                    connection,
+                    order,
+                    symbol,
+                )
+        except sqlite3.Error as error:
+            raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
 
     def save_open_order_with_credit(
         self,
@@ -1668,16 +1846,73 @@ class SQLiteMonitorStore:
                 self._upsert_observation(connection, observation, symbol)
 
     @staticmethod
-    def _upsert_observation(connection, observation: ObservationSignal, symbol: str) -> None:
+    def _observation_row_values(
+        observation: ObservationSignal,
+        symbol: str,
+    ) -> dict[str, Any]:
         payload = observation.to_dict()
+        adaptive = (
+            observation.adaptive_profile_state
+            if isinstance(observation.adaptive_profile_state, Mapping)
+            else {}
+        )
+        structure = (
+            observation.entry_structure_shadow
+            if isinstance(observation.entry_structure_shadow, Mapping)
+            else {}
+        )
+        qualification_state = str(
+            adaptive.get("qualification_state")
+            or adaptive.get("qualification_status")
+            or ""
+        )
+        adaptive_state = str(adaptive.get("state") or adaptive.get("status") or "")
+        structure_state = str(
+            structure.get("entry_structure_state") or structure.get("state") or ""
+        )
+        structure_bias = str(
+            structure.get("entry_structure_bias") or structure.get("bias") or ""
+        )
+        active_level_source = str(structure.get("active_level_source") or "")
+        return {
+            "symbol": symbol.upper(),
+            "observation_key": observation.observation_key,
+            "status": observation.status,
+            "result": observation.result,
+            "direction": observation.direction,
+            "strategy_family": observation.strategy_family,
+            "strategy_tag": observation.strategy_tag,
+            "timeframe_minutes": observation.timeframe_minutes,
+            "threshold_segment": observation.threshold_segment,
+            "opened_at": observation.opened_at,
+            "expires_at": observation.expires_at,
+            "settled_at": observation.settled_at,
+            "payload": json.dumps(payload, ensure_ascii=False),
+            "decision_id": observation.decision_id or None,
+            "runtime_config_hash": observation.runtime_config_hash or None,
+            "context_version": observation.context_version or None,
+            "candidate_origin": observation.candidate_origin or None,
+            "qualification_state": qualification_state or None,
+            "adaptive_state": adaptive_state or None,
+            "entry_structure_state": structure_state or None,
+            "entry_structure_bias": structure_bias or None,
+            "active_level_source": active_level_source or None,
+        }
+
+    @staticmethod
+    def _upsert_observation(connection, observation: ObservationSignal, symbol: str) -> None:
+        values = SQLiteMonitorStore._observation_row_values(observation, symbol)
         connection.execute(
             """
             insert into observation_signals(
                 symbol, observation_key, status, result, direction,
                 strategy_family, strategy_tag, timeframe_minutes,
-                threshold_segment, opened_at, expires_at, settled_at, payload
+                threshold_segment, opened_at, expires_at, settled_at, payload,
+                decision_id, runtime_config_hash, context_version, candidate_origin,
+                qualification_state, adaptive_state, entry_structure_state,
+                entry_structure_bias, active_level_source
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(symbol, observation_key) do update set
                 status=excluded.status,
                 result=excluded.result,
@@ -1690,24 +1925,63 @@ class SQLiteMonitorStore:
                 expires_at=excluded.expires_at,
                 settled_at=excluded.settled_at,
                 payload=excluded.payload,
+                decision_id=excluded.decision_id,
+                runtime_config_hash=excluded.runtime_config_hash,
+                context_version=excluded.context_version,
+                candidate_origin=excluded.candidate_origin,
+                qualification_state=excluded.qualification_state,
+                adaptive_state=excluded.adaptive_state,
+                entry_structure_state=excluded.entry_structure_state,
+                entry_structure_bias=excluded.entry_structure_bias,
+                active_level_source=excluded.active_level_source,
                 updated_at_ms=strftime('%s','now') * 1000
             """,
             (
-                symbol.upper(),
-                observation.observation_key,
-                observation.status,
-                observation.result,
-                observation.direction,
-                observation.strategy_family,
-                observation.strategy_tag,
-                observation.timeframe_minutes,
-                observation.threshold_segment,
-                observation.opened_at,
-                observation.expires_at,
-                observation.settled_at,
-                json.dumps(payload, ensure_ascii=False),
+                values["symbol"],
+                values["observation_key"],
+                values["status"],
+                values["result"],
+                values["direction"],
+                values["strategy_family"],
+                values["strategy_tag"],
+                values["timeframe_minutes"],
+                values["threshold_segment"],
+                values["opened_at"],
+                values["expires_at"],
+                values["settled_at"],
+                values["payload"],
+                values["decision_id"],
+                values["runtime_config_hash"],
+                values["context_version"],
+                values["candidate_origin"],
+                values["qualification_state"],
+                values["adaptive_state"],
+                values["entry_structure_state"],
+                values["entry_structure_bias"],
+                values["active_level_source"],
             ),
         )
+
+    def _insert_decision_observation(
+        self,
+        connection: sqlite3.Connection,
+        observation: ObservationSignal,
+        symbol: str,
+    ) -> None:
+        values = self._observation_row_values(observation, symbol)
+        columns = tuple(values)
+        existing = connection.execute(
+            f"select {', '.join(columns)} from observation_signals "
+            "where symbol = ? and observation_key = ?",
+            (values["symbol"], values["observation_key"]),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing) != tuple(values[column] for column in columns):
+                raise ValueError(
+                    "observation key collides with different frozen decision data"
+                )
+            return
+        self._upsert_observation(connection, observation, values["symbol"])
 
     def load_observations(self, symbol: str, limit: int = 500) -> list[ObservationSignal]:
         accepted = {field.name for field in fields(ObservationSignal)}
@@ -2119,6 +2393,225 @@ class SQLiteMonitorStore:
             profile_guard_min_group_size=profile_guard_min_group_size,
         )
 
+    @staticmethod
+    def _insert_individual_signal_audit(
+        connection: sqlite3.Connection,
+        symbol: str,
+        audit: DecisionAudit,
+    ) -> None:
+        normalized_symbol = symbol.upper()
+        normalized_decision = str(audit.decision or "UNKNOWN").upper()
+        audit_context = dict(audit.audit_context or {})
+        reason_code = str(
+            audit_context.get("reason_code")
+            or audit.signal.first_decisive_block
+            or normalized_decision
+        )
+        event_kind = str(audit.event_kind or "").strip().upper()
+        if not event_kind:
+            if normalized_decision == "OPENED":
+                event_kind = "ORDER_OPENED"
+            elif normalized_decision.endswith("BLOCKED"):
+                event_kind = "DECISIVE_BLOCK"
+            else:
+                event_kind = "DECISION"
+        payload_json = json.dumps(
+            _signal_audit_payload(
+                audit.signal,
+                normalized_decision,
+                audit_context,
+                reason_code,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        values = (
+            normalized_symbol,
+            int(audit.created_at_ms),
+            normalized_decision,
+            audit.signal.direction,
+            audit.signal.timeframe_minutes,
+            audit.signal.threshold_segment,
+            audit.signal.regime,
+            audit.signal.score,
+            audit.signal.threshold,
+            audit.signal.reason,
+            payload_json,
+            SIGNAL_AUDIT_VERSION,
+            audit.signal.decision_id,
+            audit.signal.runtime_config_hash,
+            event_kind,
+            int(audit.created_at_ms),
+            int(audit.created_at_ms),
+            1,
+            audit.signal.score,
+            audit.signal.score,
+            None,
+        )
+        existing = connection.execute(
+            """
+            select symbol, created_at_ms, decision, direction, timeframe_minutes,
+                   threshold_segment, regime, score, threshold, reason, payload,
+                   record_version, decision_id, runtime_config_hash, event_kind,
+                   first_at_ms, last_at_ms, occurrences, score_min, score_max,
+                   aggregation_key
+            from signal_audit
+            where symbol = ? and decision_id = ? and event_kind = ?
+            """,
+            (normalized_symbol, audit.signal.decision_id, event_kind),
+        ).fetchall()
+        if existing:
+            if len(existing) != 1 or tuple(existing[0]) != values:
+                raise ValueError(
+                    "decision audit collides with different frozen decision data"
+                )
+            return
+        connection.execute(
+            """
+            insert into signal_audit(
+                symbol, created_at_ms, decision, direction, timeframe_minutes,
+                threshold_segment, regime, score, threshold, reason, payload,
+                record_version, decision_id, runtime_config_hash, event_kind,
+                first_at_ms, last_at_ms, occurrences, score_min, score_max,
+                aggregation_key
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+    def _apply_open_credit(
+        self,
+        connection: sqlite3.Connection,
+        order: SimulatedOrder,
+        symbol: str,
+        credit: StakeProgressionCredit | None,
+    ) -> None:
+        self._validate_open_credit(order, credit)
+        if credit is None:
+            return
+        self._upsert_progression_credit(connection, symbol, credit)
+        persisted = connection.execute(
+            """
+            select credit_id, status, consumed_order_id, consumed_at
+            from stake_progression_credits
+            where symbol = ? and version = ? and source_order_id = ?
+            """,
+            (symbol.upper(), credit.version, credit.source_order_id),
+        ).fetchone()
+        if (
+            persisted is None
+            or persisted["status"] != "CONSUMED"
+            or persisted["consumed_order_id"] != credit.consumed_order_id
+            or persisted["consumed_at"] != credit.consumed_at
+            or persisted["credit_id"] != credit.credit_id
+        ):
+            raise ValueError("credit consumption conflicts with persisted terminal state")
+
+    def save_open_order_decision(
+        self,
+        *,
+        config: RuntimeConfigSnapshot,
+        context: DecisionContext,
+        order: SimulatedOrder,
+        credit: StakeProgressionCredit | None,
+        entry_snapshot: Mapping[str, Any],
+        audit: DecisionAudit,
+        observation: ObservationSignal | None = None,
+    ) -> None:
+        self._validate_bundle_references(
+            config,
+            context,
+            audit,
+            order=order,
+            entry_snapshot=entry_snapshot,
+            observation=observation,
+        )
+        if not context.open_allowed:
+            raise ValueError("open decision bundle requires open_allowed")
+        if observation is not None and not context.observation_allowed:
+            raise ValueError("observation requires observation_allowed")
+        try:
+            with self._connect() as connection:
+                connection.execute("begin immediate")
+                ensure_write_allowed(
+                    capacity_from_connection(connection),
+                    StorageWriteClass.CORE,
+                )
+                self._insert_runtime_config(connection, config)
+                self._after_bundle_step("config")
+                self._insert_decision_context(connection, context)
+                self._after_bundle_step("context")
+                self._insert_open_order(connection, order, context.symbol)
+                self._after_bundle_step("order")
+                self._apply_open_credit(connection, order, context.symbol, credit)
+                self._after_bundle_step("credit")
+                self._insert_order_entry_snapshot(
+                    connection,
+                    order,
+                    context.symbol,
+                    entry_snapshot,
+                )
+                self._after_bundle_step("entry_snapshot")
+                self._insert_individual_signal_audit(
+                    connection,
+                    context.symbol,
+                    audit,
+                )
+                self._after_bundle_step("audit")
+                if observation is not None:
+                    self._insert_decision_observation(
+                        connection,
+                        observation,
+                        context.symbol,
+                    )
+                self._after_bundle_step("observation")
+        except sqlite3.Error as error:
+            raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+
+    def save_decision_bundle(
+        self,
+        *,
+        config: RuntimeConfigSnapshot,
+        context: DecisionContext,
+        audit: DecisionAudit,
+        observation: ObservationSignal | None = None,
+    ) -> None:
+        self._validate_bundle_references(
+            config,
+            context,
+            audit,
+            observation=observation,
+        )
+        if observation is not None and not context.observation_allowed:
+            raise ValueError("observation requires observation_allowed")
+        try:
+            with self._connect() as connection:
+                connection.execute("begin immediate")
+                ensure_write_allowed(
+                    capacity_from_connection(connection),
+                    StorageWriteClass.CORE,
+                )
+                self._insert_runtime_config(connection, config)
+                self._after_bundle_step("config")
+                self._insert_decision_context(connection, context)
+                self._after_bundle_step("context")
+                self._insert_individual_signal_audit(
+                    connection,
+                    context.symbol,
+                    audit,
+                )
+                self._after_bundle_step("audit")
+                if observation is not None:
+                    self._insert_decision_observation(
+                        connection,
+                        observation,
+                        context.symbol,
+                    )
+                self._after_bundle_step("observation")
+        except sqlite3.Error as error:
+            raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+
     def save_signal(
         self,
         symbol: str,
@@ -2275,15 +2768,30 @@ class SQLiteMonitorStore:
 
     def save_order_entry_snapshot(self, order: SimulatedOrder, symbol: str, entry_snapshot: dict[str, Any]) -> None:
         with self._connect() as connection:
-            connection.execute(
+            self._upsert_order_entry_snapshot(connection, order, symbol, entry_snapshot)
+
+    @staticmethod
+    def _upsert_order_entry_snapshot(
+        connection: sqlite3.Connection,
+        order: SimulatedOrder,
+        symbol: str,
+        entry_snapshot: Mapping[str, Any],
+    ) -> None:
+        values = SQLiteMonitorStore._order_entry_snapshot_values(
+            order,
+            symbol,
+            entry_snapshot,
+        )
+        connection.execute(
                 """
                 insert into order_entry_snapshots(
                     symbol, order_id, direction, timeframe_minutes, opened_at, expires_at,
                     entry_price, stake, win_return, stake_progression_step,
                     threshold_segment, regime, score, threshold, edge,
-                    result, settled_at, exit_price, pnl, entry_payload
+                    result, settled_at, exit_price, pnl, entry_payload,
+                    decision_id, context_version, runtime_config_hash
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(symbol, order_id) do update set
                     direction=excluded.direction,
                     timeframe_minutes=excluded.timeframe_minutes,
@@ -2299,62 +2807,165 @@ class SQLiteMonitorStore:
                     threshold=excluded.threshold,
                     edge=excluded.edge,
                     entry_payload=excluded.entry_payload,
+                    decision_id=excluded.decision_id,
+                    context_version=excluded.context_version,
+                    runtime_config_hash=excluded.runtime_config_hash,
                     updated_at_ms=strftime('%s','now') * 1000
                 """,
                 (
-                    symbol.upper(),
-                    order.id,
-                    order.direction,
-                    order.timeframe_minutes,
-                    order.opened_at,
-                    order.expires_at,
-                    order.entry_price,
-                    order.stake,
-                    order.win_return,
-                    order.stake_progression_step,
-                    order.threshold_segment,
-                    order.regime,
-                    order.score,
-                    order.threshold,
-                    round(abs(order.score) - order.threshold, 4),
-                    order.result,
-                    order.settled_at,
-                    order.exit_price,
-                    order.pnl,
-                    json.dumps(entry_snapshot, ensure_ascii=False),
+                    values["symbol"],
+                    values["order_id"],
+                    values["direction"],
+                    values["timeframe_minutes"],
+                    values["opened_at"],
+                    values["expires_at"],
+                    values["entry_price"],
+                    values["stake"],
+                    values["win_return"],
+                    values["stake_progression_step"],
+                    values["threshold_segment"],
+                    values["regime"],
+                    values["score"],
+                    values["threshold"],
+                    values["edge"],
+                    values["result"],
+                    values["settled_at"],
+                    values["exit_price"],
+                    values["pnl"],
+                    values["entry_payload"],
+                    values["decision_id"],
+                    values["context_version"],
+                    values["runtime_config_hash"],
                 ),
             )
 
-    def update_order_entry_snapshot_settlement(self, order: SimulatedOrder, symbol: str) -> None:
+    @staticmethod
+    def _order_entry_snapshot_values(
+        order: SimulatedOrder,
+        symbol: str,
+        entry_snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "symbol": symbol.upper(),
+            "order_id": order.id,
+            "direction": order.direction,
+            "timeframe_minutes": order.timeframe_minutes,
+            "opened_at": order.opened_at,
+            "expires_at": order.expires_at,
+            "entry_price": order.entry_price,
+            "stake": order.stake,
+            "win_return": order.win_return,
+            "stake_progression_step": order.stake_progression_step,
+            "threshold_segment": order.threshold_segment,
+            "regime": order.regime,
+            "score": order.score,
+            "threshold": order.threshold,
+            "edge": round(abs(order.score) - order.threshold, 4),
+            "result": order.result,
+            "settled_at": order.settled_at,
+            "exit_price": order.exit_price,
+            "pnl": order.pnl,
+            "entry_payload": json.dumps(entry_snapshot, ensure_ascii=False),
+            "decision_id": order.decision_id or None,
+            "context_version": order.context_version or None,
+            "runtime_config_hash": order.runtime_config_hash or None,
+        }
+
+    def _insert_order_entry_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        order: SimulatedOrder,
+        symbol: str,
+        entry_snapshot: Mapping[str, Any],
+    ) -> None:
+        values = self._order_entry_snapshot_values(order, symbol, entry_snapshot)
+        frozen_columns = (
+            "symbol",
+            "order_id",
+            "direction",
+            "timeframe_minutes",
+            "opened_at",
+            "expires_at",
+            "entry_price",
+            "stake",
+            "win_return",
+            "stake_progression_step",
+            "threshold_segment",
+            "regime",
+            "score",
+            "threshold",
+            "edge",
+            "entry_payload",
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+        )
+        existing = connection.execute(
+            f"select {', '.join(frozen_columns)} from order_entry_snapshots "
+            "where symbol = ? and order_id = ?",
+            (values["symbol"], values["order_id"]),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing) != tuple(values[column] for column in frozen_columns):
+                raise ValueError(
+                    "entry snapshot collides with different frozen decision data"
+                )
+            return
+        self._upsert_order_entry_snapshot(
+            connection,
+            order,
+            values["symbol"],
+            entry_snapshot,
+        )
+
+    @staticmethod
+    def _update_order_entry_snapshot_settlement(
+        connection: sqlite3.Connection,
+        order: SimulatedOrder,
+        symbol: str,
+    ) -> None:
         settlement_payload = {
+            "decision_id": order.decision_id,
             "status": order.status,
             "result": order.result,
             "settled_at": order.settled_at,
             "exit_price": order.exit_price,
             "pnl": order.pnl,
         }
-        with self._connect() as connection:
-            connection.execute(
-                """
-                update order_entry_snapshots
-                set result = ?,
-                    settled_at = ?,
-                    exit_price = ?,
-                    pnl = ?,
-                    settlement_payload = ?,
-                    updated_at_ms = strftime('%s','now') * 1000
-                where symbol = ? and order_id = ?
-                """,
-                (
-                    order.result,
-                    order.settled_at,
-                    order.exit_price,
-                    order.pnl,
-                    json.dumps(settlement_payload, ensure_ascii=False),
-                    symbol.upper(),
-                    order.id,
-                ),
+        if order.decision_id:
+            where_sql = "symbol = ? and decision_id = ?"
+            identity = (symbol.upper(), order.decision_id)
+        else:
+            where_sql = "symbol = ? and order_id = ? and decision_id is null"
+            identity = (symbol.upper(), order.id)
+        cursor = connection.execute(
+            f"""
+            update order_entry_snapshots
+            set result = ?,
+                settled_at = ?,
+                exit_price = ?,
+                pnl = ?,
+                settlement_payload = ?,
+                updated_at_ms = strftime('%s','now') * 1000
+            where {where_sql}
+            """,
+            (
+                order.result,
+                order.settled_at,
+                order.exit_price,
+                order.pnl,
+                json.dumps(settlement_payload, ensure_ascii=False),
+                *identity,
+            ),
+        )
+        if order.decision_id and cursor.rowcount != 1:
+            raise ValueError(
+                "settlement must match exactly one entry snapshot by decision_id"
             )
+
+    def update_order_entry_snapshot_settlement(self, order: SimulatedOrder, symbol: str) -> None:
+        with self._connect() as connection:
+            self._update_order_entry_snapshot_settlement(connection, order, symbol)
 
     def load_order_entry_snapshots(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:

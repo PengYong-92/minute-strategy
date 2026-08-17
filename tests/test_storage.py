@@ -18,7 +18,7 @@ from app.decision_context import (
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
-from app.storage import SQLiteMonitorStore
+from app.storage import DecisionAudit, SQLiteMonitorStore
 from app.storage_capacity import (
     COMPACT_ONLY_BYTES,
     CoreStorageCapacityError,
@@ -202,6 +202,103 @@ def decision_storage_rows(db_path: Path):
             "select * from decision_contexts order by symbol, decision_id"
         ).fetchall()
     return runtime_rows, decision_rows
+
+
+def atomic_bundle_fixture(*, include_observation: bool = True):
+    config = runtime_config_snapshot(
+        {"stake": 10.0, "max_open_orders": 2, "guards": {"wave": False}},
+        strategy_build_id="build-task-7",
+    )
+    context = decision_context(
+        config,
+        decision_id="decision-task-7",
+        closed_kline_at_ms=601_000,
+        candidate_origin="NATIVE_ACTIONABLE",
+        inputs={
+            "identity": {
+                "direction": "LONG",
+                "profile_key": "10|drop_reclaim|live|LONG|WD-12",
+            },
+            "market": {"close": 100.0},
+        },
+        final_decision="OPENED",
+        final_reason="accepted",
+        open_allowed=True,
+        observation_allowed=include_observation,
+    )
+    decision_metadata = {
+        "decision_id": context.decision_id,
+        "context_version": context.context_version,
+        "runtime_config_hash": context.runtime_config_hash,
+        "strategy_build_id": context.strategy_build_id,
+        "candidate_origin": context.candidate_origin,
+    }
+    audit_signal = replace(
+        signal(),
+        profile_key="10|drop_reclaim|live|LONG|WD-12",
+        decision_inputs=context.to_dict()["inputs"],
+        decision_trace=context.to_dict()["decision_trace"],
+        first_decisive_block=context.first_decisive_block,
+        **decision_metadata,
+    )
+    order = replace(
+        progression_order(1, version=""),
+        profile_key=audit_signal.profile_key,
+        stake_progression_version="",
+        decision_inputs=context.to_dict()["inputs"],
+        decision_trace=context.to_dict()["decision_trace"],
+        first_decisive_block=context.first_decisive_block,
+        **decision_metadata,
+    )
+    observed = None
+    if include_observation:
+        observed = replace(
+            observation(
+                "decision-task-7-observation",
+                family="drop_reclaim",
+                tag="live",
+                direction="LONG",
+                segment="WD-12",
+                status="OPEN",
+                result=None,
+                opened_at=601_000,
+            ),
+            profile_key=audit_signal.profile_key,
+            source_decision="OPENED",
+            decision_inputs=context.to_dict()["inputs"],
+            decision_trace=context.to_dict()["decision_trace"],
+            first_decisive_block=context.first_decisive_block,
+            **decision_metadata,
+        )
+    audit = DecisionAudit(
+        signal=audit_signal,
+        decision="OPENED",
+        created_at_ms=601_000,
+        audit_context={"result_sequence_guard": {"status": "NORMAL"}},
+        event_kind="ORDER_OPENED",
+    )
+    entry_snapshot = {
+        "signal": audit_signal.to_dict(),
+        "latest_kline": {"close_time": 601_000, "close": 100.0},
+    }
+    return config, context, order, audit, entry_snapshot, observed
+
+
+def atomic_bundle_counts(db_path: Path) -> dict[str, int]:
+    tables = (
+        "runtime_config_snapshots",
+        "decision_contexts",
+        "orders",
+        "stake_progression_credits",
+        "order_entry_snapshots",
+        "signal_audit",
+        "observation_signals",
+    )
+    with closing(sqlite3.connect(db_path)) as connection:
+        return {
+            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in tables
+        }
 
 
 class SQLiteMonitorStoreTest(unittest.TestCase):
@@ -2678,6 +2775,516 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
 
         self.assertEqual(still_consumed[0].status, "CONSUMED")
         self.assertEqual(still_cancelled[0].status, "CANCELLED")
+
+
+class AtomicDecisionBundleTest(unittest.TestCase):
+    def test_open_bundle_commits_all_members_with_matching_references(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            observed = replace(
+                observed,
+                adaptive_profile_state={
+                    "qualification_state": "QUALIFIED",
+                    "status": "RESIDENT",
+                },
+                entry_structure_shadow={
+                    "entry_structure_state": "SUPPORT_RECLAIM",
+                    "entry_structure_bias": "LONG",
+                    "active_level_source": "RECENT_SWING",
+                },
+            )
+
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+                observation=observed,
+            )
+
+            self.assertEqual(
+                atomic_bundle_counts(db_path),
+                {
+                    "runtime_config_snapshots": 1,
+                    "decision_contexts": 1,
+                    "orders": 1,
+                    "stake_progression_credits": 0,
+                    "order_entry_snapshots": 1,
+                    "signal_audit": 1,
+                    "observation_signals": 1,
+                },
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                order_row = connection.execute(
+                    "select decision_id, runtime_config_hash from orders"
+                ).fetchone()
+                entry_row = connection.execute(
+                    "select decision_id, context_version, runtime_config_hash "
+                    "from order_entry_snapshots"
+                ).fetchone()
+                audit_row = connection.execute(
+                    "select decision_id, runtime_config_hash, aggregation_key, event_kind "
+                    "from signal_audit"
+                ).fetchone()
+                observation_row = connection.execute(
+                    "select decision_id, context_version, runtime_config_hash, candidate_origin, "
+                    "qualification_state, adaptive_state, entry_structure_state, "
+                    "entry_structure_bias, active_level_source "
+                    "from observation_signals"
+                ).fetchone()
+            expected_pair = (context.decision_id, context.runtime_config_hash)
+            self.assertEqual(order_row, expected_pair)
+            self.assertEqual(
+                entry_row,
+                (context.decision_id, context.context_version, context.runtime_config_hash),
+            )
+            self.assertEqual(
+                audit_row,
+                (context.decision_id, context.runtime_config_hash, None, "ORDER_OPENED"),
+            )
+            self.assertEqual(
+                observation_row,
+                (
+                    context.decision_id,
+                    context.context_version,
+                    context.runtime_config_hash,
+                    context.candidate_origin,
+                    "QUALIFIED",
+                    "RESIDENT",
+                    "SUPPORT_RECLAIM",
+                    "LONG",
+                    "RECENT_SWING",
+                ),
+            )
+
+    def test_open_bundle_is_idempotent_and_rejects_a_changed_collision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            fixture = atomic_bundle_fixture()
+            config, context, order, audit, entry_snapshot, observed = fixture
+            arguments = {
+                "config": config,
+                "context": context,
+                "order": order,
+                "credit": None,
+                "entry_snapshot": entry_snapshot,
+                "audit": audit,
+                "observation": observed,
+            }
+
+            store.save_open_order_decision(**arguments)
+            store.save_open_order_decision(**arguments)
+            unchanged = atomic_bundle_counts(db_path)
+            with self.assertRaises(ValueError):
+                store.save_open_order_decision(
+                    **{**arguments, "order": replace(order, entry_price=101.0)}
+                )
+
+            self.assertEqual(atomic_bundle_counts(db_path), unchanged)
+            self.assertEqual(unchanged["signal_audit"], 1)
+
+    def test_open_bundle_rejects_frozen_redundant_column_collisions(self):
+        cases = (
+            (
+                "observation qualification",
+                "update observation_signals set qualification_state = 'CONFLICT'",
+            ),
+            (
+                "entry score",
+                "update order_entry_snapshots set score = score + 1",
+            ),
+        )
+        for label, tamper_sql in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, observed = (
+                    atomic_bundle_fixture()
+                )
+                observed = replace(
+                    observed,
+                    adaptive_profile_state={"qualification_state": "QUALIFIED"},
+                )
+                arguments = {
+                    "config": config,
+                    "context": context,
+                    "order": order,
+                    "credit": None,
+                    "entry_snapshot": entry_snapshot,
+                    "audit": audit,
+                    "observation": observed,
+                }
+                store.save_open_order_decision(**arguments)
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.execute(tamper_sql)
+                    connection.commit()
+
+                with self.assertRaisesRegex(ValueError, "frozen decision data"):
+                    store.save_open_order_decision(**arguments)
+
+                self.assertEqual(atomic_bundle_counts(db_path)["signal_audit"], 1)
+
+    def test_decision_bundle_commits_optional_observation_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, _order, audit, _entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            blocked_context = decision_context(
+                config,
+                decision_id=context.decision_id,
+                closed_kline_at_ms=context.closed_kline_at_ms,
+                candidate_origin=context.candidate_origin,
+                inputs=context.to_dict()["inputs"],
+                decision_trace=(
+                    {
+                        "stage": "TRANSITIONAL_FINAL",
+                        "result": "BLOCK",
+                        "decisive_values": {"decision": "PROFILE_BLOCKED"},
+                        "reason_code": "PROFILE_BLOCKED",
+                    },
+                ),
+                first_decisive_block="TRANSITIONAL_FINAL",
+                final_decision="PROFILE_BLOCKED",
+                final_reason="blocked",
+                open_allowed=False,
+                observation_allowed=True,
+            )
+            blocked_signal = replace(
+                audit.signal,
+                decision_trace=blocked_context.to_dict()["decision_trace"],
+                first_decisive_block=blocked_context.first_decisive_block,
+            )
+            blocked_audit = replace(
+                audit,
+                signal=blocked_signal,
+                decision="PROFILE_BLOCKED",
+                event_kind="DECISIVE_BLOCK",
+            )
+            blocked_observation = replace(
+                observed,
+                source_decision="PROFILE_BLOCKED",
+                decision_trace=blocked_context.to_dict()["decision_trace"],
+                first_decisive_block=blocked_context.first_decisive_block,
+            )
+
+            for _ in range(2):
+                store.save_decision_bundle(
+                    config=config,
+                    context=blocked_context,
+                    audit=blocked_audit,
+                    observation=blocked_observation,
+                )
+
+            counts = atomic_bundle_counts(db_path)
+            self.assertEqual(counts["runtime_config_snapshots"], 1)
+            self.assertEqual(counts["decision_contexts"], 1)
+            self.assertEqual(counts["signal_audit"], 1)
+            self.assertEqual(counts["observation_signals"], 1)
+            self.assertEqual(counts["orders"], 0)
+
+    def test_bundle_rejects_cross_references_without_partial_rows(self):
+        cases = {
+            "order symbol metadata": lambda fixture: {
+                "order": replace(fixture[2], runtime_config_hash="0" * 64)
+            },
+            "audit decision": lambda fixture: {
+                "audit": replace(
+                    fixture[3],
+                    signal=replace(fixture[3].signal, decision_id="other-decision"),
+                )
+            },
+            "observation context": lambda fixture: {
+                "observation": replace(fixture[5], context_version="OTHER")
+            },
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                fixture = atomic_bundle_fixture()
+                config, context, order, audit, entry_snapshot, observed = fixture
+                arguments = {
+                    "config": config,
+                    "context": context,
+                    "order": order,
+                    "credit": None,
+                    "entry_snapshot": entry_snapshot,
+                    "audit": audit,
+                    "observation": observed,
+                }
+                arguments.update(mutate(fixture))
+
+                with self.assertRaises(ValueError):
+                    store.save_open_order_decision(**arguments)
+
+                self.assertEqual(
+                    atomic_bundle_counts(db_path),
+                    {key: 0 for key in atomic_bundle_counts(db_path)},
+                )
+
+    def test_each_open_bundle_step_failure_rolls_back_and_releases_lock(self):
+        steps = (
+            "config",
+            "context",
+            "order",
+            "credit",
+            "entry_snapshot",
+            "audit",
+            "observation",
+        )
+        for step in steps:
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, observed = (
+                    atomic_bundle_fixture()
+                )
+
+                def fail_after(completed_step):
+                    if completed_step == step:
+                        raise RuntimeError(f"failed after {step}")
+
+                with mock.patch.object(store, "_after_bundle_step", side_effect=fail_after):
+                    with self.assertRaisesRegex(RuntimeError, f"failed after {step}"):
+                        store.save_open_order_decision(
+                            config=config,
+                            context=context,
+                            order=order,
+                            credit=None,
+                            entry_snapshot=entry_snapshot,
+                            audit=audit,
+                            observation=observed,
+                        )
+
+                self.assertEqual(
+                    atomic_bundle_counts(db_path),
+                    {key: 0 for key in atomic_bundle_counts(db_path)},
+                )
+                store.save_decision_bundle(
+                    config=config,
+                    context=context,
+                    audit=audit,
+                )
+                self.assertEqual(atomic_bundle_counts(db_path)["decision_contexts"], 1)
+
+    def test_commit_failure_rolls_back_every_bundle_member_and_releases_lock(self):
+        class FailCommitConnection(sqlite3.Connection):
+            fail_commit = True
+
+            def commit(self):
+                if self.fail_commit:
+                    self.fail_commit = False
+                    raise sqlite3.OperationalError("injected commit failure")
+                return super().commit()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, _order, audit, _entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            real_connect = sqlite3.connect
+
+            def fail_commit_connect(*args, **kwargs):
+                return real_connect(*args, **kwargs, factory=FailCommitConnection)
+
+            with mock.patch("app.storage.sqlite3.connect", side_effect=fail_commit_connect):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "commit failure"):
+                    store.save_decision_bundle(
+                        config=config,
+                        context=context,
+                        audit=audit,
+                        observation=observed,
+                    )
+
+            self.assertEqual(
+                atomic_bundle_counts(db_path),
+                {key: 0 for key in atomic_bundle_counts(db_path)},
+            )
+            store.save_decision_bundle(config=config, context=context, audit=audit)
+
+    def test_core_capacity_failure_writes_no_bundle_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, _order, audit, _entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+
+            with mock.patch(
+                "app.storage.capacity_from_connection",
+                return_value=capacity_for_bytes(3 * 1024**3),
+            ):
+                with self.assertRaises(CoreStorageCapacityError):
+                    store.save_decision_bundle(
+                        config=config,
+                        context=context,
+                        audit=audit,
+                        observation=observed,
+                    )
+
+            self.assertEqual(
+                atomic_bundle_counts(db_path),
+                {key: 0 for key in atomic_bundle_counts(db_path)},
+            )
+
+    def test_two_stores_concurrently_retry_same_bundle_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            first = SQLiteMonitorStore(db_path)
+            second = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            barrier = threading.Barrier(2)
+            errors = []
+
+            def save(store):
+                try:
+                    barrier.wait(timeout=5)
+                    store.save_open_order_decision(
+                        config=config,
+                        context=context,
+                        order=order,
+                        credit=None,
+                        entry_snapshot=entry_snapshot,
+                        audit=audit,
+                        observation=observed,
+                    )
+                except Exception as error:  # noqa: BLE001 - test captures thread failures.
+                    errors.append(error)
+
+            threads = [
+                threading.Thread(target=save, args=(store,))
+                for store in (first, second)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            counts = atomic_bundle_counts(db_path)
+            self.assertEqual(counts["runtime_config_snapshots"], 1)
+            self.assertEqual(counts["decision_contexts"], 1)
+            self.assertEqual(counts["orders"], 1)
+            self.assertEqual(counts["order_entry_snapshots"], 1)
+            self.assertEqual(counts["signal_audit"], 1)
+            self.assertEqual(counts["observation_signals"], 1)
+
+    def test_settlement_updates_order_credit_and_snapshot_by_decision_id_atomically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, _observed = (
+                atomic_bundle_fixture(include_observation=False)
+            )
+            order = replace(order, stake_progression_version=TWO_STAGE_VERSION)
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                frozen_entry_payload = connection.execute(
+                    "select entry_payload from order_entry_snapshots"
+                ).fetchone()[0]
+            settled = replace(
+                order,
+                status="SETTLED",
+                result="WIN",
+                settled_at=order.expires_at,
+                exit_price=101.0,
+                pnl=8.0,
+            )
+            credit = StakeProgressionCredit(
+                source_order_id=order.id,
+                created_at=order.expires_at,
+                direction=order.direction,
+            )
+
+            store.save_settled_order_with_credit(settled, context.symbol, credit)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.row_factory = sqlite3.Row
+                order_row = connection.execute(
+                    "select status, result, decision_id from orders"
+                ).fetchone()
+                entry_row = connection.execute(
+                    "select decision_id, entry_payload, settlement_payload, result, pnl "
+                    "from order_entry_snapshots"
+                ).fetchone()
+            self.assertEqual(tuple(order_row), ("SETTLED", "WIN", context.decision_id))
+            self.assertEqual(entry_row["decision_id"], context.decision_id)
+            self.assertEqual(entry_row["entry_payload"], frozen_entry_payload)
+            self.assertEqual(entry_row["result"], "WIN")
+            self.assertEqual(entry_row["pnl"], 8.0)
+            self.assertEqual(
+                json.loads(entry_row["settlement_payload"])["decision_id"],
+                context.decision_id,
+            )
+            self.assertEqual(
+                store.load_stake_progression_credits(context.symbol)[0].status,
+                "PENDING",
+            )
+
+    def test_settlement_snapshot_failure_rolls_back_order_and_credit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, _observed = (
+                atomic_bundle_fixture(include_observation=False)
+            )
+            order = replace(order, stake_progression_version=TWO_STAGE_VERSION)
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+            )
+            settled = replace(
+                order,
+                status="SETTLED",
+                result="WIN",
+                settled_at=order.expires_at,
+                exit_price=101.0,
+                pnl=8.0,
+            )
+            credit = StakeProgressionCredit(
+                source_order_id=order.id,
+                created_at=order.expires_at,
+                direction=order.direction,
+            )
+
+            with mock.patch.object(
+                store,
+                "_update_order_entry_snapshot_settlement",
+                side_effect=RuntimeError("snapshot settlement failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "snapshot settlement failed"):
+                    store.save_settled_order_with_credit(
+                        settled,
+                        context.symbol,
+                        credit,
+                    )
+
+            restored = store.load_orders(context.symbol)[0]
+            self.assertEqual(restored.status, "OPEN")
+            self.assertEqual(store.load_stake_progression_credits(context.symbol), [])
 
 
 if __name__ == "__main__":
