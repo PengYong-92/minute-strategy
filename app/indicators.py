@@ -21,6 +21,11 @@ class TechnicalContext:
     rsi: float = 50.0
     bollinger_position: float = 0.5
     bollinger_width: float = 0.0
+    macd_line: float = 0.0
+    macd_signal_line: float = 0.0
+    atr: float = 0.0
+    macd_histogram_atr: float = 0.0
+    macd_delta_atr: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -40,13 +45,19 @@ def build_technical_context(klines: Sequence[Kline]) -> TechnicalContext:
     if not closes:
         return TechnicalContext()
 
-    macd_histogram, macd_histogram_delta = _macd_histogram_context(closes)
+    macd_line, macd_signal_line, macd_histogram, macd_histogram_delta = _macd_context(closes)
+    atr = _atr(klines, period=14)
     return TechnicalContext(
         macd_histogram=macd_histogram,
         macd_histogram_delta=macd_histogram_delta,
         rsi=_rsi(closes, period=14),
         bollinger_position=_bollinger_position(closes, period=20, std_dev=2.0),
         bollinger_width=_bollinger_width(closes, period=20, std_dev=2.0),
+        macd_line=macd_line,
+        macd_signal_line=macd_signal_line,
+        atr=atr,
+        macd_histogram_atr=macd_histogram / atr if atr > 0.0 else 0.0,
+        macd_delta_atr=macd_histogram_delta / atr if atr > 0.0 else 0.0,
     )
 
 
@@ -139,14 +150,7 @@ def _technical_series(klines: Sequence[Kline]) -> tuple[list[float], list[float]
     if not closes:
         return [], [], [], []
 
-    ema_fast = _ema(closes, 12)
-    ema_slow = _ema(closes, 26)
-    macd_line = [fast - slow for fast, slow in zip(ema_fast, ema_slow)]
-    signal_line = _ema(macd_line, 9)
-    macd_histogram = [macd - signal for macd, signal in zip(macd_line, signal_line)]
-    macd_delta = [0.0]
-    for previous, current in zip(macd_histogram, macd_histogram[1:]):
-        macd_delta.append(current - previous)
+    _macd_line, _signal_line, macd_histogram, macd_delta = _macd_series(closes)
 
     return (
         _rsi_series(closes, 14),
@@ -202,17 +206,44 @@ def _bollinger_position_series(closes: Sequence[float], period: int, std_dev: fl
     return values
 
 
-def _macd_histogram_context(closes: Sequence[float]) -> tuple[float, float]:
+def _macd_context(closes: Sequence[float]) -> tuple[float, float, float, float]:
     if len(closes) < 35:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
+    macd_line, signal_line, histogram, delta = _macd_series(closes)
+    return macd_line[-1], signal_line[-1], histogram[-1], delta[-1]
+
+
+def _macd_series(
+    closes: Sequence[float],
+) -> tuple[list[float], list[float], list[float], list[float]]:
     ema_fast = _ema(closes, 12)
     ema_slow = _ema(closes, 26)
     macd_line = [fast - slow for fast, slow in zip(ema_fast, ema_slow)]
     signal_line = _ema(macd_line, 9)
     histogram = [macd - signal for macd, signal in zip(macd_line, signal_line)]
-    latest = histogram[-1]
-    previous = histogram[-2] if len(histogram) >= 2 else latest
-    return latest, latest - previous
+    delta = [0.0]
+    for previous, current in zip(histogram, histogram[1:]):
+        delta.append(current - previous)
+    return macd_line, signal_line, histogram, delta
+
+
+def _atr(klines: Sequence[Kline], period: int) -> float:
+    if len(klines) < period:
+        return 0.0
+    true_ranges = []
+    for index, item in enumerate(klines):
+        if index == 0:
+            true_ranges.append(item.high - item.low)
+            continue
+        previous_close = klines[index - 1].close
+        true_ranges.append(
+            max(
+                item.high - item.low,
+                abs(item.high - previous_close),
+                abs(item.low - previous_close),
+            )
+        )
+    return sum(true_ranges[-period:]) / period
 
 
 def _ema(values: Sequence[float], period: int) -> list[float]:

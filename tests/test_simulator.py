@@ -3,7 +3,7 @@ from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from app.models import Kline, Signal, SimulatedOrder
+from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 
@@ -32,6 +32,66 @@ def signal(
 
 
 class SimulatorTest(unittest.TestCase):
+    def test_order_deep_copies_all_decision_context_fields(self):
+        selected = replace(
+            signal(),
+            decision_id="decision-1",
+            context_version="context-v1",
+            runtime_config_hash="config-hash",
+            strategy_build_id="build-1",
+            candidate_origin="strategy",
+            decision_inputs={"indicators": {"samples": [1.0, 2.0]}},
+            decision_trace=[{"block": "strategy", "details": {"passed": True}}],
+            first_decisive_block="strategy",
+            adaptive_profile_state={"profile": {"weights": [0.4, 0.6]}},
+            entry_structure_shadow={"structure": {"levels": [99.0, 101.0]}},
+        )
+
+        order = AccountSimulator().open_order(selected, 100.0, 1_000)
+
+        field_names = (
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "candidate_origin",
+            "decision_inputs",
+            "decision_trace",
+            "first_decisive_block",
+            "adaptive_profile_state",
+            "entry_structure_shadow",
+        )
+        for field_name in field_names:
+            with self.subTest(field=field_name):
+                self.assertEqual(getattr(order, field_name), getattr(selected, field_name))
+
+        self.assertIsNot(order.decision_inputs, selected.decision_inputs)
+        self.assertIsNot(
+            order.decision_inputs["indicators"],
+            selected.decision_inputs["indicators"],
+        )
+        self.assertIsNot(order.decision_trace, selected.decision_trace)
+        self.assertIsNot(order.decision_trace[0], selected.decision_trace[0])
+        self.assertIsNot(order.adaptive_profile_state, selected.adaptive_profile_state)
+        self.assertIsNot(order.entry_structure_shadow, selected.entry_structure_shadow)
+
+        selected.decision_inputs["indicators"]["samples"].append(3.0)
+        selected.decision_trace[0]["details"]["passed"] = False
+        selected.decision_trace.append({"block": "guard"})
+        selected.adaptive_profile_state["profile"]["weights"][0] = 1.0
+        selected.entry_structure_shadow["structure"]["levels"].append(102.0)
+
+        self.assertEqual(order.decision_inputs, {"indicators": {"samples": [1.0, 2.0]}})
+        self.assertEqual(
+            order.decision_trace,
+            [{"block": "strategy", "details": {"passed": True}}],
+        )
+        self.assertEqual(order.adaptive_profile_state, {"profile": {"weights": [0.4, 0.6]}})
+        self.assertEqual(
+            order.entry_structure_shadow,
+            {"structure": {"levels": [99.0, 101.0]}},
+        )
+
     def test_order_copies_direction_pulse_shadow_context(self):
         context = {
             "version": "DIRECTION_PULSE_V1_SHADOW",
@@ -199,10 +259,23 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(long_order.stake_progression_step, 2)
 
     def test_simulated_order_progression_metadata_defaults_are_backward_compatible(self):
+        compatibility_fields = [
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "candidate_origin",
+            "decision_inputs",
+            "decision_trace",
+            "first_decisive_block",
+            "adaptive_profile_state",
+            "entry_structure_shadow",
+        ]
         self.assertEqual(
-            [field.name for field in fields(SimulatedOrder)][-2:],
+            [field.name for field in fields(SimulatedOrder)][-12:-10],
             ["profile_degradation_probe", "profile_degradation_triggered_at"],
         )
+        self.assertEqual([field.name for field in fields(SimulatedOrder)][-10:], compatibility_fields)
         order = SimulatedOrder(
             id=1,
             direction="LONG",
@@ -221,15 +294,59 @@ class SimulatorTest(unittest.TestCase):
         self.assertIn("stake_progression_source_order_id", order.to_dict())
 
     def test_signal_probe_metadata_defaults_preserve_legacy_positional_arguments(self):
+        compatibility_fields = [
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "candidate_origin",
+            "decision_inputs",
+            "decision_trace",
+            "first_decisive_block",
+            "adaptive_profile_state",
+            "entry_structure_shadow",
+        ]
         self.assertEqual(
-            [field.name for field in fields(Signal)][-2:],
+            [field.name for field in fields(Signal)][-12:-10],
             ["profile_degradation_probe", "profile_degradation_triggered_at"],
         )
+        self.assertEqual([field.name for field in fields(Signal)][-10:], compatibility_fields)
         legacy = Signal("LONG", 1, "A", "legacy", 100.0, 0, 2.5)
 
         self.assertEqual(legacy.volume_ratio, 2.5)
         self.assertFalse(legacy.profile_degradation_probe)
         self.assertEqual(legacy.profile_degradation_triggered_at, 0)
+
+    def test_legacy_model_construction_uses_empty_decision_context_defaults(self):
+        legacy_models = [
+            Signal("LONG", 1, "A", "legacy", 100.0, 0),
+            SimulatedOrder(1, "LONG", 1, "A", "legacy", 100.0, 0, 60_000),
+            ObservationSignal(
+                "observation-1",
+                "unknown",
+                "unknown",
+                "LONG",
+                1,
+                "A",
+                "legacy",
+                100.0,
+                0,
+                60_000,
+            ),
+        ]
+
+        for model in legacy_models:
+            with self.subTest(model=type(model).__name__):
+                self.assertEqual(model.decision_id, "")
+                self.assertEqual(model.context_version, "")
+                self.assertEqual(model.runtime_config_hash, "")
+                self.assertEqual(model.strategy_build_id, "")
+                self.assertEqual(model.candidate_origin, "")
+                self.assertEqual(model.decision_inputs, {})
+                self.assertEqual(model.decision_trace, [])
+                self.assertEqual(model.first_decisive_block, "")
+                self.assertEqual(model.adaptive_profile_state, {})
+                self.assertEqual(model.entry_structure_shadow, {})
 
     def test_simulated_order_keeps_legacy_positional_argument_order(self):
         order = SimulatedOrder(

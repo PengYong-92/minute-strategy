@@ -111,6 +111,16 @@ class Signal:
     profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
+    decision_id: str = ""
+    context_version: str = ""
+    runtime_config_hash: str = ""
+    strategy_build_id: str = ""
+    candidate_origin: str = ""
+    decision_inputs: dict[str, object] = field(default_factory=dict)
+    decision_trace: list[dict[str, object]] = field(default_factory=list)
+    first_decisive_block: str = ""
+    adaptive_profile_state: dict[str, object] = field(default_factory=dict)
+    entry_structure_shadow: dict[str, object] = field(default_factory=dict)
 
     @property
     def actionable(self) -> bool:
@@ -185,6 +195,16 @@ class SimulatedOrder:
     profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
+    decision_id: str = ""
+    context_version: str = ""
+    runtime_config_hash: str = ""
+    strategy_build_id: str = ""
+    candidate_origin: str = ""
+    decision_inputs: dict[str, object] = field(default_factory=dict)
+    decision_trace: list[dict[str, object]] = field(default_factory=list)
+    first_decisive_block: str = ""
+    adaptive_profile_state: dict[str, object] = field(default_factory=dict)
+    entry_structure_shadow: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -242,6 +262,16 @@ class ObservationSignal:
     profile_health_win_rate: float = 0.0
     profile_health_ev: float = 0.0
     profile_health_evaluated_at: int = 0
+    decision_id: str = ""
+    context_version: str = ""
+    runtime_config_hash: str = ""
+    strategy_build_id: str = ""
+    candidate_origin: str = ""
+    decision_inputs: dict[str, object] = field(default_factory=dict)
+    decision_trace: list[dict[str, object]] = field(default_factory=list)
+    first_decisive_block: str = ""
+    adaptive_profile_state: dict[str, object] = field(default_factory=dict)
+    entry_structure_shadow: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

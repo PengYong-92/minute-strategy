@@ -1,5 +1,7 @@
+import json
 import unittest
 
+from app.indicators import build_technical_context
 from app.models import FearGreedContext, Kline, Signal
 from app.strategy import (
     _failed_breakout_observation,
@@ -87,6 +89,77 @@ def neutral_mid_klines():
 
 
 class StrategyTest(unittest.TestCase):
+    def test_technical_context_exposes_causal_atr_and_normalized_macd(self):
+        closes = [100.0 + index * 0.17 + (0.45 if index % 4 == 0 else -0.2) for index in range(50)]
+        klines = []
+        for index, close in enumerate(closes):
+            open_price = closes[index - 1] if index else close - 0.3
+            klines.append(
+                kline(
+                    index,
+                    close,
+                    100.0 + index,
+                    open_price=open_price,
+                    high=max(open_price, close) + 0.25,
+                    low=min(open_price, close) - 0.15,
+                )
+            )
+
+        context = build_technical_context(klines)
+        true_ranges = []
+        for index, item in enumerate(klines):
+            if index == 0:
+                true_ranges.append(item.high - item.low)
+                continue
+            previous_close = klines[index - 1].close
+            true_ranges.append(
+                max(
+                    item.high - item.low,
+                    abs(item.high - previous_close),
+                    abs(item.low - previous_close),
+                )
+            )
+        expected_atr = sum(true_ranges[-14:]) / 14.0
+
+        self.assertGreater(context.atr, 0.0)
+        self.assertAlmostEqual(context.atr, expected_atr, places=12)
+        self.assertAlmostEqual(
+            context.macd_line - context.macd_signal_line,
+            context.macd_histogram,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            context.macd_histogram_atr,
+            context.macd_histogram / context.atr,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            context.macd_delta_atr,
+            context.macd_histogram_delta / context.atr,
+            places=12,
+        )
+
+    def test_technical_context_uses_safe_zero_defaults_for_insufficient_and_flat_klines(self):
+        insufficient = [
+            kline(index, 100.0 + index, 100.0, high=101.0 + index, low=99.0 + index)
+            for index in range(13)
+        ]
+        flat = [kline(index, 100.0, 100.0, high=100.0, low=100.0) for index in range(40)]
+
+        for context in (
+            build_technical_context([]),
+            build_technical_context(insufficient),
+            build_technical_context(flat),
+        ):
+            with self.subTest(context=context):
+                self.assertEqual(context.macd_line, 0.0)
+                self.assertEqual(context.macd_signal_line, 0.0)
+                self.assertEqual(context.macd_histogram, 0.0)
+                self.assertEqual(context.macd_histogram_delta, 0.0)
+                self.assertEqual(context.atr, 0.0)
+                self.assertEqual(context.macd_histogram_atr, 0.0)
+                self.assertEqual(context.macd_delta_atr, 0.0)
+
     def test_generic_short_profile_identity_is_stable(self):
         klines = neutral_mid_klines()
         latest = klines[-1]
@@ -506,6 +579,195 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(signal.observe_direction, "LONG")
         self.assertGreaterEqual(signal.price_position, 0.0)
         self.assertLessEqual(signal.price_position, 1.0)
+
+    def test_strategy_decision_inputs_capture_real_indicator_volume_threshold_and_score_values(self):
+        klines = [
+            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
+            for i in range(360, 480)
+        ]
+        for offset in range(10):
+            idx = 480 + offset
+            open_price = 100.0 - offset * 0.2
+            close = open_price - 0.15
+            klines.append(
+                kline(
+                    idx,
+                    close,
+                    160,
+                    open_price=open_price,
+                    high=open_price + 0.05,
+                    low=close - 0.1,
+                )
+            )
+
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
+        inputs = signal.decision_inputs
+
+        self.assertEqual(set(inputs), {"indicators", "volume_price", "thresholds", "score"})
+        self.assertTrue(
+            {
+                "macd_line",
+                "macd_signal_line",
+                "macd_histogram",
+                "macd_histogram_delta",
+                "atr",
+                "macd_histogram_atr",
+                "macd_delta_atr",
+                "rsi",
+                "bollinger_position",
+                "bollinger_width",
+                "indicator_profile_segment",
+                "indicator_profile_sample_size",
+                "rsi_lower_threshold",
+                "rsi_upper_threshold",
+                "bollinger_lower_threshold",
+                "bollinger_upper_threshold",
+                "macd_histogram_threshold",
+                "macd_delta_threshold",
+            }.issubset(inputs["indicators"])
+        )
+        self.assertTrue(
+            {
+                "current_volume",
+                "volume_baseline",
+                "volume_ratio",
+                "high_volume_threshold",
+                "low_volume_threshold",
+                "price_change_pct",
+                "price_position",
+                "close_strength",
+                "candle_strength",
+                "upper_wick_ratio",
+                "lower_wick_ratio",
+            }.issubset(inputs["volume_price"])
+        )
+        self.assertTrue(
+            {
+                "base_threshold",
+                "direction_threshold",
+                "session_adjusted_threshold",
+                "fear_greed_adjustment",
+                "regime_adjustment",
+                "calculated_threshold",
+                "session_edge_min",
+                "max_trade_edge",
+            }.issubset(inputs["thresholds"])
+        )
+        self.assertTrue(
+            {
+                "raw_direction",
+                "raw_score",
+                "signed_score",
+                "trend_score",
+                "volume_points",
+                "move_points",
+                "trend_points",
+                "close_points",
+            }.issubset(inputs["score"])
+        )
+        self.assertEqual(inputs["volume_price"]["current_volume"], 1600)
+        self.assertAlmostEqual(
+            inputs["volume_price"]["volume_ratio"],
+            inputs["volume_price"]["current_volume"] / inputs["volume_price"]["volume_baseline"],
+        )
+
+    def test_strategy_decision_inputs_do_not_change_existing_deterministic_signal(self):
+        klines = [
+            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
+            for i in range(360, 480)
+        ]
+        for offset in range(10):
+            idx = 480 + offset
+            open_price = 100.0 - offset * 0.2
+            close = open_price - 0.15
+            klines.append(
+                kline(
+                    idx,
+                    close,
+                    160,
+                    open_price=open_price,
+                    high=open_price + 0.05,
+                    low=close - 0.1,
+                )
+            )
+
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
+
+        self.assertEqual(
+            (
+                signal.direction,
+                signal.score,
+                signal.threshold,
+                signal.reason,
+                signal.macd_histogram,
+                signal.macd_histogram_delta,
+                signal.rsi,
+                signal.bollinger_position,
+                signal.bollinger_width,
+            ),
+            (
+                "LONG",
+                100.0,
+                77.0,
+                "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多",
+                -0.180735,
+                -0.010254,
+                21.33,
+                -0.0249,
+                0.0273,
+            ),
+        )
+        indicators = signal.decision_inputs["indicators"]
+        self.assertEqual(indicators["macd_histogram"], signal.macd_histogram)
+        self.assertEqual(indicators["macd_histogram_delta"], signal.macd_histogram_delta)
+        self.assertEqual(indicators["rsi"], signal.rsi)
+        self.assertEqual(indicators["bollinger_position"], signal.bollinger_position)
+        self.assertEqual(indicators["bollinger_width"], signal.bollinger_width)
+        self.assertEqual(signal.decision_inputs["score"]["signed_score"], signal.score)
+        self.assertEqual(
+            signal.decision_inputs["thresholds"]["calculated_threshold"],
+            signal.threshold,
+        )
+
+    def test_all_analyzed_signal_paths_have_strict_json_serializable_decision_inputs(self):
+        deterministic = [
+            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
+            for i in range(360, 480)
+        ]
+        for offset in range(10):
+            idx = 480 + offset
+            open_price = 100.0 - offset * 0.2
+            close = open_price - 0.15
+            deterministic.append(
+                kline(
+                    idx,
+                    close,
+                    160,
+                    open_price=open_price,
+                    high=open_price + 0.05,
+                    low=close - 0.1,
+                )
+            )
+        signals = [
+            analyze_volume_price([], timeframe_minutes=10),
+            analyze_volume_price([kline(0, 100.0, 100.0)], timeframe_minutes=10),
+            analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10),
+            analyze_volume_price(deterministic, timeframe_minutes=10),
+            analyze_volume_price(
+                fear_falling_mid_drop_klines(),
+                timeframe_minutes=10,
+                fear_greed=FearGreedContext(
+                    value=18,
+                    classification="Extreme Fear",
+                    average_30d=37.0,
+                    trend="falling",
+                ),
+            ),
+        ]
+
+        for result in signals:
+            with self.subTest(reason=result.reason):
+                json.dumps(result.to_dict(), allow_nan=False)
 
     def test_extreme_drop_reclaim_identity_uses_brainstorm_replay_thresholds(self):
         self.assertTrue(
