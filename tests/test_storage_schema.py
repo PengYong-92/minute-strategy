@@ -23,9 +23,13 @@ AUDIT_PAYLOAD = '{"audit": "exact spacing"}'
 def _create_legacy_schema(
     connection: sqlite3.Connection,
     *,
-    order_decision_id_exists: bool = False,
+    order_decision_id_declaration: str | None = None,
 ) -> None:
-    order_extra = ", decision_id text" if order_decision_id_exists else ""
+    order_extra = (
+        f", decision_id {order_decision_id_declaration}"
+        if order_decision_id_declaration
+        else ""
+    )
     connection.executescript(
         f"""
         create table orders (
@@ -244,6 +248,30 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         if migrate is None:
             self.fail("app.storage_schema.migrate is not implemented")
         migrate(connection)
+
+    def _assert_schema_conflict_preserves_database(
+        self,
+        connection: sqlite3.Connection,
+        object_name: str,
+    ) -> None:
+        before_schema = _schema_snapshot(connection)
+        before_version = connection.execute("pragma user_version").fetchone()[0]
+        before_changes = connection.total_changes
+        before_transaction = connection.in_transaction
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            rf"(?i)schema conflict.*{object_name}",
+        ):
+            self._migrate(connection)
+
+        self.assertEqual(connection.in_transaction, before_transaction)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            before_version,
+        )
+        self.assertEqual(_schema_snapshot(connection), before_schema)
+        self.assertEqual(connection.total_changes, before_changes)
 
     def test_zero_and_v1_databases_upgrade_to_v2(self):
         self.assertEqual(SCHEMA_VERSION, 2)
@@ -467,6 +495,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         _create_legacy_schema(connection)
         self._migrate(connection)
         before = _schema_snapshot(connection)
+        changes_before = connection.total_changes
         traced = []
         connection.set_trace_callback(traced.append)
 
@@ -474,6 +503,8 @@ class StorageSchemaMigrationTest(unittest.TestCase):
 
         connection.set_trace_callback(None)
         self.assertEqual(_schema_snapshot(connection), before)
+        self.assertEqual(connection.total_changes, changes_before)
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
         self.assertFalse(
             any(
                 statement.lstrip().upper().startswith(
@@ -484,16 +515,17 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             traced,
         )
 
-    def test_database_marked_v2_returns_without_schema_mutation(self):
+    def test_incomplete_database_marked_v2_raises_without_schema_mutation(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         _create_legacy_schema(connection)
         connection.execute("pragma user_version = 2")
-        before = _schema_snapshot(connection)
 
-        self._migrate(connection)
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "runtime_config_snapshots",
+        )
 
-        self.assertEqual(_schema_snapshot(connection), before)
         self.assertNotIn("decision_id", _column_details(connection, "orders"))
         self.assertEqual(
             connection.execute(
@@ -504,6 +536,149 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    def test_incomplete_existing_v2_table_rolls_back_without_certification(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute(
+            """
+            create table runtime_config_snapshots (
+                runtime_config_hash text primary key
+            )
+            """
+        )
+        connection.execute("pragma user_version = 1")
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "runtime_config_snapshots",
+        )
+
+    def test_incompatible_extra_column_on_v2_table_is_rejected(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute(
+            """
+            create table runtime_config_snapshots (
+                runtime_config_hash text primary key,
+                context_version text not null,
+                strategy_build_id text not null,
+                canonical_payload text not null,
+                payload_bytes integer not null,
+                created_at_ms integer not null,
+                extra_required_value text not null
+            )
+            """
+        )
+        connection.execute("pragma user_version = 1")
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "runtime_config_snapshots",
+        )
+
+    def test_incompatible_existing_v2_column_rolls_back_without_certification(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(
+            connection,
+            order_decision_id_declaration="integer not null default 0",
+        )
+        _insert_legacy_sentinels(connection)
+        connection.execute("pragma user_version = 1")
+        before_payloads = _legacy_payload_snapshot(connection)
+
+        self._assert_schema_conflict_preserves_database(
+            connection,
+            "orders.decision_id",
+        )
+
+        self.assertEqual(_legacy_payload_snapshot(connection), before_payloads)
+
+    def test_unrelated_legacy_extension_column_is_not_over_validated(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute(
+            """
+            alter table orders
+            add column legacy_extension blob not null default x''
+            """
+        )
+
+        self._migrate(connection)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        columns = _column_details(connection, "orders")
+        self.assertIn("legacy_extension", columns)
+        self.assertIn("decision_id", columns)
+
+    def test_same_named_wrong_index_rolls_back_without_certification(self):
+        cases = (
+            (
+                "wrong table",
+                "create index idx_decision_contexts_symbol_closed_kline "
+                "on orders(symbol, opened_at)",
+            ),
+            (
+                "wrong columns",
+                "create index idx_decision_contexts_symbol_closed_kline "
+                "on decision_contexts(symbol, profile_key)",
+            ),
+        )
+        for label, create_index in cases:
+            with self.subTest(label=label):
+                connection = sqlite3.connect(":memory:")
+                try:
+                    _create_legacy_schema(connection)
+                    self._migrate(connection)
+                    connection.execute(
+                        "drop index idx_decision_contexts_symbol_closed_kline"
+                    )
+                    connection.execute(create_index)
+                    connection.execute("pragma user_version = 1")
+
+                    self._assert_schema_conflict_preserves_database(
+                        connection,
+                        "idx_decision_contexts_symbol_closed_kline",
+                    )
+                finally:
+                    connection.close()
+
+    def test_malformed_partial_audit_index_rolls_back_without_certification(self):
+        cases = (
+            (
+                "not unique",
+                "create index ux_signal_audit_symbol_aggregation_key "
+                "on signal_audit(symbol, aggregation_key) "
+                "where aggregation_key is not null",
+            ),
+            (
+                "not partial",
+                "create unique index ux_signal_audit_symbol_aggregation_key "
+                "on signal_audit(symbol, aggregation_key)",
+            ),
+        )
+        for label, create_index in cases:
+            with self.subTest(label=label):
+                connection = sqlite3.connect(":memory:")
+                try:
+                    _create_legacy_schema(connection)
+                    self._migrate(connection)
+                    connection.execute(
+                        "drop index ux_signal_audit_symbol_aggregation_key"
+                    )
+                    connection.execute(create_index)
+                    connection.execute("pragma user_version = 1")
+
+                    self._assert_schema_conflict_preserves_database(
+                        connection,
+                        "ux_signal_audit_symbol_aggregation_key",
+                    )
+                finally:
+                    connection.close()
 
     def test_fresh_store_is_v2_and_existing_order_behavior_still_works(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -768,7 +943,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
     def test_existing_v2_column_does_not_cause_duplicate_column_failure(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
-        _create_legacy_schema(connection, order_decision_id_exists=True)
+        _create_legacy_schema(
+            connection,
+            order_decision_id_declaration="text",
+        )
         connection.execute("pragma user_version = 1")
 
         self._migrate(connection)
