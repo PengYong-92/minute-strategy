@@ -15,7 +15,7 @@ from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.profile_health_guard import ProfileHealthGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
-from app.state import MonitorState
+from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState
 from app.time_period_guard import TimePeriodGuardConfig
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
 
@@ -239,9 +239,25 @@ def _clock_value(value: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _strategy_build_id(value: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise argparse.ArgumentTypeError("策略构建标识不能为空")
+    return normalized
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="币安事件合约量价监控程序")
     parser.add_argument("--symbol", default=os.getenv("SYMBOL", "BTCUSDT"), help="交易对，默认: BTCUSDT")
+    parser.add_argument(
+        "--strategy-build-id",
+        type=_strategy_build_id,
+        default=os.getenv("STRATEGY_BUILD_ID", DEFAULT_STRATEGY_BUILD_ID),
+        help=(
+            "策略构建标识，用于冻结运行配置和决策身份，可填写 commit 或 tag；"
+            f"默认: {DEFAULT_STRATEGY_BUILD_ID}"
+        ),
+    )
     parser.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"), help="监听地址，默认: 127.0.0.1")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="页面端口，默认: 8000")
     parser.add_argument(
@@ -575,6 +591,7 @@ def main() -> None:
 
     state = MonitorState(
         symbol=args.symbol,
+        strategy_build_id=args.strategy_build_id,
         max_open_orders=args.max_open_orders,
         max_open_long_orders=args.max_open_long_orders,
         max_open_short_orders=args.max_open_short_orders,

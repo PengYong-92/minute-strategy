@@ -285,19 +285,21 @@ class DecisionContextBuilder:
         strategy_build_id: str = "UNKNOWN",
         profile_key: str = "",
         candidate_ordinal: int = 0,
+        candidate_identity: Mapping[str, object] | None = None,
     ) -> "DecisionContextBuilder":
         normalized_symbol = symbol.upper()
-        identity_payload = _canonical_json(
-            {
-                "candidate_ordinal": candidate_ordinal,
-                "candidate_origin": candidate_origin,
-                "closed_kline_at_ms": closed_kline_at_ms,
-                "profile_key": profile_key,
-                "runtime_config_hash": runtime_config_hash,
-                "strategy_build_id": strategy_build_id,
-                "symbol": normalized_symbol,
-            }
-        )
+        identity = {
+            "candidate_ordinal": candidate_ordinal,
+            "candidate_origin": candidate_origin,
+            "closed_kline_at_ms": closed_kline_at_ms,
+            "profile_key": profile_key,
+            "runtime_config_hash": runtime_config_hash,
+            "strategy_build_id": strategy_build_id,
+            "symbol": normalized_symbol,
+        }
+        if candidate_identity is not None:
+            identity["candidate_identity"] = _canonicalize(candidate_identity)
+        identity_payload = _canonical_json(identity)
         decision_id = hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
         return cls(
             decision_id=decision_id,

@@ -3,7 +3,7 @@ import time
 from bisect import bisect_left
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -76,7 +76,7 @@ from app.wave_batch_guard import (
 DAY_MS = 86_400_000
 REALTIME_PRICE_STALE_MS = 5_000
 TRANSITIONAL_DECISION_BUILD_ID = "TASK7_TRANSITIONAL_V1"
-DEFAULT_STRATEGY_BUILD_ID = "minute-strategy-unversioned"
+DEFAULT_STRATEGY_BUILD_ID = "minute-strategy-2026.08.18"
 
 
 class MonitorState:
@@ -200,6 +200,21 @@ class MonitorState:
         self._decision_runtime_config_cache = None
         self._profile_source_cached = False
         self._cached_profile_source = None
+        self._profile_summary_prepare_error = None
+        profile_preparer = (
+            getattr(self.storage, "prepare_order_profile_summary", None)
+            if self.storage
+            else None
+        )
+        if profile_preparer is not None:
+            try:
+                profile_preparer(
+                    self.symbol,
+                    profile_guard_min_history=self.profile_guard_min_history,
+                    profile_guard_min_group_size=self.profile_guard_min_group_size,
+                )
+            except Exception as exc:  # noqa: BLE001 - 预计算失败时热路径保持无全表回退。
+                self._profile_summary_prepare_error = exc
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
         self.simulator = self._build_simulator(self.symbol, restored_orders)
@@ -813,6 +828,45 @@ class MonitorState:
     def _formal_candidate_origin(self, signal: Signal) -> str:
         return self._origin_before_profile_promotion(signal)
 
+    def _candidate_identity(
+        self,
+        signal: Signal,
+        *,
+        candidate_ordinal: int,
+        candidate_origin: str | None = None,
+        closed_kline_at_ms: int | None = None,
+    ) -> dict[str, object]:
+        direction = self._signal_direction(signal)
+        order_slot = str(signal.order_slot or "")
+        order_slot_scope = str(signal.order_slot_scope or "")
+        if closed_kline_at_ms is not None:
+            prior_open_count = sum(
+                1
+                for order in self.simulator.orders
+                if order.direction == direction
+                and order.opened_at < int(closed_kline_at_ms)
+                and (
+                    order.settled_at is None
+                    or order.settled_at > int(closed_kline_at_ms)
+                )
+            )
+            order_slot = "SECOND" if prior_open_count > 0 else "FIRST"
+            order_slot_scope = "DIRECTION_V2"
+        return {
+            "candidate_origin": str(
+                candidate_origin or self._formal_candidate_origin(signal)
+            ),
+            "candidate_ordinal": int(candidate_ordinal),
+            "direction": direction,
+            "profile_key": str(signal.profile_key or ""),
+            "strategy_family": str(signal.strategy_family or ""),
+            "strategy_tag": str(signal.strategy_tag or ""),
+            "order_slot": order_slot,
+            "order_slot_scope": order_slot_scope,
+            "timeframe_minutes": int(signal.timeframe_minutes),
+            "threshold_segment": str(signal.threshold_segment or ""),
+        }
+
     def _reuse_committed_decision(
         self,
         signal: Signal,
@@ -829,6 +883,12 @@ class MonitorState:
             return None
         config = self._decision_runtime_config()
         candidate_origin = self._formal_candidate_origin(signal)
+        candidate_identity = self._candidate_identity(
+            signal,
+            candidate_ordinal=0,
+            candidate_origin=candidate_origin,
+            closed_kline_at_ms=latest.close_time,
+        )
         try:
             context = loader(
                 self.symbol,
@@ -837,6 +897,7 @@ class MonitorState:
                 profile_key=str(signal.profile_key or ""),
                 runtime_config_hash=config.hash,
                 strategy_build_id=config.strategy_build_id,
+                candidate_identity=candidate_identity,
             )
         except Exception as exc:  # noqa: BLE001 - 决策身份读取失败必须阻断本轮。
             self._decision_storage_failed = True
@@ -844,6 +905,40 @@ class MonitorState:
             return "STORAGE_ERROR"
         if context is None:
             return None
+        frozen_signal_payload = context["inputs"].get("signal")
+        if not isinstance(frozen_signal_payload, dict):
+            return None
+        accepted_signal_fields = {field.name for field in fields(Signal)}
+        try:
+            frozen_signal = Signal(
+                **{
+                    key: deepcopy(value)
+                    for key, value in frozen_signal_payload.items()
+                    if key in accepted_signal_fields
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            self._decision_storage_failed = True
+            self._set_storage_error("已提交决策信号读取失败", exc)
+            return "STORAGE_ERROR"
+        frozen_identity = context["inputs"].get("identity")
+        if (
+            not isinstance(frozen_identity, dict)
+            or frozen_identity != candidate_identity
+            or self._candidate_identity(
+                frozen_signal,
+                candidate_ordinal=int(frozen_identity.get("candidate_ordinal", -1)),
+                candidate_origin=str(frozen_identity.get("candidate_origin", "")),
+                closed_kline_at_ms=context["closed_kline_at_ms"],
+            )
+            != frozen_identity
+        ):
+            self._decision_storage_failed = True
+            self._set_storage_error(
+                "已提交决策信号读取失败",
+                ValueError("frozen signal does not match candidate identity"),
+            )
+            return "STORAGE_ERROR"
         final_decision = str(context["final_decision"])
         if final_decision == "OPENED":
             try:
@@ -884,7 +979,7 @@ class MonitorState:
                     )
                 )
         enriched_signal = replace(
-            signal,
+            frozen_signal,
             decision_id=str(context["decision_id"]),
             context_version=str(context["context_version"]),
             runtime_config_hash=str(context["runtime_config_hash"]),
@@ -929,6 +1024,12 @@ class MonitorState:
         config = self._decision_runtime_config()
         direction = self._signal_direction(signal)
         profile_key = str(signal.profile_key or "")
+        candidate_identity = self._candidate_identity(
+            signal,
+            candidate_ordinal=candidate_ordinal,
+            candidate_origin=candidate_origin,
+            closed_kline_at_ms=latest.close_time,
+        )
         builder = DecisionContextBuilder.new(
             self.symbol,
             int(latest.close_time),
@@ -937,19 +1038,13 @@ class MonitorState:
             strategy_build_id=config.strategy_build_id,
             profile_key=profile_key,
             candidate_ordinal=int(candidate_ordinal),
+            candidate_identity=candidate_identity,
         )
         builder.capture_inputs(
             {
-                "identity": {
-                    "direction": direction,
-                    "profile_key": profile_key,
-                    "strategy_family": signal.strategy_family,
-                    "strategy_tag": signal.strategy_tag,
-                    "threshold_segment": signal.threshold_segment,
-                    "candidate_origin": candidate_origin,
-                    "candidate_ordinal": int(candidate_ordinal),
-                },
+                "identity": candidate_identity,
                 "market": {"latest_closed_kline": latest.to_dict()},
+                "signal": signal.to_dict(),
                 "strategy_inputs": deepcopy(signal.decision_inputs),
                 "audit_snapshot": deepcopy(audit_context),
                 "transition": {
@@ -2601,15 +2696,25 @@ class MonitorState:
         if self._profile_source_cached:
             return self._cached_profile_source
         self._profile_source_cached = True
-        if not self.storage or not hasattr(self.storage, "order_profile_summary"):
+        if not self.storage:
             self._cached_profile_source = None
             return None
         try:
-            self._cached_profile_source = self.storage.order_profile_summary(
-                self.symbol,
-                profile_guard_min_history=self.profile_guard_min_history,
-                profile_guard_min_group_size=self.profile_guard_min_group_size,
-            )
+            snapshot_loader = getattr(self.storage, "profile_summary_snapshot", None)
+            if snapshot_loader is not None:
+                self._cached_profile_source = snapshot_loader(
+                    self.symbol,
+                    profile_guard_min_history=self.profile_guard_min_history,
+                    profile_guard_min_group_size=self.profile_guard_min_group_size,
+                )
+            elif hasattr(self.storage, "order_profile_summary"):
+                self._cached_profile_source = self.storage.order_profile_summary(
+                    self.symbol,
+                    profile_guard_min_history=self.profile_guard_min_history,
+                    profile_guard_min_group_size=self.profile_guard_min_group_size,
+                )
+            else:
+                self._cached_profile_source = None
             return self._cached_profile_source
         except Exception:  # noqa: BLE001 - 画像守卫仅用于复盘，不能影响开单保存。
             self._cached_profile_source = None

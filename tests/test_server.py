@@ -22,6 +22,66 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_main_injects_versioned_strategy_build_id_from_cli_or_environment(self):
+        cases = (
+            ({}, [], "minute-strategy-2026.08.18"),
+            ({"STRATEGY_BUILD_ID": "commit-ae7b484"}, [], "commit-ae7b484"),
+            (
+                {"STRATEGY_BUILD_ID": "environment-build"},
+                ["--strategy-build-id", "tag-v2.1.0"],
+                "tag-v2.1.0",
+            ),
+        )
+        for environment, build_args, expected in cases:
+            with self.subTest(environment=environment, build_args=build_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *build_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch(
+                        "app.server.start_market_data",
+                        return_value=SimpleNamespace(stop=lambda: None),
+                    ),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                self.assertEqual(
+                    monitor_state.call_args.kwargs["strategy_build_id"],
+                    expected,
+                )
+
+    def test_help_documents_strategy_build_id_in_chinese(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--strategy-build-id", stdout.getvalue())
+        self.assertIn("策略构建标识", stdout.getvalue())
+
     def test_main_injects_time_period_guard_config(self):
         cases = (
             ({}, [], False),

@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import threading
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -1038,6 +1040,12 @@ class SQLiteMonitorStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._profile_summary_lock = threading.RLock()
+        self._profile_summary_revision: dict[str, int] = {}
+        self._profile_summary_cache: dict[
+            tuple[str, int, int, int],
+            dict[str, Any],
+        ] = {}
         self._init_schema()
 
     def storage_capacity(self) -> StorageCapacity:
@@ -1343,8 +1351,30 @@ class SQLiteMonitorStore:
         profile_key: str,
         runtime_config_hash: str,
         strategy_build_id: str,
+        candidate_identity: Mapping[str, Any],
     ) -> dict[str, Any] | None:
         normalized_symbol = _require_string(symbol, "symbol", non_empty=True).upper()
+        if not isinstance(candidate_identity, Mapping):
+            raise TypeError("candidate_identity must be a mapping")
+        expected_identity = dict(candidate_identity)
+        required_identity_fields = {
+            "candidate_origin",
+            "candidate_ordinal",
+            "direction",
+            "profile_key",
+            "strategy_family",
+            "strategy_tag",
+            "order_slot",
+            "order_slot_scope",
+            "timeframe_minutes",
+            "threshold_segment",
+        }
+        if set(expected_identity) != required_identity_fields:
+            raise ValueError("candidate_identity must contain the complete identity")
+        if expected_identity["candidate_origin"] != str(candidate_origin):
+            raise ValueError("candidate identity origin must match lookup origin")
+        if expected_identity["profile_key"] != str(profile_key):
+            raise ValueError("candidate identity profile must match lookup profile")
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -1352,6 +1382,7 @@ class SQLiteMonitorStore:
                 from decision_contexts
                 where symbol = ? and closed_kline_at_ms = ?
                   and candidate_origin = ? and profile_key = ?
+                  and direction = ?
                   and runtime_config_hash = ? and strategy_build_id = ?
                 """,
                 (
@@ -1359,15 +1390,24 @@ class SQLiteMonitorStore:
                     int(closed_kline_at_ms),
                     str(candidate_origin),
                     str(profile_key),
+                    str(expected_identity["direction"]),
                     str(runtime_config_hash),
                     str(strategy_build_id),
                 ),
             ).fetchall()
-        if not rows:
+        matches = []
+        for row in rows:
+            context = self.load_decision_context(
+                normalized_symbol,
+                row["decision_id"],
+            )
+            if context is not None and context["inputs"].get("identity") == expected_identity:
+                matches.append(context)
+        if not matches:
             return None
-        if len(rows) != 1:
+        if len(matches) != 1:
             raise ValueError("candidate identity maps to multiple decision contexts")
-        return self.load_decision_context(normalized_symbol, rows[0]["decision_id"])
+        return matches[0]
 
     def save_order(self, order: SimulatedOrder, symbol: str) -> None:
         with self._connect() as connection:
@@ -1713,6 +1753,7 @@ class SQLiteMonitorStore:
                 )
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+        self._refresh_profile_summary_cache(symbol, settlement=order)
 
     @staticmethod
     def _update_settled_order(
@@ -1971,8 +2012,97 @@ class SQLiteMonitorStore:
         symbol: str,
     ) -> None:
         with self._connect() as connection:
+            connection.execute("begin immediate")
             for observation in observations:
-                self._upsert_observation(connection, observation, symbol)
+                existing = connection.execute(
+                    "select payload from observation_signals "
+                    "where symbol = ? and observation_key = ?",
+                    (symbol.upper(), observation.observation_key),
+                ).fetchone()
+                if existing is None:
+                    self._upsert_observation(connection, observation, symbol)
+                else:
+                    self._update_observation_settlement(
+                        connection,
+                        observation,
+                        symbol,
+                    )
+
+    @staticmethod
+    def _update_observation_settlement(
+        connection: sqlite3.Connection,
+        observation: ObservationSignal,
+        symbol: str,
+    ) -> None:
+        normalized_symbol = symbol.upper()
+        row = connection.execute(
+            "select status, result, settled_at, payload "
+            "from observation_signals where symbol = ? and observation_key = ?",
+            (normalized_symbol, observation.observation_key),
+        ).fetchone()
+        if row is None:
+            raise ValueError("observation settlement requires an existing observation")
+        try:
+            stored_payload = json.loads(row["payload"])
+            accepted = {field.name for field in fields(ObservationSignal)}
+            stored = ObservationSignal(
+                **{
+                    key: value
+                    for key, value in stored_payload.items()
+                    if key in accepted
+                }
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("stored observation payload is malformed") from error
+
+        mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
+        stored_frozen = {
+            key: value
+            for key, value in stored.to_dict().items()
+            if key not in mutable_fields
+        }
+        requested_frozen = {
+            key: value
+            for key, value in observation.to_dict().items()
+            if key not in mutable_fields
+        }
+        if stored_frozen != requested_frozen:
+            raise ValueError("settlement conflicts with frozen observation data")
+
+        expected_payload = json.dumps(observation.to_dict(), ensure_ascii=False)
+        if row["status"] == "SETTLED":
+            if (
+                observation.status != "SETTLED"
+                or row["result"] != observation.result
+                or row["settled_at"] != observation.settled_at
+                or row["payload"] != expected_payload
+            ):
+                raise ValueError("settlement conflicts with terminal observation state")
+            return
+        if row["status"] != "OPEN":
+            raise ValueError("only an open observation can be settled")
+        if observation.status == "OPEN":
+            if row["payload"] != expected_payload:
+                raise ValueError("open observation conflicts with frozen observation data")
+            return
+        if observation.status != "SETTLED" or observation.result not in {"WIN", "LOSS"}:
+            raise ValueError("observation settlement requires SETTLED WIN or LOSS")
+        connection.execute(
+            """
+            update observation_signals
+            set status = ?, result = ?, settled_at = ?, payload = ?,
+                updated_at_ms = strftime('%s','now') * 1000
+            where symbol = ? and observation_key = ? and status = 'OPEN'
+            """,
+            (
+                observation.status,
+                observation.result,
+                observation.settled_at,
+                expected_payload,
+                normalized_symbol,
+                observation.observation_key,
+            ),
+        )
 
     @staticmethod
     def _observation_row_values(
@@ -2514,13 +2644,163 @@ class SQLiteMonitorStore:
         profile_guard_min_history: int = 15,
         profile_guard_min_group_size: int = 2,
     ) -> dict[str, Any]:
-        snapshots = self.load_order_entry_snapshots(symbol, limit=limit)
-        samples = [sample_from_entry_snapshot(snapshot) for snapshot in reversed(snapshots)]
-        return summarize_order_samples_with_guard(
-            samples,
+        return self.prepare_order_profile_summary(
+            symbol,
+            limit=limit,
             profile_guard_min_history=profile_guard_min_history,
             profile_guard_min_group_size=profile_guard_min_group_size,
         )
+
+    @staticmethod
+    def _profile_summary_key(
+        symbol: str,
+        limit: int,
+        profile_guard_min_history: int,
+        profile_guard_min_group_size: int,
+    ) -> tuple[str, int, int, int]:
+        return (
+            symbol.upper(),
+            max(1, int(limit)),
+            max(1, int(profile_guard_min_history)),
+            max(1, int(profile_guard_min_group_size)),
+        )
+
+    def prepare_order_profile_summary(
+        self,
+        symbol: str,
+        limit: int = 5000,
+        *,
+        profile_guard_min_history: int = 15,
+        profile_guard_min_group_size: int = 2,
+    ) -> dict[str, Any]:
+        key = self._profile_summary_key(
+            symbol,
+            limit,
+            profile_guard_min_history,
+            profile_guard_min_group_size,
+        )
+        while True:
+            with self._profile_summary_lock:
+                cached = self._profile_summary_cache.get(key)
+                if cached is not None:
+                    return deepcopy(cached["summary"])
+                revision = self._profile_summary_revision.get(key[0], 0)
+            snapshots = self.load_order_entry_snapshots(key[0], limit=key[1])
+            samples = [
+                sample_from_entry_snapshot(snapshot)
+                for snapshot in reversed(snapshots)
+            ]
+            summary = summarize_order_samples_with_guard(
+                samples,
+                profile_guard_min_history=key[2],
+                profile_guard_min_group_size=key[3],
+            )
+            with self._profile_summary_lock:
+                if self._profile_summary_revision.get(key[0], 0) != revision:
+                    continue
+                existing = self._profile_summary_cache.get(key)
+                if existing is None:
+                    self._profile_summary_cache[key] = {
+                        "samples": samples,
+                        "summary": summary,
+                    }
+                    existing = self._profile_summary_cache[key]
+                return deepcopy(existing["summary"])
+
+    def profile_summary_snapshot(
+        self,
+        symbol: str,
+        limit: int = 5000,
+        *,
+        profile_guard_min_history: int = 15,
+        profile_guard_min_group_size: int = 2,
+    ) -> dict[str, Any] | None:
+        key = self._profile_summary_key(
+            symbol,
+            limit,
+            profile_guard_min_history,
+            profile_guard_min_group_size,
+        )
+        with self._profile_summary_lock:
+            cached = self._profile_summary_cache.get(key)
+            return None if cached is None else deepcopy(cached["summary"])
+
+    def _refresh_profile_summary_cache(
+        self,
+        symbol: str,
+        *,
+        sample: Mapping[str, Any] | None = None,
+        settlement: SimulatedOrder | None = None,
+    ) -> None:
+        normalized_symbol = symbol.upper()
+        with self._profile_summary_lock:
+            self._profile_summary_revision[normalized_symbol] = (
+                self._profile_summary_revision.get(normalized_symbol, 0) + 1
+            )
+            for key, cached in self._profile_summary_cache.items():
+                if key[0] != normalized_symbol:
+                    continue
+                samples = cached["samples"]
+                requires_recompute = settlement is not None
+                if sample is not None:
+                    normalized_sample = dict(sample)
+                    order_id = normalized_sample.get("order_id")
+                    replaced = False
+                    previous_sample = None
+                    removed_samples = []
+                    for index, current in enumerate(samples):
+                        if current.get("order_id") == order_id:
+                            previous_sample = current
+                            samples[index] = normalized_sample
+                            replaced = True
+                            break
+                    if not replaced:
+                        samples.append(normalized_sample)
+                        if len(samples) > key[1]:
+                            removed_samples = samples[: len(samples) - key[1]]
+                            del samples[: len(samples) - key[1]]
+                    sample_is_settled = normalized_sample.get("result") in {
+                        "WIN",
+                        "LOSS",
+                    }
+                    previous_was_settled = bool(
+                        previous_sample
+                        and previous_sample.get("result") in {"WIN", "LOSS"}
+                    )
+                    requires_recompute = (
+                        requires_recompute
+                        or sample_is_settled
+                        or previous_was_settled
+                    )
+                if settlement is not None:
+                    for current in samples:
+                        if current.get("order_id") == settlement.id:
+                            current.update(
+                                {
+                                    "result": settlement.result,
+                                    "settled_at": settlement.settled_at,
+                                    "exit_price": settlement.exit_price,
+                                    "pnl": settlement.pnl,
+                                }
+                            )
+                            break
+                if requires_recompute:
+                    cached["summary"] = summarize_order_samples_with_guard(
+                        samples,
+                        profile_guard_min_history=key[2],
+                        profile_guard_min_group_size=key[3],
+                    )
+                else:
+                    cached["summary"]["snapshot_count"] = len(samples)
+                    open_delta = (
+                        int(not replaced)
+                        - sum(
+                            1
+                            for current in removed_samples
+                            if current.get("result") not in {"WIN", "LOSS"}
+                        )
+                    )
+                    cached["summary"]["open_orders"] += open_delta
 
     @staticmethod
     def _insert_individual_signal_audit(
@@ -2704,6 +2984,15 @@ class SQLiteMonitorStore:
                 self._after_bundle_step("observation")
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
+        cached_snapshot = self._order_entry_snapshot_values(
+            order,
+            context.symbol,
+            entry_snapshot,
+        )
+        self._refresh_profile_summary_cache(
+            context.symbol,
+            sample=sample_from_entry_snapshot(cached_snapshot),
+        )
         return existing_order is None
 
     def save_decision_bundle(
@@ -2914,6 +3203,15 @@ class SQLiteMonitorStore:
     def save_order_entry_snapshot(self, order: SimulatedOrder, symbol: str, entry_snapshot: dict[str, Any]) -> None:
         with self._connect() as connection:
             self._upsert_order_entry_snapshot(connection, order, symbol, entry_snapshot)
+        cached_snapshot = self._order_entry_snapshot_values(
+            order,
+            symbol,
+            entry_snapshot,
+        )
+        self._refresh_profile_summary_cache(
+            symbol,
+            sample=sample_from_entry_snapshot(cached_snapshot),
+        )
 
     @staticmethod
     def _upsert_order_entry_snapshot(
@@ -3111,6 +3409,7 @@ class SQLiteMonitorStore:
     def update_order_entry_snapshot_settlement(self, order: SimulatedOrder, symbol: str) -> None:
         with self._connect() as connection:
             self._update_order_entry_snapshot_settlement(connection, order, symbol)
+        self._refresh_profile_summary_cache(symbol, settlement=order)
 
     def load_order_entry_snapshots(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:

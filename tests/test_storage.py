@@ -1042,6 +1042,88 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             "batch-2",
         })
 
+    def test_observation_settlement_rejects_every_frozen_field_change(self):
+        mutations = {
+            "direction": lambda item: replace(item, direction="SHORT"),
+            "strategy_family": lambda item: replace(item, strategy_family="MUTATED"),
+            "strategy_tag": lambda item: replace(item, strategy_tag="MUTATED"),
+            "threshold_segment": lambda item: replace(item, threshold_segment="WD-23"),
+            "opened_at": lambda item: replace(item, opened_at=item.opened_at + 1),
+            "decision_id": lambda item: replace(item, decision_id="MUTATED"),
+            "profile_key": lambda item: replace(item, profile_key="MUTATED"),
+            "candidate_origin": lambda item: replace(item, candidate_origin="MUTATED"),
+            "entry_price": lambda item: replace(item, entry_price=item.entry_price + 1),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+                opened = replace(
+                    observation(
+                        "frozen-observation",
+                        family="drop_reclaim",
+                        tag="live",
+                        direction="LONG",
+                        segment="WD-08",
+                        status="OPEN",
+                        result=None,
+                    ),
+                    profile_key="10|drop_reclaim|live|LONG|WD-08",
+                    decision_id="decision-observation",
+                    context_version=CONTEXT_VERSION,
+                    runtime_config_hash="a" * 64,
+                    strategy_build_id="build-observation",
+                    candidate_origin="RESEARCH_OBSERVATION",
+                )
+                store.save_observation(opened, "BTCUSDT")
+                settled = replace(
+                    opened,
+                    status="SETTLED",
+                    result="WIN",
+                    settled_at=opened.expires_at,
+                    exit_price=opened.entry_price + 1,
+                    pnl=8.0,
+                )
+
+                with self.assertRaisesRegex(ValueError, "frozen observation"):
+                    store.save_observation(mutate(settled), "BTCUSDT")
+
+                self.assertEqual(store.load_observations("BTCUSDT"), [opened])
+
+    def test_observation_settlement_updates_only_terminal_fields_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            opened = replace(
+                observation(
+                    "valid-settlement",
+                    family="drop_reclaim",
+                    tag="live",
+                    direction="LONG",
+                    segment="WD-08",
+                    status="OPEN",
+                    result=None,
+                ),
+                profile_key="10|drop_reclaim|live|LONG|WD-08",
+                decision_id="decision-observation",
+                context_version=CONTEXT_VERSION,
+                runtime_config_hash="a" * 64,
+                strategy_build_id="build-observation",
+                candidate_origin="RESEARCH_OBSERVATION",
+            )
+            settled = replace(
+                opened,
+                status="SETTLED",
+                result="LOSS",
+                settled_at=opened.expires_at,
+                exit_price=opened.entry_price - 1,
+                pnl=-10.0,
+            )
+
+            store.save_observation(opened, "BTCUSDT")
+            store.save_observations([settled], "BTCUSDT")
+            store.save_observations([settled], "BTCUSDT")
+
+            self.assertEqual(store.load_observations("BTCUSDT"), [settled])
+
     def test_persists_and_restores_wave_batch_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -2195,7 +2277,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             for key in list(legacy_order):
                 if key.startswith("wave_"):
                     legacy_order.pop(key)
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection, connection:
                 connection.execute(
                     """
                     create table orders (
@@ -2221,7 +2303,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
 
             store = SQLiteMonitorStore(db_path)
             restored = store.load_orders("BTCUSDT")
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection, connection:
                 tables = {
                     row[0]
                     for row in connection.execute(
@@ -2306,7 +2388,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
     def test_upgrades_legacy_progression_credit_table_with_direction_column(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection, connection:
                 connection.execute(
                     """
                     create table stake_progression_credits (
@@ -3038,16 +3120,32 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                 atomic_bundle_fixture()
             )
             attempts = (
-                (order, audit),
+                (order, audit, entry_snapshot),
                 (
                     replace(order, id=order.id + 1),
-                    replace(audit, signal=replace(audit.signal)),
+                    replace(
+                        audit,
+                        signal=replace(
+                            audit.signal,
+                            reason="competing audit content",
+                            score=audit.signal.score + 1,
+                        ),
+                        audit_context={"result_sequence_guard": {"status": "COMPETING"}},
+                    ),
+                    {
+                        **entry_snapshot,
+                        "signal": {
+                            **entry_snapshot["signal"],
+                            "reason": "competing audit content",
+                            "score": audit.signal.score + 1,
+                        },
+                    },
                 ),
             )
             barrier = threading.Barrier(2)
             errors = []
 
-            def save(store, attempted_order, attempted_audit):
+            def save(store, attempted_order, attempted_audit, attempted_snapshot):
                 try:
                     barrier.wait(timeout=5)
                     store.save_open_order_decision(
@@ -3055,7 +3153,7 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                         context=context,
                         order=attempted_order,
                         credit=None,
-                        entry_snapshot=entry_snapshot,
+                        entry_snapshot=attempted_snapshot,
                         audit=attempted_audit,
                         observation=observed,
                     )
@@ -3071,6 +3169,7 @@ class AtomicDecisionBundleTest(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=5)
 
+            self.assertFalse(any(thread.is_alive() for thread in threads))
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], ValueError)
             self.assertRegex(str(errors[0]), "decision.*order")
@@ -3080,6 +3179,19 @@ class AtomicDecisionBundleTest(unittest.TestCase):
             self.assertEqual(counts["order_entry_snapshots"], 1)
             self.assertEqual(counts["signal_audit"], 1)
             self.assertEqual(counts["observation_signals"], 1)
+            with closing(sqlite3.connect(db_path)) as connection:
+                winning_order_id = connection.execute(
+                    "select order_id from orders"
+                ).fetchone()[0]
+                persisted_reason = connection.execute(
+                    "select reason from signal_audit"
+                ).fetchone()[0]
+            expected_reason = (
+                audit.signal.reason
+                if winning_order_id == order.id
+                else "competing audit content"
+            )
+            self.assertEqual(persisted_reason, expected_reason)
 
     def test_open_bundle_retry_does_not_repeat_credit_consumption_or_members(self):
         with tempfile.TemporaryDirectory() as temp_dir:
