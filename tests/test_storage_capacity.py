@@ -4,6 +4,7 @@ import unittest
 from contextlib import closing
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from unittest import mock
 
 from app.storage import SQLiteMonitorStore
 from app.storage_capacity import (
@@ -16,6 +17,7 @@ from app.storage_capacity import (
     StorageCapacity,
     StorageCapacityConfigurationError,
     StorageWriteClass,
+    capacity_from_connection,
     capacity_for_bytes,
     classify_capacity,
     configure_max_page_count,
@@ -163,13 +165,117 @@ class SQLiteCapacityIntegrationTest(unittest.TestCase):
             self.assertEqual(first, expected)
             self.assertEqual(second, expected)
 
+    def test_existing_database_above_requested_cap_starts_hard_limited(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "monitor.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("pragma page_size = 1024")
+                connection.execute(
+                    "create table business_rows(id integer primary key, payload blob)"
+                )
+                for _ in range(12):
+                    connection.execute(
+                        "insert into business_rows(payload) values (zeroblob(4096))"
+                    )
+                connection.commit()
+                page_size = connection.execute("pragma page_size").fetchone()[0]
+                page_count = connection.execute("pragma page_count").fetchone()[0]
+                capped_bytes = (page_count - 1) * page_size
+                initial_rows = connection.execute(
+                    "select count(*) from business_rows"
+                ).fetchone()[0]
+
+                with mock.patch(
+                    "app.storage_capacity.MAX_DATABASE_BYTES",
+                    capped_bytes,
+                ):
+                    effective = configure_max_page_count(connection)
+                    capacity = capacity_from_connection(connection)
+
+                    self.assertEqual(effective, page_count)
+                    self.assertEqual(
+                        connection.execute("pragma max_page_count").fetchone()[0],
+                        page_count,
+                    )
+                    self.assertEqual(capacity.status, "HARD_LIMIT")
+                    self.assertFalse(capacity.core_write_allowed)
+
+                    connection.execute("begin")
+                    with self.assertRaises(sqlite3.OperationalError) as full:
+                        for _ in range(100):
+                            connection.execute(
+                                "insert into business_rows(payload) "
+                                "values (zeroblob(65536))"
+                            )
+                    self.assertEqual(
+                        full.exception.sqlite_errorcode & 0xFF,
+                        sqlite3.SQLITE_FULL,
+                    )
+                    connection.rollback()
+
+                self.assertEqual(
+                    connection.execute(
+                        "select count(*) from business_rows"
+                    ).fetchone()[0],
+                    initial_rows,
+                )
+                self.assertEqual(
+                    connection.execute("pragma page_count").fetchone()[0],
+                    page_count,
+                )
+
+    def test_small_real_page_cap_translates_full_and_rolls_back_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "monitor.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("pragma page_size = 1024")
+                connection.execute(
+                    "create table business_rows(id integer primary key, payload blob)"
+                )
+                connection.commit()
+                page_count = connection.execute("pragma page_count").fetchone()[0]
+                effective = connection.execute(
+                    f"pragma max_page_count = {page_count + 2}"
+                ).fetchone()[0]
+                self.assertEqual(effective, page_count + 2)
+
+                connection.execute("begin")
+                try:
+                    for _ in range(100):
+                        connection.execute(
+                            "insert into business_rows(payload) "
+                            "values (zeroblob(65536))"
+                        )
+                except sqlite3.OperationalError as error:
+                    self.assertEqual(
+                        error.sqlite_errorcode & 0xFF,
+                        sqlite3.SQLITE_FULL,
+                    )
+                    with self.assertRaises(CoreStorageCapacityError) as raised:
+                        raise_for_sqlite_write_error(
+                            error,
+                            StorageWriteClass.CORE,
+                        )
+                    self.assertIs(raised.exception.__cause__, error)
+                    connection.rollback()
+                else:
+                    self.fail("expected the real SQLite page cap to be exhausted")
+
+                self.assertEqual(
+                    connection.execute(
+                        "select count(*) from business_rows"
+                    ).fetchone()[0],
+                    0,
+                )
+
     def test_configure_max_page_count_verifies_effective_value(self):
         class WrongEffectiveConnection:
             def execute(self, statement):
                 values = {
                     "pragma page_size": 8192,
-                    f"pragma max_page_count = {MAX_DATABASE_BYTES // 8192}": 7,
-                    "pragma max_page_count": 7,
+                    "pragma page_count": 12,
+                    "pragma max_page_count = 10": 13,
+                    "pragma max_page_count": 13,
                 }
 
                 class Result:
@@ -181,8 +287,12 @@ class SQLiteCapacityIntegrationTest(unittest.TestCase):
 
                 return Result(values[statement])
 
-        with self.assertRaises(StorageCapacityConfigurationError):
-            configure_max_page_count(WrongEffectiveConnection())
+        with mock.patch(
+            "app.storage_capacity.MAX_DATABASE_BYTES",
+            10 * 8192,
+        ):
+            with self.assertRaises(StorageCapacityConfigurationError):
+                configure_max_page_count(WrongEffectiveConnection())
 
 
 class SQLiteFullTranslationTest(unittest.TestCase):

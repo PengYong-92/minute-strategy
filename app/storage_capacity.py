@@ -90,9 +90,19 @@ def configure_max_page_count(connection: _PragmaConnection) -> int:
         raise StorageCapacityConfigurationError(
             "SQLite returned an invalid page_size"
         )
-    expected = MAX_DATABASE_BYTES // page_size_row[0]
+    page_count_row = connection.execute("pragma page_count").fetchone()
+    if (
+        not page_count_row
+        or type(page_count_row[0]) is not int
+        or page_count_row[0] < 0
+    ):
+        raise StorageCapacityConfigurationError(
+            "SQLite returned an invalid page_count"
+        )
+    requested = MAX_DATABASE_BYTES // page_size_row[0]
+    expected = max(requested, page_count_row[0])
     effective_row = connection.execute(
-        f"pragma max_page_count = {expected}"
+        f"pragma max_page_count = {requested}"
     ).fetchone()
     if not effective_row or effective_row[0] != expected:
         effective = effective_row[0] if effective_row else None
