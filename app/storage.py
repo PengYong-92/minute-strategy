@@ -198,6 +198,7 @@ def _compact_rolling_edge_guard(value: object) -> dict[str, object]:
             "pnl",
             "ev",
             "blocked",
+            "key",
             "edge",
             "threshold",
         )
@@ -209,7 +210,7 @@ def _compact_time_period_guard(value: object) -> dict[str, object]:
     source = value if isinstance(value, Mapping) else {}
     return {
         key: source[key]
-        for key in ("enabled", "blocked", "code", "local_hour", "window")
+        for key in ("status", "code", "enabled", "blocked", "local_hour", "window")
         if key in source
     }
 
@@ -292,7 +293,7 @@ def _signal_audit_guard_states(
         "wave_signal": {
             "mode": str(signal.wave_guard_mode or ""),
             "status": str(signal.wave_guard_status or "UNKNOWN"),
-            "code": str(signal.wave_guard_reason or signal.wave_guard_status or "UNKNOWN"),
+            "code": str(signal.wave_guard_status or "UNKNOWN"),
         },
     }
 

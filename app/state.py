@@ -1,6 +1,7 @@
 import threading
 import time
 from bisect import bisect_left
+from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -177,7 +178,7 @@ class MonitorState:
         self._storage_futures: list[Future] = []
         self._storage_futures_condition = threading.Condition()
         self._storage_write_failures: list[Exception] = []
-        self._observation_audit_collector: list[tuple[Signal, str]] | None = None
+        self._observation_audit_collector: list[tuple[Signal, str, dict]] | None = None
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
         self.simulator = self._build_simulator(self.symbol, restored_orders)
@@ -444,13 +445,14 @@ class MonitorState:
                         "ORDER_OPENED" if self.order_decision == "OPENED" else None
                     ),
                 )
-                for observation_signal, source_decision in observation_audits:
+                for observation_signal, source_decision, audit_context in observation_audits:
                     self._save_signal(
                         observation_signal,
                         source_decision,
                         self.updated_at_ms,
                         force_independent=True,
                         event_kind="OBSERVATION_CANDIDATE",
+                        audit_context_override=audit_context,
                     )
             return self.order_decision != "STORAGE_ERROR"
 
@@ -1533,7 +1535,11 @@ class MonitorState:
         self.observations.append(observation)
         if self._observation_audit_collector is not None:
             self._observation_audit_collector.append(
-                (replace(signal, direction=direction), str(decision or "RESEARCH_OBSERVE"))
+                (
+                    replace(signal, direction=direction),
+                    str(decision or "RESEARCH_OBSERVE"),
+                    self._observation_signal_audit_context(signal, direction),
+                )
             )
         if self.storage:
             self._save_observation(observation)
@@ -1868,19 +1874,17 @@ class MonitorState:
         has_formal_candidate: bool = False,
         force_independent: bool = False,
         event_kind: str | None = None,
+        audit_context_override: dict | None = None,
     ) -> None:
         symbol = self.symbol
-        audit_context = {
-            "rolling_edge": dict(self.rolling_edge),
-            "result_sequence_guard": dict(self.result_sequence_guard),
-            "wave_batch_guard": dict(self.wave_batch_guard),
-            "profile_degradation_guard": dict(self.profile_degradation_guard),
-            "profile_health_guard": dict(self.profile_health_guard),
-            "time_period_guard": dict(self.time_period_guard),
-            "profile_guard": dict(self.profile_guard_audit),
-        }
+        audit_context = deepcopy(
+            audit_context_override
+            if audit_context_override is not None
+            else self._current_signal_audit_context()
+        )
+        signal_snapshot = deepcopy(signal)
         self._submit_storage_write(
-            lambda signal=signal, symbol=symbol, decision=decision, created_at_ms=created_at_ms,
+            lambda signal=signal_snapshot, symbol=symbol, decision=decision, created_at_ms=created_at_ms,
             audit_context=audit_context: (
                 self.storage.save_signal(
                     symbol,
@@ -1894,6 +1898,85 @@ class MonitorState:
                 )
             )
         )
+
+    def _current_signal_audit_context(self) -> dict:
+        return {
+            "rolling_edge": dict(self.rolling_edge),
+            "result_sequence_guard": dict(self.result_sequence_guard),
+            "wave_batch_guard": dict(self.wave_batch_guard),
+            "profile_degradation_guard": dict(self.profile_degradation_guard),
+            "profile_health_guard": dict(self.profile_health_guard),
+            "time_period_guard": dict(self.time_period_guard),
+            "profile_guard": dict(self.profile_guard_audit),
+        }
+
+    def _observation_signal_audit_context(
+        self,
+        signal: Signal,
+        direction: str,
+    ) -> dict:
+        not_evaluated = "NOT_EVALUATED"
+        time_period = self.time_period_guard
+        return {
+            "rolling_edge": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "blocked": False,
+                "key": "|".join(
+                    [
+                        str(signal.timeframe_minutes),
+                        str(signal.threshold_segment or "GLOBAL"),
+                        str(signal.reason or "UNKNOWN").split("：", 1)[0]
+                        .split(";", 1)[0]
+                        .strip()
+                        or "UNKNOWN",
+                    ]
+                ),
+            },
+            "result_sequence_guard": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "blocked": False,
+                "scope": self.result_sequence_guard_config.scope,
+                "direction": direction,
+            },
+            "wave_batch_guard": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "mode": not_evaluated,
+                "blocked": False,
+                "current_batch_id": str(signal.wave_batch_id or ""),
+            },
+            "profile_degradation_guard": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "blocked": False,
+                "profile_key": str(signal.profile_key or ""),
+                "daily_profile_version": str(signal.daily_profile_version or ""),
+            },
+            "profile_health_guard": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "blocked": False,
+                "direction": direction,
+            },
+            "time_period_guard": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "enabled": bool(time_period.get("enabled", False)),
+                "blocked": False,
+                "local_hour": int(time_period.get("local_hour", 0)),
+                "window": str(time_period.get("window", "")),
+            },
+            "profile_guard": {
+                "status": not_evaluated,
+                "code": not_evaluated,
+                "enabled": self.enable_profile_guard,
+                "observe_only": not self.enable_profile_guard,
+                "blocked": False,
+                "hit_keys": [],
+            },
+        }
 
     def _save_observation(self, observation: ObservationSignal) -> None:
         observation_snapshot = replace(observation)

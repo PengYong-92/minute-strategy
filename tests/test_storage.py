@@ -1311,7 +1311,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                 "status": "DEGRADED", "code": "ROLLING_EDGE_BLOCKED",
                 "sample_size": 6, "wins": 2, "losses": 4, "win_rate": 0.3333,
                 "pnl": -24.0, "ev": -4.0, "blocked": True,
-                "edge": 10.0, "threshold": 0.5,
+                "key": "10|WD-12|rebound-long", "edge": 10.0, "threshold": 0.5,
             },
             "time_period_guard": {
                 "enabled": True, "blocked": True, "code": "TIME_PERIOD_SHADOW_ONLY",
@@ -1367,6 +1367,10 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(payload["guards"]["profile_degradation"]["probe_order_id"], 7)
         self.assertEqual(payload["guards"]["profile_health"]["allow_second_order"], False)
         self.assertEqual(payload["guards"]["rolling_edge"]["threshold"], 0.5)
+        self.assertEqual(
+            payload["guards"]["rolling_edge"]["key"],
+            "10|WD-12|rebound-long",
+        )
         self.assertEqual(payload["guards"]["time_period"]["local_hour"], 14)
         self.assertEqual(payload["guards"]["profile_guard"]["hit_keys"], ["risk-a"])
         self.assertEqual(payload["guards"]["wave_signal"]["status"], "UNKNOWN")
@@ -1377,6 +1381,30 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertNotIn("history", raw_payload)
         self.assertNotIn("quality_score_inputs", raw_payload)
         self.assertLess(len(raw_payload.encode("utf-8")), 5_000)
+
+    def test_wave_signal_uses_stable_status_as_code_not_human_reason(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_signal(
+                "BTCUSDT",
+                replace(
+                    signal(),
+                    wave_guard_mode="DIRECTION_BLOCKED",
+                    wave_guard_status="DIRECTION_BLOCKED",
+                    wave_guard_reason="一分钟波段方向不允许开多",
+                ),
+                decision="WAVE_DIRECTION_BLOCKED",
+                created_at_ms=1_000,
+                force_independent=True,
+            )
+            with store._connect() as connection:
+                row = connection.execute("select payload from signal_audit").fetchone()
+
+        wave_signal = json.loads(row["payload"])["guards"]["wave_signal"]
+        self.assertEqual(wave_signal["mode"], "DIRECTION_BLOCKED")
+        self.assertEqual(wave_signal["status"], "DIRECTION_BLOCKED")
+        self.assertEqual(wave_signal["code"], "DIRECTION_BLOCKED")
+        self.assertNotIn("一分钟", wave_signal["code"])
 
     def test_signal_audit_summary_weights_v2_occurrences_and_legacy_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1510,6 +1538,60 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             run(sqlite3.OperationalError("database or disk is full"), decision="OPENED")
         with self.assertRaisesRegex(sqlite3.OperationalError, "syntax error"):
             run(sqlite3.OperationalError("syntax error"), decision="WAIT")
+
+    def test_save_signal_handles_real_sqlite_page_exhaustion_without_partial_rows(self):
+        normal_capacity = capacity_for_bytes(0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(path)
+            with sqlite3.connect(path) as connection:
+                page_count = connection.execute("pragma page_count").fetchone()[0]
+            page_limit = page_count + 1
+
+            def configure_tiny_page_limit(connection):
+                return connection.execute(
+                    f"pragma max_page_count = {page_limit}"
+                ).fetchone()[0]
+
+            with mock.patch(
+                "app.storage.configure_max_page_count",
+                side_effect=configure_tiny_page_limit,
+            ), mock.patch(
+                "app.storage.capacity_from_connection",
+                return_value=normal_capacity,
+            ):
+                ordinary_result = True
+                attempts = 0
+                while ordinary_result and attempts < 100:
+                    attempts += 1
+                    ordinary_result = store.save_signal(
+                        "BTCUSDT",
+                        replace(signal(direction="WAIT"), reason="x" * 1_500),
+                        decision="WAIT",
+                        created_at_ms=attempts * 600_000,
+                    )
+
+                with sqlite3.connect(path) as connection:
+                    rows_before_core = connection.execute(
+                        "select count(*) from signal_audit"
+                    ).fetchone()[0]
+                with self.assertRaises(CoreStorageCapacityError):
+                    store.save_signal(
+                        "BTCUSDT",
+                        replace(signal(), reason="y" * 1_500),
+                        decision="OPENED",
+                        created_at_ms=(attempts + 1) * 600_000,
+                        force_independent=True,
+                    )
+                with sqlite3.connect(path) as connection:
+                    rows_after_core = connection.execute(
+                        "select count(*) from signal_audit"
+                    ).fetchone()[0]
+
+        self.assertLess(attempts, 100)
+        self.assertFalse(ordinary_result)
+        self.assertEqual(rows_before_core, attempts - 1)
+        self.assertEqual(rows_after_core, rows_before_core)
 
     def test_persists_order_entry_snapshot_and_updates_settlement(self):
         with tempfile.TemporaryDirectory() as temp_dir:

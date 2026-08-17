@@ -536,7 +536,76 @@ class MonitorStateTest(unittest.TestCase):
             [item[1]["profile_key"] for item in observations],
             ["short-profile", "long-profile"],
         )
+        self.assertEqual(main[4]["result_sequence_guard"]["direction"], "LONG")
+        self.assertNotEqual(main[4]["result_sequence_guard"]["status"], "NOT_EVALUATED")
+        self.assertEqual(main[4]["profile_health_guard"]["direction"], "LONG")
+        short_audit = observations[0][4]
+        for guard_name in (
+            "rolling_edge",
+            "result_sequence_guard",
+            "wave_batch_guard",
+            "profile_degradation_guard",
+            "profile_health_guard",
+            "profile_guard",
+        ):
+            self.assertEqual(short_audit[guard_name]["status"], "NOT_EVALUATED")
+            self.assertEqual(short_audit[guard_name]["code"], "NOT_EVALUATED")
+        self.assertEqual(short_audit["result_sequence_guard"]["direction"], "SHORT")
+        self.assertEqual(short_audit["profile_health_guard"]["direction"], "SHORT")
+        self.assertNotIn("consecutive_losses", short_audit["result_sequence_guard"])
+        self.assertNotIn("sample_size", short_audit["profile_health_guard"])
+        self.assertNotIn("batch_orders", short_audit["wave_batch_guard"])
+        self.assertEqual(
+            short_audit["profile_degradation_guard"]["profile_key"],
+            "short-profile",
+        )
+        self.assertEqual(
+            short_audit["wave_batch_guard"]["current_batch_id"],
+            observations[0][1]["wave_batch_id"],
+        )
+        self.assertEqual(short_audit["time_period_guard"]["status"], "NOT_EVALUATED")
+        self.assertEqual(short_audit["time_period_guard"]["code"], "NOT_EVALUATED")
+        self.assertIn("local_hour", short_audit["time_period_guard"])
+        self.assertIn("window", short_audit["time_period_guard"])
         self.assertEqual(len(storage.observations), 2)
+
+    def test_signal_audit_context_override_is_snapshotted_before_async_write(self):
+        storage = RecordingStorage()
+        storage.write_gate = threading.Event()
+        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        audit_context = {
+            "result_sequence_guard": {
+                "status": "NOT_EVALUATED",
+                "code": "NOT_EVALUATED",
+                "direction": "SHORT",
+                "hit_keys": ["original"],
+            }
+        }
+
+        state._save_signal(
+            Signal(
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="B",
+                reason="observation",
+                price=100.0,
+                open_time=60_000,
+            ),
+            "RESEARCH_OBSERVE",
+            60_000,
+            force_independent=True,
+            event_kind="OBSERVATION_CANDIDATE",
+            audit_context_override=audit_context,
+        )
+        audit_context["result_sequence_guard"]["status"] = "MUTATED"
+        audit_context["result_sequence_guard"]["hit_keys"].append("mutated")
+        state.result_sequence_guard["status"] = "PAUSED"
+        storage.write_gate.set()
+        state.wait_for_storage_writes()
+
+        stored = storage.signals[0][4]["result_sequence_guard"]
+        self.assertEqual(stored["status"], "NOT_EVALUATED")
+        self.assertEqual(stored["hit_keys"], ["original"])
 
     def test_observation_audit_collector_is_cleared_after_update_exception(self):
         state = MonitorState(symbol="BTCUSDT")
