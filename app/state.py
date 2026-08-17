@@ -413,6 +413,10 @@ class MonitorState:
                 observation_signals,
                 latest.close_time,
             )
+            has_formal_candidate = bool(selected_signal.actionable)
+            has_observation_candidate = bool(observation_signals) or (
+                self._should_record_observation(selected_signal)
+            )
             selected_signal = self._apply_wave_guard(selected_signal, wave_state)
             selected_signal = self._attach_quality_score(
                 selected_signal,
@@ -426,7 +430,13 @@ class MonitorState:
             )
             self._record_observation_candidates(observation_signals, latest)
             if self.storage:
-                self._save_signal(self.selected_signal or selected_signal, self.order_decision, self.updated_at_ms)
+                self._save_signal(
+                    self.selected_signal or selected_signal,
+                    self.order_decision,
+                    self.updated_at_ms,
+                    has_formal_candidate=has_formal_candidate,
+                    has_observation_candidate=has_observation_candidate,
+                )
             return self.order_decision != "STORAGE_ERROR"
 
     def seed_klines(
@@ -1806,7 +1816,15 @@ class MonitorState:
             )
         )
 
-    def _save_signal(self, signal: Signal, decision: str, created_at_ms: int) -> None:
+    def _save_signal(
+        self,
+        signal: Signal,
+        decision: str,
+        created_at_ms: int,
+        *,
+        has_formal_candidate: bool = False,
+        has_observation_candidate: bool = False,
+    ) -> None:
         symbol = self.symbol
         audit_context = {
             "rolling_edge": dict(self.rolling_edge),
@@ -1826,6 +1844,8 @@ class MonitorState:
                     decision,
                     created_at_ms,
                     audit_context=audit_context,
+                    has_formal_candidate=has_formal_candidate,
+                    has_observation_candidate=has_observation_candidate,
                 )
             )
         )

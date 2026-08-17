@@ -19,6 +19,7 @@ from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import SQLiteMonitorStore
+from app.storage_capacity import COMPACT_ONLY_BYTES, capacity_for_bytes
 from app.wave_state import WaveSnapshot
 
 
@@ -1136,6 +1137,181 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(sequence_status["COOLDOWN"], 1)
         self.assertEqual(sequence_status["NORMAL"], 1)
 
+    def test_signal_audit_v2_aggregates_only_identical_ordinary_heartbeats(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            base = replace(
+                signal(direction="WAIT"),
+                score=11.0,
+                profile_key="10|volume_price|wait|WAIT|WD-12",
+                context_version="DECISION_CONTEXT_V2",
+                runtime_config_hash="a" * 64,
+                first_decisive_block="SCORE",
+                quality_score_inputs={"must_not_repeat": "quality-inputs"},
+                direction_pulse_shadow={"must_not_repeat": "pulse"},
+            )
+            audit = {
+                "result_sequence_guard": {"status": "NORMAL", "history": [1, 2, 3]},
+                "profile_degradation_guard": {"status": "NORMAL"},
+                "profile_guard": {"full_config": "must-not-repeat"},
+            }
+
+            self.assertTrue(
+                store.save_signal(
+                    "BTCUSDT",
+                    base,
+                    decision="BELOW_THRESHOLD",
+                    created_at_ms=60_000,
+                    audit_context=audit,
+                    has_formal_candidate=False,
+                    has_observation_candidate=False,
+                )
+            )
+            self.assertTrue(
+                store.save_signal(
+                    "BTCUSDT",
+                    replace(base, score=19.0, rsi=41.0),
+                    decision="BELOW_THRESHOLD",
+                    created_at_ms=120_000,
+                    audit_context=audit,
+                    has_formal_candidate=False,
+                    has_observation_candidate=False,
+                )
+            )
+            with store._connect() as connection:
+                rows = connection.execute(
+                    "select * from signal_audit order by id"
+                ).fetchall()
+
+            recent = store.load_recent_signals("BTCUSDT", limit=5)
+
+        self.assertEqual(len(rows), 1)
+        row = dict(rows[0])
+        self.assertEqual(row["record_version"], "SIGNAL_AUDIT_V2")
+        self.assertEqual(row["event_kind"], "HEARTBEAT")
+        self.assertEqual(row["occurrences"], 2)
+        self.assertEqual((row["first_at_ms"], row["last_at_ms"]), (60_000, 120_000))
+        self.assertEqual((row["score_min"], row["score_max"]), (11.0, 19.0))
+        payload = json.loads(row["payload"])
+        self.assertEqual(payload["metrics"]["score"], 19.0)
+        self.assertEqual(payload["metrics"]["rsi"], 41.0)
+        self.assertNotIn("quality-inputs", row["payload"])
+        self.assertNotIn("must-not-repeat", row["payload"])
+        self.assertEqual(recent[0]["occurrences"], 2)
+        self.assertEqual(recent[0]["last_at_ms"], 120_000)
+
+    def test_signal_audit_v2_separates_bucket_guard_state_and_observation_candidates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            wait_signal = replace(
+                signal(direction="WAIT"),
+                profile_key="10|volume_price|wait|WAIT|WD-12",
+                context_version="DECISION_CONTEXT_V2",
+                runtime_config_hash="b" * 64,
+                first_decisive_block="SCORE",
+            )
+            normal = {"result_sequence_guard": {"status": "NORMAL"}}
+            cooldown = {"result_sequence_guard": {"status": "COOLDOWN"}}
+
+            calls = (
+                (60_000, normal, False, False),
+                (600_000, normal, False, False),
+                (660_000, cooldown, False, False),
+                (720_000, cooldown, False, True),
+                (780_000, cooldown, True, False),
+            )
+            for created_at_ms, audit, has_formal, has_observation in calls:
+                store.save_signal(
+                    "BTCUSDT",
+                    wait_signal,
+                    decision="BELOW_THRESHOLD",
+                    created_at_ms=created_at_ms,
+                    audit_context=audit,
+                    has_formal_candidate=has_formal,
+                    has_observation_candidate=has_observation,
+                )
+            with store._connect() as connection:
+                rows = connection.execute(
+                    "select aggregation_key, occurrences, event_kind from signal_audit order by id"
+                ).fetchall()
+
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(row["occurrences"] == 1 for row in rows))
+        self.assertIsNone(rows[2]["aggregation_key"])
+        self.assertEqual(rows[2]["event_kind"], "STATE_CHANGE")
+        self.assertIsNone(rows[-2]["aggregation_key"])
+        self.assertIsNone(rows[-1]["aggregation_key"])
+        self.assertEqual(rows[-2]["event_kind"], "OBSERVATION_CANDIDATE")
+        self.assertEqual(rows[-1]["event_kind"], "DECISION")
+
+    def test_signal_audit_summary_weights_v2_occurrences_and_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            with store._connect() as connection:
+                connection.execute(
+                    """
+                    insert into signal_audit(
+                        symbol, created_at_ms, decision, direction, timeframe_minutes,
+                        threshold_segment, regime, score, threshold, reason, payload
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "BTCUSDT", 1, "WAIT", "WAIT", 10, "WD-12", "UNKNOWN",
+                        0.0, 70.0, "legacy", json.dumps({"profile_key": "legacy"}),
+                    ),
+                )
+            heartbeat = replace(
+                signal(direction="WAIT"),
+                profile_key="v2-profile",
+                context_version="DECISION_CONTEXT_V2",
+                runtime_config_hash="c" * 64,
+            )
+            for created_at_ms in range(10_000, 19_000, 1_000):
+                store.save_signal(
+                    "BTCUSDT",
+                    heartbeat,
+                    decision="WAIT",
+                    created_at_ms=created_at_ms,
+                    has_formal_candidate=False,
+                    has_observation_candidate=False,
+                )
+
+            summary = store.signal_audit_summary("BTCUSDT")
+
+        self.assertEqual(summary["sample_count"], 10)
+        self.assertEqual(summary["storage_rows"], 2)
+        decisions = {item["key"]: item["count"] for item in summary["by_decision"]}
+        self.assertEqual(decisions["WAIT"], 10)
+        contexts = {item["key"]: item for item in summary["by_profile_dps_slot"]}
+        self.assertEqual(contexts["v2-profile|STATIC|UNKNOWN"]["signals"], 9)
+
+    def test_compact_only_skips_ordinary_heartbeat_but_keeps_core_audit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            compact = capacity_for_bytes(COMPACT_ONLY_BYTES)
+            with mock.patch("app.storage.capacity_from_connection", return_value=compact):
+                skipped = store.save_signal(
+                    "BTCUSDT",
+                    signal(direction="WAIT"),
+                    decision="WAIT",
+                    created_at_ms=1_000,
+                    has_formal_candidate=False,
+                    has_observation_candidate=False,
+                )
+                saved = store.save_signal(
+                    "BTCUSDT",
+                    signal(),
+                    decision="OPENED",
+                    created_at_ms=2_000,
+                    has_formal_candidate=True,
+                    has_observation_candidate=False,
+                )
+            rows = store.load_recent_signals("BTCUSDT", limit=10)
+
+        self.assertFalse(skipped)
+        self.assertTrue(saved)
+        self.assertEqual([row["decision"] for row in rows], ["OPENED"])
+
     def test_persists_order_entry_snapshot_and_updates_settlement(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -1402,6 +1578,121 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(promote["confidence"], "MEDIUM")
         self.assertEqual(blocked["action"], "BLOCK_WATCH")
         self.assertLess(blocked["ev"], 0)
+
+    def test_observation_queries_cover_rows_beyond_legacy_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observations(
+                [
+                    observation(
+                        f"row-{idx:04d}",
+                        result="WIN" if idx % 2 == 0 else "LOSS",
+                        opened_at=idx * 1_000,
+                    )
+                    for idx in range(5_101)
+                ],
+                "BTCUSDT",
+            )
+
+            summary = store.observation_summary("BTCUSDT", window="all")
+            last_page = store.page_observations(
+                "BTCUSDT", page=256, page_size=20
+            )
+
+        self.assertEqual(summary["total"]["settled"], 5_101)
+        self.assertEqual(summary["total"]["signals"], 5_101)
+        self.assertEqual(last_page["total"], 5_101)
+        self.assertEqual(last_page["page"], 256)
+        self.assertEqual(len(last_page["observations"]), 1)
+        self.assertEqual(last_page["observations"][0]["observation_key"], "row-0000")
+
+    def test_observation_summary_uses_stable_anchor_and_time_windows(self):
+        day = 86_400_000
+        anchor = 40 * day
+        fixtures = [
+            ("anchor", anchor),
+            ("seven-edge", anchor - 7 * day),
+            ("seven-old", anchor - 7 * day - 1),
+            ("fourteen-edge", anchor - 14 * day),
+            ("fourteen-old", anchor - 14 * day - 1),
+            ("thirty-edge", anchor - 30 * day),
+            ("thirty-old", anchor - 30 * day - 1),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observations(
+                [observation(key, opened_at=opened_at) for key, opened_at in fixtures],
+                "BTCUSDT",
+            )
+
+            seven = store.observation_summary("BTCUSDT", window="7d")
+            default = store.observation_summary("BTCUSDT")
+            thirty = store.observation_summary("BTCUSDT", window="30d")
+            all_rows = store.observation_summary("BTCUSDT", window="all")
+
+        self.assertEqual(seven["total"]["signals"], 2)
+        self.assertEqual(default["window"], "14d")
+        self.assertEqual(default["total"]["signals"], 4)
+        self.assertEqual(thirty["total"]["signals"], 6)
+        self.assertEqual(all_rows["total"]["signals"], 7)
+        self.assertEqual(seven["anchor"], anchor)
+        self.assertEqual(seven["cutoff"], anchor - 7 * day)
+
+    def test_observation_summary_preserves_zero_pnl_result_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observations(
+                [
+                    replace(observation("win", result="WIN"), pnl=0.0),
+                    replace(observation("loss", result="LOSS", opened_at=2_000), pnl=0.0),
+                ],
+                "BTCUSDT",
+            )
+
+            summary = store.observation_summary("BTCUSDT", window="all")
+
+        self.assertEqual(summary["total"]["pnl"], -2.0)
+        self.assertEqual(summary["total"]["ev"], -1.0)
+
+    def test_observation_sql_filters_and_options_use_the_full_symbol_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observations(
+                [
+                    observation(f"base-{idx}", opened_at=idx)
+                    for idx in range(5_005)
+                ]
+                + [
+                    observation(
+                        "rare",
+                        family="rare_family",
+                        tag="rare_tag",
+                        direction="LONG",
+                        segment="WE-23",
+                        status="OPEN",
+                        result=None,
+                        opened_at=-1,
+                    )
+                ],
+                "BTCUSDT",
+            )
+
+            page = store.page_observations(
+                "BTCUSDT",
+                page=1,
+                page_size=10,
+                direction="LONG",
+                family="rare_family",
+                tag="rare_tag",
+                segment="WE-23",
+                result="OPEN",
+            )
+
+        self.assertEqual(page["total"], 1)
+        self.assertEqual(page["observations"][0]["observation_key"], "rare")
+        self.assertIn("RARE_FAMILY", page["filter_options"]["family"])
+        self.assertIn("RARE_TAG", page["filter_options"]["tag"])
+        self.assertIn("WE-23", page["filter_options"]["segment"])
 
     def test_summarizes_order_entry_snapshots_for_weak_profile(self):
         with tempfile.TemporaryDirectory() as temp_dir:

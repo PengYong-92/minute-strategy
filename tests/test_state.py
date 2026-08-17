@@ -386,10 +386,28 @@ class RecordingStorage:
             self.fail_once_methods.remove(method_name)
             raise OSError(f"{method_name} failed")
 
-    def save_signal(self, symbol, signal, decision, created_at_ms, audit_context=None):
+    def save_signal(
+        self,
+        symbol,
+        signal,
+        decision,
+        created_at_ms,
+        audit_context=None,
+        *,
+        has_formal_candidate=False,
+        has_observation_candidate=False,
+    ):
         self._wait_for_write_gate()
         self.signals.append(
-            (symbol, signal.to_dict(), decision, created_at_ms, audit_context)
+            (
+                symbol,
+                signal.to_dict(),
+                decision,
+                created_at_ms,
+                audit_context,
+                has_formal_candidate,
+                has_observation_candidate,
+            )
         )
 
     def save_observation(self, observation, symbol):
@@ -433,6 +451,32 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_signal_audit_call_explicitly_marks_observation_candidate(self):
+        storage = RecordingStorage()
+        state = MonitorState(symbol="BTCUSDT", storage=storage)
+        candidate = Signal(
+            direction="WAIT",
+            timeframe_minutes=10,
+            level="B",
+            reason="below threshold",
+            price=100.0,
+            open_time=1_000,
+            score=0.0,
+            threshold=70.0,
+        )
+
+        state._save_signal(
+            candidate,
+            "BELOW_THRESHOLD",
+            1_000,
+            has_observation_candidate=True,
+        )
+        state.wait_for_storage_writes()
+
+        self.assertEqual(len(storage.signals), 1)
+        self.assertFalse(storage.signals[0][5])
+        self.assertTrue(storage.signals[0][6])
+
     def test_realtime_price_update_does_not_enter_strategy_state(self):
         state = MonitorState(symbol="BTCUSDT", now_ms=lambda: 100_020)
         context = state.capture_symbol_context()

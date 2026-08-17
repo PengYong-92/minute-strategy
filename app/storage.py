@@ -17,18 +17,23 @@ from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage_capacity import (
+    OrdinaryAuditCapacityError,
     StorageCapacity,
+    StorageWriteClass,
     capacity_from_connection,
     configure_max_page_count,
+    ensure_write_allowed,
+    raise_for_sqlite_write_error,
 )
 from app.storage_schema import migrate
 from app.wave_state import WAVE_RUNTIME_VERSION, WaveSnapshot
 
 
 ORDER_PAGE_SIZES = (10, 20, 30, 50, 100)
-OBSERVATION_SUMMARY_LIMIT = 5000
 OBSERVATION_PROMOTE_SAMPLE = 30
 OBSERVATION_WATCH_SAMPLE = 10
+SIGNAL_AUDIT_VERSION = "SIGNAL_AUDIT_V2"
+_ORDINARY_SIGNAL_DECISIONS = frozenset({"WAIT", "BELOW_THRESHOLD"})
 _LOWERCASE_HEX = frozenset("0123456789abcdef")
 _DECISION_CONTEXT_KEYS = {
     "decision_id",
@@ -77,6 +82,227 @@ def _compact_json(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _profile_key_for_signal(signal: Signal) -> str:
+    profile_key = str(signal.profile_key or "")
+    if profile_key:
+        return profile_key
+    direction = str(signal.direction or signal.observe_direction or "").upper()
+    return "|".join(
+        [
+            str(int(signal.timeframe_minutes or 0)),
+            str(signal.strategy_family or "unknown"),
+            str(signal.strategy_tag or "unknown"),
+            direction,
+            str(signal.threshold_segment or "GLOBAL").upper(),
+        ]
+    )
+
+
+def _compact_guard(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    retained = (
+        "status",
+        "code",
+        "mode",
+        "blocked",
+        "allow_progression",
+        "sample_size",
+        "wins",
+        "losses",
+        "win_rate",
+        "pnl",
+        "ev",
+        "key",
+        "triggered_at",
+        "remaining_ms",
+    )
+    return {key: value[key] for key in retained if key in value}
+
+
+def _signal_audit_guard_states(
+    signal: Signal,
+    audit_context: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "rolling_edge": _compact_guard(audit_context.get("rolling_edge")),
+        "result_sequence": _compact_guard(
+            audit_context.get("result_sequence_guard")
+        ),
+        "wave_batch": _compact_guard(audit_context.get("wave_batch_guard")),
+        "profile_degradation": _compact_guard(
+            audit_context.get("profile_degradation_guard")
+        ),
+        "profile_health": _compact_guard(
+            audit_context.get("profile_health_guard")
+        ),
+        "wave": {
+            "mode": str(signal.wave_guard_mode or ""),
+            "status": str(signal.wave_guard_status or ""),
+        },
+    }
+
+
+def _signal_audit_state_code(
+    signal: Signal,
+    audit_context: Mapping[str, object],
+) -> dict[str, object]:
+    adaptive = signal.adaptive_profile_state
+    structure = signal.entry_structure_shadow
+    return {
+        "guards": _signal_audit_guard_states(signal, audit_context),
+        "daily_profile_selected": bool(signal.daily_profile_selected),
+        "daily_profile_version": str(signal.daily_profile_version or ""),
+        "order_slot": str(signal.order_slot or ""),
+        "order_slot_scope": str(signal.order_slot_scope or ""),
+        "profile_health_status": str(signal.profile_health_status or ""),
+        "adaptive_status": str(
+            adaptive.get("status", "") if isinstance(adaptive, Mapping) else ""
+        ),
+        "structure_state": str(
+            structure.get("entry_structure_state", structure.get("state", ""))
+            if isinstance(structure, Mapping)
+            else ""
+        ),
+        "structure_bias": str(
+            structure.get("entry_structure_bias", structure.get("bias", ""))
+            if isinstance(structure, Mapping)
+            else ""
+        ),
+    }
+
+
+def _signal_audit_payload(
+    signal: Signal,
+    decision: str,
+    audit_context: Mapping[str, object],
+    reason_code: str,
+) -> dict[str, object]:
+    structure = signal.entry_structure_shadow
+    compact_structure = {}
+    if isinstance(structure, Mapping):
+        structure_keys = (
+            "entry_structure_version",
+            "entry_structure_mode",
+            "entry_structure_state",
+            "entry_structure_bias",
+            "entry_structure_reason_code",
+            "active_level_source",
+            "active_level_lower",
+            "active_level_upper",
+            "active_level_touch_count",
+            "active_level_confirmed_at",
+            "active_level_distance_atr",
+        )
+        compact_structure = {
+            key: structure[key] for key in structure_keys if key in structure
+        }
+    adaptive = signal.adaptive_profile_state
+    compact_adaptive = {}
+    if isinstance(adaptive, Mapping):
+        adaptive_keys = (
+            "qualification_state",
+            "status",
+            "reason_code",
+            "n12_samples",
+            "n12_wins",
+            "n12_win_rate",
+            "n20_samples",
+            "n20_ev",
+            "updated_at",
+        )
+        compact_adaptive = {
+            key: adaptive[key] for key in adaptive_keys if key in adaptive
+        }
+    return {
+        "identity": {
+            "decision_id": str(signal.decision_id or ""),
+            "context_version": str(signal.context_version or ""),
+            "runtime_config_hash": str(signal.runtime_config_hash or ""),
+            "strategy_build_id": str(signal.strategy_build_id or ""),
+            "candidate_origin": str(signal.candidate_origin or ""),
+            "profile_key": _profile_key_for_signal(signal),
+            "strategy_family": str(signal.strategy_family or "unknown"),
+            "strategy_tag": str(signal.strategy_tag or "unknown"),
+            "daily_profile_version": str(signal.daily_profile_version or "STATIC"),
+            "order_slot": str(signal.order_slot or "UNKNOWN"),
+        },
+        "metrics": {
+            "price": signal.price,
+            "score": signal.score,
+            "threshold": signal.threshold,
+            "calculated_threshold": signal.calculated_threshold,
+            "volume_ratio": signal.volume_ratio,
+            "volume_threshold": signal.volume_threshold,
+            "price_change_pct": signal.price_change_pct,
+            "price_position": signal.price_position,
+            "close_strength": signal.close_strength,
+            "analysis_window_minutes": signal.analysis_window_minutes,
+            "threshold_window_minutes": signal.threshold_window_minutes,
+            "mtf_10m_bias": signal.mtf_10m_bias,
+            "macd_histogram": signal.macd_histogram,
+            "macd_histogram_delta": signal.macd_histogram_delta,
+            "macd_histogram_threshold": signal.macd_histogram_threshold,
+            "macd_delta_threshold": signal.macd_delta_threshold,
+            "rsi": signal.rsi,
+            "rsi_lower_threshold": signal.rsi_lower_threshold,
+            "rsi_upper_threshold": signal.rsi_upper_threshold,
+            "bollinger_position": signal.bollinger_position,
+            "bollinger_width": signal.bollinger_width,
+            "bollinger_lower_threshold": signal.bollinger_lower_threshold,
+            "bollinger_upper_threshold": signal.bollinger_upper_threshold,
+            "indicator_profile_segment": signal.indicator_profile_segment,
+            "indicator_profile_sample_size": signal.indicator_profile_sample_size,
+            "fear_greed_value": signal.fear_greed_value,
+            "fear_greed_adjustment": signal.fear_greed_adjustment,
+            "risk_flags": signal.risk_flags,
+        },
+        "profile": {
+            "selected": bool(signal.daily_profile_selected),
+            "session_allowed": bool(signal.session_allowed),
+            "session_sample_size": signal.session_sample_size,
+            "session_win_rate": signal.session_win_rate,
+            "session_ev": signal.session_ev,
+            "profile_health_status": str(signal.profile_health_status or ""),
+            "profile_health_sample_size": signal.profile_health_sample_size,
+            "profile_health_win_rate": signal.profile_health_win_rate,
+            "profile_health_ev": signal.profile_health_ev,
+            "adaptive": compact_adaptive,
+        },
+        "structure": compact_structure,
+        "guards": _signal_audit_guard_states(signal, audit_context),
+        "state_code": _signal_audit_state_code(signal, audit_context),
+        "decision": {
+            "final": str(decision),
+            "reason_code": reason_code,
+            "first_decisive_block": str(signal.first_decisive_block or ""),
+        },
+    }
+
+
+def _signal_audit_aggregation_key(
+    symbol: str,
+    signal: Signal,
+    decision: str,
+    created_at_ms: int,
+    reason_code: str,
+    audit_context: Mapping[str, object],
+) -> str:
+    identity = {
+        "symbol": symbol,
+        "bucket_10m": int(created_at_ms) // 600_000,
+        "decision": decision,
+        "reason_code": reason_code,
+        "profile_key": _profile_key_for_signal(signal),
+        "direction": str(signal.direction or signal.observe_direction or "").upper(),
+        "context_version": str(signal.context_version or ""),
+        "runtime_config_hash": str(signal.runtime_config_hash or ""),
+        "first_decisive_block": str(signal.first_decisive_block or ""),
+        "state": _signal_audit_state_code(signal, audit_context),
+    }
+    return hashlib.sha256(_compact_json(identity).encode("utf-8")).hexdigest()
 
 
 def _parse_canonical_json(payload: object, name: str) -> object:
@@ -408,7 +634,7 @@ def _summarize_signal_audit(records: Sequence[dict[str, Any]]) -> dict[str, Any]
         grouped: dict[str, int] = {}
         for record in records:
             key = str(record.get(field) or "UNKNOWN")
-            grouped[key] = grouped.get(key, 0) + 1
+            grouped[key] = grouped.get(key, 0) + int(record.get("occurrences", 1))
         return [
             {"key": key, "count": count}
             for key, count in sorted(grouped.items())
@@ -418,10 +644,11 @@ def _summarize_signal_audit(records: Sequence[dict[str, Any]]) -> dict[str, Any]
     for record in records:
         key = str(record.get("profile_context") or "UNKNOWN")
         group = contexts.setdefault(key, {"signals": 0, "blocked": 0, "opened": 0})
-        group["signals"] += 1
+        occurrences = int(record.get("occurrences", 1))
+        group["signals"] += occurrences
         decision = str(record.get("decision") or "")
         if decision == "OPENED":
-            group["opened"] += 1
+            group["opened"] += occurrences
         elif decision.endswith("BLOCKED") or decision in {
             "HOLD_OPEN_ORDER",
             "HOLD_LONG_OPEN_ORDER",
@@ -430,9 +657,10 @@ def _summarize_signal_audit(records: Sequence[dict[str, Any]]) -> dict[str, Any]
             "DAILY_PROFILE_NOT_SELECTED",
             "SHORT_OBSERVE_ONLY",
         }:
-            group["blocked"] += 1
+            group["blocked"] += occurrences
     return {
-        "sample_count": len(records),
+        "sample_count": sum(int(record.get("occurrences", 1)) for record in records),
+        "storage_rows": len(records),
         "by_decision": counts("decision"),
         "by_profile_dps_slot": [
             {"key": key, **values}
@@ -1460,19 +1688,260 @@ class SQLiteMonitorStore:
         segment: str = "",
         result: str = "",
     ) -> dict[str, Any]:
-        return page_observation_list(
-            self.load_observations(symbol, limit=5000),
-            page=page,
-            page_size=page_size,
-            direction=direction,
-            family=family,
-            tag=tag,
-            segment=segment,
-            result=result,
+        normalized_symbol = symbol.upper()
+        filters = {
+            "direction": _clean_filter(direction),
+            "family": _clean_filter(family),
+            "tag": _clean_filter(tag),
+            "segment": _clean_filter(segment),
+            "result": _clean_filter(result),
+        }
+        clauses = ["symbol = ?"]
+        parameters: list[object] = [normalized_symbol]
+        column_filters = (
+            ("direction", "direction"),
+            ("family", "strategy_family"),
+            ("tag", "strategy_tag"),
+            ("segment", "threshold_segment"),
         )
+        for filter_name, column_name in column_filters:
+            if filters[filter_name]:
+                clauses.append(f"upper({column_name}) = ?")
+                parameters.append(filters[filter_name])
+        if filters["result"] == "OPEN":
+            clauses.append("upper(status) = 'OPEN'")
+        elif filters["result"]:
+            clauses.append("upper(coalesce(result, '')) = ?")
+            parameters.append(filters["result"])
+        where_sql = " and ".join(clauses)
+        normalized_page_size = _normalize_page_size(page_size)
 
-    def observation_summary(self, symbol: str, limit: int = OBSERVATION_SUMMARY_LIMIT) -> dict[str, Any]:
-        return summarize_observations(self.load_observations(symbol, limit=limit))
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"select count(*) from observation_signals where {where_sql}",
+                    parameters,
+                ).fetchone()[0]
+            )
+            total_pages = max(
+                1, (total + normalized_page_size - 1) // normalized_page_size
+            )
+            normalized_page = min(max(1, int(page or 1)), total_pages)
+            offset = (normalized_page - 1) * normalized_page_size
+            rows = connection.execute(
+                f"""
+                select payload
+                from observation_signals
+                where {where_sql}
+                order by opened_at desc, observation_key desc
+                limit ? offset ?
+                """,
+                [*parameters, normalized_page_size, offset],
+            ).fetchall()
+            filter_options = self._observation_filter_options_sql(
+                connection, normalized_symbol
+            )
+
+        accepted = {field.name for field in fields(ObservationSignal)}
+        observations = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            clean_payload = {
+                key: value for key, value in payload.items() if key in accepted
+            }
+            observations.append(ObservationSignal(**clean_payload).to_dict())
+        return {
+            "observations": observations,
+            "total": total,
+            "page": normalized_page,
+            "page_size": normalized_page_size,
+            "total_pages": total_pages,
+            "filters": filters,
+            "filter_options": filter_options,
+        }
+
+    @staticmethod
+    def _observation_filter_options_sql(
+        connection: sqlite3.Connection,
+        symbol: str,
+    ) -> dict[str, list[str] | list[int]]:
+        def distinct(column: str) -> list[str]:
+            rows = connection.execute(
+                f"""
+                select distinct upper({column}) as value
+                from observation_signals
+                where symbol = ? and coalesce({column}, '') != ''
+                order by value
+                """,
+                (symbol,),
+            ).fetchall()
+            return [str(row["value"]) for row in rows]
+
+        result_rows = connection.execute(
+            """
+            select distinct
+                case when upper(status) = 'OPEN'
+                     then 'OPEN' else upper(coalesce(result, '')) end as value
+            from observation_signals
+            where symbol = ?
+            """,
+            (symbol,),
+        ).fetchall()
+        result_order = {"OPEN": 0, "WIN": 1, "LOSS": 2}
+        results = sorted(
+            {str(row["value"]) for row in result_rows if row["value"]},
+            key=lambda item: result_order.get(item, 99),
+        )
+        return {
+            "direction": distinct("direction"),
+            "family": distinct("strategy_family"),
+            "tag": distinct("strategy_tag"),
+            "segment": distinct("threshold_segment"),
+            "result": results,
+            "page_size": list(ORDER_PAGE_SIZES),
+        }
+
+    def observation_summary(
+        self,
+        symbol: str,
+        window: str | int = "14d",
+        limit: int | None = None,
+        *,
+        group_limit: int = 50,
+    ) -> dict[str, Any]:
+        del limit  # Legacy row limits are accepted but no longer truncate statistics.
+        normalized_window = self._normalize_observation_window(window)
+        normalized_symbol = symbol.upper()
+        with self._connect() as connection:
+            anchor_row = connection.execute(
+                "select max(opened_at) from observation_signals where symbol = ?",
+                (normalized_symbol,),
+            ).fetchone()
+            anchor = anchor_row[0] if anchor_row else None
+            cutoff = None
+            if anchor is not None and normalized_window != "all":
+                days = int(normalized_window[:-1])
+                cutoff = int(anchor) - days * 86_400_000
+            where_sql = "symbol = ?"
+            parameters: list[object] = [normalized_symbol]
+            if cutoff is not None:
+                where_sql += " and opened_at >= ?"
+                parameters.append(cutoff)
+
+            total_row = connection.execute(
+                self._observation_summary_sql(where_sql, grouped=False),
+                parameters,
+            ).fetchone()
+            group_rows = connection.execute(
+                self._observation_summary_sql(where_sql, grouped=True),
+                parameters,
+            ).fetchall()
+
+        total = self._observation_stats_from_sql(total_row)
+        groups = [
+            _finalize_observation_group(self._observation_stats_from_sql(row))
+            for row in group_rows
+        ]
+        groups.sort(
+            key=lambda item: (
+                _observation_action_rank(item["action"]),
+                -item["settled"],
+                -item["ev"],
+                item["strategy_family"],
+                item["strategy_tag"],
+                item["direction"],
+                item["threshold_segment"],
+            )
+        )
+        action_counts: dict[str, int] = {}
+        for group in groups:
+            action_counts[group["action"]] = action_counts.get(group["action"], 0) + 1
+        return {
+            "total": _finalize_observation_stats(total),
+            "groups": groups[: max(1, int(group_limit))],
+            "group_limit": max(1, int(group_limit)),
+            "action_counts": action_counts,
+            "rules": {
+                "promote_sample": OBSERVATION_PROMOTE_SAMPLE,
+                "watch_sample": OBSERVATION_WATCH_SAMPLE,
+                "promote_win_rate": 0.6,
+                "promote_ev": 0.8,
+                "block_win_rate": 0.5,
+                "block_ev": -1.0,
+            },
+            "window": normalized_window,
+            "cutoff": cutoff,
+            "anchor": anchor,
+        }
+
+    @staticmethod
+    def _normalize_observation_window(window: str | int) -> str:
+        if isinstance(window, int):
+            return "14d"
+        normalized = str(window or "14d").strip().lower()
+        if normalized not in {"7d", "14d", "30d", "all"}:
+            raise ValueError("observation window must be 7d, 14d, 30d, or all")
+        return normalized
+
+    @staticmethod
+    def _observation_summary_sql(where_sql: str, *, grouped: bool) -> str:
+        identity = (
+            "timeframe_minutes, strategy_family, strategy_tag, direction, "
+            "threshold_segment, "
+            if grouped
+            else ""
+        )
+        group_by = (
+            " group by timeframe_minutes, strategy_family, strategy_tag, "
+            "direction, threshold_segment"
+            if grouped
+            else ""
+        )
+        settled = (
+            "upper(status) != 'OPEN' and "
+            "upper(coalesce(result, '')) in ('WIN', 'LOSS')"
+        )
+        pnl = (
+            "case when "
+            + settled
+            + " then case "
+            "when coalesce(cast(json_extract(payload, '$.pnl') as real), 0) != 0 "
+            "then cast(json_extract(payload, '$.pnl') as real) "
+            "when upper(result) = 'WIN' then 8.0 else -10.0 end else 0 end"
+        )
+        return f"""
+            select {identity}
+                   count(*) as signals,
+                   sum(case when not ({settled}) then 1 else 0 end) as open,
+                   sum(case when {settled} then 1 else 0 end) as settled,
+                   sum(case when {settled} and upper(result) = 'WIN' then 1 else 0 end) as wins,
+                   sum(case when {settled} and upper(result) = 'LOSS' then 1 else 0 end) as losses,
+                   sum({pnl}) as pnl,
+                   min(opened_at) as first_opened_at,
+                   max(opened_at) as last_opened_at
+            from observation_signals
+            where {where_sql}{group_by}
+        """
+
+    @staticmethod
+    def _observation_stats_from_sql(row: sqlite3.Row | None) -> dict[str, Any]:
+        values = dict(row) if row is not None else {}
+        return _empty_observation_stats(
+            timeframe_minutes=values.get("timeframe_minutes"),
+            strategy_family=str(values.get("strategy_family") or ""),
+            strategy_tag=str(values.get("strategy_tag") or ""),
+            direction=str(values.get("direction") or ""),
+            threshold_segment=str(values.get("threshold_segment") or ""),
+        ) | {
+            "signals": int(values.get("signals") or 0),
+            "open": int(values.get("open") or 0),
+            "settled": int(values.get("settled") or 0),
+            "wins": int(values.get("wins") or 0),
+            "losses": int(values.get("losses") or 0),
+            "pnl": float(values.get("pnl") or 0.0),
+            "first_opened_at": values.get("first_opened_at"),
+            "last_opened_at": values.get("last_opened_at"),
+        }
 
     def order_profile_summary(
         self,
@@ -1497,34 +1966,150 @@ class SQLiteMonitorStore:
         decision: str,
         created_at_ms: int,
         audit_context: dict[str, Any] | None = None,
-    ) -> None:
-        payload = {
-            **signal.to_dict(),
-            "audit_context": dict(audit_context or {}),
-        }
-        with self._connect() as connection:
-            connection.execute(
-                """
-                insert into signal_audit(
-                    symbol, created_at_ms, decision, direction, timeframe_minutes,
-                    threshold_segment, regime, score, threshold, reason, payload
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    symbol.upper(),
-                    created_at_ms,
-                    decision,
-                    signal.direction,
-                    signal.timeframe_minutes,
-                    signal.threshold_segment,
-                    signal.regime,
-                    signal.score,
-                    signal.threshold,
-                    signal.reason,
-                    json.dumps(payload, ensure_ascii=False),
-                ),
+        *,
+        has_formal_candidate: bool = False,
+        has_observation_candidate: bool = False,
+    ) -> bool:
+        normalized_symbol = symbol.upper()
+        normalized_decision = str(decision or "UNKNOWN").upper()
+        normalized_audit = dict(audit_context or {})
+        ordinary_heartbeat = (
+            normalized_decision in _ORDINARY_SIGNAL_DECISIONS
+            and not bool(has_formal_candidate)
+            and not bool(has_observation_candidate)
+        )
+        reason_code = str(
+            normalized_audit.get("reason_code")
+            or signal.first_decisive_block
+            or normalized_decision
+        )
+        aggregation_key = (
+            _signal_audit_aggregation_key(
+                normalized_symbol,
+                signal,
+                normalized_decision,
+                created_at_ms,
+                reason_code,
+                normalized_audit,
             )
+            if ordinary_heartbeat
+            else None
+        )
+        if has_observation_candidate:
+            event_kind = "OBSERVATION_CANDIDATE"
+        elif normalized_decision == "OPENED":
+            event_kind = "ORDER_OPENED"
+        elif ordinary_heartbeat:
+            event_kind = "HEARTBEAT"
+        elif normalized_decision.endswith("BLOCKED"):
+            event_kind = "DECISIVE_BLOCK"
+        else:
+            event_kind = "DECISION"
+        payload = _signal_audit_payload(
+            signal,
+            normalized_decision,
+            normalized_audit,
+            reason_code,
+        )
+        write_class = (
+            StorageWriteClass.ORDINARY_AUDIT
+            if ordinary_heartbeat
+            else StorageWriteClass.CORE
+        )
+        try:
+            with self._connect() as connection:
+                connection.execute("begin immediate")
+                if ordinary_heartbeat:
+                    previous = connection.execute(
+                        """
+                        select payload
+                        from signal_audit
+                        where symbol = ? and record_version = ?
+                        order by coalesce(last_at_ms, created_at_ms) desc, id desc
+                        limit 1
+                        """,
+                        (normalized_symbol, SIGNAL_AUDIT_VERSION),
+                    ).fetchone()
+                    if previous is not None:
+                        try:
+                            previous_payload = json.loads(previous["payload"])
+                        except (TypeError, json.JSONDecodeError):
+                            previous_payload = {}
+                        previous_state = previous_payload.get("state_code")
+                        if (
+                            previous_state is not None
+                            and previous_state != payload["state_code"]
+                        ):
+                            ordinary_heartbeat = False
+                            aggregation_key = None
+                            event_kind = "STATE_CHANGE"
+                            write_class = StorageWriteClass.CORE
+                capacity = capacity_from_connection(connection)
+                if ordinary_heartbeat and not capacity.ordinary_audit_allowed:
+                    return False
+                if not ordinary_heartbeat:
+                    ensure_write_allowed(capacity, write_class)
+                connection.execute(
+                    """
+                    insert into signal_audit(
+                        symbol, created_at_ms, decision, direction, timeframe_minutes,
+                        threshold_segment, regime, score, threshold, reason, payload,
+                        record_version, decision_id, runtime_config_hash, event_kind,
+                        first_at_ms, last_at_ms, occurrences, score_min, score_max,
+                        aggregation_key
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    on conflict(symbol, aggregation_key)
+                    where aggregation_key is not null
+                    do update set
+                        created_at_ms=excluded.created_at_ms,
+                        decision=excluded.decision,
+                        direction=excluded.direction,
+                        timeframe_minutes=excluded.timeframe_minutes,
+                        threshold_segment=excluded.threshold_segment,
+                        regime=excluded.regime,
+                        score=excluded.score,
+                        threshold=excluded.threshold,
+                        reason=excluded.reason,
+                        payload=excluded.payload,
+                        record_version=excluded.record_version,
+                        decision_id=excluded.decision_id,
+                        runtime_config_hash=excluded.runtime_config_hash,
+                        event_kind=excluded.event_kind,
+                        last_at_ms=excluded.last_at_ms,
+                        occurrences=signal_audit.occurrences + 1,
+                        score_min=min(signal_audit.score_min, excluded.score_min),
+                        score_max=max(signal_audit.score_max, excluded.score_max)
+                    """,
+                    (
+                        normalized_symbol,
+                        int(created_at_ms),
+                        normalized_decision,
+                        signal.direction,
+                        signal.timeframe_minutes,
+                        signal.threshold_segment,
+                        signal.regime,
+                        signal.score,
+                        signal.threshold,
+                        signal.reason,
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                        SIGNAL_AUDIT_VERSION,
+                        signal.decision_id or None,
+                        signal.runtime_config_hash or None,
+                        event_kind,
+                        int(created_at_ms),
+                        int(created_at_ms),
+                        signal.score,
+                        signal.score,
+                        aggregation_key,
+                    ),
+                )
+        except sqlite3.Error as error:
+            try:
+                raise_for_sqlite_write_error(error, write_class)
+            except OrdinaryAuditCapacityError:
+                return False
+        return True
 
     def save_order_entry_snapshot(self, order: SimulatedOrder, symbol: str, entry_snapshot: dict[str, Any]) -> None:
         with self._connect() as connection:
@@ -1634,10 +2219,13 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 """
                 select symbol, created_at_ms, decision, direction, timeframe_minutes,
-                       threshold_segment, regime, score, threshold, reason
+                       threshold_segment, regime, score, threshold, reason,
+                       record_version, decision_id, runtime_config_hash, event_kind,
+                       first_at_ms, last_at_ms, occurrences, score_min, score_max,
+                       aggregation_key
                 from signal_audit
                 where symbol = ?
-                order by id desc
+                order by coalesce(last_at_ms, created_at_ms) desc, id desc
                 limit ?
                 """,
                 (symbol.upper(), limit),
@@ -1649,10 +2237,11 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 """
                 select created_at_ms, decision, direction, timeframe_minutes,
-                       threshold_segment, payload
+                       threshold_segment, payload, occurrences,
+                       coalesce(last_at_ms, created_at_ms) as effective_at_ms
                 from signal_audit
                 where symbol = ?
-                order by id desc
+                order by coalesce(last_at_ms, created_at_ms) desc, id desc
                 limit ?
                 """,
                 (symbol.upper(), max(1, int(limit))),
@@ -1660,8 +2249,13 @@ class SQLiteMonitorStore:
         records = []
         for row in reversed(rows):
             payload = json.loads(row["payload"])
-            audit = payload.get("audit_context") or {}
-            profile_key = str(payload.get("profile_key") or "")
+            audit = payload.get("audit_context") or payload.get("guards") or {}
+            identity = payload.get("identity") or {}
+            profile_key = str(
+                payload.get("profile_key")
+                or identity.get("profile_key")
+                or ""
+            )
             if not profile_key:
                 profile_key = "|".join(
                     [
@@ -1678,27 +2272,52 @@ class SQLiteMonitorStore:
                     "profile_context": "|".join(
                         [
                             profile_key,
-                            str(payload.get("daily_profile_version") or "STATIC"),
-                            str(payload.get("order_slot") or "UNKNOWN"),
+                            str(
+                                payload.get("daily_profile_version")
+                                or identity.get("daily_profile_version")
+                                or "STATIC"
+                            ),
+                            str(
+                                payload.get("order_slot")
+                                or identity.get("order_slot")
+                                or "UNKNOWN"
+                            ),
                         ]
                     ),
                     "result_sequence_status": str(
-                        (audit.get("result_sequence_guard") or {}).get("status")
+                        (
+                            audit.get("result_sequence_guard")
+                            or audit.get("result_sequence")
+                            or {}
+                        ).get("status")
                         or "UNKNOWN"
                     ),
                     "profile_degradation_status": str(
-                        (audit.get("profile_degradation_guard") or {}).get("status")
+                        (
+                            audit.get("profile_degradation_guard")
+                            or audit.get("profile_degradation")
+                            or {}
+                        ).get("status")
                         or "UNKNOWN"
                     ),
                     "wave_batch_status": str(
-                        (audit.get("wave_batch_guard") or {}).get("status")
-                        or (audit.get("wave_batch_guard") or {}).get("code")
+                        (
+                            audit.get("wave_batch_guard")
+                            or audit.get("wave_batch")
+                            or {}
+                        ).get("status")
+                        or (
+                            audit.get("wave_batch_guard")
+                            or audit.get("wave_batch")
+                            or {}
+                        ).get("code")
                         or "UNKNOWN"
                     ),
                     "rolling_edge_status": str(
                         (audit.get("rolling_edge") or {}).get("status")
                         or "UNKNOWN"
                     ),
+                    "occurrences": int(row["occurrences"] or 1),
                 }
             )
         return _summarize_signal_audit(records)
