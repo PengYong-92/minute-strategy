@@ -9,6 +9,7 @@ from typing import Any
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
+from app.storage_schema import migrate
 from app.wave_state import WAVE_RUNTIME_VERSION, WaveSnapshot
 
 
@@ -1445,3 +1446,4 @@ class SQLiteMonitorStore:
             connection.execute(
                 "create index if not exists idx_order_entry_snapshots_symbol_result on order_entry_snapshots(symbol, result)"
             )
+            migrate(connection)

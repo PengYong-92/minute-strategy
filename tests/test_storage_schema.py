@@ -1,0 +1,629 @@
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from app.models import SimulatedOrder
+from app.storage import SQLiteMonitorStore
+
+try:
+    from app.storage_schema import SCHEMA_VERSION, migrate
+except ModuleNotFoundError:
+    SCHEMA_VERSION = None
+    migrate = None
+
+
+ORDER_PAYLOAD = '{"legacy":"order","raw":"\\u0000"}'
+OBSERVATION_PAYLOAD = b"\x00\xfflegacy-observation"
+ENTRY_PAYLOAD = '{"entry":[1,2,3]}'
+SETTLEMENT_PAYLOAD = b"\x10\x11settled"
+AUDIT_PAYLOAD = '{"audit": "exact spacing"}'
+
+
+def _create_legacy_schema(
+    connection: sqlite3.Connection,
+    *,
+    order_decision_id_exists: bool = False,
+) -> None:
+    order_extra = ", decision_id text" if order_decision_id_exists else ""
+    connection.executescript(
+        f"""
+        create table orders (
+            symbol text not null,
+            order_id integer not null,
+            status text not null,
+            result text,
+            opened_at integer not null,
+            settled_at integer,
+            payload text not null,
+            updated_at_ms integer not null default (strftime('%s','now') * 1000)
+            {order_extra},
+            primary key(symbol, order_id)
+        );
+
+        create table observation_signals (
+            symbol text not null,
+            observation_key text not null,
+            status text not null,
+            result text,
+            direction text not null,
+            strategy_family text not null,
+            strategy_tag text not null,
+            timeframe_minutes integer not null,
+            threshold_segment text not null,
+            opened_at integer not null,
+            expires_at integer not null,
+            settled_at integer,
+            payload text not null,
+            created_at_ms integer not null default (strftime('%s','now') * 1000),
+            updated_at_ms integer not null default (strftime('%s','now') * 1000),
+            primary key(symbol, observation_key)
+        );
+
+        create table order_entry_snapshots (
+            symbol text not null,
+            order_id integer not null,
+            direction text not null,
+            timeframe_minutes integer not null,
+            opened_at integer not null,
+            expires_at integer not null,
+            entry_price real not null,
+            stake real not null,
+            win_return real not null,
+            stake_progression_step integer not null,
+            threshold_segment text not null,
+            regime text not null,
+            score real not null,
+            threshold real not null,
+            edge real not null,
+            result text,
+            settled_at integer,
+            exit_price real,
+            pnl real not null default 0.0,
+            entry_payload text not null,
+            settlement_payload text,
+            created_at_ms integer not null default (strftime('%s','now') * 1000),
+            updated_at_ms integer not null default (strftime('%s','now') * 1000),
+            primary key(symbol, order_id)
+        );
+
+        create table signal_audit (
+            id integer primary key autoincrement,
+            symbol text not null,
+            created_at_ms integer not null,
+            decision text not null,
+            direction text not null,
+            timeframe_minutes integer not null,
+            threshold_segment text not null,
+            regime text not null,
+            score real not null,
+            threshold real not null,
+            reason text not null,
+            payload text not null
+        );
+        """
+    )
+
+
+def _insert_legacy_sentinels(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        insert into orders(
+            symbol, order_id, status, result, opened_at, settled_at, payload
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("BTCUSDT", 7, "OPEN", None, 1_000, None, ORDER_PAYLOAD),
+    )
+    connection.execute(
+        """
+        insert into observation_signals(
+            symbol, observation_key, status, result, direction,
+            strategy_family, strategy_tag, timeframe_minutes,
+            threshold_segment, opened_at, expires_at, settled_at, payload
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BTCUSDT",
+            "legacy-observation",
+            "OPEN",
+            None,
+            "LONG",
+            "legacy",
+            "sentinel",
+            10,
+            "WD-00",
+            1_000,
+            601_000,
+            None,
+            sqlite3.Binary(OBSERVATION_PAYLOAD),
+        ),
+    )
+    connection.execute(
+        """
+        insert into order_entry_snapshots(
+            symbol, order_id, direction, timeframe_minutes, opened_at,
+            expires_at, entry_price, stake, win_return,
+            stake_progression_step, threshold_segment, regime, score,
+            threshold, edge, result, settled_at, exit_price, pnl,
+            entry_payload, settlement_payload
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BTCUSDT",
+            7,
+            "LONG",
+            10,
+            1_000,
+            601_000,
+            100.0,
+            10.0,
+            18.0,
+            1,
+            "WD-00",
+            "UNKNOWN",
+            80.0,
+            70.0,
+            10.0,
+            None,
+            None,
+            None,
+            0.0,
+            ENTRY_PAYLOAD,
+            sqlite3.Binary(SETTLEMENT_PAYLOAD),
+        ),
+    )
+    connection.execute(
+        """
+        insert into signal_audit(
+            symbol, created_at_ms, decision, direction, timeframe_minutes,
+            threshold_segment, regime, score, threshold, reason, payload
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BTCUSDT",
+            1_000,
+            "OPENED",
+            "LONG",
+            10,
+            "WD-00",
+            "UNKNOWN",
+            80.0,
+            70.0,
+            "legacy audit",
+            AUDIT_PAYLOAD,
+        ),
+    )
+    connection.commit()
+
+
+def _column_details(connection: sqlite3.Connection, table: str) -> dict[str, tuple]:
+    return {
+        row[1]: (str(row[2]).upper(), row[3], row[4], row[5])
+        for row in connection.execute(f"pragma table_info({table})")
+    }
+
+
+def _schema_snapshot(connection: sqlite3.Connection) -> tuple[int, tuple[tuple, ...]]:
+    schema_version = connection.execute("pragma schema_version").fetchone()[0]
+    objects = tuple(
+        connection.execute(
+            """
+            select type, name, tbl_name, sql
+            from sqlite_master
+            where name not like 'sqlite_%'
+            order by type, name
+            """
+        ).fetchall()
+    )
+    return schema_version, objects
+
+
+def _legacy_payload_snapshot(connection: sqlite3.Connection) -> dict[str, tuple]:
+    return {
+        "orders": connection.execute(
+            "select count(*), typeof(payload), payload from orders"
+        ).fetchone(),
+        "observation_signals": connection.execute(
+            "select count(*), typeof(payload), payload from observation_signals"
+        ).fetchone(),
+        "order_entry_snapshots": connection.execute(
+            """
+            select count(*), typeof(entry_payload), entry_payload,
+                   typeof(settlement_payload), settlement_payload
+            from order_entry_snapshots
+            """
+        ).fetchone(),
+        "signal_audit": connection.execute(
+            "select count(*), typeof(payload), payload from signal_audit"
+        ).fetchone(),
+    }
+
+
+class StorageSchemaMigrationTest(unittest.TestCase):
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        if migrate is None:
+            self.fail("app.storage_schema.migrate is not implemented")
+        migrate(connection)
+
+    def test_zero_and_v1_databases_upgrade_to_v2(self):
+        self.assertEqual(SCHEMA_VERSION, 2)
+        for legacy_version in (0, 1):
+            with self.subTest(legacy_version=legacy_version):
+                connection = sqlite3.connect(":memory:")
+                self.addCleanup(connection.close)
+                _create_legacy_schema(connection)
+                connection.execute(f"pragma user_version = {legacy_version}")
+
+                self._migrate(connection)
+
+                self.assertEqual(
+                    connection.execute("pragma user_version").fetchone()[0],
+                    2,
+                )
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "select name from sqlite_master where type = 'table'"
+                    )
+                }
+                self.assertIn("runtime_config_snapshots", tables)
+                self.assertIn("decision_contexts", tables)
+
+    def test_creates_all_v2_tables_columns_indexes_and_partial_unique_rule(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+
+        self._migrate(connection)
+
+        runtime_columns = _column_details(connection, "runtime_config_snapshots")
+        self.assertEqual(
+            runtime_columns,
+            {
+                "runtime_config_hash": ("TEXT", 0, None, 1),
+                "context_version": ("TEXT", 1, None, 0),
+                "strategy_build_id": ("TEXT", 1, None, 0),
+                "canonical_payload": ("TEXT", 1, None, 0),
+                "payload_bytes": ("INTEGER", 1, None, 0),
+                "created_at_ms": ("INTEGER", 1, None, 0),
+            },
+        )
+        decision_columns = _column_details(connection, "decision_contexts")
+        self.assertEqual(
+            decision_columns,
+            {
+                "symbol": ("TEXT", 1, None, 1),
+                "decision_id": ("TEXT", 1, None, 2),
+                "context_version": ("TEXT", 1, None, 0),
+                "runtime_config_hash": ("TEXT", 1, None, 0),
+                "strategy_build_id": ("TEXT", 1, None, 0),
+                "created_at_ms": ("INTEGER", 1, None, 0),
+                "closed_kline_at_ms": ("INTEGER", 1, None, 0),
+                "direction": ("TEXT", 1, "''", 0),
+                "profile_key": ("TEXT", 1, "''", 0),
+                "candidate_origin": ("TEXT", 1, "''", 0),
+                "input_payload": ("TEXT", 1, None, 0),
+                "outcome_payload": ("TEXT", 1, None, 0),
+            },
+        )
+        expected_added_columns = {
+            "orders": {
+                "decision_id": ("TEXT", 0, None, 0),
+                "runtime_config_hash": ("TEXT", 0, None, 0),
+            },
+            "observation_signals": {
+                "decision_id": ("TEXT", 0, None, 0),
+                "runtime_config_hash": ("TEXT", 0, None, 0),
+                "context_version": ("TEXT", 0, None, 0),
+                "candidate_origin": ("TEXT", 0, None, 0),
+                "qualification_state": ("TEXT", 0, None, 0),
+                "adaptive_state": ("TEXT", 0, None, 0),
+                "entry_structure_state": ("TEXT", 0, None, 0),
+                "entry_structure_bias": ("TEXT", 0, None, 0),
+                "active_level_source": ("TEXT", 0, None, 0),
+            },
+            "order_entry_snapshots": {
+                "decision_id": ("TEXT", 0, None, 0),
+                "context_version": ("TEXT", 0, None, 0),
+                "runtime_config_hash": ("TEXT", 0, None, 0),
+            },
+            "signal_audit": {
+                "record_version": ("TEXT", 0, None, 0),
+                "decision_id": ("TEXT", 0, None, 0),
+                "runtime_config_hash": ("TEXT", 0, None, 0),
+                "event_kind": ("TEXT", 0, None, 0),
+                "first_at_ms": ("INTEGER", 0, None, 0),
+                "last_at_ms": ("INTEGER", 0, None, 0),
+                "occurrences": ("INTEGER", 1, "1", 0),
+                "score_min": ("REAL", 0, None, 0),
+                "score_max": ("REAL", 0, None, 0),
+                "aggregation_key": ("TEXT", 0, None, 0),
+            },
+        }
+        for table, expected in expected_added_columns.items():
+            with self.subTest(table=table):
+                actual = _column_details(connection, table)
+                self.assertEqual(
+                    {column: actual[column] for column in expected},
+                    expected,
+                )
+
+        expected_indexes = {
+            "decision_contexts": {
+                ("symbol", "closed_kline_at_ms"): (0, 0),
+                ("symbol", "profile_key", "closed_kline_at_ms"): (0, 0),
+            },
+            "observation_signals": {
+                ("symbol", "candidate_origin", "opened_at"): (0, 0),
+                ("symbol", "adaptive_state", "opened_at"): (0, 0),
+                ("symbol", "entry_structure_bias", "opened_at"): (0, 0),
+            },
+            "signal_audit": {
+                ("symbol", "aggregation_key"): (1, 1),
+            },
+        }
+        for table, expected in expected_indexes.items():
+            actual = {}
+            for row in connection.execute(f"pragma index_list({table})"):
+                columns = tuple(
+                    info[2]
+                    for info in connection.execute(
+                        f"pragma index_info('{row[1]}')"
+                    )
+                )
+                actual[columns] = (row[2], row[4])
+            with self.subTest(table=table):
+                for columns, flags in expected.items():
+                    self.assertEqual(actual.get(columns), flags)
+
+        self._insert_audit(connection, "BTCUSDT", "aggregate-1")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_audit(connection, "BTCUSDT", "aggregate-1")
+        self._insert_audit(connection, "ETHUSDT", "aggregate-1")
+        self._insert_audit(connection, "BTCUSDT", None)
+        self._insert_audit(connection, "BTCUSDT", None)
+
+    def test_preserves_legacy_row_counts_and_exact_payload_values(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        _insert_legacy_sentinels(connection)
+        before = _legacy_payload_snapshot(connection)
+        changes_before = connection.total_changes
+
+        self._migrate(connection)
+
+        self.assertEqual(_legacy_payload_snapshot(connection), before)
+        self.assertEqual(connection.total_changes, changes_before)
+        self.assertEqual(before["orders"], (1, "text", ORDER_PAYLOAD))
+        self.assertEqual(
+            before["observation_signals"],
+            (1, "blob", OBSERVATION_PAYLOAD),
+        )
+        self.assertEqual(
+            before["order_entry_snapshots"],
+            (1, "text", ENTRY_PAYLOAD, "blob", SETTLEMENT_PAYLOAD),
+        )
+        self.assertEqual(before["signal_audit"], (1, "text", AUDIT_PAYLOAD))
+
+    def test_old_rows_keep_nullable_v2_columns_null_and_new_audit_uses_default(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        _insert_legacy_sentinels(connection)
+
+        self._migrate(connection)
+
+        self.assertEqual(
+            connection.execute(
+                "select decision_id, runtime_config_hash from orders"
+            ).fetchone(),
+            (None, None),
+        )
+        self.assertEqual(
+            connection.execute(
+                """
+                select decision_id, runtime_config_hash, context_version,
+                       candidate_origin, qualification_state, adaptive_state,
+                       entry_structure_state, entry_structure_bias,
+                       active_level_source
+                from observation_signals
+                """
+            ).fetchone(),
+            (None,) * 9,
+        )
+        self.assertEqual(
+            connection.execute(
+                """
+                select decision_id, context_version, runtime_config_hash
+                from order_entry_snapshots
+                """
+            ).fetchone(),
+            (None, None, None),
+        )
+        self.assertEqual(
+            connection.execute(
+                """
+                select record_version, decision_id, runtime_config_hash,
+                       event_kind, first_at_ms, last_at_ms, score_min,
+                       score_max, aggregation_key
+                from signal_audit
+                """
+            ).fetchone(),
+            (None,) * 9,
+        )
+        new_id = self._insert_audit(connection, "BTCUSDT", "default-check")
+        self.assertEqual(
+            connection.execute(
+                "select occurrences from signal_audit where id = ?",
+                (new_id,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_second_migration_is_a_schema_no_op(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        self._migrate(connection)
+        before = _schema_snapshot(connection)
+        traced = []
+        connection.set_trace_callback(traced.append)
+
+        self._migrate(connection)
+
+        connection.set_trace_callback(None)
+        self.assertEqual(_schema_snapshot(connection), before)
+        self.assertFalse(
+            any(
+                statement.lstrip().upper().startswith(
+                    ("ALTER ", "CREATE ", "DROP ", "INSERT ", "UPDATE ", "DELETE ")
+                )
+                for statement in traced
+            ),
+            traced,
+        )
+
+    def test_database_marked_v2_returns_without_schema_mutation(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute("pragma user_version = 2")
+        before = _schema_snapshot(connection)
+
+        self._migrate(connection)
+
+        self.assertEqual(_schema_snapshot(connection), before)
+        self.assertNotIn("decision_id", _column_details(connection, "orders"))
+        self.assertEqual(
+            connection.execute(
+                """
+                select count(*) from sqlite_master
+                where name in ('runtime_config_snapshots', 'decision_contexts')
+                """
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_fresh_store_is_v2_and_existing_order_behavior_still_works(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            order = SimulatedOrder(
+                id=9,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="schema integration",
+                entry_price=100.0,
+                opened_at=1_000,
+                expires_at=601_000,
+            )
+
+            store.save_order(order, "BTCUSDT")
+            restored = store.load_orders("BTCUSDT")
+            with sqlite3.connect(db_path) as connection:
+                version = connection.execute("pragma user_version").fetchone()[0]
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "select name from sqlite_master where type = 'table'"
+                    )
+                }
+                order_v2_values = connection.execute(
+                    """
+                    select decision_id, runtime_config_hash
+                    from orders where symbol = 'BTCUSDT' and order_id = 9
+                    """
+                ).fetchone()
+
+        self.assertEqual(version, 2)
+        self.assertTrue(
+            {
+                "orders",
+                "stake_progression_runtime",
+                "wave_runtime",
+                "stake_progression_credits",
+                "signal_audit",
+                "observation_signals",
+                "daily_profile_selections",
+                "order_entry_snapshots",
+                "runtime_config_snapshots",
+                "decision_contexts",
+            }.issubset(tables)
+        )
+        self.assertEqual(order_v2_values, (None, None))
+        self.assertEqual(restored, [order])
+
+    def test_ddl_failure_rolls_back_schema_and_user_version(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        connection.execute("pragma user_version = 1")
+        before = _schema_snapshot(connection)
+
+        def deny_v2_index(action, arg1, _arg2, _database, _trigger):
+            if (
+                action == sqlite3.SQLITE_CREATE_INDEX
+                and arg1 == "idx_decision_contexts_symbol_closed_kline"
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(deny_v2_index)
+        with self.assertRaises(sqlite3.DatabaseError):
+            self._migrate(connection)
+        connection.set_authorizer(None)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 1)
+        self.assertEqual(_schema_snapshot(connection), before)
+        self.assertNotIn("decision_id", _column_details(connection, "orders"))
+        self.assertEqual(
+            connection.execute(
+                """
+                select count(*) from sqlite_master
+                where type = 'table' and name in (
+                    'runtime_config_snapshots', 'decision_contexts'
+                )
+                """
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_existing_v2_column_does_not_cause_duplicate_column_failure(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection, order_decision_id_exists=True)
+        connection.execute("pragma user_version = 1")
+
+        self._migrate(connection)
+
+        order_columns = [
+            row[1] for row in connection.execute("pragma table_info(orders)")
+        ]
+        self.assertEqual(order_columns.count("decision_id"), 1)
+        self.assertIn("runtime_config_hash", order_columns)
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+
+    @staticmethod
+    def _insert_audit(
+        connection: sqlite3.Connection,
+        symbol: str,
+        aggregation_key: str | None,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            insert into signal_audit(
+                symbol, created_at_ms, decision, direction, timeframe_minutes,
+                threshold_segment, regime, score, threshold, reason, payload,
+                aggregation_key
+            ) values (?, 2000, 'OPENED', 'LONG', 10, 'WD-00',
+                      'UNKNOWN', 80.0, 70.0, 'new audit', '{}', ?)
+            """,
+            (symbol, aggregation_key),
+        )
+        return cursor.lastrowid
+
+
+if __name__ == "__main__":
+    unittest.main()
