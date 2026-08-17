@@ -1,11 +1,19 @@
+import hashlib
 import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import fields, replace
 from unittest import mock
 from pathlib import Path
 
+from app.decision_context import (
+    CONTEXT_VERSION,
+    DecisionContext,
+    RuntimeConfigSnapshot,
+    runtime_config_snapshot,
+)
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
@@ -102,7 +110,484 @@ def progression_order(
     )
 
 
+def decision_context(
+    snapshot: RuntimeConfigSnapshot,
+    **overrides,
+) -> DecisionContext:
+    arguments = {
+        "decision_id": "decision-1",
+        "context_version": CONTEXT_VERSION,
+        "runtime_config_hash": snapshot.hash,
+        "strategy_build_id": snapshot.strategy_build_id,
+        "symbol": "BTCUSDT",
+        "closed_kline_at_ms": 1_700_000_000_000,
+        "candidate_origin": "strategy",
+        "inputs": {
+            "identity": {
+                "direction": "LONG",
+                "profile_key": "profile-a",
+            },
+            "market": {"close": 100.25},
+        },
+        "decision_trace": (
+            {
+                "stage": "qualification",
+                "result": "PASS",
+                "decisive_values": {"score": 82.0},
+                "reason_code": "QUALIFIED",
+            },
+        ),
+        "first_decisive_block": "",
+        "final_decision": "OPEN",
+        "final_reason": "accepted",
+        "open_allowed": True,
+        "observation_allowed": False,
+    }
+    arguments.update(overrides)
+    return DecisionContext(**arguments)
+
+
+def snapshot_with_payload(
+    canonical_payload: str,
+    *,
+    strategy_build_id: str = "build-7",
+    runtime_config_hash: str | None = None,
+) -> RuntimeConfigSnapshot:
+    return RuntimeConfigSnapshot(
+        hash=runtime_config_hash
+        or hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest(),
+        canonical_payload=canonical_payload,
+        strategy_build_id=strategy_build_id,
+    )
+
+
 class SQLiteMonitorStoreTest(unittest.TestCase):
+    def test_runtime_config_snapshot_round_trip_is_json_safe_and_independent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            snapshot = runtime_config_snapshot(
+                {"threshold": 81.5, "guard": {"enabled": True}},
+                strategy_build_id="build-7",
+            )
+
+            store.save_runtime_config_snapshot(snapshot)
+            first = store.load_runtime_config_snapshot(snapshot.hash)
+            second = store.load_runtime_config_snapshot(snapshot.hash)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(
+            set(first),
+            {
+                "runtime_config_hash",
+                "context_version",
+                "strategy_build_id",
+                "canonical_payload",
+                "payload_bytes",
+                "created_at_ms",
+            },
+        )
+        self.assertEqual(first["runtime_config_hash"], snapshot.hash)
+        self.assertEqual(first["context_version"], CONTEXT_VERSION)
+        self.assertEqual(first["strategy_build_id"], "build-7")
+        self.assertEqual(first["canonical_payload"], snapshot.canonical_payload)
+        self.assertEqual(
+            first["payload_bytes"],
+            len(snapshot.canonical_payload.encode("utf-8")),
+        )
+        self.assertIs(type(first["created_at_ms"]), int)
+        self.assertEqual(json.loads(json.dumps(first, allow_nan=False)), first)
+        self.assertEqual(second, first)
+        self.assertIsNot(second, first)
+        first["strategy_build_id"] = "mutated"
+        self.assertEqual(second["strategy_build_id"], "build-7")
+
+    def test_runtime_config_repeated_save_keeps_one_unchanged_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            snapshot = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-7",
+            )
+
+            store.save_runtime_config_snapshot(snapshot)
+            original = store.load_runtime_config_snapshot(snapshot.hash)
+            store.save_runtime_config_snapshot(snapshot)
+            repeated = store.load_runtime_config_snapshot(snapshot.hash)
+            with closing(sqlite3.connect(db_path)) as connection:
+                count = connection.execute(
+                    "select count(*) from runtime_config_snapshots"
+                ).fetchone()[0]
+
+        self.assertEqual(count, 1)
+        self.assertEqual(repeated, original)
+
+    def test_runtime_config_same_hash_preserves_first_seen_build(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            first_store = SQLiteMonitorStore(db_path)
+            second_store = SQLiteMonitorStore(db_path)
+            first = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-a",
+            )
+            second = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-b",
+            )
+
+            first_store.save_runtime_config_snapshot(first)
+            second_store.save_runtime_config_snapshot(second)
+            restored = second_store.load_runtime_config_snapshot(first.hash)
+            with closing(sqlite3.connect(db_path)) as connection:
+                count = connection.execute(
+                    "select count(*) from runtime_config_snapshots"
+                ).fetchone()[0]
+
+        self.assertEqual(first.hash, second.hash)
+        self.assertEqual(count, 1)
+        self.assertEqual(restored["strategy_build_id"], "build-a")
+
+    def test_runtime_config_rejects_malformed_hash_or_payload_without_writing(self):
+        payloads = {
+            "malformed hash": snapshot_with_payload(
+                '{"threshold":81.5}',
+                runtime_config_hash="A" * 64,
+            ),
+            "noncanonical json": snapshot_with_payload('{"b":2, "a":1}'),
+            "nan": snapshot_with_payload('{"threshold":NaN}'),
+            "invalid json": snapshot_with_payload("{"),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+
+            for label, snapshot in payloads.items():
+                with self.subTest(label=label):
+                    with self.assertRaises((TypeError, ValueError)):
+                        store.save_runtime_config_snapshot(snapshot)
+                    with closing(sqlite3.connect(db_path)) as connection:
+                        count = connection.execute(
+                            "select count(*) from runtime_config_snapshots"
+                        ).fetchone()[0]
+                    self.assertEqual(count, 0)
+
+    def test_runtime_config_rejects_injected_collision_without_overwriting(self):
+        valid = runtime_config_snapshot(
+            {"threshold": 81.5},
+            strategy_build_id="build-7",
+        )
+        conflicts = {
+            "payload": {
+                "context_version": CONTEXT_VERSION,
+                "canonical_payload": '{"threshold":80.0}',
+                "payload_bytes": len('{"threshold":80.0}'.encode("utf-8")),
+            },
+            "version": {
+                "context_version": "DECISION_CONTEXT_V1",
+                "canonical_payload": valid.canonical_payload,
+                "payload_bytes": len(valid.canonical_payload.encode("utf-8")),
+            },
+            "bytes": {
+                "context_version": CONTEXT_VERSION,
+                "canonical_payload": valid.canonical_payload,
+                "payload_bytes": 1,
+            },
+        }
+        for label, conflict in conflicts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                injected = (
+                    valid.hash,
+                    conflict["context_version"],
+                    "injected-build",
+                    conflict["canonical_payload"],
+                    conflict["payload_bytes"],
+                    123,
+                )
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.execute(
+                        """
+                        insert into runtime_config_snapshots(
+                            runtime_config_hash, context_version, strategy_build_id,
+                            canonical_payload, payload_bytes, created_at_ms
+                        ) values (?, ?, ?, ?, ?, ?)
+                        """,
+                        injected,
+                    )
+                    connection.commit()
+
+                with self.assertRaises(ValueError):
+                    store.save_runtime_config_snapshot(valid)
+
+                with closing(sqlite3.connect(db_path)) as connection:
+                    persisted = connection.execute(
+                        """
+                        select runtime_config_hash, context_version, strategy_build_id,
+                               canonical_payload, payload_bytes, created_at_ms
+                        from runtime_config_snapshots
+                        """
+                    ).fetchone()
+                self.assertEqual(persisted, injected)
+
+    def test_decision_context_round_trip_matches_context_dict(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            snapshot = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-7",
+            )
+            context = decision_context(snapshot)
+
+            store.save_runtime_config_snapshot(snapshot)
+            store.save_decision_context(context)
+            restored = store.load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    "select * from decision_contexts"
+                ).fetchone()
+
+        self.assertEqual(restored, context.to_dict())
+        self.assertEqual(json.loads(json.dumps(restored, allow_nan=False)), restored)
+        self.assertEqual(row["created_at_ms"], context.closed_kline_at_ms)
+        self.assertEqual(row["direction"], "LONG")
+        self.assertEqual(row["profile_key"], "profile-a")
+        self.assertEqual(row["candidate_origin"], context.candidate_origin)
+        self.assertEqual(row["input_payload"], json.dumps(
+            context.to_dict()["inputs"],
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ))
+        self.assertEqual(
+            set(json.loads(row["outcome_payload"])),
+            {
+                "decision_trace",
+                "first_decisive_block",
+                "final_decision",
+                "final_reason",
+                "open_allowed",
+                "observation_allowed",
+            },
+        )
+
+    def test_decision_context_repeated_save_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            snapshot = runtime_config_snapshot({"threshold": 81.5})
+            context = decision_context(snapshot)
+            store.save_runtime_config_snapshot(snapshot)
+
+            store.save_decision_context(context)
+            with closing(sqlite3.connect(db_path)) as connection:
+                original = connection.execute(
+                    "select * from decision_contexts"
+                ).fetchone()
+            store.save_decision_context(context)
+            with closing(sqlite3.connect(db_path)) as connection:
+                repeated = connection.execute(
+                    "select * from decision_contexts"
+                ).fetchone()
+                count = connection.execute(
+                    "select count(*) from decision_contexts"
+                ).fetchone()[0]
+
+        self.assertEqual(count, 1)
+        self.assertEqual(repeated, original)
+
+    def test_decision_context_rejects_changed_frozen_data_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            snapshot = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-7",
+            )
+            context = decision_context(snapshot)
+            store.save_runtime_config_snapshot(snapshot)
+            store.save_decision_context(context)
+            with closing(sqlite3.connect(db_path)) as connection:
+                original = connection.execute(
+                    "select * from decision_contexts"
+                ).fetchone()
+
+            variants = {
+                "input": decision_context(
+                    snapshot,
+                    inputs={
+                        "identity": {
+                            "direction": "LONG",
+                            "profile_key": "profile-a",
+                        },
+                        "market": {"close": 101.0},
+                    },
+                ),
+                "outcome": decision_context(snapshot, final_reason="rejected"),
+                "metadata": decision_context(
+                    snapshot,
+                    candidate_origin="manual-replay",
+                ),
+            }
+            for label, changed in variants.items():
+                with self.subTest(label=label):
+                    with self.assertRaises(ValueError):
+                        store.save_decision_context(changed)
+                    with closing(sqlite3.connect(db_path)) as connection:
+                        persisted = connection.execute(
+                            "select * from decision_contexts"
+                        ).fetchone()
+                        count = connection.execute(
+                            "select count(*) from decision_contexts"
+                        ).fetchone()[0]
+                    self.assertEqual(count, 1)
+                    self.assertEqual(persisted, original)
+
+    def test_decision_context_rejects_missing_or_wrong_version_config_reference(self):
+        snapshot = runtime_config_snapshot({"threshold": 81.5})
+        for label in ("missing", "wrong version"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                if label == "wrong version":
+                    with closing(sqlite3.connect(db_path)) as connection:
+                        connection.execute(
+                            """
+                            insert into runtime_config_snapshots(
+                                runtime_config_hash, context_version,
+                                strategy_build_id, canonical_payload,
+                                payload_bytes, created_at_ms
+                            ) values (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                snapshot.hash,
+                                "DECISION_CONTEXT_V1",
+                                snapshot.strategy_build_id,
+                                snapshot.canonical_payload,
+                                len(snapshot.canonical_payload.encode("utf-8")),
+                                123,
+                            ),
+                        )
+                        connection.commit()
+
+                with self.assertRaises(ValueError):
+                    store.save_decision_context(decision_context(snapshot))
+
+                with closing(sqlite3.connect(db_path)) as connection:
+                    count = connection.execute(
+                        "select count(*) from decision_contexts"
+                    ).fetchone()[0]
+                self.assertEqual(count, 0)
+
+    def test_decision_context_load_detects_malformed_stored_json(self):
+        snapshot = runtime_config_snapshot({"threshold": 81.5})
+        corruptions = {
+            "invalid input json": ("input_payload", "{"),
+            "input is not an object": ("input_payload", "[]"),
+            "outcome is not an object": ("outcome_payload", "[]"),
+            "trace is not a list": (
+                "outcome_payload",
+                json.dumps(
+                    {
+                        "decision_trace": {},
+                        "first_decisive_block": "",
+                        "final_decision": "OPEN",
+                        "final_reason": "accepted",
+                        "open_allowed": True,
+                        "observation_allowed": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        }
+        for label, (column, value) in corruptions.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                context = decision_context(snapshot)
+                store.save_runtime_config_snapshot(snapshot)
+                store.save_decision_context(context)
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.execute(
+                        f"update decision_contexts set {column} = ?",
+                        (value,),
+                    )
+                    connection.commit()
+
+                with self.assertRaises(ValueError):
+                    store.load_decision_context(
+                        context.symbol,
+                        context.decision_id,
+                    )
+
+    def test_decision_context_rejects_invalid_identity_metadata_without_writing(self):
+        snapshot = runtime_config_snapshot({"threshold": 81.5})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.save_runtime_config_snapshot(snapshot)
+            invalid = decision_context(
+                snapshot,
+                inputs={
+                    "identity": {
+                        "direction": ["LONG"],
+                        "profile_key": "profile-a",
+                    }
+                },
+            )
+
+            with self.assertRaises((TypeError, ValueError)):
+                store.save_decision_context(invalid)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                count = connection.execute(
+                    "select count(*) from decision_contexts"
+                ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_two_store_instances_persist_decision_context_deterministically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            first_store = SQLiteMonitorStore(db_path)
+            second_store = SQLiteMonitorStore(db_path)
+            snapshot = runtime_config_snapshot(
+                {"threshold": 81.5},
+                strategy_build_id="build-7",
+            )
+            context = decision_context(snapshot)
+
+            first_store.save_runtime_config_snapshot(snapshot)
+            first_store.save_decision_context(context)
+            second_store.save_runtime_config_snapshot(snapshot)
+            second_store.save_decision_context(context)
+            first = first_store.load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            second = second_store.load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                counts = connection.execute(
+                    """
+                    select
+                        (select count(*) from runtime_config_snapshots),
+                        (select count(*) from decision_contexts)
+                    """
+                ).fetchone()
+
+        self.assertEqual(counts, (1, 1))
+        self.assertEqual(first, context.to_dict())
+        self.assertEqual(second, first)
+
     def test_persists_and_restores_wave_runtime(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")

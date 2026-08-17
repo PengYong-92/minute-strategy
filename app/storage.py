@@ -1,11 +1,13 @@
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
+from app.decision_context import CONTEXT_VERSION, DecisionContext, RuntimeConfigSnapshot
 from app.models import ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
@@ -17,6 +19,225 @@ ORDER_PAGE_SIZES = (10, 20, 30, 50, 100)
 OBSERVATION_SUMMARY_LIMIT = 5000
 OBSERVATION_PROMOTE_SAMPLE = 30
 OBSERVATION_WATCH_SAMPLE = 10
+_LOWERCASE_HEX = frozenset("0123456789abcdef")
+_DECISION_CONTEXT_KEYS = {
+    "decision_id",
+    "context_version",
+    "runtime_config_hash",
+    "strategy_build_id",
+    "symbol",
+    "closed_kline_at_ms",
+    "candidate_origin",
+    "inputs",
+    "decision_trace",
+    "first_decisive_block",
+    "final_decision",
+    "final_reason",
+    "open_allowed",
+    "observation_allowed",
+}
+_DECISION_OUTCOME_KEYS = {
+    "decision_trace",
+    "first_decisive_block",
+    "final_decision",
+    "final_reason",
+    "open_allowed",
+    "observation_allowed",
+}
+_DECISION_CONTEXT_COLUMNS = (
+    "symbol",
+    "decision_id",
+    "context_version",
+    "runtime_config_hash",
+    "strategy_build_id",
+    "created_at_ms",
+    "closed_kline_at_ms",
+    "direction",
+    "profile_key",
+    "candidate_origin",
+    "input_payload",
+    "outcome_payload",
+)
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _parse_canonical_json(payload: object, name: str) -> object:
+    if not isinstance(payload, str):
+        raise ValueError(f"stored {name} must be a string")
+    try:
+        value = json.loads(payload)
+        canonical_payload = _compact_json(value)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must contain valid finite JSON") from error
+    if canonical_payload != payload:
+        raise ValueError(f"{name} must use canonical JSON encoding")
+    return value
+
+
+def _require_string(
+    value: object,
+    name: str,
+    *,
+    non_empty: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if non_empty and not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+def _require_runtime_config_hash(value: object) -> str:
+    digest = _require_string(value, "runtime_config_hash")
+    if len(digest) != 64 or any(character not in _LOWERCASE_HEX for character in digest):
+        raise ValueError("runtime_config_hash must be a 64-character lowercase hex digest")
+    return digest
+
+
+def _runtime_snapshot_values(
+    snapshot: RuntimeConfigSnapshot,
+) -> tuple[str, str, int]:
+    if not isinstance(snapshot, RuntimeConfigSnapshot):
+        raise TypeError("snapshot must be a RuntimeConfigSnapshot")
+    runtime_config_hash = _require_runtime_config_hash(snapshot.hash)
+    canonical_payload = _require_string(
+        snapshot.canonical_payload,
+        "canonical_payload",
+    )
+    _require_string(
+        snapshot.strategy_build_id,
+        "strategy_build_id",
+        non_empty=True,
+    )
+    _parse_canonical_json(canonical_payload, "canonical_payload")
+    actual_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    if actual_hash != runtime_config_hash:
+        raise ValueError("runtime_config_hash does not match canonical_payload")
+    return runtime_config_hash, canonical_payload, len(canonical_payload.encode("utf-8"))
+
+
+def _runtime_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    snapshot = dict(row)
+    try:
+        runtime_config_hash = _require_runtime_config_hash(
+            snapshot["runtime_config_hash"]
+        )
+        context_version = _require_string(
+            snapshot["context_version"],
+            "context_version",
+        )
+        strategy_build_id = _require_string(
+            snapshot["strategy_build_id"],
+            "strategy_build_id",
+            non_empty=True,
+        )
+        canonical_payload = _require_string(
+            snapshot["canonical_payload"],
+            "canonical_payload",
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("stored runtime configuration metadata is malformed") from error
+    if context_version != CONTEXT_VERSION:
+        raise ValueError("stored runtime configuration context version is unsupported")
+    _parse_canonical_json(canonical_payload, "canonical_payload")
+    if hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest() != runtime_config_hash:
+        raise ValueError("stored runtime configuration hash does not match its payload")
+    payload_bytes = snapshot.get("payload_bytes")
+    if type(payload_bytes) is not int or payload_bytes != len(
+        canonical_payload.encode("utf-8")
+    ):
+        raise ValueError("stored runtime configuration payload byte count is invalid")
+    created_at_ms = snapshot.get("created_at_ms")
+    if type(created_at_ms) is not int or created_at_ms < 0:
+        raise ValueError("stored runtime configuration timestamp is invalid")
+    snapshot["strategy_build_id"] = strategy_build_id
+    return snapshot
+
+
+def _decision_context_values(context: DecisionContext) -> dict[str, Any]:
+    if not isinstance(context, DecisionContext):
+        raise TypeError("context must be a DecisionContext")
+    payload = context.to_dict()
+    if not isinstance(payload, dict) or set(payload) != _DECISION_CONTEXT_KEYS:
+        raise ValueError("decision context has an invalid serialized shape")
+    try:
+        normalized_context = DecisionContext(**payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError("decision context is invalid") from error
+    normalized = normalized_context.to_dict()
+
+    symbol = _require_string(normalized["symbol"], "symbol", non_empty=True)
+    decision_id = _require_string(
+        normalized["decision_id"],
+        "decision_id",
+        non_empty=True,
+    )
+    context_version = _require_string(
+        normalized["context_version"],
+        "context_version",
+    )
+    if context_version != CONTEXT_VERSION:
+        raise ValueError("decision context version is unsupported")
+    runtime_config_hash = _require_runtime_config_hash(
+        normalized["runtime_config_hash"]
+    )
+    strategy_build_id = _require_string(
+        normalized["strategy_build_id"],
+        "strategy_build_id",
+        non_empty=True,
+    )
+    candidate_origin = _require_string(
+        normalized["candidate_origin"],
+        "candidate_origin",
+        non_empty=True,
+    )
+    closed_kline_at_ms = normalized["closed_kline_at_ms"]
+    if type(closed_kline_at_ms) is not int or closed_kline_at_ms < 0:
+        raise ValueError("closed_kline_at_ms must be a non-negative integer")
+
+    inputs = normalized["inputs"]
+    if not isinstance(inputs, dict):
+        raise TypeError("decision context inputs must be an object")
+    direction = ""
+    profile_key = ""
+    identity = inputs.get("identity")
+    if isinstance(identity, Mapping):
+        direction = _require_string(identity.get("direction", ""), "direction")
+        profile_key = _require_string(identity.get("profile_key", ""), "profile_key")
+
+    outcome = {
+        "decision_trace": normalized["decision_trace"],
+        "first_decisive_block": normalized["first_decisive_block"],
+        "final_decision": normalized["final_decision"],
+        "final_reason": normalized["final_reason"],
+        "open_allowed": normalized["open_allowed"],
+        "observation_allowed": normalized["observation_allowed"],
+    }
+    if not isinstance(outcome["decision_trace"], list):
+        raise TypeError("decision_trace must be a list")
+
+    return {
+        "symbol": symbol,
+        "decision_id": decision_id,
+        "context_version": context_version,
+        "runtime_config_hash": runtime_config_hash,
+        "strategy_build_id": strategy_build_id,
+        "created_at_ms": closed_kline_at_ms,
+        "closed_kline_at_ms": closed_kline_at_ms,
+        "direction": direction,
+        "profile_key": profile_key,
+        "candidate_origin": candidate_origin,
+        "input_payload": _compact_json(inputs),
+        "outcome_payload": _compact_json(outcome),
+    }
 
 
 def page_order_list(
@@ -392,6 +613,190 @@ class SQLiteMonitorStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+
+    def save_runtime_config_snapshot(
+        self,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> None:
+        runtime_config_hash, canonical_payload, payload_bytes = (
+            _runtime_snapshot_values(snapshot)
+        )
+        with self._connect() as connection:
+            connection.execute("begin immediate")
+            connection.execute(
+                """
+                insert or ignore into runtime_config_snapshots(
+                    runtime_config_hash, context_version, strategy_build_id,
+                    canonical_payload, payload_bytes, created_at_ms
+                )
+                values (?, ?, ?, ?, ?, strftime('%s','now') * 1000)
+                """,
+                (
+                    runtime_config_hash,
+                    CONTEXT_VERSION,
+                    snapshot.strategy_build_id,
+                    canonical_payload,
+                    payload_bytes,
+                ),
+            )
+            row = connection.execute(
+                """
+                select runtime_config_hash, context_version, strategy_build_id,
+                       canonical_payload, payload_bytes, created_at_ms
+                from runtime_config_snapshots
+                where runtime_config_hash = ?
+                """,
+                (runtime_config_hash,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("runtime configuration snapshot was not persisted")
+            stored = _runtime_row_to_dict(row)
+            if (
+                stored["context_version"] != CONTEXT_VERSION
+                or stored["canonical_payload"] != canonical_payload
+                or stored["payload_bytes"] != payload_bytes
+            ):
+                raise ValueError("runtime configuration hash collides with stored data")
+
+    def load_runtime_config_snapshot(
+        self,
+        runtime_config_hash: str,
+    ) -> dict[str, Any] | None:
+        normalized_hash = _require_runtime_config_hash(runtime_config_hash)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select runtime_config_hash, context_version, strategy_build_id,
+                       canonical_payload, payload_bytes, created_at_ms
+                from runtime_config_snapshots
+                where runtime_config_hash = ?
+                """,
+                (normalized_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _runtime_row_to_dict(row)
+
+    def save_decision_context(self, context: DecisionContext) -> None:
+        values = _decision_context_values(context)
+        with self._connect() as connection:
+            connection.execute("begin immediate")
+            runtime_row = connection.execute(
+                """
+                select context_version
+                from runtime_config_snapshots
+                where runtime_config_hash = ?
+                """,
+                (values["runtime_config_hash"],),
+            ).fetchone()
+            if runtime_row is None or runtime_row["context_version"] != CONTEXT_VERSION:
+                raise ValueError(
+                    "decision context requires a persisted V2 runtime configuration"
+                )
+
+            connection.execute(
+                """
+                insert or ignore into decision_contexts(
+                    symbol, decision_id, context_version, runtime_config_hash,
+                    strategy_build_id, created_at_ms, closed_kline_at_ms,
+                    direction, profile_key, candidate_origin, input_payload,
+                    outcome_payload
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(values[column] for column in _DECISION_CONTEXT_COLUMNS),
+            )
+            row = connection.execute(
+                """
+                select symbol, decision_id, context_version, runtime_config_hash,
+                       strategy_build_id, created_at_ms, closed_kline_at_ms,
+                       direction, profile_key, candidate_origin, input_payload,
+                       outcome_payload
+                from decision_contexts
+                where symbol = ? and decision_id = ?
+                """,
+                (values["symbol"], values["decision_id"]),
+            ).fetchone()
+            if row is None or any(
+                row[column] != values[column]
+                for column in _DECISION_CONTEXT_COLUMNS
+            ):
+                raise ValueError("decision context conflicts with frozen stored data")
+
+    def load_decision_context(
+        self,
+        symbol: str,
+        decision_id: str,
+    ) -> dict[str, Any] | None:
+        normalized_symbol = _require_string(symbol, "symbol", non_empty=True)
+        normalized_decision_id = _require_string(
+            decision_id,
+            "decision_id",
+            non_empty=True,
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select symbol, decision_id, context_version, runtime_config_hash,
+                       strategy_build_id, created_at_ms, closed_kline_at_ms,
+                       direction, profile_key, candidate_origin, input_payload,
+                       outcome_payload
+                from decision_contexts
+                where symbol = ? and decision_id = ?
+                """,
+                (normalized_symbol, normalized_decision_id),
+            ).fetchone()
+            if row is None:
+                return None
+            runtime_row = connection.execute(
+                """
+                select context_version
+                from runtime_config_snapshots
+                where runtime_config_hash = ?
+                """,
+                (row["runtime_config_hash"],),
+            ).fetchone()
+        if runtime_row is None or runtime_row["context_version"] != CONTEXT_VERSION:
+            raise ValueError("stored decision context has no V2 runtime configuration")
+
+        try:
+            inputs = _parse_canonical_json(row["input_payload"], "input_payload")
+            outcome = _parse_canonical_json(
+                row["outcome_payload"],
+                "outcome_payload",
+            )
+        except ValueError as error:
+            raise ValueError("stored decision context JSON is malformed") from error
+        if not isinstance(inputs, dict):
+            raise ValueError("stored decision context inputs must be an object")
+        if not isinstance(outcome, dict) or set(outcome) != _DECISION_OUTCOME_KEYS:
+            raise ValueError("stored decision context outcome has an invalid shape")
+        if not isinstance(outcome["decision_trace"], list):
+            raise ValueError("stored decision trace must be a list")
+
+        try:
+            restored_context = DecisionContext(
+                decision_id=row["decision_id"],
+                context_version=row["context_version"],
+                runtime_config_hash=row["runtime_config_hash"],
+                strategy_build_id=row["strategy_build_id"],
+                symbol=row["symbol"],
+                closed_kline_at_ms=row["closed_kline_at_ms"],
+                candidate_origin=row["candidate_origin"],
+                inputs=inputs,
+                decision_trace=outcome["decision_trace"],
+                first_decisive_block=outcome["first_decisive_block"],
+                final_decision=outcome["final_decision"],
+                final_reason=outcome["final_reason"],
+                open_allowed=outcome["open_allowed"],
+                observation_allowed=outcome["observation_allowed"],
+            )
+            expected = _decision_context_values(restored_context)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("stored decision context is malformed") from error
+        if any(row[column] != expected[column] for column in _DECISION_CONTEXT_COLUMNS):
+            raise ValueError("stored decision context metadata does not match its payload")
+        return restored_context.to_dict()
 
     def save_order(self, order: SimulatedOrder, symbol: str) -> None:
         with self._connect() as connection:
