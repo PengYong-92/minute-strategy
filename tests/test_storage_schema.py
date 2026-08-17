@@ -951,6 +951,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             '"aggregation_key" IS NOT NULL',
             "(aggregation_key) is not null",
             "aggregation_key NOTNULL",
+            "aggregation_key NOT NULL",
             '((("aggregation_key"))) NotNull',
             "((aggregation_key IS NOT NULL))",
         )

@@ -634,6 +634,10 @@ def _canonical_partial_predicate(sql: str | None) -> tuple[str, str] | None:
     operators = (
         (("keyword", "notnull"),),
         (
+            ("keyword", "not"),
+            ("keyword", "null"),
+        ),
+        (
             ("keyword", "is"),
             ("keyword", "not"),
             ("keyword", "null"),
