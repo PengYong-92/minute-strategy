@@ -161,7 +161,63 @@ def snapshot_with_payload(
     )
 
 
+def insert_runtime_config_row(
+    db_path: Path,
+    snapshot: RuntimeConfigSnapshot,
+    **overrides,
+) -> None:
+    values = {
+        "runtime_config_hash": snapshot.hash,
+        "context_version": CONTEXT_VERSION,
+        "strategy_build_id": snapshot.strategy_build_id,
+        "canonical_payload": snapshot.canonical_payload,
+        "payload_bytes": len(snapshot.canonical_payload.encode("utf-8")),
+        "created_at_ms": 123,
+    }
+    values.update(overrides)
+    columns = tuple(values)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"""
+            insert into runtime_config_snapshots({", ".join(columns)})
+            values ({", ".join("?" for _ in columns)})
+            """,
+            tuple(values[column] for column in columns),
+        )
+        connection.commit()
+
+
+def decision_storage_rows(db_path: Path):
+    with closing(sqlite3.connect(db_path)) as connection:
+        runtime_rows = connection.execute(
+            "select * from runtime_config_snapshots order by runtime_config_hash"
+        ).fetchall()
+        decision_rows = connection.execute(
+            "select * from decision_contexts order by symbol, decision_id"
+        ).fetchall()
+    return runtime_rows, decision_rows
+
+
 class SQLiteMonitorStoreTest(unittest.TestCase):
+    def assert_save_rejects_invalid_runtime_reference(
+        self,
+        snapshot: RuntimeConfigSnapshot,
+        **runtime_overrides,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            insert_runtime_config_row(db_path, snapshot, **runtime_overrides)
+            before = decision_storage_rows(db_path)
+
+            with self.assertRaises(ValueError):
+                store.save_decision_context(decision_context(snapshot))
+
+            after = decision_storage_rows(db_path)
+        self.assertEqual(after, before)
+        self.assertEqual(len(after[0]), 1)
+        self.assertEqual(after[1], [])
+
     def test_runtime_config_snapshot_round_trip_is_json_safe_and_independent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -484,6 +540,75 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                         "select count(*) from decision_contexts"
                     ).fetchone()[0]
                 self.assertEqual(count, 0)
+
+    def test_decision_context_save_rejects_runtime_payload_hash_mismatch(self):
+        snapshot = runtime_config_snapshot({"threshold": 81.5})
+        mismatched_payload = '{"threshold":80.0}'
+
+        self.assert_save_rejects_invalid_runtime_reference(
+            snapshot,
+            canonical_payload=mismatched_payload,
+            payload_bytes=len(mismatched_payload.encode("utf-8")),
+        )
+
+    def test_decision_context_save_rejects_runtime_payload_byte_mismatch(self):
+        snapshot = runtime_config_snapshot({"threshold": 81.5})
+
+        self.assert_save_rejects_invalid_runtime_reference(
+            snapshot,
+            payload_bytes=1,
+        )
+
+    def test_decision_context_save_rejects_malformed_or_noncanonical_runtime_json(self):
+        for label, payload in {
+            "malformed": "{",
+            "noncanonical": '{"threshold": 81.5}',
+        }.items():
+            with self.subTest(label=label):
+                self.assert_save_rejects_invalid_runtime_reference(
+                    snapshot_with_payload(payload),
+                )
+
+    def test_decision_context_load_rejects_corrupt_runtime_reference_without_changes(self):
+        corruptions = {
+            "payload": ("canonical_payload", '{"threshold":80.0}'),
+            "hash": ("runtime_config_hash", "A" * 64),
+            "bytes": ("payload_bytes", 1),
+            "version": ("context_version", "DECISION_CONTEXT_V1"),
+            "timestamp": ("created_at_ms", -1),
+        }
+        for label, (column, value) in corruptions.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                snapshot = runtime_config_snapshot({"threshold": 81.5})
+                context = decision_context(snapshot)
+                store.save_runtime_config_snapshot(snapshot)
+                store.save_decision_context(context)
+                self.assertEqual(
+                    store.load_decision_context(context.symbol, context.decision_id),
+                    context.to_dict(),
+                )
+
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.execute(
+                        f"update runtime_config_snapshots set {column} = ?",
+                        (value,),
+                    )
+                    if column == "runtime_config_hash":
+                        connection.execute(
+                            "update decision_contexts set runtime_config_hash = ?",
+                            (value,),
+                        )
+                    connection.commit()
+                before_rejection = decision_storage_rows(db_path)
+
+                with self.assertRaises(ValueError):
+                    store.load_decision_context(context.symbol, context.decision_id)
+
+                self.assertEqual(decision_storage_rows(db_path), before_rejection)
+                self.assertEqual(len(before_rejection[0]), 1)
+                self.assertEqual(len(before_rejection[1]), 1)
 
     def test_decision_context_load_detects_malformed_stored_json(self):
         snapshot = runtime_config_snapshot({"threshold": 81.5})

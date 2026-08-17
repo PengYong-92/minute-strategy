@@ -683,16 +683,18 @@ class SQLiteMonitorStore:
             connection.execute("begin immediate")
             runtime_row = connection.execute(
                 """
-                select context_version
+                select runtime_config_hash, context_version, strategy_build_id,
+                       canonical_payload, payload_bytes, created_at_ms
                 from runtime_config_snapshots
                 where runtime_config_hash = ?
                 """,
                 (values["runtime_config_hash"],),
             ).fetchone()
-            if runtime_row is None or runtime_row["context_version"] != CONTEXT_VERSION:
+            if runtime_row is None:
                 raise ValueError(
                     "decision context requires a persisted V2 runtime configuration"
                 )
+            _runtime_row_to_dict(runtime_row)
 
             connection.execute(
                 """
@@ -750,14 +752,16 @@ class SQLiteMonitorStore:
                 return None
             runtime_row = connection.execute(
                 """
-                select context_version
+                select runtime_config_hash, context_version, strategy_build_id,
+                       canonical_payload, payload_bytes, created_at_ms
                 from runtime_config_snapshots
                 where runtime_config_hash = ?
                 """,
                 (row["runtime_config_hash"],),
             ).fetchone()
-        if runtime_row is None or runtime_row["context_version"] != CONTEXT_VERSION:
-            raise ValueError("stored decision context has no V2 runtime configuration")
+            if runtime_row is None:
+                raise ValueError("stored decision context has no V2 runtime configuration")
+            _runtime_row_to_dict(runtime_row)
 
         try:
             inputs = _parse_canonical_json(row["input_payload"], "input_payload")
