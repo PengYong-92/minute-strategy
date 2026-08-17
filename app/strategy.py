@@ -60,12 +60,63 @@ class SessionEdge:
     ev: float
 
 
-def _empty_decision_inputs() -> dict[str, object]:
+def _applied_score_components(
+    branch: str,
+    direction_multiplier: float = 0.0,
+    *,
+    base_points: float = 0.0,
+    volume_points: float = 0.0,
+    move_points: float = 0.0,
+    trend_points: float = 0.0,
+    close_points: float = 0.0,
+    indicator_points: float = 0.0,
+    diagnostic_trend_score: float | None = None,
+    diagnostic_unweighted_volume_points: float | None = None,
+    diagnostic_unweighted_move_points: float | None = None,
+) -> dict[str, object]:
+    reconstructed_raw_score = direction_multiplier * (
+        base_points
+        + volume_points
+        + move_points
+        + trend_points
+        + close_points
+        + indicator_points
+    )
+    components: dict[str, object] = {
+        "branch": branch,
+        "direction_multiplier": direction_multiplier,
+        "base_points": base_points,
+        "volume_points": volume_points,
+        "move_points": move_points,
+        "trend_points": trend_points,
+        "close_points": close_points,
+        "indicator_points": indicator_points,
+        "reconstructed_raw_score": reconstructed_raw_score,
+    }
+    if diagnostic_trend_score is not None:
+        components["diagnostic_trend_score"] = diagnostic_trend_score
+    if diagnostic_unweighted_volume_points is not None:
+        components["diagnostic_unweighted_volume_points"] = diagnostic_unweighted_volume_points
+    if diagnostic_unweighted_move_points is not None:
+        components["diagnostic_unweighted_move_points"] = diagnostic_unweighted_move_points
+    return components
+
+
+def _empty_decision_inputs(branch: str) -> dict[str, object]:
     return {
         "indicators": {},
         "volume_price": {},
         "thresholds": {},
-        "score": {"raw_score": 0.0, "signed_score": 0.0},
+        "score": {
+            "raw_direction": "WAIT",
+            "raw_score": 0.0,
+            "signed_score": 0.0,
+            "score_abs": 0.0,
+            "edge": 0.0,
+            "final_direction": "WAIT",
+            "actionable": False,
+            **_applied_score_components(branch),
+        },
     }
 
 
@@ -167,7 +218,7 @@ def analyze_volume_price(
             "暂无K线数据",
             0.0,
             0,
-            decision_inputs=_empty_decision_inputs(),
+            decision_inputs=_empty_decision_inputs("no_klines_wait"),
         )
 
     if len(klines) < timeframe_minutes * 3:
@@ -179,7 +230,7 @@ def analyze_volume_price(
             "历史K线不足，等待累计样本",
             latest.close,
             latest.open_time,
-            decision_inputs=_empty_decision_inputs(),
+            decision_inputs=_empty_decision_inputs("insufficient_history_wait"),
         )
 
     latest = klines[-1]
@@ -523,26 +574,49 @@ def _score_setup(
     timeframe_minutes: int,
     regime: str,
     fear_greed_value: int | None,
-) -> tuple[str, float, str, dict[str, float]]:
-    score_components = {"trend_score": trend_score}
+) -> tuple[str, float, str, dict[str, object]]:
     if volume_state == "LOW":
         if position == "LOW" and direction == "DOWN":
-            return "WAIT", 0.0, "低位缩量下跌：买盘未明显承接，等待", score_components
+            return (
+                "WAIT",
+                0.0,
+                "低位缩量下跌：买盘未明显承接，等待",
+                _applied_score_components("low_volume_low_position_down_wait"),
+            )
         return (
             "WAIT",
             0.0,
             f"{_cn_position(position)}缩量{_cn_direction(direction)}：量能不足，等待",
-            score_components,
+            _applied_score_components("low_volume_wait"),
         )
 
     volume_points = _volume_points(volume_ratio, volume_threshold)
     move_points = _move_points(price_change_pct, move_threshold_pct)
-    trend_points = abs(trend_score) * 12.0
-    score_components.update(
-        volume_points=volume_points,
-        move_points=move_points,
-        trend_points=trend_points,
-    )
+
+    def components(
+        branch: str,
+        direction_multiplier: float = 0.0,
+        *,
+        base_points: float = 0.0,
+        applied_volume_points: float = 0.0,
+        applied_move_points: float = 0.0,
+        applied_trend_points: float = 0.0,
+        close_points: float = 0.0,
+        indicator_points: float = 0.0,
+    ) -> dict[str, object]:
+        return _applied_score_components(
+            branch,
+            direction_multiplier,
+            base_points=base_points,
+            volume_points=applied_volume_points,
+            move_points=applied_move_points,
+            trend_points=applied_trend_points,
+            close_points=close_points,
+            indicator_points=indicator_points,
+            diagnostic_trend_score=trend_score,
+            diagnostic_unweighted_volume_points=volume_points,
+            diagnostic_unweighted_move_points=move_points,
+        )
 
     short_observe = _fear_falling_trend_short_confirmed(
         timeframe_minutes,
@@ -561,34 +635,61 @@ def _score_setup(
                 "WAIT",
                 0.0,
                 f"高位放量下跌：SHORT确认不足（{note}），仅预警观察不开单",
-                score_components,
+                components("high_position_high_volume_down_unconfirmed_wait"),
             )
         indicator_points = short_indicator_points(technical, mtf_10m_bias, mtf_30m_bias)
         close_points = (1.0 - close_strength) * 8.0
-        score_components.update(indicator_points=indicator_points, close_points=close_points)
         score = -(30.0 + volume_points + move_points + max(-trend_score, 0.0) * 10.0 + close_points + indicator_points)
-        return "SHORT", score, "高位放量下跌：MACD/RSI/BOLL确认卖压，动态评分偏空", score_components
+        return (
+            "SHORT",
+            score,
+            "高位放量下跌：MACD/RSI/BOLL确认卖压，动态评分偏空",
+            components(
+                "high_position_high_volume_down_short",
+                -1.0,
+                base_points=30.0,
+                applied_volume_points=volume_points,
+                applied_move_points=move_points,
+                applied_trend_points=max(-trend_score, 0.0) * 10.0,
+                close_points=close_points,
+                indicator_points=indicator_points,
+            ),
+        )
 
     if position == "HIGH" and volume_state == "HIGH" and (has_upper_rejection or direction == "FLAT"):
-        return "WAIT", 0.0, "高位放量滞涨：回测胜率不足，仅预警观察不开单", score_components
+        return (
+            "WAIT",
+            0.0,
+            "高位放量滞涨：回测胜率不足，仅预警观察不开单",
+            components("high_position_high_volume_stall_wait"),
+        )
 
     if position == "LOW" and volume_state == "HIGH" and direction == "UP":
         return (
             "WAIT",
             0.0,
             "低位放量上涨：容易把低位反弹误判为确定性机会，回测未覆盖赔率，仅预警观察不开单",
-            score_components,
+            components("low_position_high_volume_up_wait"),
         )
 
     if position == "LOW" and volume_state == "HIGH" and direction == "DOWN" and has_lower_reclaim:
-        return "WAIT", 0.0, "低位放量承接：三个月回测未覆盖赔率，仅预警观察不开单", score_components
+        return (
+            "WAIT",
+            0.0,
+            "低位放量承接：三个月回测未覆盖赔率，仅预警观察不开单",
+            components("low_position_high_volume_down_reclaim_wait"),
+        )
 
     if volume_state == "HIGH" and direction == "UP":
-        return "WAIT", 0.0, "量增价升：回测未达到事件合约盈亏平衡，仅观察不开单", score_components
+        return (
+            "WAIT",
+            0.0,
+            "量增价升：回测未达到事件合约盈亏平衡，仅观察不开单",
+            components("high_volume_up_wait"),
+        )
 
     if volume_state == "HIGH" and direction == "DOWN":
         close_points = (1.0 - close_strength) * 6.0
-        score_components["close_points"] = close_points
         score = 34.0 + volume_points + move_points + max(-trend_score, 0.0) * 10.0 + close_points
         strict_rebound_risk = _trend_strict_rebound_risk(
             timeframe_minutes,
@@ -618,26 +719,63 @@ def _score_setup(
                 "WAIT",
                 0.0,
                 "趋势过滤禁多：STRICT候选，RSI未跌透或恐慌低值下双周期反弹，禁止急跌反抽LONG，仅记录观察",
-                score_components,
+                components("high_volume_down_strict_wait"),
             )
         if broad_rebound_risk:
             return (
                 "SHORT",
                 -score,
                 "趋势候选顺势SHORT：BROAD_ONLY，双周期反弹中破位或BOLL未跌透，放弃急跌反抽LONG并顺势试空",
-                score_components,
+                components(
+                    "high_volume_down_broad_short",
+                    -1.0,
+                    base_points=34.0,
+                    applied_volume_points=volume_points,
+                    applied_move_points=move_points,
+                    applied_trend_points=max(-trend_score, 0.0) * 10.0,
+                    close_points=close_points,
+                ),
             )
         reason = "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多"
         if short_observe:
             reason += "；SHORT观察：恐慌下行中位急跌且RSI/BOLL未过冷，仅记录不阻断"
-        return "LONG", score, reason, score_components
+        return (
+            "LONG",
+            score,
+            reason,
+            components(
+                "high_volume_down_rebound_long",
+                1.0,
+                base_points=34.0,
+                applied_volume_points=volume_points,
+                applied_move_points=move_points,
+                applied_trend_points=max(-trend_score, 0.0) * 10.0,
+                close_points=close_points,
+            ),
+        )
 
     if volume_state == "HIGH" and direction == "FLAT" and position != "LOW":
-        return "WAIT", 0.0, "量增价平：胜率未覆盖事件合约赔率，仅预警观察不开单", score_components
+        return (
+            "WAIT",
+            0.0,
+            "量增价平：胜率未覆盖事件合约赔率，仅预警观察不开单",
+            components("high_volume_flat_wait"),
+        )
 
     if volume_state == "NORMAL" and direction == "UP":
         score = 20.0 + move_points * 0.8 + max(trend_score, 0.0) * 8.0
-        return "LONG", score, "量平价升：趋势延续但量能未放大", score_components
+        return (
+            "LONG",
+            score,
+            "量平价升：趋势延续但量能未放大",
+            components(
+                "normal_volume_up_long",
+                1.0,
+                base_points=20.0,
+                applied_move_points=move_points * 0.8,
+                applied_trend_points=max(trend_score, 0.0) * 8.0,
+            ),
+        )
 
     if volume_state == "NORMAL" and direction == "DOWN":
         confirmed, note = confirm_short_setup(
@@ -648,17 +786,33 @@ def _score_setup(
             require_bollinger_room=False,
         )
         if not confirmed:
-            return "WAIT", 0.0, f"量平价跌：SHORT确认不足（{note}），等待", score_components
+            return (
+                "WAIT",
+                0.0,
+                f"量平价跌：SHORT确认不足（{note}），等待",
+                components("normal_volume_down_unconfirmed_wait"),
+            )
         indicator_points = short_indicator_points(technical, mtf_10m_bias, mtf_30m_bias)
-        score_components["indicator_points"] = indicator_points
         score = -(18.0 + move_points * 0.8 + max(-trend_score, 0.0) * 8.0 + indicator_points)
-        return "SHORT", score, "量平价跌：MACD/RSI确认弱势延续，动态评分偏空", score_components
+        return (
+            "SHORT",
+            score,
+            "量平价跌：MACD/RSI确认弱势延续，动态评分偏空",
+            components(
+                "normal_volume_down_short",
+                -1.0,
+                base_points=18.0,
+                applied_move_points=move_points * 0.8,
+                applied_trend_points=max(-trend_score, 0.0) * 8.0,
+                indicator_points=indicator_points,
+            ),
+        )
 
     return (
         "WAIT",
         0.0,
         f"{_cn_position(position)}{_cn_volume(volume_state)}{_cn_direction(direction)}：信号不足",
-        score_components,
+        components("no_setup_wait"),
     )
 
 

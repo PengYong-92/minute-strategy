@@ -88,6 +88,65 @@ def neutral_mid_klines():
     return klines
 
 
+def normal_volume_short_klines():
+    klines = []
+    for offset in range(260):
+        idx = 960 + offset
+        close = 105.0 + offset * 0.015
+        low = 100.0 if offset == 0 else close - 0.2
+        klines.append(
+            kline(
+                idx,
+                close,
+                100,
+                open_price=close - 0.01,
+                high=close + 0.2,
+                low=low,
+            )
+        )
+    for offset in range(40):
+        idx = 1220 + offset
+        close = 109.0 + (offset % 3) * 0.02 if offset < 34 else 108.8 + (offset - 34) * 0.3
+        klines.append(
+            kline(
+                idx,
+                close,
+                100,
+                open_price=close - 0.02,
+                high=112.2,
+                low=close - 0.2,
+            )
+        )
+    start = klines[-1].open_time // 60_000 + 1
+    price = 111.2
+    for offset, step in enumerate([-1, -1, 1, -1, -1, 1, -1, -1, -1, -1]):
+        idx = start + offset
+        open_price = price
+        price += step * 0.15
+        close = price
+        klines.append(
+            kline(
+                idx,
+                close,
+                100,
+                open_price=open_price,
+                high=max(open_price, close) + 0.04,
+                low=min(open_price, close) - 0.08,
+            )
+        )
+    return klines
+
+
+APPLIED_SCORE_POINT_FIELDS = (
+    "base_points",
+    "volume_points",
+    "move_points",
+    "trend_points",
+    "close_points",
+    "indicator_points",
+)
+
+
 class StrategyTest(unittest.TestCase):
     def test_technical_context_exposes_causal_atr_and_normalized_macd(self):
         closes = [100.0 + index * 0.17 + (0.45 if index % 4 == 0 else -0.2) for index in range(50)]
@@ -658,11 +717,15 @@ class StrategyTest(unittest.TestCase):
                 "raw_direction",
                 "raw_score",
                 "signed_score",
-                "trend_score",
+                "branch",
+                "direction_multiplier",
+                "base_points",
                 "volume_points",
                 "move_points",
                 "trend_points",
                 "close_points",
+                "indicator_points",
+                "reconstructed_raw_score",
             }.issubset(inputs["score"])
         )
         self.assertEqual(inputs["volume_price"]["current_volume"], 1600)
@@ -724,10 +787,64 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(indicators["bollinger_position"], signal.bollinger_position)
         self.assertEqual(indicators["bollinger_width"], signal.bollinger_width)
         self.assertEqual(signal.decision_inputs["score"]["signed_score"], signal.score)
+        score_inputs = signal.decision_inputs["score"]
+        self.assertEqual(score_inputs["branch"], "high_volume_down_rebound_long")
+        self.assertEqual(score_inputs["direction_multiplier"], 1.0)
+        self.assertEqual(score_inputs["base_points"], 34.0)
+        self.assertEqual(
+            score_inputs["move_points"],
+            score_inputs["diagnostic_unweighted_move_points"],
+        )
+        self.assertAlmostEqual(
+            score_inputs["trend_points"],
+            max(-score_inputs["diagnostic_trend_score"], 0.0) * 10.0,
+        )
+        reconstructed = score_inputs["direction_multiplier"] * sum(
+            score_inputs[field] for field in APPLIED_SCORE_POINT_FIELDS
+        )
+        self.assertAlmostEqual(reconstructed, score_inputs["reconstructed_raw_score"])
+        self.assertAlmostEqual(reconstructed, score_inputs["raw_score"])
         self.assertEqual(
             signal.decision_inputs["thresholds"]["calculated_threshold"],
             signal.threshold,
         )
+
+    def test_normal_volume_short_score_components_use_exact_weighted_terms(self):
+        signal = analyze_volume_price(normal_volume_short_klines(), timeframe_minutes=10)
+        score_inputs = signal.decision_inputs["score"]
+
+        self.assertEqual(score_inputs["raw_direction"], "SHORT")
+        self.assertEqual(score_inputs["branch"], "normal_volume_down_short")
+        self.assertEqual(score_inputs["direction_multiplier"], -1.0)
+        self.assertEqual(score_inputs["base_points"], 18.0)
+        self.assertEqual(score_inputs["volume_points"], 0.0)
+        self.assertAlmostEqual(
+            score_inputs["move_points"],
+            score_inputs["diagnostic_unweighted_move_points"] * 0.8,
+        )
+        self.assertAlmostEqual(
+            score_inputs["trend_points"],
+            max(-score_inputs["diagnostic_trend_score"], 0.0) * 8.0,
+        )
+        self.assertEqual(score_inputs["close_points"], 0.0)
+        reconstructed = score_inputs["direction_multiplier"] * sum(
+            score_inputs[field] for field in APPLIED_SCORE_POINT_FIELDS
+        )
+        self.assertAlmostEqual(reconstructed, score_inputs["reconstructed_raw_score"])
+        self.assertAlmostEqual(reconstructed, score_inputs["raw_score"])
+
+    def test_wait_score_components_record_no_applied_points(self):
+        signal = analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10)
+        score_inputs = signal.decision_inputs["score"]
+
+        self.assertEqual(score_inputs["raw_direction"], "WAIT")
+        self.assertEqual(score_inputs["branch"], "no_setup_wait")
+        self.assertEqual(score_inputs["direction_multiplier"], 0.0)
+        for field in APPLIED_SCORE_POINT_FIELDS:
+            with self.subTest(field=field):
+                self.assertEqual(score_inputs[field], 0.0)
+        self.assertEqual(score_inputs["reconstructed_raw_score"], 0.0)
+        self.assertEqual(score_inputs["raw_score"], 0.0)
 
     def test_all_analyzed_signal_paths_have_strict_json_serializable_decision_inputs(self):
         deterministic = [
