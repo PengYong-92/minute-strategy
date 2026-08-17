@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 import unittest
@@ -5,6 +6,7 @@ from dataclasses import FrozenInstanceError, dataclass
 
 from app.decision_context import (
     CONTEXT_VERSION,
+    DecisionContext,
     DecisionContextBuilder,
     runtime_config_snapshot,
 )
@@ -35,6 +37,50 @@ class DecisionContextTest(unittest.TestCase):
             observation_allowed=True,
         )
 
+    def trace_record(self, **overrides):
+        record = {
+            "stage": "risk",
+            "result": "PASS",
+            "decisive_values": None,
+            "reason_code": "",
+        }
+        record.update(overrides)
+        return record
+
+    def direct_context(self, **overrides):
+        arguments = {
+            "decision_id": "decision-id",
+            "context_version": CONTEXT_VERSION,
+            "runtime_config_hash": "config-hash",
+            "strategy_build_id": "build-7",
+            "symbol": "BTCUSDT",
+            "closed_kline_at_ms": 1_700_000_000_000,
+            "candidate_origin": "strategy",
+            "inputs": {},
+            "decision_trace": (),
+            "first_decisive_block": "",
+            "final_decision": "OPEN",
+            "final_reason": "accepted",
+            "open_allowed": True,
+            "observation_allowed": True,
+        }
+        arguments.update(overrides)
+        return DecisionContext(**arguments)
+
+    def test_builder_public_methods_have_explicit_annotations(self):
+        for method in (
+            DecisionContextBuilder.new,
+            DecisionContextBuilder.capture_inputs,
+            DecisionContextBuilder.trace,
+            DecisionContextBuilder.finish,
+        ):
+            with self.subTest(method=method.__name__):
+                signature = inspect.signature(method)
+                for name, parameter in signature.parameters.items():
+                    if name not in {"self", "cls"}:
+                        self.assertIsNot(parameter.annotation, inspect.Parameter.empty)
+                self.assertIsNot(signature.return_annotation, inspect.Signature.empty)
+
     def test_config_key_order_does_not_affect_hash(self):
         first = runtime_config_snapshot(
             {"threshold": 1.5, "guard": {"enabled": True, "window": 20}},
@@ -48,6 +94,42 @@ class DecisionContextTest(unittest.TestCase):
         self.assertEqual(first.hash, second.hash)
         self.assertEqual(first.canonical_payload, second.canonical_payload)
         self.assertNotEqual(first.strategy_build_id, second.strategy_build_id)
+
+    def test_golden_config_hash_and_decision_id(self):
+        snapshot = runtime_config_snapshot(
+            {
+                "threshold": 1.5,
+                "guard": {"enabled": True, "window": 20},
+                "labels": {"beta", "alpha"},
+                "api_key": "excluded",
+            },
+            strategy_build_id="build-7",
+        )
+        builder = DecisionContextBuilder.new(
+            "btcusdt",
+            1_700_000_000_000,
+            "strategy",
+            snapshot.hash,
+            strategy_build_id="build-7",
+            profile_key="profile-a",
+            candidate_ordinal=2,
+        )
+        builder.capture_inputs({})
+        context = self.finish(builder)
+
+        self.assertEqual(
+            snapshot.canonical_payload,
+            '{"guard":{"enabled":true,"window":20},'
+            '"labels":["alpha","beta"],"threshold":1.5}',
+        )
+        self.assertEqual(
+            snapshot.hash,
+            "e076670441aeacf49d3a21c390ec5a5613ced9f71ec4bc12442177c32b7cda8c",
+        )
+        self.assertEqual(
+            context.decision_id,
+            "7a792c6dec68833d181fbf892a255cc6e1afd60ce1fb5bf9f145282d256e6b9d",
+        )
 
     def test_recursive_credentials_are_excluded_and_do_not_affect_hash(self):
         first = runtime_config_snapshot(
@@ -155,6 +237,123 @@ class DecisionContextTest(unittest.TestCase):
             context.decision_trace[1]["decisive_values"],
             {"risk": "high"},
         )
+
+    def test_invalid_trace_metadata_is_rejected_before_first_block(self):
+        builder = self.new_builder()
+        builder.capture_inputs({"score": 9})
+
+        invalid_calls = (
+            ((object(), "BLOCK"), TypeError),
+            (("risk", object()), TypeError),
+            (("risk", "BLOCK", None, object()), TypeError),
+            (("", "BLOCK"), ValueError),
+            (("risk", ""), ValueError),
+        )
+        for arguments, error in invalid_calls:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(error):
+                    builder.trace(*arguments)
+
+        builder.trace("risk", "BLOCK", {"risk": "high"}, "RISK_HIGH")
+        builder.trace("capacity", "BLOCK", {"open_orders": 2}, "AT_CAPACITY")
+        context = builder.finish("BLOCK", "risk high", False, True)
+
+        self.assertEqual(context.first_decisive_block, "risk")
+        self.assertEqual(len(context.decision_trace), 2)
+
+    def test_invalid_finish_outcomes_are_rejected_without_finishing_builder(self):
+        builder = self.new_builder()
+        builder.capture_inputs({})
+        invalid_calls = (
+            ((object(), "reason", True, True), TypeError),
+            (("", "reason", True, True), ValueError),
+            (("OPEN", object(), True, True), TypeError),
+            (("OPEN", "reason", 1, True), TypeError),
+            (("OPEN", "reason", True, 0), TypeError),
+        )
+        for arguments, error in invalid_calls:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(error):
+                    builder.finish(*arguments)
+
+        context = builder.finish("BLOCK", "", False, True)
+        self.assertEqual(context.final_reason, "")
+
+    def test_direct_construction_deep_freezes_and_copies_nested_values(self):
+        inputs = {"features": {"scores": [7, 8]}}
+        decisive_values = {"flags": ["spread"]}
+        trace_record = {
+            "stage": "risk",
+            "result": "BLOCK",
+            "decisive_values": decisive_values,
+            "reason_code": "RISK_HIGH",
+        }
+        context = self.direct_context(
+            inputs=inputs,
+            decision_trace=(trace_record,),
+            first_decisive_block="risk",
+            final_decision="BLOCK",
+            open_allowed=False,
+        )
+
+        inputs["features"]["scores"].append(-1)
+        decisive_values["flags"].append("volume")
+        trace_record["reason_code"] = "MUTATED"
+
+        self.assertEqual(context.inputs["features"]["scores"], (7, 8))
+        self.assertEqual(
+            context.decision_trace[0]["decisive_values"]["flags"],
+            ("spread",),
+        )
+        self.assertEqual(context.decision_trace[0]["reason_code"], "RISK_HIGH")
+        with self.assertRaises(TypeError):
+            context.decision_trace[0]["reason_code"] = "CHANGED"
+        persisted = context.to_dict()
+        json.dumps(persisted, allow_nan=False)
+        persisted["inputs"]["features"]["scores"].append(9)
+        self.assertEqual(context.inputs["features"]["scores"], (7, 8))
+
+    def test_direct_construction_rejects_invalid_trace_and_outcome_metadata(self):
+        invalid_contexts = (
+            (
+                {
+                    "decision_trace": (
+                        self.trace_record(stage=object()),
+                    ),
+                },
+                TypeError,
+            ),
+            (
+                {"decision_trace": (self.trace_record(result=""),)},
+                ValueError,
+            ),
+            (
+                {
+                    "decision_trace": (
+                        self.trace_record(reason_code=object()),
+                    ),
+                },
+                TypeError,
+            ),
+            (
+                {
+                    "decision_trace": (
+                        self.trace_record(decisive_values=object()),
+                    ),
+                },
+                TypeError,
+            ),
+            ({"first_decisive_block": object()}, TypeError),
+            ({"final_decision": object()}, TypeError),
+            ({"final_decision": ""}, ValueError),
+            ({"final_reason": object()}, TypeError),
+            ({"open_allowed": 1}, TypeError),
+            ({"observation_allowed": 0}, TypeError),
+        )
+        for overrides, error in invalid_contexts:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(error):
+                    self.direct_context(**overrides)
 
     def test_builder_lifecycle_rejects_invalid_calls(self):
         builder = self.new_builder()
