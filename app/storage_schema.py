@@ -2,8 +2,8 @@ import sqlite3
 from dataclasses import dataclass
 
 
-SCHEMA_VERSION = 3
-_MIGRATION_SAVEPOINT = "storage_schema_v3"
+SCHEMA_VERSION = 4
+_MIGRATION_SAVEPOINT = "storage_schema_v4"
 
 
 class SchemaConflictError(RuntimeError):
@@ -361,12 +361,10 @@ _V2_TABLE_SPECS = _TABLE_SPECS[:2]
 _PROFILE_TABLE_SPECS = _TABLE_SPECS[2:]
 
 
-_ADDED_COLUMN_SPECS = {
+_V3_ADDED_COLUMN_SPECS = {
     "orders": (
         _ColumnSpec("decision_id", "text", "TEXT"),
         _ColumnSpec("runtime_config_hash", "text", "TEXT"),
-        _ColumnSpec("exit_price", "real", "REAL"),
-        _ColumnSpec("pnl", "real not null default 0.0", "REAL", not_null=1, default="0.0"),
     ),
     "observation_signals": (
         _ColumnSpec("decision_id", "text", "TEXT"),
@@ -378,8 +376,6 @@ _ADDED_COLUMN_SPECS = {
         _ColumnSpec("entry_structure_state", "text", "TEXT"),
         _ColumnSpec("entry_structure_bias", "text", "TEXT"),
         _ColumnSpec("active_level_source", "text", "TEXT"),
-        _ColumnSpec("exit_price", "real", "REAL"),
-        _ColumnSpec("pnl", "real not null default 0.0", "REAL", not_null=1, default="0.0"),
     ),
     "order_entry_snapshots": (
         _ColumnSpec("decision_id", "text", "TEXT"),
@@ -406,8 +402,36 @@ _ADDED_COLUMN_SPECS = {
     ),
 }
 
+_V4_ADDED_COLUMN_SPECS = {
+    "orders": (
+        _ColumnSpec("exit_price", "real", "REAL"),
+        _ColumnSpec(
+            "pnl",
+            "real not null default 0.0",
+            "REAL",
+            not_null=1,
+            default="0.0",
+        ),
+    ),
+    "observation_signals": (
+        _ColumnSpec("exit_price", "real", "REAL"),
+        _ColumnSpec(
+            "pnl",
+            "real not null default 0.0",
+            "REAL",
+            not_null=1,
+            default="0.0",
+        ),
+    ),
+}
 
-_INDEX_SPECS = (
+_ADDED_COLUMN_SPECS = {
+    table: column_specs + _V4_ADDED_COLUMN_SPECS.get(table, ())
+    for table, column_specs in _V3_ADDED_COLUMN_SPECS.items()
+}
+
+
+_V3_INDEX_SPECS = (
     _IndexSpec(
         name="ux_orders_symbol_decision_id",
         table="orders",
@@ -546,6 +570,38 @@ _INDEX_SPECS = (
     ),
 )
 
+_V4_INDEX_SPECS = (
+    _IndexSpec(
+        name="idx_orders_symbol_status_opened",
+        table="orders",
+        create_sql="""
+            create index if not exists idx_orders_symbol_status_opened
+            on orders(symbol, status, opened_at)
+        """,
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("status"),
+            _IndexTermSpec("opened_at"),
+        ),
+    ),
+    _IndexSpec(
+        name="idx_observation_signals_symbol_status_opened",
+        table="observation_signals",
+        create_sql="""
+            create index if not exists
+                idx_observation_signals_symbol_status_opened
+            on observation_signals(symbol, status, opened_at)
+        """,
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("status"),
+            _IndexTermSpec("opened_at"),
+        ),
+    ),
+)
+
+_INDEX_SPECS = _V3_INDEX_SPECS + _V4_INDEX_SPECS
+
 _V3_DECISION_INDEX_NAMES = frozenset(
     {
         "ux_orders_symbol_decision_id",
@@ -554,7 +610,7 @@ _V3_DECISION_INDEX_NAMES = frozenset(
     }
 )
 _V2_INDEX_SPECS = tuple(
-    spec for spec in _INDEX_SPECS if spec.name not in _V3_DECISION_INDEX_NAMES
+    spec for spec in _V3_INDEX_SPECS if spec.name not in _V3_DECISION_INDEX_NAMES
 )
 
 
@@ -1136,10 +1192,11 @@ def _validate_schema(
     connection: sqlite3.Connection,
     table_specs: tuple[_TableSpec, ...],
     index_specs: tuple[_IndexSpec, ...] = _INDEX_SPECS,
+    added_column_specs: dict[str, tuple[_ColumnSpec, ...]] = _ADDED_COLUMN_SPECS,
 ) -> None:
     for table_spec in table_specs:
         _validate_table(connection, table_spec)
-    for table, column_specs in _ADDED_COLUMN_SPECS.items():
+    for table, column_specs in added_column_specs.items():
         _require_table(connection, table)
         actual = _column_rows_by_name(connection, table)
         for column_spec in column_specs:
@@ -1247,53 +1304,58 @@ def migrate(connection: sqlite3.Connection) -> None:
         )
     if version == SCHEMA_VERSION:
         _validate_schema(connection, _TABLE_SPECS)
-        caller_in_transaction = connection.in_transaction
-        connection.execute(f"savepoint {_MIGRATION_SAVEPOINT}")
-        try:
-            added_columns = {
-                table: _ensure_added_columns(connection, table, column_specs)
-                for table, column_specs in _ADDED_COLUMN_SPECS.items()
-            }
-            _backfill_added_lifecycle_columns(connection, added_columns)
-            connection.execute(f"release savepoint {_MIGRATION_SAVEPOINT}")
-        except Exception as migration_error:
-            try:
-                _rollback_migration(
-                    connection,
-                    caller_in_transaction=caller_in_transaction,
-                )
-            except Exception as cleanup_error:
-                raise migration_error from cleanup_error
-            raise
         return
     if version == 2:
         _validate_schema(
             connection,
             _V2_TABLE_SPECS,
             _V2_INDEX_SPECS,
+            _V3_ADDED_COLUMN_SPECS,
         )
 
     caller_in_transaction = connection.in_transaction
     connection.execute(f"savepoint {_MIGRATION_SAVEPOINT}")
     try:
-        for table_spec in _V2_TABLE_SPECS:
-            existing = _schema_object(connection, table_spec.name)
-            if existing is not None and existing[0].casefold() != "table":
-                _require_table(connection, table_spec.name)
-            connection.execute(table_spec.create_sql)
-            _validate_table(connection, table_spec)
+        if version < 3:
+            for table_spec in _V2_TABLE_SPECS:
+                existing = _schema_object(connection, table_spec.name)
+                if existing is not None and existing[0].casefold() != "table":
+                    _require_table(connection, table_spec.name)
+                connection.execute(table_spec.create_sql)
+                _validate_table(connection, table_spec)
+
+            for table, column_specs in _V3_ADDED_COLUMN_SPECS.items():
+                _ensure_added_columns(connection, table, column_specs)
+
+            _ensure_profile_tables_v3(connection)
+            _reject_duplicate_decision_lifecycle_rows(connection)
+            for index_spec in _V3_INDEX_SPECS:
+                if _schema_object(connection, index_spec.name) is not None:
+                    _validate_index(connection, index_spec)
+                else:
+                    connection.execute(index_spec.create_sql)
+                _validate_index(connection, index_spec)
+            _validate_schema(
+                connection,
+                _TABLE_SPECS,
+                _V3_INDEX_SPECS,
+                _V3_ADDED_COLUMN_SPECS,
+            )
+            connection.execute("pragma user_version = 3")
+        else:
+            _validate_schema(
+                connection,
+                _TABLE_SPECS,
+                _V3_INDEX_SPECS,
+                _V3_ADDED_COLUMN_SPECS,
+            )
 
         added_columns = {
             table: _ensure_added_columns(connection, table, column_specs)
-            for table, column_specs in _ADDED_COLUMN_SPECS.items()
+            for table, column_specs in _V4_ADDED_COLUMN_SPECS.items()
         }
         _backfill_added_lifecycle_columns(connection, added_columns)
-
-        _ensure_profile_tables_v3(connection)
-
-        _reject_duplicate_decision_lifecycle_rows(connection)
-
-        for index_spec in _INDEX_SPECS:
+        for index_spec in _V4_INDEX_SPECS:
             if _schema_object(connection, index_spec.name) is not None:
                 _validate_index(connection, index_spec)
             else:

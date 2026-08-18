@@ -438,29 +438,32 @@ def _hydrate_decision_linked_payload(
     return payload
 
 
-def _normalize_stored_model_payload(
-    stored: dict[str, Any],
-    incoming: dict[str, Any],
+def _canonical_storage_projection(
+    payload: dict[str, Any],
+    row: Mapping[str, Any],
+    *,
+    apply_lifecycle_authority: bool,
 ) -> dict[str, Any]:
-    if "decision_context_ref" not in incoming or "decision_context_ref" in stored:
-        return stored
-    normalized = dict(stored)
-    for key in (
-        "decision_inputs",
-        "decision_trace",
-        "first_decisive_block",
-        "quality_score_inputs",
-        "quality_score",
-        "quality_score_version",
-        "quality_score_mode",
-        "quality_score_context",
-        "quality_score_components",
-        "adaptive_profile_state",
-        "entry_structure_shadow",
-    ):
-        normalized.pop(key, None)
-    normalized["decision_context_ref"] = deepcopy(incoming["decision_context_ref"])
-    return normalized
+    hydrated = _hydrate_decision_linked_payload(
+        payload,
+        row,
+        apply_lifecycle_authority=apply_lifecycle_authority,
+    )
+    if "id" in hydrated:
+        model_type = SimulatedOrder
+    elif "observation_key" in hydrated:
+        model_type = ObservationSignal
+    else:
+        raise ValueError("decision-linked payload has no model identity")
+    accepted = {item.name for item in fields(model_type)}
+    values = {key: value for key, value in hydrated.items() if key in accepted}
+    if model_type is SimulatedOrder and "calculated_threshold" not in values:
+        values["calculated_threshold"] = float(values.get("threshold", 0.0))
+    try:
+        model = model_type(**values)
+    except (TypeError, ValueError) as error:
+        raise ValueError("decision-linked payload is malformed") from error
+    return decision_linked_storage_payload(model)
 
 
 def _profile_key_for_signal(signal: Signal) -> str:
@@ -2046,11 +2049,18 @@ class SQLiteMonitorStore:
         incoming = decision_linked_storage_payload(order)
         payload = json.dumps(incoming, ensure_ascii=False)
         bound_order = connection.execute(
-            """
-            select order_id, status, result, opened_at, settled_at,
-                   exit_price, pnl, payload, decision_id, runtime_config_hash
+            f"""
+            select orders.order_id, orders.status, orders.result,
+                   orders.opened_at, orders.settled_at, orders.exit_price,
+                   orders.pnl, orders.payload, orders.decision_id,
+                   orders.runtime_config_hash,
+                   {_ORDER_LIFECYCLE_COLUMNS},
+                   {_LINKED_CONTEXT_COLUMNS}
             from orders
-            where symbol = ? and decision_id = ?
+            left join decision_contexts
+              on decision_contexts.symbol = orders.symbol
+             and decision_contexts.decision_id = orders.decision_id
+            where orders.symbol = ? and orders.decision_id = ?
             """,
             (normalized_symbol, order.decision_id),
         ).fetchone()
@@ -2061,7 +2071,16 @@ class SQLiteMonitorStore:
                 persisted = json.loads(bound_order["payload"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise ValueError("stored order payload is malformed") from error
-            persisted = _normalize_stored_model_payload(persisted, incoming)
+            persisted = _canonical_storage_projection(
+                persisted,
+                bound_order,
+                apply_lifecycle_authority=True,
+            )
+            incoming = _canonical_storage_projection(
+                incoming,
+                bound_order,
+                apply_lifecycle_authority=False,
+            )
             mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
             persisted_frozen = {
                 key: value for key, value in persisted.items() if key not in mutable_fields
@@ -2873,10 +2892,22 @@ class SQLiteMonitorStore:
     ) -> None:
         values = self._observation_row_values(observation, symbol)
         columns = tuple(values)
+        selected_columns = ", ".join(
+            f"observation_signals.{column} as {column}" for column in columns
+        )
         if values["decision_id"]:
             existing = connection.execute(
-                f"select {', '.join(columns)} from observation_signals "
-                "where symbol = ? and decision_id = ?",
+                f"""
+                select {selected_columns},
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
+                       {_LINKED_CONTEXT_COLUMNS}
+                from observation_signals
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                where observation_signals.symbol = ?
+                  and observation_signals.decision_id = ?
+                """,
                 (values["symbol"], values["decision_id"]),
             ).fetchone()
             if (
@@ -2888,7 +2919,7 @@ class SQLiteMonitorStore:
                 )
         else:
             existing = connection.execute(
-                f"select {', '.join(columns)} from observation_signals "
+                f"select {selected_columns} from observation_signals "
                 "where symbol = ? and observation_key = ?",
                 (values["symbol"], values["observation_key"]),
             ).fetchone()
@@ -2909,9 +2940,15 @@ class SQLiteMonitorStore:
                 requested_payload = json.loads(values["payload"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise ValueError("stored observation payload is malformed") from error
-            persisted_payload = _normalize_stored_model_payload(
+            persisted_payload = _canonical_storage_projection(
                 persisted_payload,
+                existing,
+                apply_lifecycle_authority=True,
+            )
+            requested_payload = _canonical_storage_projection(
                 requested_payload,
+                existing,
+                apply_lifecycle_authority=False,
             )
             mutable_payload_fields = {
                 "status",

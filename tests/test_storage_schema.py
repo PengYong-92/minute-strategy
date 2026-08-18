@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -269,6 +270,149 @@ def _legacy_payload_snapshot(connection: sqlite3.Connection) -> dict[str, tuple]
     }
 
 
+def _create_e0_v3_lifecycle_fixture(connection: sqlite3.Connection) -> None:
+    """Build the e0ffd03 schema shape with settled rows awaiting v4 backfill."""
+    _create_legacy_schema(connection)
+    migrate(connection)
+    context_inputs = json.dumps(
+        {
+            "identity": {"direction": "LONG", "profile_key": "fixture-profile"},
+            "signal": {"direction": "LONG", "reason": "v3 fixture"},
+            "score": {},
+            "market": {"candidate_time_ms": 1_000, "entry_price": 100.0},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    context_outcome = json.dumps(
+        {
+            "decision_trace": [],
+            "first_decisive_block": "",
+            "final_decision": "OPENED",
+            "final_reason": "accepted",
+            "open_allowed": True,
+            "observation_allowed": True,
+            "selected_order_terms": {
+                "stake": 10.0,
+                "win_return": 18.0,
+                "expires_at": 601_000,
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    order_payload = json.dumps(
+        {
+            "id": 7,
+            "status": "SETTLED",
+            "result": "WIN",
+            "exit_price": 101.0,
+            "settled_at": 601_000,
+            "pnl": 8.0,
+        }
+    )
+    observation_payload = json.dumps(
+        {
+            "observation_key": "v3-observation",
+            "status": "SETTLED",
+            "result": "WIN",
+            "exit_price": 101.0,
+            "settled_at": 601_000,
+            "pnl": 8.0,
+        }
+    )
+    connection.execute(
+        "insert into runtime_config_snapshots values (?, ?, ?, ?, ?, ?)",
+        ("v3-config", "DECISION_CONTEXT_V2", "v3-build", "{}", 2, 900),
+    )
+    connection.execute(
+        """
+        insert into decision_contexts(
+            symbol, decision_id, context_version, runtime_config_hash,
+            strategy_build_id, created_at_ms, closed_kline_at_ms, direction,
+            profile_key, candidate_origin, input_payload, outcome_payload
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BTCUSDT", "v3-decision", "DECISION_CONTEXT_V2", "v3-config",
+            "v3-build", 900, 1_000, "LONG", "fixture-profile",
+            "NATIVE_ACTIONABLE", context_inputs, context_outcome,
+        ),
+    )
+    connection.execute(
+        "insert into profile_summary_revisions(symbol, revision) values (?, ?)",
+        ("BTCUSDT", 17),
+    )
+    connection.execute(
+        """
+        insert into orders(
+            symbol, order_id, status, result, opened_at, settled_at, payload,
+            decision_id, runtime_config_hash, exit_price, pnl
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BTCUSDT", 7, "SETTLED", "WIN", 1_000, 601_000,
+            order_payload, "v3-decision", "v3-config", 101.0, 8.0,
+        ),
+    )
+    connection.execute(
+        """
+        insert into observation_signals(
+            symbol, observation_key, status, result, direction,
+            strategy_family, strategy_tag, timeframe_minutes,
+            threshold_segment, opened_at, expires_at, settled_at, payload,
+            decision_id, runtime_config_hash, context_version,
+            candidate_origin, qualification_state, adaptive_state,
+            entry_structure_state, entry_structure_bias, active_level_source,
+            exit_price, pnl
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BTCUSDT", "v3-observation", "SETTLED", "WIN", "LONG",
+            "drop_reclaim", "live", 10, "WD-08", 1_000, 601_000,
+            601_000, observation_payload, "v3-decision", "v3-config",
+            "DECISION_CONTEXT_V2", "NATIVE_ACTIONABLE", "QUALIFIED",
+            "RESIDENT", "NOT_AVAILABLE", "NEUTRAL", "NOT_AVAILABLE",
+            101.0, 8.0,
+        ),
+    )
+    connection.commit()
+    connection.execute("drop index if exists idx_orders_symbol_status_opened")
+    connection.execute(
+        "drop index if exists idx_observation_signals_symbol_status_opened"
+    )
+    for table in ("orders", "observation_signals"):
+        connection.execute(f"alter table {table} drop column exit_price")
+        connection.execute(f"alter table {table} drop column pnl")
+    connection.execute("pragma user_version = 3")
+    connection.commit()
+
+
+def _downgrade_current_schema_to_v2(connection: sqlite3.Connection) -> None:
+    for index in (
+        "ux_orders_symbol_decision_id",
+        "ux_signal_audit_symbol_decision_id",
+        "ux_observation_signals_symbol_decision_id",
+        "idx_orders_symbol_status_opened",
+        "idx_observation_signals_symbol_status_opened",
+    ):
+        connection.execute(f"drop index {index}")
+    for table in (
+        "profile_summary_leases",
+        "profile_guard_settlement_successors",
+        "profile_guard_settlement_branches",
+        "profile_guard_materializations",
+        "profile_summary_materializations",
+        "profile_summary_revisions",
+    ):
+        connection.execute(f"drop table {table}")
+    for table in ("orders", "observation_signals"):
+        connection.execute(f"alter table {table} drop column exit_price")
+        connection.execute(f"alter table {table} drop column pnl")
+    connection.execute("pragma user_version = 2")
+    connection.commit()
+
+
 class StorageSchemaMigrationTest(unittest.TestCase):
     def _migrate(self, connection: sqlite3.Connection) -> None:
         if migrate is None:
@@ -300,7 +444,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(connection.total_changes, before_changes)
 
     def test_zero_and_v1_databases_upgrade_to_current_schema(self):
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertEqual(SCHEMA_VERSION, 4)
         for legacy_version in (0, 1):
             with self.subTest(legacy_version=legacy_version):
                 connection = sqlite3.connect(":memory:")
@@ -322,6 +466,114 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                 }
                 self.assertIn("runtime_config_snapshots", tables)
                 self.assertIn("decision_contexts", tables)
+
+    def test_e0_v3_upgrades_lifecycle_columns_and_preserves_settled_data(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_e0_v3_lifecycle_fixture(connection)
+
+        self._migrate(connection)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 4)
+        self.assertEqual(
+            connection.execute(
+                "select status, result, settled_at, exit_price, pnl from orders"
+            ).fetchone(),
+            ("SETTLED", "WIN", 601_000, 101.0, 8.0),
+        )
+        self.assertEqual(
+            connection.execute(
+                "select status, result, settled_at, exit_price, pnl "
+                "from observation_signals"
+            ).fetchone(),
+            ("SETTLED", "WIN", 601_000, 101.0, 8.0),
+        )
+        self.assertEqual(
+            connection.execute(
+                "select decision_id, runtime_config_hash from decision_contexts"
+            ).fetchone(),
+            ("v3-decision", "v3-config"),
+        )
+        self.assertEqual(
+            connection.execute(
+                "select revision from profile_summary_revisions where symbol = 'BTCUSDT'"
+            ).fetchone()[0],
+            17,
+        )
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "select name from sqlite_master where type = 'index'"
+            )
+        }
+        self.assertTrue(
+            {
+                "idx_orders_symbol_status_opened",
+                "idx_observation_signals_symbol_status_opened",
+            }.issubset(indexes)
+        )
+
+    def test_v3_to_v4_failure_rolls_back_columns_rows_and_version(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_e0_v3_lifecycle_fixture(connection)
+        connection.execute("alter table observation_signals add column exit_price text")
+        connection.commit()
+        before = _schema_snapshot(connection)
+        before_rows = connection.execute(
+            "select payload from orders union all select payload from observation_signals"
+        ).fetchall()
+
+        with self.assertRaisesRegex(RuntimeError, "observation_signals.exit_price"):
+            self._migrate(connection)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 3)
+        self.assertEqual(_schema_snapshot(connection), before)
+        self.assertEqual(
+            connection.execute(
+                "select payload from orders union all select payload from observation_signals"
+            ).fetchall(),
+            before_rows,
+        )
+        self.assertNotIn("exit_price", _column_details(connection, "orders"))
+        self.assertNotIn("pnl", _column_details(connection, "orders"))
+
+    def test_malformed_v3_is_rejected_before_v4_certification(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_e0_v3_lifecycle_fixture(connection)
+        connection.execute("alter table observation_signals drop column qualification_state")
+        connection.commit()
+        before = _schema_snapshot(connection)
+
+        with self.assertRaisesRegex(RuntimeError, "qualification_state"):
+            self._migrate(connection)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 3)
+        self.assertEqual(_schema_snapshot(connection), before)
+
+    def test_v2_schema_runs_v3_then_v4_chain(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        _create_legacy_schema(connection)
+        self._migrate(connection)
+        _downgrade_current_schema_to_v2(connection)
+
+        self._migrate(connection)
+
+        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 4)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "select name from sqlite_master where type = 'table'"
+            )
+        }
+        self.assertIn("profile_summary_materializations", tables)
+        self.assertIn("profile_summary_leases", tables)
+        for table in ("orders", "observation_signals"):
+            columns = _column_details(connection, table)
+            self.assertEqual(columns["exit_price"], ("REAL", 0, None, 0))
+            self.assertEqual(columns["pnl"], ("REAL", 1, "0.0", 0))
 
     def test_creates_all_v2_tables_columns_indexes_and_partial_unique_rule(self):
         connection = sqlite3.connect(":memory:")

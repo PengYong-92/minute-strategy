@@ -15,7 +15,14 @@ from zoneinfo import ZoneInfo
 from app import storage as storage_module
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.decision_context import DecisionContext
-from app.models import FearGreedContext, Kline, ObservationSignal, Signal, SimulatedOrder
+from app.models import (
+    FearGreedContext,
+    Kline,
+    ObservationSignal,
+    Signal,
+    SimulatedOrder,
+    decision_linked_storage_payload,
+)
 from app.order_policy import OrderGate
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.profile_degradation_guard import MINUTE_MS, ProfileDegradationGuardConfig
@@ -179,6 +186,26 @@ def managed_sqlite_states():
                     first_error = error
             if first_error is not None:
                 raise first_error
+
+
+def atomic_sqlite_bundle_counts(db_path: Path) -> dict[str, int]:
+    with closing(sqlite3.connect(db_path)) as connection:
+        counts = {
+            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in (
+                "runtime_config_snapshots",
+                "decision_contexts",
+                "orders",
+                "stake_progression_credits",
+                "order_entry_snapshots",
+                "signal_audit",
+                "observation_signals",
+            )
+        }
+        counts["audit_occurrences"] = connection.execute(
+            "select coalesce(sum(occurrences), 0) from signal_audit"
+        ).fetchone()[0]
+        return counts
 
 
 def selected_profile_signal(
@@ -1666,6 +1693,161 @@ class MonitorStateTest(unittest.TestCase):
                 if restart_store is not None:
                     restart_store.close()
 
+    def test_real_task8_bundle_replays_full_e0_ref_and_compact_payloads(self):
+        compatibility_fields = {
+            "decision_inputs",
+            "decision_trace",
+            "first_decisive_block",
+            "quality_score_inputs",
+            "quality_score",
+            "quality_score_version",
+            "quality_score_mode",
+            "quality_score_context",
+            "quality_score_components",
+            "adaptive_profile_state",
+            "entry_structure_shadow",
+        }
+
+        class CapturingStore(SQLiteMonitorStore):
+            def __init__(self, path):
+                super().__init__(path)
+                self.last_open_bundle = None
+
+            def save_open_order_decision(self, **arguments):
+                created = super().save_open_order_decision(**arguments)
+                self.last_open_bundle = arguments
+                return created
+
+        def stored_payload(model, style):
+            if style == "full":
+                return model.to_dict()
+            compact = decision_linked_storage_payload(model)
+            if style == "compact":
+                return compact
+            payload = model.to_dict()
+            for field in compatibility_fields:
+                payload.pop(field, None)
+            payload["decision_context_ref"] = deepcopy(
+                compact["decision_context_ref"]
+            )
+            return payload
+
+        for style in ("full", "e0_ref", "compact"):
+            with self.subTest(style=style), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = CapturingStore(db_path)
+                webhook = RecordingWebhook()
+                state = MonitorState(
+                    symbol="BTCUSDT",
+                    storage=store,
+                    webhook=webhook,
+                    min_order_gap_ms=0,
+                )
+                try:
+                    signal = selected_profile_signal(
+                        119_999,
+                        reason=f"legacy replay {style}",
+                    )
+                    latest = latest_kline(119_999)
+                    self.assertEqual(state._maybe_open_order(signal, latest), "OPENED")
+                    arguments = store.last_open_bundle
+                    self.assertIsNotNone(arguments)
+                    self.assertIn("signal", arguments["context"].inputs)
+                    order = arguments["order"]
+                    observed = arguments["observation"]
+                    self.assertIsNotNone(observed)
+
+                    def rewrite(order_model, observation_model):
+                        with closing(sqlite3.connect(db_path)) as connection:
+                            connection.execute(
+                                "update orders set payload = ? where symbol = ? and order_id = ?",
+                                (
+                                    json.dumps(stored_payload(order_model, style), ensure_ascii=False),
+                                    "BTCUSDT",
+                                    order_model.id,
+                                ),
+                            )
+                            self.assertEqual(
+                                connection.execute("select changes()").fetchone()[0],
+                                1,
+                            )
+                            connection.execute(
+                                "update observation_signals set payload = ? "
+                                "where symbol = ? and observation_key = ?",
+                                (
+                                    json.dumps(
+                                        stored_payload(observation_model, style),
+                                        ensure_ascii=False,
+                                    ),
+                                    "BTCUSDT",
+                                    observation_model.observation_key,
+                                ),
+                            )
+                            self.assertEqual(
+                                connection.execute("select changes()").fetchone()[0],
+                                1,
+                            )
+                            connection.commit()
+
+                    rewrite(order, observed)
+                    if style == "e0_ref":
+                        tampered = stored_payload(order, style)
+                        tampered["score"] = float(tampered["score"]) + 1.0
+                        with closing(sqlite3.connect(db_path)) as connection:
+                            connection.execute(
+                                "update orders set payload = ? where order_id = ?",
+                                (json.dumps(tampered, ensure_ascii=False), order.id),
+                            )
+                            connection.commit()
+                        with self.assertRaisesRegex(ValueError, "score|frozen"):
+                            store.save_open_order_decision(**arguments)
+                        rewrite(order, observed)
+
+                    before = atomic_sqlite_bundle_counts(db_path)
+                    self.assertFalse(store.save_open_order_decision(**arguments))
+                    self.assertFalse(store.save_open_order_decision(**arguments))
+                    self.assertEqual(atomic_sqlite_bundle_counts(db_path), before)
+                    self.assertEqual(state._maybe_open_order(signal, latest), "OPENED")
+                    self.assertEqual(len(webhook.calls), 1)
+
+                    settled_order = replace(
+                        store.load_orders("BTCUSDT")[0],
+                        status="SETTLED",
+                        result="WIN",
+                        settled_at=order.expires_at,
+                        exit_price=order.entry_price + 1.0,
+                        pnl=order.win_return - order.stake,
+                    )
+                    settled_observation = replace(
+                        store.load_observations("BTCUSDT")[0],
+                        status="SETTLED",
+                        result="WIN",
+                        settled_at=observed.expires_at,
+                        exit_price=observed.entry_price + 1.0,
+                        pnl=8.0,
+                    )
+                    store.save_settled_order_with_credit(
+                        settled_order,
+                        "BTCUSDT",
+                        None,
+                    )
+                    store.save_observation(settled_observation, "BTCUSDT")
+                    rewrite(settled_order, settled_observation)
+                    settled_counts = atomic_sqlite_bundle_counts(db_path)
+
+                    self.assertFalse(store.save_open_order_decision(**arguments))
+                    self.assertFalse(store.save_open_order_decision(**arguments))
+                    self.assertEqual(atomic_sqlite_bundle_counts(db_path), settled_counts)
+                    self.assertEqual(store.load_orders("BTCUSDT")[0].status, "SETTLED")
+                    self.assertEqual(
+                        store.load_observations("BTCUSDT")[0].status,
+                        "SETTLED",
+                    )
+                    self.assertEqual(len(webhook.calls), 1)
+                finally:
+                    state.close()
+                    store.close()
+
     def test_context_frozen_fields_and_sql_lifecycle_columns_are_authoritative(self):
         with managed_sqlite_states() as (db_path, store, states):
             state = MonitorState(
@@ -1891,8 +2073,26 @@ class MonitorStateTest(unittest.TestCase):
                     "RESEARCH_OBSERVE",
                 )
             )
+            for index in range(9):
+                store.save_observation(
+                    settled_observation(
+                        10_000 + index,
+                        "WIN",
+                        240_000 + index * 60_000,
+                        family="pagination_control",
+                        tag="pagination_control",
+                        direction="WAIT",
+                        segment="PAGINATION",
+                    ),
+                    "BTCUSDT",
+                )
 
             with closing(sqlite3.connect(db_path)) as connection:
+                long_key = next(
+                    item.observation_key
+                    for item in state.observations
+                    if item.direction == "LONG"
+                )
                 connection.execute(
                     """
                     update observation_signals
@@ -1904,9 +2104,11 @@ class MonitorStateTest(unittest.TestCase):
                         entry_structure_state = 'RESISTANCE_REJECT',
                         entry_structure_bias = 'SHORT',
                         active_level_source = 'ROUND_LEVEL'
-                    where json_extract(payload, '$.direction') = 'LONG'
-                    """
+                    where symbol = ? and observation_key = ?
+                    """,
+                    ("BTCUSDT", long_key),
                 )
+                self.assertEqual(connection.execute("select changes()").fetchone()[0], 1)
                 connection.commit()
 
             long_page = store.page_observations("BTCUSDT", direction="LONG")
@@ -1959,14 +2161,18 @@ class MonitorStateTest(unittest.TestCase):
                 )["total"],
                 1,
             )
-            self.assertEqual(
-                long_page["filter_options"]["direction"],
-                ["LONG", "SHORT"],
+            self.assertTrue(
+                {"LONG", "SHORT"}.issubset(
+                    long_page["filter_options"]["direction"]
+                )
             )
             self.assertIn(
                 "CANONICAL_LONG_FAMILY",
                 long_page["filter_options"]["family"],
             )
+            paged = store.page_observations("BTCUSDT", page=2, page_size=10)
+            self.assertEqual((paged["total"], paged["page"], paged["total_pages"]), (11, 2, 2))
+            self.assertEqual(len(paged["observations"]), 1)
 
     def test_open_bundle_payload_size_and_5000_projection_fit_capacity_contract(self):
         with managed_sqlite_states() as (db_path, store, states):
