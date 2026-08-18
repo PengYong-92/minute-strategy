@@ -1,9 +1,11 @@
 from copy import deepcopy
 import json
 import math
+import time
 import unittest
 
 from app.entry_structure_shadow import StructureConfig
+from app.models import Kline
 from tests.test_entry_structure_shadow import (
     candidate,
     detected_level,
@@ -185,7 +187,82 @@ class StructureStateRegressionTest(unittest.TestCase):
         )[0]
 
         self.assertEqual(fifth_result["state"], "RETEST_HELD")
-        self.assertEqual(sixth_result["state"], "BREAKOUT_CONFIRMED")
+        self.assertEqual(sixth_result["state"], "APPROACHING_SUPPORT")
+
+    def test_held_can_fail_inside_window_but_expires_after_window(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        reclaimed = state_bars(
+            [98.8, 98.7, 99.4, 100.5],
+            lows=[98.5, 98.4, 99.0, 99.8],
+            highs=[99.0, 99.0, 100.5, 101.0],
+        )
+        expired = state_bars(
+            [98.8, 98.7, 99.4, 98.6, 98.5, 98.4, 98.3, 104.5],
+            lows=[98.5, 98.4, 99.0, 98.3, 98.2, 98.1, 98.0, 104.3],
+            highs=[99.0, 99.0, 100.5, 99.0, 99.0, 99.0, 99.0, 104.7],
+        )
+        machine = StructureStateMachine()
+
+        reclaimed_result = machine.evaluate(
+            at_last_bar(detected_level("SUPPORT"), reclaimed), reclaimed
+        )[0]
+        expired_result = machine.evaluate(
+            at_last_bar(detected_level("SUPPORT"), expired), expired
+        )[0]
+
+        self.assertEqual(reclaimed_result["state"], "FALSE_BREAKOUT")
+        self.assertEqual(expired_result["state"], "APPROACHING_SUPPORT")
+
+    def test_false_breakout_is_one_bar_event_and_current_bar_reclassifies(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        cases = [
+            (98.7, 98.4, 99.0, "BREAKOUT_PENDING"),
+            (101.6, 100.5, 102.0, "SUPPORT_REJECTED"),
+            (104.5, 104.3, 104.7, "APPROACHING_SUPPORT"),
+            (110.0, 109.8, 110.2, "NO_NEARBY_LEVEL"),
+        ]
+        for close, low, high, expected in cases:
+            with self.subTest(expected=expected):
+                bars = state_bars(
+                    [98.8, 100.5, close],
+                    lows=[98.5, 99.8, low],
+                    highs=[99.0, 101.0, high],
+                )
+                result = StructureStateMachine().evaluate(
+                    at_last_bar(detected_level("SUPPORT"), bars), bars
+                )[0]
+                self.assertEqual(result["state"], expected)
+
+    def test_confirmed_held_and_retest_pending_expire_then_reclassify(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        histories = [
+            (
+                [98.8, 98.7, 98.6, 98.5, 98.4, 98.3, 98.2, 110.0],
+                [98.5, 98.4, 98.3, 98.2, 98.1, 98.0, 97.9, 109.8],
+                [99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 110.2],
+            ),
+            (
+                [98.8, 98.7, 99.4, 98.6, 98.5, 98.4, 98.3, 110.0],
+                [98.5, 98.4, 99.0, 98.3, 98.2, 98.1, 98.0, 109.8],
+                [99.0, 99.0, 100.5, 99.0, 99.0, 99.0, 99.0, 110.2],
+            ),
+            (
+                [98.8, 98.7, 99.8, 98.6, 98.5, 98.4, 98.3, 110.0],
+                [98.5, 98.4, 99.0, 98.3, 98.2, 98.1, 98.0, 109.8],
+                [99.0, 99.0, 100.5, 99.0, 99.0, 99.0, 99.0, 110.2],
+            ),
+        ]
+        machine = StructureStateMachine()
+        for closes, lows, highs in histories:
+            with self.subTest(initial_event=closes[2]):
+                bars = state_bars(closes, lows=lows, highs=highs)
+                result = machine.evaluate(
+                    at_last_bar(detected_level("SUPPORT"), bars), bars
+                )[0]
+                self.assertEqual(result["state"], "NO_NEARBY_LEVEL")
 
     def test_new_breakout_overrides_older_false_breakout(self):
         from app.entry_structure_shadow import StructureStateMachine
@@ -216,6 +293,21 @@ class StructureStateRegressionTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "BREAKOUT_PENDING")
         self.assertEqual(result["breakout_closed_bars"], 1)
+
+    def test_breakout_confirm_bars_one_confirms_first_breakout(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        bars = state_bars([98.8], lows=[98.5], highs=[99.0])
+        machine = StructureStateMachine(
+            StructureConfig(breakout_confirm_bars=1)
+        )
+        result = machine.evaluate(
+            at_last_bar(detected_level("SUPPORT"), bars), bars
+        )[0]
+
+        self.assertEqual(result["state"], "BREAKOUT_CONFIRMED")
+        self.assertEqual(result["breakout_closed_bars"], 1)
+        self.assertEqual(result["retest_status"], "AWAITING")
 
     def test_confirmed_gap_reclaim_is_false_breakout_without_intersection(self):
         from app.entry_structure_shadow import StructureStateMachine
@@ -304,6 +396,86 @@ class StructureStateRegressionTest(unittest.TestCase):
             )
         )
 
+    def test_gate_handles_non_mapping_detector_results_and_attach_inputs(self):
+        from app.entry_structure_shadow import EntryStructureGate, StructureDetector
+
+        class MalformedDetector(StructureDetector):
+            def __init__(self, result):
+                super().__init__()
+                self.result = result
+
+            def detect(self, symbol, closed_klines):
+                return self.result
+
+        for malformed in (None, []):
+            with self.subTest(malformed=malformed):
+                gate = EntryStructureGate(detector=MalformedDetector(malformed))
+                payload = gate.evaluate(candidate(), "BTCUSDT", state_bars([100.0]))
+                self.assertEqual(
+                    (payload["entry_structure_state"], payload["entry_structure_bias"]),
+                    ("ERROR", "NEUTRAL"),
+                )
+                self.assertEqual(
+                    payload["entry_structure_reason_code"],
+                    "DETECTOR_RESULT_INVALID",
+                )
+
+        attached = EntryStructureGate().attach(
+            candidate(), None, "NATIVE_ACTIONABLE"
+        )
+        self.assertEqual(
+            (attached["entry_structure_state"], attached["entry_structure_bias"]),
+            ("ERROR", "NEUTRAL"),
+        )
+
+    def test_error_details_never_leak_exception_message(self):
+        from app.entry_structure_shadow import EntryStructureGate, StructureDetector
+
+        class SecretDetector(StructureDetector):
+            def detect(self, symbol, closed_klines):
+                raise RuntimeError("token=abc123 /private/secret/path")
+
+        payload = EntryStructureGate(detector=SecretDetector()).evaluate(
+            candidate(), "BTCUSDT", state_bars([100.0])
+        )
+        serialized = json.dumps(payload, sort_keys=True)
+
+        self.assertEqual(payload["error_detail"], "RuntimeError")
+        self.assertEqual(
+            payload["entry_structure_reason_code"],
+            "DETECTOR_ERROR_RUNTIMEERROR",
+        )
+        self.assertNotIn("abc123", serialized)
+        self.assertNotIn("/private/secret/path", serialized)
+
+    def test_custom_breakout_buffer_is_used_by_all_error_paths(self):
+        from app.entry_structure_shadow import (
+            EntryStructureGate,
+            StructureDetector,
+            StructureStateMachine,
+        )
+
+        config = StructureConfig(breakout_atr=0.20)
+        machine = StructureStateMachine(config)
+        machine_error = machine.evaluate(None, [])
+
+        class BrokenDetector(StructureDetector):
+            def detect(self, symbol, closed_klines):
+                raise RuntimeError("hidden")
+
+        gate_error = EntryStructureGate(
+            detector=BrokenDetector(config),
+            state_machine=machine,
+        ).evaluate(candidate(), "BTCUSDT", [])
+        attach_error = EntryStructureGate(
+            detector=StructureDetector(config),
+            state_machine=machine,
+        ).attach(candidate(), None, "NATIVE_ACTIONABLE")
+
+        self.assertEqual(machine_error[0]["breakout_buffer_atr"], 0.20)
+        self.assertEqual(gate_error["breakout_buffer_atr"], 0.20)
+        self.assertEqual(attach_error["breakout_buffer_atr"], 0.20)
+
     def test_malformed_evidence_degrades_to_error_neutral(self):
         from app.entry_structure_shadow import EntryStructureGate, map_direction_bias
 
@@ -314,6 +486,8 @@ class StructureStateRegressionTest(unittest.TestCase):
             {"distance_bps": float("inf")},
             {"touch_count": -1},
             {"lower": None},
+            {"lower": 10**400},
+            {"distance_atr": 10**400},
         ):
             item = {**evidence("SUPPORT", "SUPPORT_REJECTED"), **mutation}
             with self.subTest(mutation=mutation):
@@ -330,6 +504,52 @@ class StructureStateRegressionTest(unittest.TestCase):
             ("ERROR", "NEUTRAL"),
         )
         json.dumps(payload, allow_nan=False)
+
+    def test_reverse_causal_scan_handles_large_cache_without_changing_result(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        class CountingBars:
+            def __init__(self, values):
+                self.values = values
+                self.reads = 0
+
+            def __len__(self):
+                return len(self.values)
+
+            def __getitem__(self, index):
+                self.reads += 1
+                return self.values[index]
+
+        count = 140_000
+        bars = [
+            Kline(
+                open_time=index * 60_000,
+                open=100.0,
+                high=100.2,
+                low=99.8,
+                close=100.0,
+                volume=1.0,
+                close_time=(index + 1) * 60_000,
+            )
+            for index in range(count)
+        ]
+        evaluated_index = count - 11
+        evaluated_at = bars[evaluated_index].close_time
+        detected = detected_level("SUPPORT", evaluated_at=evaluated_at)
+        machine = StructureStateMachine()
+        cached = CountingBars(bars)
+
+        started = time.perf_counter()
+        large_result = machine.evaluate(detected, cached)
+        elapsed = time.perf_counter() - started
+        scoped_result = machine.evaluate(
+            detected,
+            bars[evaluated_index - 239 : evaluated_index + 1],
+        )
+
+        self.assertEqual(large_result, scoped_result)
+        self.assertLess(cached.reads, 1_000)
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":

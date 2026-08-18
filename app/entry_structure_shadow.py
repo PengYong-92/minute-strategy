@@ -791,14 +791,19 @@ class StructureDetector:
 
 
 def _finite_number(value: object, *, minimum: float = 0.0) -> bool:
-    return (
-        type(value) in (int, float)
-        and math.isfinite(float(value))
-        and float(value) >= minimum
-    )
+    if type(value) not in (int, float):
+        return False
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= minimum
 
 
-def _error_evidence(reason_code: str) -> dict[str, object]:
+def _error_evidence(
+    reason_code: str,
+    breakout_buffer_atr: float = 0.10,
+) -> dict[str, object]:
     return {
         "id": "structure-error",
         "kind": "",
@@ -816,7 +821,7 @@ def _error_evidence(reason_code: str) -> dict[str, object]:
         "state": "ERROR",
         "breakout_direction": "NONE",
         "breakout_closed_bars": 0,
-        "breakout_buffer_atr": 0.10,
+        "breakout_buffer_atr": breakout_buffer_atr,
         "retest_status": "NOT_APPLICABLE",
         "reason_code": reason_code,
     }
@@ -856,15 +861,26 @@ def _causal_bars(
     closed_klines: Sequence[Kline],
     evaluated_at: int,
 ) -> tuple[Kline, ...] | None:
-    causal = []
-    for item in closed_klines:
+    reverse_causal = []
+    found_evaluated_at = False
+    for item in reversed(closed_klines):
         if not isinstance(item, Kline) or type(item.close_time) is not int:
             return None
-        if item.close_time <= evaluated_at:
-            causal.append(item)
-    scoped = tuple(causal[-MAX_STRUCTURE_BARS:])
+        if not found_evaluated_at:
+            if item.close_time > evaluated_at:
+                continue
+            if item.close_time < evaluated_at:
+                return None
+            found_evaluated_at = True
+        elif item.close_time >= evaluated_at:
+            return None
+        reverse_causal.append(item)
+        if len(reverse_causal) >= MAX_STRUCTURE_BARS:
+            break
+    scoped = tuple(reversed(reverse_causal))
     if (
-        not scoped
+        not found_evaluated_at
+        or not scoped
         or scoped[-1].close_time != evaluated_at
         or not _valid_scoped_klines(scoped)
     ):
@@ -903,7 +919,10 @@ def _classify_level_state(
     confirmed_at = int(level["last_confirmed_at"])
     relevant = tuple(item for item in bars if item.close_time >= confirmed_at)
     if not relevant:
-        return _error_evidence("STRUCTURE_LEVEL_HAS_NO_CAUSAL_BARS")
+        return _error_evidence(
+            "STRUCTURE_LEVEL_HAS_NO_CAUSAL_BARS",
+            config.breakout_atr,
+        )
 
     breakout_direction = "DOWN" if kind == "SUPPORT" else "UP"
     breakout_buffer = config.breakout_atr * atr
@@ -944,20 +963,37 @@ def _classify_level_state(
             retest_status = "FAILED"
             break
 
+        if lifecycle == "FALSE":
+            lifecycle = "IDLE"
+            breakout_count = 0
+            confirmed_index = None
+            retest_status = "NOT_APPLICABLE"
+        if (
+            lifecycle in ("CONFIRMED", "RETEST_PENDING", "HELD")
+            and confirmed_index is not None
+            and index - confirmed_index > config.retest_window_bars
+        ):
+            lifecycle = "IDLE"
+            breakout_count = 0
+            confirmed_index = None
+            retest_status = "NOT_APPLICABLE"
+
         breakout = is_breakout(item)
         intersects = item.low <= upper and item.high >= lower
 
-        if lifecycle in ("IDLE", "FALSE"):
+        if lifecycle == "IDLE":
             if breakout:
-                lifecycle = "PENDING"
                 breakout_count = 1
-                confirmed_index = None
-                state = "BREAKOUT_PENDING"
-                retest_status = "NOT_APPLICABLE"
-                continue
-            if lifecycle == "FALSE":
-                state = "FALSE_BREAKOUT"
-                retest_status = "FAILED"
+                if breakout_count >= config.breakout_confirm_bars:
+                    lifecycle = "CONFIRMED"
+                    confirmed_index = index
+                    state = "BREAKOUT_CONFIRMED"
+                    retest_status = "AWAITING"
+                else:
+                    lifecycle = "PENDING"
+                    confirmed_index = None
+                    state = "BREAKOUT_PENDING"
+                    retest_status = "NOT_APPLICABLE"
                 continue
             rejected = (
                 intersects
@@ -1014,10 +1050,6 @@ def _classify_level_state(
             inside_retest_window = (
                 1 <= bars_after_confirmation <= config.retest_window_bars
             )
-            if lifecycle == "HELD":
-                state = "RETEST_HELD"
-                retest_status = "HELD"
-                continue
             if not inside_retest_window:
                 lifecycle = "CONFIRMED"
                 state = "BREAKOUT_CONFIRMED"
@@ -1026,6 +1058,15 @@ def _classify_level_state(
                     if bars_after_confirmation <= config.retest_window_bars
                     else "NOT_APPLICABLE"
                 )
+                continue
+            if lifecycle == "HELD":
+                if is_reclaimed(item):
+                    lifecycle = "FALSE"
+                    state = "FALSE_BREAKOUT"
+                    retest_status = "FAILED"
+                else:
+                    state = "RETEST_HELD"
+                    retest_status = "HELD"
                 continue
             if is_reclaimed(item):
                 lifecycle = "FALSE"
@@ -1105,18 +1146,38 @@ class StructureStateMachine:
         closed_klines: Sequence[Kline],
     ) -> list[dict[str, object]]:
         if not isinstance(detected, Mapping):
-            return [_error_evidence("STRUCTURE_SNAPSHOT_INVALID")]
+            return [
+                _error_evidence(
+                    "STRUCTURE_SNAPSHOT_INVALID",
+                    self.config.breakout_atr,
+                )
+            ]
         if detected.get("status") != "READY":
             return []
         evaluated_at = detected.get("evaluated_at")
         atr = detected.get("atr")
         if type(evaluated_at) is not int or evaluated_at <= 0:
-            return [_error_evidence("STRUCTURE_EVALUATED_AT_INVALID")]
+            return [
+                _error_evidence(
+                    "STRUCTURE_EVALUATED_AT_INVALID",
+                    self.config.breakout_atr,
+                )
+            ]
         if not _finite_number(atr) or float(atr) <= 0:
-            return [_error_evidence("STRUCTURE_ATR_INVALID")]
+            return [
+                _error_evidence(
+                    "STRUCTURE_ATR_INVALID",
+                    self.config.breakout_atr,
+                )
+            ]
         causal = _causal_bars(closed_klines, evaluated_at)
         if causal is None:
-            return [_error_evidence("STRUCTURE_CAUSAL_WINDOW_INVALID")]
+            return [
+                _error_evidence(
+                    "STRUCTURE_CAUSAL_WINDOW_INVALID",
+                    self.config.breakout_atr,
+                )
+            ]
 
         nearest = []
         for kind, key, fallback_key in (
@@ -1131,9 +1192,19 @@ class StructureStateMachine:
             if level is None:
                 continue
             if not _valid_level(level, evaluated_at):
-                return [_error_evidence("STRUCTURE_LEVEL_INVALID")]
+                return [
+                    _error_evidence(
+                        "STRUCTURE_LEVEL_INVALID",
+                        self.config.breakout_atr,
+                    )
+                ]
             if str(level.get("kind")) != kind:
-                return [_error_evidence("STRUCTURE_LEVEL_KIND_INVALID")]
+                return [
+                    _error_evidence(
+                        "STRUCTURE_LEVEL_KIND_INVALID",
+                        self.config.breakout_atr,
+                    )
+                ]
             nearest.append(level)
 
         if not nearest:
@@ -1156,9 +1227,10 @@ _BREAKOUT_STATES = {
 def _invalid_mapped_evidence(
     evidence: object,
     reason_code: str = "STRUCTURE_EVIDENCE_INVALID",
+    breakout_buffer_atr: float = 0.10,
 ) -> dict[str, object]:
     result = dict(evidence) if isinstance(evidence, Mapping) else {}
-    result.update(_error_evidence(reason_code))
+    result.update(_error_evidence(reason_code, breakout_buffer_atr))
     result["bias"] = "NEUTRAL"
     return result
 
@@ -1303,11 +1375,13 @@ class EntryStructureGate:
     def attach(
         self,
         signal: Signal,
-        market_snapshot: dict[str, object],
+        market_snapshot: object,
         candidate_origin: str,
     ) -> dict[str, object]:
-        status = str(market_snapshot.get("status", "ERROR"))
-        states = market_snapshot.get("states", [])
+        snapshot = market_snapshot if isinstance(market_snapshot, Mapping) else {}
+        snapshot_valid = isinstance(market_snapshot, Mapping)
+        status = str(snapshot.get("status", "ERROR"))
+        states = snapshot.get("states", [])
         mapped = []
         if status == "READY" and isinstance(states, Sequence):
             mapped = [
@@ -1316,26 +1390,43 @@ class EntryStructureGate:
                 if isinstance(item, Mapping)
             ]
         if status == "INSUFFICIENT_DATA":
-            active = _error_evidence("STRUCTURE_INSUFFICIENT_DATA")
+            active = _error_evidence(
+                "STRUCTURE_INSUFFICIENT_DATA",
+                self.state_machine.config.breakout_atr,
+            )
             active["state"] = "INSUFFICIENT_DATA"
             active["bias"] = "NEUTRAL"
+        elif not snapshot_valid:
+            active = _invalid_mapped_evidence(
+                {},
+                "STRUCTURE_SNAPSHOT_INVALID",
+                self.state_machine.config.breakout_atr,
+            )
         elif status != "READY":
             active = _invalid_mapped_evidence(
-                {}, "STRUCTURE_SNAPSHOT_NOT_READY"
+                {},
+                "STRUCTURE_SNAPSHOT_NOT_READY",
+                self.state_machine.config.breakout_atr,
             )
         elif mapped:
             active = self.rank(mapped)[0]
         else:
-            active = _error_evidence("STRUCTURE_NO_NEARBY_LEVEL")
+            active = _error_evidence(
+                "STRUCTURE_NO_NEARBY_LEVEL",
+                self.state_machine.config.breakout_atr,
+            )
             active["state"] = "NO_NEARBY_LEVEL"
             active["bias"] = "NEUTRAL"
+
+        if active.get("state") == "ERROR":
+            active["breakout_buffer_atr"] = self.state_machine.config.breakout_atr
 
         state = str(active.get("state", "ERROR"))
         bias = str(active.get("bias", "NEUTRAL"))
         reason_code = str(
             active.get("reason_code", f"STRUCTURE_STATE_{state}")
         )
-        evaluated_at = market_snapshot.get("evaluated_at", 0)
+        evaluated_at = snapshot.get("evaluated_at", 0)
         safe_evaluated_at = evaluated_at if type(evaluated_at) is int else 0
         payload = {
             "entry_structure_version": ENTRY_STRUCTURE_VERSION,
@@ -1373,11 +1464,11 @@ class EntryStructureGate:
             active.get("last_confirmed_at")
         )
         payload.update(
-            _level_payload("nearest_support", market_snapshot.get("nearest_support"))
+            _level_payload("nearest_support", snapshot.get("nearest_support"))
         )
         payload.update(
             _level_payload(
-                "nearest_resistance", market_snapshot.get("nearest_resistance")
+                "nearest_resistance", snapshot.get("nearest_resistance")
             )
         )
         payload.update(
@@ -1420,7 +1511,12 @@ class EntryStructureGate:
                 {
                     "status": "ERROR",
                     "evaluated_at": 0,
-                    "states": [_error_evidence(code)],
+                    "states": [
+                        _error_evidence(
+                            code,
+                            self.state_machine.config.breakout_atr,
+                        )
+                    ],
                     "nearest_support": None,
                     "nearest_resistance": None,
                 },
@@ -1428,7 +1524,29 @@ class EntryStructureGate:
             )
             payload["entry_structure_reason_code"] = code
             payload["reason_code"] = code
-            payload["error_detail"] = str(exc)[:240]
+            payload["error_detail"] = type(exc).__name__
+            return payload
+
+        if not isinstance(detected, Mapping):
+            code = "DETECTOR_RESULT_INVALID"
+            payload = self.attach(
+                signal,
+                {
+                    "status": "ERROR",
+                    "evaluated_at": 0,
+                    "states": [
+                        _error_evidence(
+                            code,
+                            self.state_machine.config.breakout_atr,
+                        )
+                    ],
+                    "nearest_support": None,
+                    "nearest_resistance": None,
+                },
+                candidate_origin,
+            )
+            payload["entry_structure_reason_code"] = code
+            payload["reason_code"] = code
             return payload
 
         try:
@@ -1442,7 +1560,12 @@ class EntryStructureGate:
                 {
                     "status": "ERROR",
                     "evaluated_at": detected.get("evaluated_at", 0),
-                    "states": [_error_evidence(code)],
+                    "states": [
+                        _error_evidence(
+                            code,
+                            self.state_machine.config.breakout_atr,
+                        )
+                    ],
                     "nearest_support": detected.get("nearest_support"),
                     "nearest_resistance": detected.get("nearest_resistance"),
                 },
@@ -1450,5 +1573,5 @@ class EntryStructureGate:
             )
             payload["entry_structure_reason_code"] = code
             payload["reason_code"] = code
-            payload["error_detail"] = str(exc)[:240]
+            payload["error_detail"] = type(exc).__name__
             return payload

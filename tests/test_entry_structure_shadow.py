@@ -454,7 +454,8 @@ class EntryStructureStateTest(unittest.TestCase):
             failed["entry_structure_reason_code"],
             "DETECTOR_ERROR_RUNTIMEERROR",
         )
-        self.assertIn("broken detector", failed["error_detail"])
+        self.assertEqual(failed["error_detail"], "RuntimeError")
+        self.assertNotIn("broken detector", str(failed))
 
 
 if __name__ == "__main__":
