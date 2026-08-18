@@ -28,19 +28,33 @@ class DailyProfileSelectorConfig:
     evaluation_minute: int = 50
     activation_hour: int = 8
     activation_minute: int = 0
-    stable_lookback_days: int = 14
+    stable_lookback_days: int | None = None
     joint_failures_to_exit: int | None = None
     joint_failures_source: str = field(default="", init=False)
 
+    @property
+    def effective_stable_lookback_days(self) -> int:
+        if self.stable_lookback_days is None:
+            return max(14, int(self.lookback_days))
+        return int(self.stable_lookback_days)
+
+    @property
+    def stable_lookback_source(self) -> str:
+        if self.stable_lookback_days is not None:
+            return "stable_lookback_days"
+        return "lookback_days" if int(self.lookback_days) > 14 else "default"
+
     def normalized(self) -> "DailyProfileSelectorConfig":
         lookback_days = int(self.lookback_days)
-        stable_lookback_days = int(self.stable_lookback_days)
+        stable_lookback_days = (
+            None if self.stable_lookback_days is None else int(self.stable_lookback_days)
+        )
         degraded_runs_to_exit = int(self.degraded_runs_to_exit)
         if lookback_days <= 0:
             raise ValueError("lookback_days must be positive")
-        if stable_lookback_days <= 0:
+        if stable_lookback_days is not None and stable_lookback_days <= 0:
             raise ValueError("stable_lookback_days must be positive")
-        if stable_lookback_days < lookback_days:
+        if stable_lookback_days is not None and stable_lookback_days < lookback_days:
             raise ValueError("stable_lookback_days must not be shorter than lookback_days")
         if degraded_runs_to_exit <= 0:
             raise ValueError("degraded_runs_to_exit must be positive")
@@ -142,13 +156,13 @@ def build_daily_selection(
     evaluated_at_ms: int,
     *,
     config: DailyProfileSelectorConfig | None = None,
-    previous_snapshot: dict | None = None,
+    previous_snapshot: dict | Sequence[dict] | None = None,
 ) -> dict:
     resolved = (config or DailyProfileSelectorConfig()).normalized()
     fast_window = _selection_window_for(evaluated_at_ms, resolved.lookback_days, resolved)
     stable_window = _selection_window_for(
         evaluated_at_ms,
-        resolved.stable_lookback_days,
+        resolved.effective_stable_lookback_days,
         resolved,
     )
 
@@ -165,17 +179,15 @@ def build_daily_selection(
         )
         grouped.setdefault(key, []).append(item)
 
-    previous_snapshot = previous_snapshot or {}
-    previous_by_key = _previous_candidates(previous_snapshot)
+    evaluation_key = fast_window["lookback_end"]
+    previous_by_key = _previous_candidates(
+        previous_snapshot,
+        evaluation_key=evaluation_key,
+        evaluated_at_ms=evaluated_at_ms,
+    )
     for key in previous_by_key:
         grouped.setdefault(key, [])
 
-    evaluation_key = fast_window["lookback_end"]
-    previous_evaluation_key = previous_snapshot.get(
-        "evaluation_key",
-        previous_snapshot.get("lookback_end"),
-    )
-    same_evaluation_day = previous_evaluation_key == evaluation_key
     candidates = [
         _candidate_summary(
             key,
@@ -185,7 +197,6 @@ def build_daily_selection(
             fast_window,
             stable_window,
             evaluation_key=evaluation_key,
-            same_evaluation_day=same_evaluation_day,
         )
         for key, rows in grouped.items()
     ]
@@ -210,6 +221,8 @@ def build_daily_selection(
     config_snapshot = asdict(resolved)
     config_snapshot.update(
         {
+            "effective_stable_lookback_days": resolved.effective_stable_lookback_days,
+            "stable_lookback_source": resolved.stable_lookback_source,
             "effective_joint_failures_to_exit": resolved.joint_failures_to_exit,
             "retention_min_win_rate": resolved.exit_win_rate,
             "retention_min_ev": resolved.exit_ev,
@@ -222,7 +235,10 @@ def build_daily_selection(
         "evaluation_key": evaluation_key,
         **fast_window,
         "fast_7d": _window_metadata(fast_window, resolved.lookback_days),
-        "stable_14d": _window_metadata(stable_window, resolved.stable_lookback_days),
+        "stable_14d": _window_metadata(
+            stable_window,
+            resolved.effective_stable_lookback_days,
+        ),
         "config": config_snapshot,
         "candidates": candidates,
         "selected_profiles": selected_profiles,
@@ -261,22 +277,109 @@ def _eligible_for_window(item: ObservationSignal, window: dict) -> bool:
     )
 
 
-def _previous_candidates(previous_snapshot: dict) -> dict[str, dict]:
-    previous_by_key = {
-        str(item.get("key", "")): dict(item)
-        for item in previous_snapshot.get("candidates", [])
-        if item.get("key")
-    }
-    selected_keys = set()
-    for item in previous_snapshot.get("selected_profiles", []):
-        key = str(item.get("key", ""))
-        if not key:
+def _previous_candidates(
+    previous_snapshot: dict | Sequence[dict] | None,
+    *,
+    evaluation_key: int,
+    evaluated_at_ms: int,
+) -> dict[str, dict]:
+    if not previous_snapshot:
+        return {}
+    snapshots = (
+        [previous_snapshot]
+        if isinstance(previous_snapshot, dict)
+        else [item for item in previous_snapshot if isinstance(item, dict)]
+    )
+    chosen: dict[str, tuple[tuple[int, int, int], dict]] = {}
+    for snapshot_index, snapshot in enumerate(snapshots):
+        if _future_prior(snapshot, evaluation_key, evaluated_at_ms):
             continue
-        selected_keys.add(key)
-        previous_by_key[key] = {**previous_by_key.get(key, {}), **item}
-    for key, item in previous_by_key.items():
-        item["_previously_selected"] = key in selected_keys
-    return previous_by_key
+        inherited = {
+            name: snapshot[name]
+            for name in ("evaluation_key", "lookback_end", "evaluated_at")
+            if snapshot.get(name) is not None
+        }
+        candidates = _nearest_rows_by_key(
+            snapshot.get("candidates", []),
+            inherited,
+            evaluation_key,
+            evaluated_at_ms,
+        )
+        selected = _nearest_rows_by_key(
+            snapshot.get("selected_profiles", []),
+            inherited,
+            evaluation_key,
+            evaluated_at_ms,
+        )
+        for key in candidates.keys() | selected.keys():
+            candidate = candidates.get(key)
+            selected_row = selected.get(key)
+            previously_selected = bool(
+                selected_row is not None
+                and (
+                    candidate is None
+                    or _prior_rank(selected_row) >= _prior_rank(candidate)
+                )
+            )
+            row = (
+                {**(candidate or {}), **selected_row}
+                if previously_selected
+                else dict(candidate or selected_row or {})
+            )
+            row["_previously_selected"] = previously_selected
+            rank = (*_prior_rank(row), snapshot_index)
+            if key not in chosen or rank >= chosen[key][0]:
+                chosen[key] = (rank, row)
+    return {key: row for key, (_rank, row) in chosen.items()}
+
+
+def _nearest_rows_by_key(
+    rows: Sequence[dict],
+    inherited: dict,
+    evaluation_key: int,
+    evaluated_at_ms: int,
+) -> dict[str, dict]:
+    chosen: dict[str, tuple[tuple[int, int], dict]] = {}
+    for item in rows:
+        if not isinstance(item, dict) or not item.get("key"):
+            continue
+        row = {**inherited, **item}
+        if _future_prior(row, evaluation_key, evaluated_at_ms):
+            continue
+        key = str(row["key"])
+        rank = _prior_rank(row)
+        if key not in chosen or rank >= chosen[key][0]:
+            chosen[key] = (rank, row)
+    return {key: row for key, (_rank, row) in chosen.items()}
+
+
+def _future_prior(item: dict, evaluation_key: int, evaluated_at_ms: int) -> bool:
+    return any(
+        _optional_int(item.get(name)) > limit
+        for name, limit in (
+            ("evaluation_key", evaluation_key),
+            ("lookback_end", evaluation_key),
+            ("evaluated_at", evaluated_at_ms),
+        )
+        if _optional_int(item.get(name)) is not None
+    )
+
+
+def _prior_rank(item: dict) -> tuple[int, int]:
+    primary = _optional_int(item.get("evaluation_key"))
+    if primary is None:
+        primary = _optional_int(item.get("lookback_end"))
+    return (
+        primary if primary is not None else -1,
+        _optional_int(item.get("evaluated_at")) or -1,
+    )
+
+
+def _optional_int(value) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _candidate_summary(
@@ -288,7 +391,6 @@ def _candidate_summary(
     stable_window: dict,
     *,
     evaluation_key: int,
-    same_evaluation_day: bool,
 ) -> dict:
     parts = key.split("|", 4)
     if len(parts) != 5:
@@ -302,7 +404,7 @@ def _candidate_summary(
     stable = _window_summary(
         rows,
         stable_window,
-        config.stable_lookback_days,
+        config.effective_stable_lookback_days,
         min_samples,
         config,
     )
@@ -314,7 +416,7 @@ def _candidate_summary(
         previous
         and previous.get("evaluation_key", previous.get("lookback_end")) == evaluation_key
     )
-    same_evaluation_day = same_evaluation_day or candidate_same_evaluation
+    same_evaluation_day = candidate_same_evaluation
     migration_state = str((previous or {}).get("migration_state", ""))
     migration_evaluation_key = (previous or {}).get("migration_evaluation_key")
     legacy_selected = previously_selected and not any(

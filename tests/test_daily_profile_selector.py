@@ -102,9 +102,28 @@ class DailyProfileSelectorTest(unittest.TestCase):
     def test_config_normalizes_positive_dual_windows_and_failure_limit(self):
         defaults = DailyProfileSelectorConfig().normalized()
         self.assertEqual(defaults.lookback_days, 7)
-        self.assertEqual(defaults.stable_lookback_days, 14)
+        self.assertIsNone(defaults.stable_lookback_days)
+        self.assertEqual(defaults.effective_stable_lookback_days, 14)
+        self.assertEqual(defaults.stable_lookback_source, "default")
         self.assertEqual(defaults.joint_failures_to_exit, 2)
         self.assertEqual(defaults.joint_failures_source, "default")
+
+        for lookback_days in (15, 30):
+            with self.subTest(lookback_days=lookback_days):
+                compatible = DailyProfileSelectorConfig(
+                    lookback_days=lookback_days,
+                ).normalized()
+                self.assertIsNone(compatible.stable_lookback_days)
+                self.assertEqual(compatible.effective_stable_lookback_days, lookback_days)
+                self.assertEqual(compatible.stable_lookback_source, "lookback_days")
+
+        explicit = DailyProfileSelectorConfig(
+            lookback_days=15,
+            stable_lookback_days=21,
+        ).normalized()
+        self.assertEqual(explicit.stable_lookback_days, 21)
+        self.assertEqual(explicit.effective_stable_lookback_days, 21)
+        self.assertEqual(explicit.stable_lookback_source, "stable_lookback_days")
 
         invalid_configs = [
             DailyProfileSelectorConfig(lookback_days=0),
@@ -158,7 +177,8 @@ class DailyProfileSelectorTest(unittest.TestCase):
             (9, 21, 11, 0.61, 0.2, 0.57, -0.1, 5, 3, 6, 45, 9, 15),
         )
         normalized = config.normalized()
-        self.assertEqual(normalized.stable_lookback_days, 14)
+        self.assertIsNone(normalized.stable_lookback_days)
+        self.assertEqual(normalized.effective_stable_lookback_days, 14)
         self.assertEqual(normalized.joint_failures_to_exit, 5)
         self.assertEqual(normalized.joint_failures_source, "degraded_runs_to_exit")
 
@@ -631,6 +651,9 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertEqual(snapshot["evaluation_key"], snapshot["lookback_end"])
         self.assertEqual(snapshot["config"]["effective_joint_failures_to_exit"], 2)
         self.assertEqual(snapshot["config"]["joint_failures_source"], "default")
+        self.assertIsNone(snapshot["config"]["stable_lookback_days"])
+        self.assertEqual(snapshot["config"]["effective_stable_lookback_days"], 14)
+        self.assertEqual(snapshot["config"]["stable_lookback_source"], "default")
         self.assertEqual(snapshot["config"]["retention_min_win_rate"], 0.60)
         self.assertEqual(snapshot["config"]["retention_min_ev"], 0.0)
         self.assertEqual(item["sample_size"], item["fast_7d"]["sample_size"])
@@ -641,6 +664,162 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertIn("joint_failure_runs", item)
         self.assertIn("reason", item)
         self.assertIn("version", item)
+
+    def test_future_previous_selection_is_not_used_as_current_prior_state(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        future_key = cutoff + 86_400_000
+        key = profile_key(10, "short_observe", "generic_short_observe", "SHORT", "WD-02")
+        future_item = {
+            "key": key,
+            "evaluation_key": future_key,
+            "qualification_state": "QUALIFIED",
+            "selection_state": "RETAINED",
+            "joint_failure_runs": 1,
+            "fast_7d": {},
+            "stable_14d": {},
+        }
+        future = {
+            "evaluation_key": future_key,
+            "lookback_end": future_key,
+            "evaluated_at": future_key,
+            "candidates": [future_item],
+            "selected_profiles": [dict(future_item)],
+        }
+
+        snapshot = build_daily_selection([], cutoff, previous_snapshot=future)
+
+        self.assertEqual(snapshot["candidates"], [])
+        self.assertEqual(snapshot["selected_profiles"], [])
+        self.assertEqual(snapshot["selected_count"], 0)
+
+    def test_historical_replay_chooses_nearest_non_future_prior_snapshot(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        key = profile_key(10, "short_observe", "generic_short_observe", "SHORT", "WD-02")
+
+        def prior(day_offset: int, runs: int) -> dict:
+            evaluation_key = cutoff + day_offset * 86_400_000
+            item = {
+                "key": key,
+                "evaluation_key": evaluation_key,
+                "qualification_state": "QUALIFICATION_WATCH",
+                "selection_state": "QUALIFICATION_WATCH",
+                "joint_failure_runs": runs,
+                "fast_7d": {},
+                "stable_14d": {},
+            }
+            return {
+                "evaluation_key": evaluation_key,
+                "lookback_end": evaluation_key,
+                "evaluated_at": evaluation_key,
+                "candidates": [item],
+                "selected_profiles": [dict(item)],
+            }
+
+        snapshot = build_daily_selection(
+            [],
+            cutoff,
+            config=DailyProfileSelectorConfig(joint_failures_to_exit=5),
+            previous_snapshot=[prior(-2, 1), prior(-1, 2), prior(1, 4)],
+        )
+
+        item = candidate(snapshot)
+        self.assertEqual(item["selection_state"], "QUALIFICATION_WATCH")
+        self.assertEqual(item["joint_failure_runs"], 3)
+
+    def test_mixed_candidate_timestamps_reject_future_rows_and_keep_nearest_past(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        key = profile_key(10, "short_observe", "generic_short_observe", "SHORT", "WD-02")
+        past_key = cutoff - 86_400_000
+        base = {
+            "key": key,
+            "qualification_state": "QUALIFICATION_WATCH",
+            "selection_state": "QUALIFICATION_WATCH",
+            "fast_7d": {},
+            "stable_14d": {},
+        }
+        previous = {
+            "evaluation_key": past_key,
+            "lookback_end": past_key,
+            "evaluated_at": past_key,
+            "candidates": [
+                {**base, "evaluation_key": past_key, "joint_failure_runs": 1},
+                {**base, "evaluation_key": cutoff + 86_400_000, "joint_failure_runs": 4},
+            ],
+            "selected_profiles": [
+                {**base, "evaluation_key": past_key, "joint_failure_runs": 1},
+                {**base, "evaluation_key": cutoff + 86_400_000, "joint_failure_runs": 4},
+            ],
+        }
+
+        snapshot = build_daily_selection(
+            [],
+            cutoff,
+            config=DailyProfileSelectorConfig(joint_failures_to_exit=5),
+            previous_snapshot=previous,
+        )
+
+        item = candidate(snapshot)
+        self.assertEqual(item["selection_state"], "QUALIFICATION_WATCH")
+        self.assertEqual(item["joint_failure_runs"], 2)
+
+    def test_future_evaluated_at_or_lookback_end_invalidates_prior_candidate(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        key = profile_key(10, "short_observe", "generic_short_observe", "SHORT", "WD-02")
+        for future_field in ("evaluated_at", "lookback_end"):
+            with self.subTest(future_field=future_field):
+                previous = {
+                    "evaluation_key": cutoff - 86_400_000,
+                    "lookback_end": cutoff - 86_400_000,
+                    "evaluated_at": cutoff - 86_400_000,
+                    "selected_profiles": [
+                        {
+                            "key": key,
+                            "evaluation_key": cutoff - 86_400_000,
+                            future_field: cutoff + 1,
+                        }
+                    ],
+                }
+                snapshot = build_daily_selection([], cutoff, previous_snapshot=previous)
+                self.assertEqual(snapshot["selected_profiles"], [])
+
+    def test_newer_unselected_candidate_overrides_older_selected_state(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        key = profile_key(10, "short_observe", "generic_short_observe", "SHORT", "WD-02")
+        older = cutoff - 2 * 86_400_000
+        newer = cutoff - 86_400_000
+        previous = {
+            "evaluation_key": newer,
+            "lookback_end": newer,
+            "evaluated_at": newer,
+            "candidates": [
+                {
+                    "key": key,
+                    "evaluation_key": newer,
+                    "qualification_state": "NOT_QUALIFIED",
+                    "selection_state": "WIN_RATE_BELOW_THRESHOLD",
+                    "joint_failure_runs": 0,
+                    "fast_7d": {},
+                    "stable_14d": {},
+                }
+            ],
+            "selected_profiles": [
+                {
+                    "key": key,
+                    "evaluation_key": older,
+                    "qualification_state": "QUALIFICATION_WATCH",
+                    "selection_state": "QUALIFICATION_WATCH",
+                    "joint_failure_runs": 3,
+                    "fast_7d": {},
+                    "stable_14d": {},
+                }
+            ],
+        }
+
+        snapshot = build_daily_selection([], cutoff, previous_snapshot=previous)
+
+        item = candidate(snapshot)
+        self.assertEqual(item["selection_state"], "INSUFFICIENT_SAMPLES")
+        self.assertEqual(snapshot["selected_profiles"], [])
 
 
 if __name__ == "__main__":

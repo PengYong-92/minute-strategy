@@ -333,6 +333,7 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--live-short-segments", result.stdout)
         self.assertIn("--no-daily-profile-selector", result.stdout)
         self.assertIn("--daily-profile-lookback-days", result.stdout)
+        self.assertIn("--daily-profile-stable-lookback-days", result.stdout)
         self.assertIn("--daily-profile-min-samples", result.stdout)
         self.assertIn("--daily-profile-weekend-min-samples", result.stdout)
         self.assertIn("--daily-profile-min-win-rate", result.stdout)
@@ -340,6 +341,8 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--daily-profile-exit-win-rate", result.stdout)
         self.assertIn("--daily-profile-exit-ev", result.stdout)
         self.assertIn("--daily-profile-degraded-runs", result.stdout)
+        self.assertIn("--daily-profile-joint-failures-to-exit", result.stdout)
+        self.assertIn("未指定时沿用连续退化次数", result.stdout)
         self.assertIn("--daily-profile-max-active", result.stdout)
         self.assertIn("--daily-profile-evaluation-time", result.stdout)
         self.assertIn("--daily-profile-activation-time", result.stdout)
@@ -413,6 +416,7 @@ process.stdout.write(JSON.stringify({
                     "LIVE_SHORT_SEGMENTS": "WD-23",
                     "DAILY_PROFILE_SELECTOR": "0",
                     "DAILY_PROFILE_LOOKBACK_DAYS": "8",
+                    "DAILY_PROFILE_STABLE_LOOKBACK_DAYS": "16",
                     "DAILY_PROFILE_MIN_SAMPLES": "25",
                     "DAILY_PROFILE_WEEKEND_MIN_SAMPLES": "9",
                     "DAILY_PROFILE_MIN_WIN_RATE": "0.61",
@@ -420,6 +424,7 @@ process.stdout.write(JSON.stringify({
                     "DAILY_PROFILE_EXIT_WIN_RATE": "0.57",
                     "DAILY_PROFILE_EXIT_EV": "0.1",
                     "DAILY_PROFILE_DEGRADED_RUNS": "3",
+                    "DAILY_PROFILE_JOINT_FAILURES_TO_EXIT": "4",
                     "DAILY_PROFILE_MAX_ACTIVE": "2",
                     "DAILY_PROFILE_EVALUATION_TIME": "07:45",
                     "DAILY_PROFILE_ACTIVATION_TIME": "08:05",
@@ -481,6 +486,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(args[args.index("--live-short-segments") + 1], "WD-23")
         self.assertIn("--no-daily-profile-selector", args)
         self.assertEqual(args[args.index("--daily-profile-lookback-days") + 1], "8")
+        self.assertEqual(args[args.index("--daily-profile-stable-lookback-days") + 1], "16")
         self.assertEqual(args[args.index("--daily-profile-min-samples") + 1], "25")
         self.assertEqual(args[args.index("--daily-profile-weekend-min-samples") + 1], "9")
         self.assertEqual(args[args.index("--daily-profile-min-win-rate") + 1], "0.61")
@@ -488,6 +494,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(args[args.index("--daily-profile-exit-win-rate") + 1], "0.57")
         self.assertEqual(args[args.index("--daily-profile-exit-ev") + 1], "0.1")
         self.assertEqual(args[args.index("--daily-profile-degraded-runs") + 1], "3")
+        self.assertEqual(args[args.index("--daily-profile-joint-failures-to-exit") + 1], "4")
         self.assertEqual(args[args.index("--daily-profile-max-active") + 1], "2")
         self.assertEqual(args[args.index("--daily-profile-evaluation-time") + 1], "07:45")
         self.assertEqual(args[args.index("--daily-profile-activation-time") + 1], "08:05")
@@ -496,6 +503,45 @@ process.stdout.write(JSON.stringify({
             args[args.index("--profile-degradation-cooldown-minutes") + 1],
             "75",
         )
+
+    def test_run_script_keeps_optional_daily_profile_args_unset_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+            }
+
+            result = run(
+                ["bash", str(ROOT / "scripts" / "run.sh")],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            args = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("--daily-profile-stable-lookback-days", args)
+        self.assertNotIn("--daily-profile-joint-failures-to-exit", args)
+        self.assertEqual(args[args.index("--daily-profile-degraded-runs") + 1], "2")
 
     def test_run_script_forwards_profile_degradation_cooldown_default_and_cli_forms(self):
         with tempfile.TemporaryDirectory() as temp_dir:

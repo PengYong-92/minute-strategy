@@ -104,6 +104,76 @@ class OrdersApiTest(unittest.TestCase):
         self.assertIn("--strategy-build-id", stdout.getvalue())
         self.assertIn("策略构建标识", stdout.getvalue())
 
+    def test_daily_profile_startup_defaults_and_explicit_precedence(self):
+        cases = (
+            ({}, [], None, 14, "default", 2, "default"),
+            (
+                {"DAILY_PROFILE_LOOKBACK_DAYS": "15", "DAILY_PROFILE_DEGRADED_RUNS": "5"},
+                [],
+                None,
+                15,
+                "lookback_days",
+                5,
+                "degraded_runs_to_exit",
+            ),
+            (
+                {
+                    "DAILY_PROFILE_DEGRADED_RUNS": "5",
+                    "DAILY_PROFILE_JOINT_FAILURES_TO_EXIT": "4",
+                    "DAILY_PROFILE_STABLE_LOOKBACK_DAYS": "21",
+                },
+                [
+                    "--daily-profile-joint-failures-to-exit", "3",
+                    "--daily-profile-stable-lookback-days", "18",
+                ],
+                18,
+                18,
+                "stable_lookback_days",
+                3,
+                "joint_failures_to_exit",
+            ),
+        )
+        for environment, cli_args, raw_stable, effective_stable, stable_source, failures, failure_source in cases:
+            with self.subTest(environment=environment, cli_args=cli_args):
+                fake_server = SimpleNamespace(serve_forever=lambda: None, server_close=lambda: None)
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["app.server", "--no-warmup", "--no-persistence", "--no-webhook", *cli_args],
+                    ),
+                    patch("app.server.MonitorState", return_value=SimpleNamespace(symbol="BTCUSDT")) as monitor_state,
+                    patch("app.server.start_market_data", return_value=SimpleNamespace(stop=lambda: None)),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                raw = monitor_state.call_args.kwargs["daily_profile_selector_config"]
+                normalized = raw.normalized()
+                self.assertEqual(raw.stable_lookback_days, raw_stable)
+                self.assertEqual(normalized.effective_stable_lookback_days, effective_stable)
+                self.assertEqual(normalized.stable_lookback_source, stable_source)
+                self.assertEqual(normalized.joint_failures_to_exit, failures)
+                self.assertEqual(normalized.joint_failures_source, failure_source)
+
+    def test_help_documents_daily_profile_compatibility_options_in_chinese(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        help_text = stdout.getvalue()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--daily-profile-stable-lookback-days", help_text)
+        self.assertIn("--daily-profile-joint-failures-to-exit", help_text)
+        self.assertIn("未指定时取 14 与快速窗口天数的较大值", help_text)
+        self.assertIn("未指定时沿用连续退化次数", help_text)
+
     def test_main_injects_time_period_guard_config(self):
         cases = (
             ({}, [], False),

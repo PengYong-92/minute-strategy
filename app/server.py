@@ -206,6 +206,13 @@ def _env_float(name: str, default: float | None) -> float | None:
     return float(value)
 
 
+def _env_optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
+
+
 def _trade_score_threshold(value: str) -> float | None:
     normalized = str(value).strip().lower()
     if normalized in {"", "auto"}:
@@ -519,6 +526,12 @@ def main() -> None:
         help="每日画像统计回看天数，默认: 7",
     )
     parser.add_argument(
+        "--daily-profile-stable-lookback-days",
+        type=int,
+        default=_env_optional_int("DAILY_PROFILE_STABLE_LOOKBACK_DAYS"),
+        help="每日画像稳定窗口天数；未指定时取 14 与快速窗口天数的较大值",
+    )
+    parser.add_argument(
         "--daily-profile-min-samples",
         type=int,
         default=int(os.getenv("DAILY_PROFILE_MIN_SAMPLES", "20")),
@@ -557,8 +570,14 @@ def main() -> None:
     parser.add_argument(
         "--daily-profile-degraded-runs",
         type=int,
-        default=int(os.getenv("DAILY_PROFILE_DEGRADED_RUNS", "1")),
-        help="画像连续退化多少次后退出，默认: 1",
+        default=int(os.getenv("DAILY_PROFILE_DEGRADED_RUNS", "2")),
+        help="兼容画像连续退化次数，默认: 2",
+    )
+    parser.add_argument(
+        "--daily-profile-joint-failures-to-exit",
+        type=int,
+        default=_env_optional_int("DAILY_PROFILE_JOINT_FAILURES_TO_EXIT"),
+        help="双窗口同时失败多少次后退出；未指定时沿用连续退化次数",
     )
     parser.add_argument(
         "--daily-profile-max-active",
@@ -635,6 +654,7 @@ def main() -> None:
         enable_daily_profile_selector=not args.no_daily_profile_selector,
         daily_profile_selector_config=DailyProfileSelectorConfig(
             lookback_days=args.daily_profile_lookback_days,
+            stable_lookback_days=args.daily_profile_stable_lookback_days,
             min_samples=args.daily_profile_min_samples,
             weekend_min_samples=args.daily_profile_weekend_min_samples,
             min_win_rate=args.daily_profile_min_win_rate,
@@ -642,6 +662,7 @@ def main() -> None:
             exit_win_rate=args.daily_profile_exit_win_rate,
             exit_ev=args.daily_profile_exit_ev,
             degraded_runs_to_exit=args.daily_profile_degraded_runs,
+            joint_failures_to_exit=args.daily_profile_joint_failures_to_exit,
             max_active_profiles=args.daily_profile_max_active,
             evaluation_hour=args.daily_profile_evaluation_time[0],
             evaluation_minute=args.daily_profile_evaluation_time[1],

@@ -855,7 +855,18 @@ class MonitorState:
                 },
                 "profiles": {
                     "daily_selector_enabled": self.enable_daily_profile_selector,
-                    "daily_selector": asdict(self.daily_profile_selector_config),
+                    "daily_selector": {
+                        **asdict(self.daily_profile_selector_config),
+                        "effective_stable_lookback_days": (
+                            self.daily_profile_selector_config.effective_stable_lookback_days
+                        ),
+                        "stable_lookback_source": (
+                            self.daily_profile_selector_config.stable_lookback_source
+                        ),
+                        "effective_joint_failures_to_exit": (
+                            self.daily_profile_selector_config.joint_failures_to_exit
+                        ),
+                    },
                     "observation_promotion_enabled": (
                         self.enable_observation_profile_promotion
                     ),
@@ -3563,7 +3574,7 @@ class MonitorState:
                 lookback_days=max(
                     self.observation_profile_lookback_days,
                     self.daily_profile_selector_config.lookback_days,
-                    self.daily_profile_selector_config.stable_lookback_days,
+                    self.daily_profile_selector_config.effective_stable_lookback_days,
                 ),
             )
         return self.storage.load_observations(self.symbol)
@@ -4133,6 +4144,15 @@ class MonitorState:
             "error": latest.get("error"),
             "config": {
                 **self.daily_profile_selector_config.__dict__,
+                "effective_stable_lookback_days": (
+                    self.daily_profile_selector_config.effective_stable_lookback_days
+                ),
+                "stable_lookback_source": (
+                    self.daily_profile_selector_config.stable_lookback_source
+                ),
+                "effective_joint_failures_to_exit": (
+                    self.daily_profile_selector_config.joint_failures_to_exit
+                ),
             },
         }
 

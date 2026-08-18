@@ -6406,6 +6406,32 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(storage.profile_loads, [("BTCUSDT", 18), ("ETHUSDT", 18)])
         state.close()
 
+    def test_profile_restore_uses_effective_stable_window_when_unspecified(self):
+        class ProfileRestoreStorage(RecordingStorage):
+            def __init__(self):
+                super().__init__()
+                self.profile_loads = []
+
+            def load_observations_for_profile(self, symbol, *, lookback_days=7):
+                self.profile_loads.append((symbol, lookback_days))
+                return []
+
+        storage = ProfileRestoreStorage()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            observation_profile_lookback_days=10,
+            daily_profile_selector_config=DailyProfileSelectorConfig(lookback_days=30),
+        )
+        self.assertEqual(storage.profile_loads, [("BTCUSDT", 30)])
+        runtime = json.loads(state._decision_runtime_config().canonical_payload)["profiles"][
+            "daily_selector"
+        ]
+        self.assertIsNone(runtime["stable_lookback_days"])
+        self.assertEqual(runtime["effective_stable_lookback_days"], 30)
+        self.assertEqual(runtime["stable_lookback_source"], "lookback_days")
+        state.close()
+
     def test_restart_loaded_history_matches_full_history_dual_window_selection(self):
         cutoff = shanghai_timestamp("2026-07-30T07:50:00")
         config = DailyProfileSelectorConfig()

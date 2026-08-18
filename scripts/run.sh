@@ -48,13 +48,15 @@ OBSERVATION_PROFILE_MIN_EDGE="${OBSERVATION_PROFILE_MIN_EDGE:-10}"
 LIVE_SHORT_SEGMENTS="${LIVE_SHORT_SEGMENTS:-WD-02,WD-23}"
 DAILY_PROFILE_SELECTOR="${DAILY_PROFILE_SELECTOR:-1}"
 DAILY_PROFILE_LOOKBACK_DAYS="${DAILY_PROFILE_LOOKBACK_DAYS:-7}"
+DAILY_PROFILE_STABLE_LOOKBACK_DAYS="${DAILY_PROFILE_STABLE_LOOKBACK_DAYS-}"
 DAILY_PROFILE_MIN_SAMPLES="${DAILY_PROFILE_MIN_SAMPLES:-20}"
 DAILY_PROFILE_WEEKEND_MIN_SAMPLES="${DAILY_PROFILE_WEEKEND_MIN_SAMPLES:-10}"
 DAILY_PROFILE_MIN_WIN_RATE="${DAILY_PROFILE_MIN_WIN_RATE:-0.60}"
 DAILY_PROFILE_MIN_EV="${DAILY_PROFILE_MIN_EV:-0}"
 DAILY_PROFILE_EXIT_WIN_RATE="${DAILY_PROFILE_EXIT_WIN_RATE:-0.60}"
 DAILY_PROFILE_EXIT_EV="${DAILY_PROFILE_EXIT_EV:-0}"
-DAILY_PROFILE_DEGRADED_RUNS="${DAILY_PROFILE_DEGRADED_RUNS:-1}"
+DAILY_PROFILE_DEGRADED_RUNS="${DAILY_PROFILE_DEGRADED_RUNS:-2}"
+DAILY_PROFILE_JOINT_FAILURES_TO_EXIT="${DAILY_PROFILE_JOINT_FAILURES_TO_EXIT-}"
 DAILY_PROFILE_MAX_ACTIVE="${DAILY_PROFILE_MAX_ACTIVE:-0}"
 DAILY_PROFILE_EVALUATION_TIME="${DAILY_PROFILE_EVALUATION_TIME:-07:50}"
 DAILY_PROFILE_ACTIVATION_TIME="${DAILY_PROFILE_ACTIVATION_TIME:-08:00}"
@@ -141,6 +143,8 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
                          关闭每日观察画像策略选择器，回退到静态主策略
   --daily-profile-lookback-days N
                          每日画像统计回看天数，默认: 7
+  --daily-profile-stable-lookback-days N
+                         稳定窗口天数，未指定时取 14 与快速窗口天数的较大值
   --daily-profile-min-samples N
                          工作日新画像入选所需最小独立样本数，默认: 20
   --daily-profile-weekend-min-samples N
@@ -154,7 +158,9 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --daily-profile-exit-ev N
                          已启用画像退化EV线，默认: 0U
   --daily-profile-degraded-runs N
-                         连续退化多少次后退出，默认: 1
+                         兼容连续退化次数，默认: 2
+  --daily-profile-joint-failures-to-exit N
+                         双窗口同时失败多少次后退出，未指定时沿用连续退化次数
   --daily-profile-max-active N
                          每天最多启用画像数量，0 表示不限制，默认: 0
   --daily-profile-evaluation-time HH:MM
@@ -187,10 +193,12 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   OBSERVATION_PROFILE_MIN_SAMPLES, OBSERVATION_PROFILE_MIN_WIN_RATE,
   OBSERVATION_PROFILE_MIN_EV, OBSERVATION_PROFILE_MIN_EDGE, LIVE_SHORT_SEGMENTS,
   DAILY_PROFILE_SELECTOR, DAILY_PROFILE_LOOKBACK_DAYS,
+  DAILY_PROFILE_STABLE_LOOKBACK_DAYS,
   DAILY_PROFILE_MIN_SAMPLES, DAILY_PROFILE_WEEKEND_MIN_SAMPLES,
   DAILY_PROFILE_MIN_WIN_RATE, DAILY_PROFILE_MIN_EV,
   DAILY_PROFILE_EXIT_WIN_RATE, DAILY_PROFILE_EXIT_EV,
-  DAILY_PROFILE_DEGRADED_RUNS, DAILY_PROFILE_MAX_ACTIVE,
+  DAILY_PROFILE_DEGRADED_RUNS, DAILY_PROFILE_JOINT_FAILURES_TO_EXIT,
+  DAILY_PROFILE_MAX_ACTIVE,
   DAILY_PROFILE_EVALUATION_TIME, DAILY_PROFILE_ACTIVATION_TIME,
   NO_WARMUP, NO_PERSISTENCE, NO_WEBHOOK, NO_WEBSOCKET,
   WARMUP_CURRENT_MONTH_DAILY, PYTHON_BIN
@@ -563,6 +571,15 @@ while [ "$#" -gt 0 ]; do
       DAILY_PROFILE_LOOKBACK_DAYS="${1#*=}"
       shift
       ;;
+    --daily-profile-stable-lookback-days)
+      require_value "$1" "${2:-}"
+      DAILY_PROFILE_STABLE_LOOKBACK_DAYS="$2"
+      shift 2
+      ;;
+    --daily-profile-stable-lookback-days=*)
+      DAILY_PROFILE_STABLE_LOOKBACK_DAYS="${1#*=}"
+      shift
+      ;;
     --daily-profile-min-samples)
       require_value "$1" "${2:-}"
       DAILY_PROFILE_MIN_SAMPLES="$2"
@@ -624,6 +641,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --daily-profile-degraded-runs=*)
       DAILY_PROFILE_DEGRADED_RUNS="${1#*=}"
+      shift
+      ;;
+    --daily-profile-joint-failures-to-exit)
+      require_value "$1" "${2:-}"
+      DAILY_PROFILE_JOINT_FAILURES_TO_EXIT="$2"
+      shift 2
+      ;;
+    --daily-profile-joint-failures-to-exit=*)
+      DAILY_PROFILE_JOINT_FAILURES_TO_EXIT="${1#*=}"
       shift
       ;;
     --daily-profile-max-active)
@@ -777,6 +803,12 @@ case "$WARMUP_CURRENT_MONTH_DAILY" in
     EXTRA_ARGS+=(--no-current-month-daily)
     ;;
 esac
+if [ -n "$DAILY_PROFILE_STABLE_LOOKBACK_DAYS" ]; then
+  EXTRA_ARGS+=(--daily-profile-stable-lookback-days "$DAILY_PROFILE_STABLE_LOOKBACK_DAYS")
+fi
+if [ -n "$DAILY_PROFILE_JOINT_FAILURES_TO_EXIT" ]; then
+  EXTRA_ARGS+=(--daily-profile-joint-failures-to-exit "$DAILY_PROFILE_JOINT_FAILURES_TO_EXIT")
+fi
 
 "$PYTHON_BIN" - <<'PY'
 import sys
