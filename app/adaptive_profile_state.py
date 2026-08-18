@@ -46,7 +46,6 @@ class AdaptiveProfileStateConfig:
 @dataclass
 class _ProfileReplay:
     samples: deque[ObservationSignal]
-    bindings: _IdentityBindings
     selection: _IncrementalCanonicalSelection
     previous_status: str | None = None
 
@@ -66,33 +65,35 @@ class _SelectionUpdate:
 
 class _IdentityBindings:
     def __init__(self) -> None:
-        self._decisions_by_observation: dict[str, str] = {}
-        self._observations_by_decision: dict[str, str] = {}
+        self._decisions_by_observation: dict[str, tuple[str, str]] = {}
+        self._observations_by_decision: dict[str, tuple[str, str]] = {}
 
-    def accept(self, event: ObservationSignal) -> bool:
+    def accept(self, profile_key: str, event: ObservationSignal) -> bool:
         observation_identity = event.observation_key
         decision_identity = event.decision_id
         if (
             observation_identity
             and observation_identity in self._decisions_by_observation
-            and self._decisions_by_observation[observation_identity] != decision_identity
+            and self._decisions_by_observation[observation_identity]
+            != (decision_identity, profile_key)
         ):
             return False
         if (
             decision_identity
             and decision_identity in self._observations_by_decision
-            and self._observations_by_decision[decision_identity] != observation_identity
+            and self._observations_by_decision[decision_identity]
+            != (observation_identity, profile_key)
         ):
             return False
         if observation_identity:
             self._decisions_by_observation.setdefault(
                 observation_identity,
-                decision_identity,
+                (decision_identity, profile_key),
             )
         if decision_identity:
             self._observations_by_decision.setdefault(
                 decision_identity,
-                observation_identity,
+                (observation_identity, profile_key),
             )
         return True
 
@@ -102,6 +103,7 @@ class _IncrementalCanonicalSelection:
         self._serial = 0
         self._identity_selected: list[_ReplayCandidate] = []
         self._identity_keys: list[tuple] = []
+        self._identity_opened_at: list[int] = []
         self._interval_selected: list[_ReplayCandidate] = []
         self._interval_keys: list[tuple] = []
         self._observation_owners: dict[str, _ReplayCandidate] = {}
@@ -156,6 +158,7 @@ class _IncrementalCanonicalSelection:
     def _insert_identity_candidate(self, candidate: _ReplayCandidate) -> None:
         position = bisect_right(self._identity_keys, candidate.order_key)
         self._identity_keys.insert(position, candidate.order_key)
+        self._identity_opened_at.insert(position, candidate.event.opened_at)
         self._identity_selected.insert(position, candidate)
         self._set_owner(candidate)
 
@@ -166,6 +169,7 @@ class _IncrementalCanonicalSelection:
     ) -> None:
         position = bisect_left(self._identity_keys, owner.order_key)
         self._identity_keys.pop(position)
+        self._identity_opened_at.pop(position)
         self._identity_selected.pop(position)
         self._insert_identity_candidate(candidate)
 
@@ -211,24 +215,32 @@ class _IncrementalCanonicalSelection:
         prefix_end = bisect_left(old_keys, affected_key)
         selected = old_selected[:prefix_end]
         next_independent_at = selected[-1].event.expires_at if selected else 0
-        old_positions = {
-            candidate.serial: index for index, candidate in enumerate(old_selected)
-        }
+        old_expires = [candidate.event.expires_at for candidate in old_selected]
         identity_start = bisect_left(self._identity_keys, affected_key)
+        identity_position = identity_start
 
-        for candidate in self._identity_selected[identity_start:]:
-            if candidate.event.opened_at >= next_independent_at:
-                selected.append(candidate)
-                next_independent_at = candidate.event.expires_at
-            old_position = old_positions.get(candidate.serial)
+        while identity_position < len(self._identity_selected):
+            identity_position = bisect_left(
+                self._identity_opened_at,
+                next_independent_at,
+                identity_position,
+            )
+            if identity_position >= len(self._identity_selected):
+                break
+            candidate = self._identity_selected[identity_position]
+            selected.append(candidate)
+            next_independent_at = candidate.event.expires_at
+            old_position = bisect_left(old_expires, next_independent_at)
             if (
                 convergence_after is not None
-                and candidate.order_key >= convergence_after
-                and old_position is not None
-                and next_independent_at == candidate.event.expires_at
+                and old_position < len(old_selected)
+                and old_expires[old_position] == next_independent_at
+                and old_selected[old_position].order_key >= convergence_after
+                and old_selected[old_position].order_key >= candidate.order_key
             ):
                 selected.extend(old_selected[old_position + 1 :])
                 break
+            identity_position += 1
 
         self._interval_selected = selected
         self._interval_keys = [candidate.order_key for candidate in selected]
@@ -343,11 +355,16 @@ def independent_settled_samples(
 ) -> list[ObservationSignal]:
     cutoff = _validated_evaluated_at(evaluated_at)
     _validate_profile_key(profile_key)
-    candidates = []
+    prepared_events = []
     for item in observations:
         prepared = _prepare_event(item, cutoff)
-        if prepared is not None and prepared[0] == profile_key:
-            candidates.append(item)
+        if prepared is not None:
+            prepared_events.append(prepared)
+    candidates = [
+        event
+        for key, event in _causally_bound_prepared_events(prepared_events)
+        if key == profile_key
+    ]
 
     return _canonical_independent_samples(candidates, cutoff)
 
@@ -356,7 +373,7 @@ def _canonical_independent_samples(
     candidates: Sequence[ObservationSignal],
     evaluated_at: int,
 ) -> list[ObservationSignal]:
-    ordered = sorted(_causally_bound_candidates(candidates), key=_opened_sort_key)
+    ordered = sorted(candidates, key=_opened_sort_key)
 
     deduplicated = []
     seen_observation_keys: set[str] = set()
@@ -379,14 +396,14 @@ def _canonical_independent_samples(
     return _independent_samples(deduplicated, -(2**63), evaluated_at)
 
 
-def _causally_bound_candidates(
-    candidates: Sequence[ObservationSignal],
-) -> list[ObservationSignal]:
+def _causally_bound_prepared_events(
+    events: Sequence[tuple[str, ObservationSignal]],
+) -> list[tuple[str, ObservationSignal]]:
     bindings = _IdentityBindings()
     accepted = []
-    for event in sorted(candidates, key=_causal_observation_sort_key):
-        if bindings.accept(event):
-            accepted.append(event)
+    for key, event in sorted(events, key=_prepared_event_sort_key):
+        if bindings.accept(key, event):
+            accepted.append((key, event))
     return accepted
 
 
@@ -402,7 +419,7 @@ def rebuild_adaptive_profile_states(
         prepared = _prepare_event(item, cutoff)
         if prepared is not None:
             events.append(prepared)
-    events.sort(key=_prepared_event_sort_key)
+    events = _causally_bound_prepared_events(events)
 
     states: dict[str, dict] = {}
     profiles: dict[str, _ProfileReplay] = {}
@@ -412,13 +429,10 @@ def rebuild_adaptive_profile_states(
         if replay is None:
             replay = _ProfileReplay(
                 samples=deque(maxlen=resolved.full_window_samples),
-                bindings=_IdentityBindings(),
                 selection=_IncrementalCanonicalSelection(),
             )
             profiles[key] = replay
 
-        if not replay.bindings.accept(event):
-            continue
         update = replay.selection.add(event)
         if not update.changed:
             continue

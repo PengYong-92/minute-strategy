@@ -198,6 +198,21 @@ def cross_linked_conflict_rows(sample_size: int) -> list[ObservationSignal]:
     return rows
 
 
+def nested_overlap_rows(sample_size: int) -> list[ObservationSignal]:
+    settlement_start = CUTOFF - sample_size - 1
+    opened_start = settlement_start - 10 * MINUTE_MS - sample_size
+    return [
+        observation(
+            f"nested-overlap-{index:05d}",
+            "WIN" if index % 2 == 0 else "LOSS",
+            opened_start + (sample_size - 1 - index),
+            settled_at=settlement_start + index,
+            decision_id=f"nested-overlap-decision-{index:05d}",
+        )
+        for index in range(sample_size)
+    ]
+
+
 def state_trace_item(key: str, result: dict) -> tuple:
     return (
         key,
@@ -232,7 +247,7 @@ def progressive_reference_rebuild(
             float(item.pnl).hex(),
         ),
     )
-    prefixes: dict[str, list[ObservationSignal]] = {}
+    prefix: list[ObservationSignal] = []
     signatures: dict[str, tuple] = {}
     states: dict[str, dict] = {}
     trace = []
@@ -244,7 +259,6 @@ def progressive_reference_rebuild(
             event.direction,
             event.threshold_segment,
         )
-        prefix = prefixes.setdefault(key, [])
         prefix.append(event)
         event_cutoff = event.settled_at + 1
         samples = independent_settled_samples(prefix, key, event_cutoff)
@@ -260,7 +274,7 @@ def progressive_reference_rebuild(
             )
             for item in samples
         )
-        if signature == signatures.get(key):
+        if signature == signatures.get(key, ()):
             continue
         signatures[key] = signature
         result = classify_profile_state(
@@ -913,6 +927,129 @@ class AdaptiveProfileStateTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first[PROFILE_KEY]["n12"]["wins"], 0)
 
+    def test_global_binding_rejects_cross_profile_conflicts_and_profile_drift(self):
+        start = CUTOFF - 200 * MINUTE_MS
+        other_values = {
+            "family": "aaa_family",
+            "tag": "aaa_tag",
+            "direction": "LONG",
+            "segment": "WE-03",
+        }
+        other_key = profile_key(10, "aaa_family", "aaa_tag", "LONG", "WE-03")
+        rows = [
+            observation(
+                "shared-global-observation",
+                "LOSS",
+                start,
+                settled_at=start + 20 * MINUTE_MS,
+                decision_id="global-owner-decision",
+                **other_values,
+            ),
+            observation(
+                "shared-global-observation",
+                "WIN",
+                start + 20 * MINUTE_MS,
+                settled_at=start + 40 * MINUTE_MS,
+                decision_id="conflicting-target-decision",
+            ),
+            observation(
+                "drifting-global-observation",
+                "LOSS",
+                start + 40 * MINUTE_MS,
+                settled_at=start + 60 * MINUTE_MS,
+                decision_id="drifting-global-decision",
+                **other_values,
+            ),
+            observation(
+                "drifting-global-observation",
+                "WIN",
+                start + 60 * MINUTE_MS,
+                settled_at=start + 80 * MINUTE_MS,
+                decision_id="drifting-global-decision",
+            ),
+            observation(
+                "valid-target-observation",
+                "WIN",
+                start + 80 * MINUTE_MS,
+                settled_at=start + 100 * MINUTE_MS,
+                decision_id="valid-target-decision",
+            ),
+        ]
+        expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+        actual_trace = []
+        real_classify = adaptive_module.classify_profile_state
+
+        def recording_classify(*args, **kwargs):
+            result = real_classify(*args, **kwargs)
+            actual_trace.append(state_trace_item(args[1], result))
+            return result
+
+        with patch.object(
+            adaptive_module,
+            "classify_profile_state",
+            side_effect=recording_classify,
+        ):
+            actual = rebuild_adaptive_profile_states(list(reversed(rows)), CUTOFF)
+        public = independent_settled_samples(
+            list(reversed(rows)),
+            PROFILE_KEY,
+            CUTOFF,
+        )
+
+        self.assertEqual([item.observation_key for item in public], ["valid-target-observation"])
+        self.assertEqual(set(actual), {other_key, PROFILE_KEY})
+        self.assertEqual(actual_trace, expected_trace)
+        self.assertEqual(actual, expected)
+
+    def test_global_binding_same_time_is_deterministic_and_malformed_does_not_bind(self):
+        opened_at = CUTOFF - 60 * MINUTE_MS
+        settled_at = CUTOFF - 1
+        malformed = observation(
+            "malformed-global-observation",
+            "LOSS",
+            opened_at - 40 * MINUTE_MS,
+            settled_at=settled_at - 1,
+            family="",
+            decision_id="malformed-global-decision",
+        )
+        valid_after_malformed = observation(
+            "malformed-global-observation",
+            "WIN",
+            opened_at - 20 * MINUTE_MS,
+            settled_at=settled_at,
+            decision_id="malformed-global-decision",
+        )
+        other = observation(
+            "same-time-global-observation",
+            "LOSS",
+            opened_at,
+            settled_at=settled_at,
+            family="aaa_family",
+            tag="aaa_tag",
+            direction="LONG",
+            segment="WE-03",
+            decision_id="aaa-global-decision",
+        )
+        target_conflict = observation(
+            "same-time-global-observation",
+            "WIN",
+            opened_at,
+            settled_at=settled_at,
+            decision_id="target-global-decision",
+        )
+        rows = [target_conflict, valid_after_malformed, other, malformed]
+
+        first = rebuild_adaptive_profile_states(rows, CUTOFF)
+        second = rebuild_adaptive_profile_states(list(reversed(rows)), CUTOFF)
+        public = independent_settled_samples(rows, PROFILE_KEY, CUTOFF)
+
+        self.assertEqual(
+            [item.observation_key for item in public],
+            ["malformed-global-observation"],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first[PROFILE_KEY]["n12"]["wins"], 1)
+
     def test_rebuild_progressive_overlap_replacement_preserves_transition_history(self):
         start = CUTOFF - 60 * 20 * MINUTE_MS
         results = ["LOSS"] * 8 + ["WIN"] * 5 + ["LOSS"] * 7
@@ -1050,6 +1187,32 @@ class AdaptiveProfileStateTest(unittest.TestCase):
         self.assertEqual(add.call_count, 5_000)
         self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 20)
         self.assertLess(elapsed, 5.0)
+
+    def test_rebuild_nested_overlaps_use_successor_jumps(self):
+        elapsed_by_size = {}
+        for sample_size in (1_000, 2_000, 4_000, 10_000):
+            rows = nested_overlap_rows(sample_size)
+            started = time.perf_counter()
+            with patch.object(
+                adaptive_module,
+                "_canonical_independent_samples",
+                side_effect=AssertionError("rebuild must not scan canonical prefixes"),
+            ):
+                with patch.object(
+                    adaptive_module,
+                    "classify_profile_state",
+                    wraps=adaptive_module.classify_profile_state,
+                ) as classify:
+                    rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+            elapsed_by_size[sample_size] = time.perf_counter() - started
+            self.assertEqual(classify.call_count, sample_size)
+            self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 1)
+
+        self.assertLess(elapsed_by_size[10_000], 1.0)
+        self.assertLess(
+            elapsed_by_size[10_000],
+            elapsed_by_size[2_000] * 8 + 0.1,
+        )
 
     def test_rebuild_replays_paused_then_watch_without_future_leak(self):
         start = CUTOFF - 30 * 20 * MINUTE_MS
