@@ -712,6 +712,9 @@ def main() -> None:
     finally:
         server.server_close()
         market_data.stop()
+        closer = getattr(state, "close", None)
+        if closer is not None:
+            closer()
 
 
 if __name__ == "__main__":

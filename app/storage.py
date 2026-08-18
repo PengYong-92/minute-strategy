@@ -2,6 +2,8 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -237,6 +239,10 @@ def _compact_profile_guard(value: object) -> dict[str, object]:
             "observe_only",
             "blocked",
             "hit_keys",
+            "cache_status",
+            "source_revision",
+            "current_revision",
+            "stale",
         )
         if key in source
     }
@@ -1041,12 +1047,20 @@ class SQLiteMonitorStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._profile_summary_lock = threading.RLock()
-        self._profile_summary_revision: dict[str, int] = {}
         self._profile_summary_dirty: set[str] = set()
-        self._profile_summary_cache: dict[
-            tuple[str, int, int, int],
-            dict[str, Any],
+        self._profile_summary_keys: set[tuple[str, int, int, int]] = set()
+        self._profile_summary_futures: dict[
+            tuple[str, int, int, int], Future
         ] = {}
+        self._profile_summary_condition = threading.Condition(
+            self._profile_summary_lock
+        )
+        self.profile_worker_thread_prefix = f"profile-summary-{id(self):x}"
+        self._profile_summary_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=self.profile_worker_thread_prefix,
+        )
+        self._profile_summary_closed = False
         self._init_schema()
 
     def _maintain_profile_summary_after_commit(
@@ -1065,6 +1079,22 @@ class SQLiteMonitorStore:
         except Exception:  # noqa: BLE001 - 事务已提交，缓存维护只能标记为陈旧。
             with self._profile_summary_lock:
                 self._profile_summary_dirty.add(symbol.upper())
+
+    def close(self) -> None:
+        with self._profile_summary_lock:
+            if self._profile_summary_closed:
+                return
+            self._profile_summary_closed = True
+        self._profile_summary_executor.shutdown(wait=True)
+
+    def wait_for_profile_summary_rebuilds(self, timeout: float | None = None) -> None:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._profile_summary_condition:
+            while self._profile_summary_futures:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("profile summary rebuild did not drain")
+                self._profile_summary_condition.wait(timeout=remaining)
 
     def storage_capacity(self) -> StorageCapacity:
         with self._connect() as connection:
@@ -1764,14 +1794,17 @@ class SQLiteMonitorStore:
                 self._update_settled_order(connection, order, symbol)
                 if credit is not None:
                     self._upsert_progression_credit(connection, symbol, credit)
-                self._update_order_entry_snapshot_settlement(
+                snapshot_changed = self._update_order_entry_snapshot_settlement(
                     connection,
                     order,
                     symbol,
                 )
+                if snapshot_changed:
+                    self._bump_profile_summary_revision(connection, symbol)
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
-        self._maintain_profile_summary_after_commit(symbol, settlement=order)
+        if snapshot_changed:
+            self._maintain_profile_summary_after_commit(symbol)
 
     @staticmethod
     def _update_settled_order(
@@ -2697,33 +2730,16 @@ class SQLiteMonitorStore:
             profile_guard_min_history,
             profile_guard_min_group_size,
         )
-        while True:
-            with self._profile_summary_lock:
-                cached = self._profile_summary_cache.get(key)
-                if cached is not None:
-                    return deepcopy(cached["summary"])
-                revision = self._profile_summary_revision.get(key[0], 0)
-            snapshots = self.load_order_entry_snapshots(key[0], limit=key[1])
-            samples = [
-                sample_from_entry_snapshot(snapshot)
-                for snapshot in reversed(snapshots)
-            ]
-            summary = summarize_order_samples_with_guard(
-                samples,
-                profile_guard_min_history=key[2],
-                profile_guard_min_group_size=key[3],
-            )
-            with self._profile_summary_lock:
-                if self._profile_summary_revision.get(key[0], 0) != revision:
-                    continue
-                existing = self._profile_summary_cache.get(key)
-                if existing is None:
-                    self._profile_summary_cache[key] = {
-                        "samples": samples,
-                        "summary": summary,
-                    }
-                    existing = self._profile_summary_cache[key]
-                return deepcopy(existing["summary"])
+        with self._profile_summary_lock:
+            if self._profile_summary_closed:
+                raise RuntimeError("profile summary worker is closed")
+            self._profile_summary_keys.add(key)
+        return self.profile_summary_snapshot(
+            key[0],
+            limit=key[1],
+            profile_guard_min_history=key[2],
+            profile_guard_min_group_size=key[3],
+        )
 
     def profile_summary_snapshot(
         self,
@@ -2732,7 +2748,7 @@ class SQLiteMonitorStore:
         *,
         profile_guard_min_history: int = 15,
         profile_guard_min_group_size: int = 2,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         key = self._profile_summary_key(
             symbol,
             limit,
@@ -2740,8 +2756,265 @@ class SQLiteMonitorStore:
             profile_guard_min_group_size,
         )
         with self._profile_summary_lock:
-            cached = self._profile_summary_cache.get(key)
-            return None if cached is None else deepcopy(cached["summary"])
+            self._profile_summary_keys.add(key)
+        current_revision, source_revision, payload = (
+            self._read_profile_summary_materialization(key)
+        )
+        stale = source_revision is None or source_revision != current_revision
+        if source_revision is None:
+            summary = {}
+            status = "PREPARING"
+        else:
+            summary = payload
+            status = "STALE" if stale else "READY"
+        summary.update(
+            {
+                "cache_status": status,
+                "source_revision": source_revision,
+                "current_revision": current_revision,
+                "stale": stale,
+            }
+        )
+        if stale:
+            self._schedule_profile_summary_rebuild(key)
+        return summary
+
+    def exact_order_profile_summary(
+        self,
+        symbol: str,
+        limit: int = 5000,
+        *,
+        profile_guard_min_history: int = 15,
+        profile_guard_min_group_size: int = 2,
+    ) -> dict[str, Any]:
+        key = self._profile_summary_key(
+            symbol,
+            limit,
+            profile_guard_min_history,
+            profile_guard_min_group_size,
+        )
+        with self._profile_summary_lock:
+            pending = self._profile_summary_futures.get(key)
+        if pending is not None:
+            try:
+                pending.result()
+            except Exception:  # noqa: BLE001 - 正式模式随后执行同步精确重试。
+                pass
+            current_revision, source_revision, payload = (
+                self._read_profile_summary_materialization(key)
+            )
+            if source_revision == current_revision:
+                payload.update(
+                    {
+                        "cache_status": "READY",
+                        "source_revision": source_revision,
+                        "current_revision": current_revision,
+                        "stale": False,
+                    }
+                )
+                return payload
+        while True:
+            revision, samples = self._profile_summary_rebuild_input(key)
+            summary = self._compute_profile_summary(key, samples)
+            if self._write_profile_summary_materialization(key, revision, summary):
+                summary = deepcopy(summary)
+                summary.update(
+                    {
+                        "cache_status": "READY",
+                        "source_revision": revision,
+                        "current_revision": revision,
+                        "stale": False,
+                    }
+                )
+                return summary
+
+    def profile_summary_revision(self, symbol: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "select revision from profile_summary_revisions where symbol = ?",
+                (symbol.upper(),),
+            ).fetchone()
+        return 0 if row is None else int(row["revision"])
+
+    @staticmethod
+    def _bump_profile_summary_revision(
+        connection: sqlite3.Connection,
+        symbol: str,
+    ) -> int:
+        normalized_symbol = symbol.upper()
+        connection.execute(
+            """
+            insert into profile_summary_revisions(symbol, revision)
+            values (?, 1)
+            on conflict(symbol) do update set
+                revision = profile_summary_revisions.revision + 1,
+                updated_at_ms = strftime('%s','now') * 1000
+            """,
+            (normalized_symbol,),
+        )
+        row = connection.execute(
+            "select revision from profile_summary_revisions where symbol = ?",
+            (normalized_symbol,),
+        ).fetchone()
+        return int(row["revision"])
+
+    def _read_profile_summary_materialization(
+        self,
+        key: tuple[str, int, int, int],
+    ) -> tuple[int, int | None, dict[str, Any]]:
+        with self._connect() as connection:
+            revision_row = connection.execute(
+                "select revision from profile_summary_revisions where symbol = ?",
+                (key[0],),
+            ).fetchone()
+            materialized = connection.execute(
+                """
+                select source_revision, payload
+                from profile_summary_materializations
+                where symbol = ? and snapshot_limit = ?
+                  and profile_guard_min_history = ?
+                  and profile_guard_min_group_size = ?
+                """,
+                key,
+            ).fetchone()
+        current_revision = 0 if revision_row is None else int(revision_row["revision"])
+        if materialized is None:
+            return current_revision, None, {}
+        payload = json.loads(materialized["payload"])
+        if not isinstance(payload, dict):
+            raise ValueError("materialized profile summary must be an object")
+        return current_revision, int(materialized["source_revision"]), payload
+
+    def _schedule_profile_summary_rebuild(
+        self,
+        key: tuple[str, int, int, int],
+    ) -> None:
+        with self._profile_summary_condition:
+            if self._profile_summary_closed:
+                raise RuntimeError("profile summary worker is closed")
+            existing = self._profile_summary_futures.get(key)
+            if existing is not None and not existing.done():
+                return
+            future = self._profile_summary_executor.submit(
+                self._rebuild_profile_summary,
+                key,
+            )
+            self._profile_summary_futures[key] = future
+            future.add_done_callback(
+                lambda completed, rebuild_key=key: (
+                    self._profile_summary_rebuild_completed(rebuild_key, completed)
+                )
+            )
+
+    def _profile_summary_rebuild_completed(
+        self,
+        key: tuple[str, int, int, int],
+        future: Future,
+    ) -> None:
+        error = future.exception()
+        with self._profile_summary_condition:
+            if self._profile_summary_futures.get(key) is future:
+                self._profile_summary_futures.pop(key, None)
+            if error is None:
+                self._profile_summary_dirty.discard(key[0])
+            else:
+                self._profile_summary_dirty.add(key[0])
+            self._profile_summary_condition.notify_all()
+
+    def _rebuild_profile_summary(
+        self,
+        key: tuple[str, int, int, int],
+    ) -> None:
+        while True:
+            revision, samples = self._profile_summary_rebuild_input(key)
+            summary = self._compute_profile_summary(key, samples)
+            if self._write_profile_summary_materialization(key, revision, summary):
+                return
+
+    def _profile_summary_rebuild_input(
+        self,
+        key: tuple[str, int, int, int],
+    ) -> tuple[int, list[dict[str, Any]]]:
+        with self._connect() as connection:
+            connection.execute("begin")
+            revision_row = connection.execute(
+                "select revision from profile_summary_revisions where symbol = ?",
+                (key[0],),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                select * from order_entry_snapshots
+                where symbol = ?
+                order by opened_at desc, order_id desc
+                limit ?
+                """,
+                (key[0], key[1]),
+            ).fetchall()
+        snapshots = self._profile_snapshot_rows(rows)
+        samples = [
+            sample_from_entry_snapshot(snapshot)
+            for snapshot in reversed(snapshots)
+        ]
+        revision = 0 if revision_row is None else int(revision_row["revision"])
+        return revision, samples
+
+    @staticmethod
+    def _compute_profile_summary(
+        key: tuple[str, int, int, int],
+        samples: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return summarize_order_samples_with_guard(
+            samples,
+            profile_guard_min_history=key[2],
+            profile_guard_min_group_size=key[3],
+        )
+
+    def _write_profile_summary_materialization(
+        self,
+        key: tuple[str, int, int, int],
+        source_revision: int,
+        summary: Mapping[str, Any],
+    ) -> bool:
+        payload = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        with self._connect() as connection:
+            connection.execute("begin immediate")
+            revision_row = connection.execute(
+                "select revision from profile_summary_revisions where symbol = ?",
+                (key[0],),
+            ).fetchone()
+            current_revision = 0 if revision_row is None else int(revision_row["revision"])
+            if current_revision != int(source_revision):
+                return False
+            existing = connection.execute(
+                """
+                select source_revision from profile_summary_materializations
+                where symbol = ? and snapshot_limit = ?
+                  and profile_guard_min_history = ?
+                  and profile_guard_min_group_size = ?
+                """,
+                key,
+            ).fetchone()
+            if existing is not None and int(existing["source_revision"]) > source_revision:
+                return False
+            connection.execute(
+                """
+                insert into profile_summary_materializations(
+                    symbol, snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size, source_revision, payload
+                ) values (?, ?, ?, ?, ?, ?)
+                on conflict(
+                    symbol, snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size
+                ) do update set
+                    source_revision = excluded.source_revision,
+                    payload = excluded.payload,
+                    updated_at_ms = strftime('%s','now') * 1000
+                where excluded.source_revision >=
+                      profile_summary_materializations.source_revision
+                """,
+                (*key, int(source_revision), payload),
+            )
+        return True
 
     def _refresh_profile_summary_cache(
         self,
@@ -2752,73 +3025,14 @@ class SQLiteMonitorStore:
     ) -> None:
         normalized_symbol = symbol.upper()
         with self._profile_summary_lock:
-            self._profile_summary_revision[normalized_symbol] = (
-                self._profile_summary_revision.get(normalized_symbol, 0) + 1
+            keys = tuple(
+                key
+                for key in self._profile_summary_keys
+                if key[0] == normalized_symbol
             )
-            for key, cached in self._profile_summary_cache.items():
-                if key[0] != normalized_symbol:
-                    continue
-                samples = cached["samples"]
-                requires_recompute = settlement is not None
-                if sample is not None:
-                    normalized_sample = dict(sample)
-                    order_id = normalized_sample.get("order_id")
-                    replaced = False
-                    previous_sample = None
-                    removed_samples = []
-                    for index, current in enumerate(samples):
-                        if current.get("order_id") == order_id:
-                            previous_sample = current
-                            samples[index] = normalized_sample
-                            replaced = True
-                            break
-                    if not replaced:
-                        samples.append(normalized_sample)
-                        if len(samples) > key[1]:
-                            removed_samples = samples[: len(samples) - key[1]]
-                            del samples[: len(samples) - key[1]]
-                    sample_is_settled = normalized_sample.get("result") in {
-                        "WIN",
-                        "LOSS",
-                    }
-                    previous_was_settled = bool(
-                        previous_sample
-                        and previous_sample.get("result") in {"WIN", "LOSS"}
-                    )
-                    requires_recompute = (
-                        requires_recompute
-                        or sample_is_settled
-                        or previous_was_settled
-                    )
-                if settlement is not None:
-                    for current in samples:
-                        if current.get("order_id") == settlement.id:
-                            current.update(
-                                {
-                                    "result": settlement.result,
-                                    "settled_at": settlement.settled_at,
-                                    "exit_price": settlement.exit_price,
-                                    "pnl": settlement.pnl,
-                                }
-                            )
-                            break
-                if requires_recompute:
-                    cached["summary"] = summarize_order_samples_with_guard(
-                        samples,
-                        profile_guard_min_history=key[2],
-                        profile_guard_min_group_size=key[3],
-                    )
-                else:
-                    cached["summary"]["snapshot_count"] = len(samples)
-                    open_delta = (
-                        int(not replaced)
-                        - sum(
-                            1
-                            for current in removed_samples
-                            if current.get("result") not in {"WIN", "LOSS"}
-                        )
-                    )
-                    cached["summary"]["open_orders"] += open_delta
+            self._profile_summary_dirty.add(normalized_symbol)
+        for key in keys:
+            self._schedule_profile_summary_rebuild(key)
 
     @staticmethod
     def _insert_individual_signal_audit(
@@ -2980,12 +3194,17 @@ class SQLiteMonitorStore:
                 self._after_bundle_step("order")
                 self._apply_open_credit(connection, order, context.symbol, credit)
                 self._after_bundle_step("credit")
-                self._insert_order_entry_snapshot(
+                snapshot_changed = self._insert_order_entry_snapshot(
                     connection,
                     order,
                     context.symbol,
                     entry_snapshot,
                 )
+                if snapshot_changed:
+                    self._bump_profile_summary_revision(
+                        connection,
+                        context.symbol,
+                    )
                 self._after_bundle_step("entry_snapshot")
                 self._insert_individual_signal_audit(
                     connection,
@@ -3002,15 +3221,8 @@ class SQLiteMonitorStore:
                 self._after_bundle_step("observation")
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
-        cached_snapshot = self._order_entry_snapshot_values(
-            order,
-            context.symbol,
-            entry_snapshot,
-        )
-        self._maintain_profile_summary_after_commit(
-            context.symbol,
-            sample=sample_from_entry_snapshot(cached_snapshot),
-        )
+        if snapshot_changed:
+            self._maintain_profile_summary_after_commit(context.symbol)
         return existing_order is None
 
     def save_decision_bundle(
@@ -3220,16 +3432,16 @@ class SQLiteMonitorStore:
 
     def save_order_entry_snapshot(self, order: SimulatedOrder, symbol: str, entry_snapshot: dict[str, Any]) -> None:
         with self._connect() as connection:
-            self._upsert_order_entry_snapshot(connection, order, symbol, entry_snapshot)
-        cached_snapshot = self._order_entry_snapshot_values(
-            order,
-            symbol,
-            entry_snapshot,
-        )
-        self._maintain_profile_summary_after_commit(
-            symbol,
-            sample=sample_from_entry_snapshot(cached_snapshot),
-        )
+            changed = self._insert_order_entry_snapshot(
+                connection,
+                order,
+                symbol,
+                entry_snapshot,
+            )
+            if changed:
+                self._bump_profile_summary_revision(connection, symbol)
+        if changed:
+            self._maintain_profile_summary_after_commit(symbol)
 
     @staticmethod
     def _upsert_order_entry_snapshot(
@@ -3338,7 +3550,7 @@ class SQLiteMonitorStore:
         order: SimulatedOrder,
         symbol: str,
         entry_snapshot: Mapping[str, Any],
-    ) -> None:
+    ) -> bool:
         values = self._order_entry_snapshot_values(order, symbol, entry_snapshot)
         frozen_columns = (
             "symbol",
@@ -3371,20 +3583,21 @@ class SQLiteMonitorStore:
                 raise ValueError(
                     "entry snapshot collides with different frozen decision data"
                 )
-            return
+            return False
         self._upsert_order_entry_snapshot(
             connection,
             order,
             values["symbol"],
             entry_snapshot,
         )
+        return True
 
     @staticmethod
     def _update_order_entry_snapshot_settlement(
         connection: sqlite3.Connection,
         order: SimulatedOrder,
         symbol: str,
-    ) -> None:
+    ) -> bool:
         settlement_payload = {
             "decision_id": order.decision_id,
             "status": order.status,
@@ -3399,6 +3612,20 @@ class SQLiteMonitorStore:
         else:
             where_sql = "symbol = ? and order_id = ? and decision_id is null"
             identity = (symbol.upper(), order.id)
+        existing = connection.execute(
+            f"select result, settled_at, exit_price, pnl, settlement_payload "
+            f"from order_entry_snapshots where {where_sql}",
+            identity,
+        ).fetchone()
+        expected = (
+            order.result,
+            order.settled_at,
+            order.exit_price,
+            order.pnl,
+            json.dumps(settlement_payload, ensure_ascii=False),
+        )
+        if existing is not None and tuple(existing) == expected:
+            return False
         cursor = connection.execute(
             f"""
             update order_entry_snapshots
@@ -3423,11 +3650,19 @@ class SQLiteMonitorStore:
             raise ValueError(
                 "settlement must match exactly one entry snapshot by decision_id"
             )
+        return cursor.rowcount > 0
 
     def update_order_entry_snapshot_settlement(self, order: SimulatedOrder, symbol: str) -> None:
         with self._connect() as connection:
-            self._update_order_entry_snapshot_settlement(connection, order, symbol)
-        self._maintain_profile_summary_after_commit(symbol, settlement=order)
+            changed = self._update_order_entry_snapshot_settlement(
+                connection,
+                order,
+                symbol,
+            )
+            if changed:
+                self._bump_profile_summary_revision(connection, symbol)
+        if changed:
+            self._maintain_profile_summary_after_commit(symbol)
 
     def load_order_entry_snapshots(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -3436,11 +3671,15 @@ class SQLiteMonitorStore:
                 select *
                 from order_entry_snapshots
                 where symbol = ?
-                order by order_id desc
+                order by opened_at desc, order_id desc
                 limit ?
                 """,
                 (symbol.upper(), limit),
             ).fetchall()
+        return self._profile_snapshot_rows(rows)
+
+    @staticmethod
+    def _profile_snapshot_rows(rows: Sequence[sqlite3.Row]) -> list[dict[str, Any]]:
         result = []
         for row in rows:
             item = dict(row)
@@ -3743,6 +3982,32 @@ class SQLiteMonitorStore:
             )
             connection.execute(
                 "create index if not exists idx_order_entry_snapshots_symbol_result on order_entry_snapshots(symbol, result)"
+            )
+            connection.execute(
+                """
+                create table if not exists profile_summary_revisions (
+                    symbol text primary key,
+                    revision integer not null check(revision >= 0),
+                    updated_at_ms integer not null default (strftime('%s','now') * 1000)
+                )
+                """
+            )
+            connection.execute(
+                """
+                create table if not exists profile_summary_materializations (
+                    symbol text not null,
+                    snapshot_limit integer not null,
+                    profile_guard_min_history integer not null,
+                    profile_guard_min_group_size integer not null,
+                    source_revision integer not null check(source_revision >= 0),
+                    payload text not null,
+                    updated_at_ms integer not null default (strftime('%s','now') * 1000),
+                    primary key(
+                        symbol, snapshot_limit, profile_guard_min_history,
+                        profile_guard_min_group_size
+                    )
+                )
+                """
             )
             migrate(connection)
             duplicates = connection.execute(

@@ -682,6 +682,20 @@ class MonitorState:
             self._last_order_opened_at = self._latest_order_opened_at_by_direction(
                 restored_orders
             )
+            profile_preparer = (
+                getattr(self.storage, "prepare_order_profile_summary", None)
+                if self.storage
+                else None
+            )
+            if profile_preparer is not None:
+                try:
+                    profile_preparer(
+                        self.symbol,
+                        profile_guard_min_history=self.profile_guard_min_history,
+                        profile_guard_min_group_size=self.profile_guard_min_group_size,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 页面可继续返回 PREPARING。
+                    self._profile_summary_prepare_error = exc
 
     def _matches_symbol_context(self, expected_context: tuple[str, int] | None) -> bool:
         return expected_context is None or expected_context == (
@@ -1155,6 +1169,10 @@ class MonitorState:
         self._cached_profile_source = None
         self.risk_pause = ""
         self.profile_guard_audit = self._empty_profile_guard_audit()
+        if not self.enable_profile_guard:
+            self._update_profile_summary_audit(
+                self._profile_guard_shadow_source()
+            )
         signal = self._attach_direction_pulse_shadow(signal, current_time=latest.close_time)
         candidate_origin = self._formal_candidate_origin(signal)
         if signal.candidate_origin != candidate_origin:
@@ -1335,7 +1353,12 @@ class MonitorState:
                 should_observe=should_observe,
             )
         if self.enable_profile_guard:
-            profile_guard = self._profile_guard_shadow(signal)
+            try:
+                profile_guard = self._profile_guard_shadow(signal)
+            except Exception as exc:  # noqa: BLE001 - 正式守卫不可用 stale 静默放行。
+                self._decision_storage_failed = True
+                self._set_storage_error("画像守卫精确摘要读取失败", exc)
+                return "STORAGE_ERROR"
             profile_guard_blocked = profile_guard["status"] == "WOULD_BLOCK"
             self.profile_guard_audit = {
                 "status": str(profile_guard.get("status") or "NOT_EVALUATED"),
@@ -1348,6 +1371,12 @@ class MonitorState:
                 "observe_only": False,
                 "blocked": profile_guard_blocked,
                 "hit_keys": list(profile_guard.get("hit_keys") or []),
+                "cache_status": str(
+                    profile_guard.get("cache_status") or "UNKNOWN"
+                ),
+                "source_revision": profile_guard.get("source_revision"),
+                "current_revision": profile_guard.get("current_revision"),
+                "stale": bool(profile_guard.get("stale", False)),
             }
             if profile_guard["status"] == "WOULD_BLOCK":
                 return self._block_order(
@@ -2718,11 +2747,25 @@ class MonitorState:
         )
 
     def _profile_guard_shadow(self, signal: Signal) -> dict:
-        return profile_guard_shadow(
+        source = self._profile_guard_shadow_source()
+        result = profile_guard_shadow(
             signal,
-            self._profile_guard_shadow_source(),
+            source,
             use_recommended=True,
         )
+        if isinstance(source, dict):
+            result.update(
+                {
+                    key: source.get(key)
+                    for key in (
+                        "cache_status",
+                        "source_revision",
+                        "current_revision",
+                        "stale",
+                    )
+                }
+            )
+        return result
 
     def _profile_guard_default_shadow(self, signal: Signal) -> dict:
         return profile_guard_shadow(
@@ -2754,10 +2797,43 @@ class MonitorState:
                 )
             else:
                 self._cached_profile_source = None
+            if (
+                self.enable_profile_guard
+                and isinstance(self._cached_profile_source, dict)
+                and bool(self._cached_profile_source.get("stale", False))
+            ):
+                exact_loader = getattr(
+                    self.storage,
+                    "exact_order_profile_summary",
+                    None,
+                )
+                if exact_loader is None:
+                    raise RuntimeError(
+                        "stale profile summary requires exact fallback"
+                    )
+                self._cached_profile_source = exact_loader(
+                    self.symbol,
+                    profile_guard_min_history=self.profile_guard_min_history,
+                    profile_guard_min_group_size=self.profile_guard_min_group_size,
+                )
             return self._cached_profile_source
-        except Exception:  # noqa: BLE001 - 画像守卫仅用于复盘，不能影响开单保存。
+        except Exception:
+            if self.enable_profile_guard:
+                raise
             self._cached_profile_source = None
             return None
+
+    def _update_profile_summary_audit(self, source: dict | None) -> None:
+        if not isinstance(source, dict):
+            return
+        self.profile_guard_audit.update(
+            {
+                "cache_status": str(source.get("cache_status") or "UNKNOWN"),
+                "source_revision": source.get("source_revision"),
+                "current_revision": source.get("current_revision"),
+                "stale": bool(source.get("stale", False)),
+            }
+        )
 
     def _profile_guard_config(self) -> dict:
         return {
@@ -2886,6 +2962,20 @@ class MonitorState:
             self._storage_write_failures.clear()
         if failures:
             raise failures[0]
+
+    def close(self) -> None:
+        failure = None
+        try:
+            self.wait_for_storage_writes()
+        except Exception as exc:  # noqa: BLE001 - 关闭完成后保留原异步失败。
+            failure = exc
+        finally:
+            self._storage_executor.shutdown(wait=True)
+            closer = getattr(self.storage, "close", None) if self.storage else None
+            if closer is not None:
+                closer()
+        if failure is not None:
+            raise failure
 
     def _empty_rolling_edge(self) -> dict:
         return {
@@ -3152,6 +3242,10 @@ class MonitorState:
             "observe_only": not self.enable_profile_guard,
             "blocked": False,
             "hit_keys": [],
+            "cache_status": "UNKNOWN",
+            "source_revision": None,
+            "current_revision": None,
+            "stale": False,
         }
 
     def _send_webhook(self, signal: Signal, order=None) -> None:

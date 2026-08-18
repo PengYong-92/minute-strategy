@@ -326,6 +326,161 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertLessEqual(generated_at, completed_at)
         self.assertGreaterEqual(summary["elapsed_seconds"], 0.03)
 
+    def test_profile_revision_is_transactional_monotonic_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            order = SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="revision",
+                entry_price=100.0,
+                opened_at=1_000,
+                expires_at=601_000,
+            )
+            entry = {"signal": signal().to_dict()}
+
+            store.save_order_entry_snapshot(order, "BTCUSDT", entry)
+            first = store.profile_summary_revision("BTCUSDT")
+            store.save_order_entry_snapshot(order, "BTCUSDT", entry)
+            duplicate = store.profile_summary_revision("BTCUSDT")
+            settled = replace(
+                order,
+                status="SETTLED",
+                result="WIN",
+                settled_at=601_000,
+                exit_price=101.0,
+                pnl=8.0,
+            )
+            store.update_order_entry_snapshot_settlement(settled, "BTCUSDT")
+            final = SQLiteMonitorStore(db_path).profile_summary_revision("BTCUSDT")
+
+            self.assertEqual((first, duplicate, final), (1, 1, 2))
+
+    def test_profile_summary_is_persistent_and_cross_store_stale_aware(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            first_store = SQLiteMonitorStore(db_path)
+            second_store = SQLiteMonitorStore(db_path)
+            base = SimulatedOrder(
+                id=1,
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="cross store",
+                entry_price=100.0,
+                opened_at=1_000,
+                expires_at=601_000,
+            )
+            first_store.save_order_entry_snapshot(
+                base,
+                "BTCUSDT",
+                {"signal": signal().to_dict()},
+            )
+            first_store.prepare_order_profile_summary("BTCUSDT")
+            first_store.wait_for_profile_summary_rebuilds(timeout=10)
+
+            persisted = second_store.profile_summary_snapshot("BTCUSDT")
+            self.assertEqual(persisted["cache_status"], "READY")
+            self.assertEqual(persisted["snapshot_count"], 1)
+
+            second = replace(base, id=2, opened_at=2_000, expires_at=602_000)
+            with mock.patch.object(
+                second_store,
+                "_schedule_profile_summary_rebuild",
+                return_value=None,
+            ):
+                second_store.save_order_entry_snapshot(
+                    second,
+                    "BTCUSDT",
+                    {"signal": replace(signal(), open_time=2_000).to_dict()},
+                )
+            stale = first_store.profile_summary_snapshot("BTCUSDT")
+            self.assertEqual(stale["cache_status"], "STALE")
+            self.assertEqual(stale["source_revision"], 1)
+            self.assertEqual(stale["current_revision"], 2)
+            self.assertTrue(stale["stale"])
+
+            first_store.wait_for_profile_summary_rebuilds(timeout=10)
+            refreshed = second_store.profile_summary_snapshot("BTCUSDT")
+            self.assertEqual(refreshed["cache_status"], "READY")
+            self.assertEqual(refreshed["snapshot_count"], 2)
+
+    def test_older_profile_revision_cannot_overwrite_new_materialization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            key = store._profile_summary_key("BTCUSDT", 5000, 15, 2)
+            with store._connect() as connection:
+                store._bump_profile_summary_revision(connection, "BTCUSDT")
+                store._bump_profile_summary_revision(connection, "BTCUSDT")
+
+            newer = {"snapshot_count": 2, "marker": "new"}
+            older = {"snapshot_count": 1, "marker": "old"}
+            self.assertTrue(store._write_profile_summary_materialization(key, 2, newer))
+            self.assertFalse(store._write_profile_summary_materialization(key, 1, older))
+
+            summary = store.profile_summary_snapshot("BTCUSDT")
+            self.assertEqual(summary["marker"], "new")
+            self.assertEqual(summary["source_revision"], 2)
+
+    def test_profile_worker_can_drain_and_close_without_leaking_thread(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.prepare_order_profile_summary("BTCUSDT")
+            store.wait_for_profile_summary_rebuilds(timeout=10)
+            store.close()
+
+            worker_threads = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith(store.profile_worker_thread_prefix)
+            ]
+            self.assertEqual(worker_threads, [])
+            with self.assertRaises(RuntimeError):
+                store.prepare_order_profile_summary("BTCUSDT")
+
+    def test_profile_rebuild_is_single_flight_under_concurrent_reads(self):
+        class BlockingStore(SQLiteMonitorStore):
+            def __init__(self, path):
+                self.compute_started = threading.Event()
+                self.compute_release = threading.Event()
+                self.compute_calls = 0
+                super().__init__(path)
+
+            def _compute_profile_summary(self, key, samples):
+                self.compute_calls += 1
+                self.compute_started.set()
+                self.compute_release.wait(timeout=5)
+                return super()._compute_profile_summary(key, samples)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = BlockingStore(Path(temp_dir) / "monitor.sqlite3")
+            store.prepare_order_profile_summary("BTCUSDT")
+            self.assertTrue(store.compute_started.wait(timeout=5))
+            errors = []
+
+            def read_summary():
+                try:
+                    for _ in range(10):
+                        page = store.profile_summary_snapshot("BTCUSDT")
+                        self.assertEqual(page["cache_status"], "PREPARING")
+                except Exception as exc:  # noqa: BLE001 - captures thread failure.
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=read_summary) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+            store.compute_release.set()
+            store.wait_for_profile_summary_rebuilds(timeout=10)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(store.compute_calls, 1)
+
     def assert_save_rejects_invalid_runtime_reference(
         self,
         snapshot: RuntimeConfigSnapshot,
@@ -2276,6 +2431,8 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                 store.update_order_entry_snapshot_settlement(order, "BTCUSDT")
 
             summary = store.order_profile_summary("BTCUSDT")
+            store.wait_for_profile_summary_rebuilds(timeout=10)
+            summary = store.order_profile_summary("BTCUSDT")
 
         self.assertEqual(summary["total"]["orders"], 2)
         self.assertEqual(summary["total"]["losses"], 2)
@@ -3447,6 +3604,7 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                     atomic_bundle_counts(db_path),
                     {key: 0 for key in atomic_bundle_counts(db_path)},
                 )
+                self.assertEqual(store.profile_summary_revision("BTCUSDT"), 0)
                 store.save_decision_bundle(
                     config=config,
                     context=context,
@@ -3633,6 +3791,7 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                 entry_snapshot=entry_snapshot,
                 audit=audit,
             )
+            store.wait_for_profile_summary_rebuilds(timeout=10)
             settled = replace(
                 order,
                 status="SETTLED",
@@ -3653,6 +3812,7 @@ class AtomicDecisionBundleTest(unittest.TestCase):
             snapshots = store.load_order_entry_snapshots("BTCUSDT")
             self.assertEqual((restored[0].status, restored[0].result), ("SETTLED", "WIN"))
             self.assertEqual(snapshots[0]["result"], "WIN")
+            self.assertIn("BTCUSDT", store._profile_summary_dirty)
 
     def test_settlement_snapshot_failure_rolls_back_order_and_credit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
