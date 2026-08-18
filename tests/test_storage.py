@@ -1500,6 +1500,38 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(sequence_status["COOLDOWN"], 1)
         self.assertEqual(sequence_status["NORMAL"], 1)
 
+    def test_signal_audit_summary_normalizes_legacy_three_part_profile_key(self):
+        complete_key = "10|drop_reclaim|long_observe|LONG|WD-08"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            guarded = replace(
+                signal(),
+                strategy_family="drop_reclaim",
+                strategy_tag="long_observe",
+                threshold_segment="WD-08",
+                profile_key="drop_reclaim|LONG|WD-08",
+                daily_profile_version="DPS-1",
+                order_slot="FIRST",
+            )
+            store.save_signal(
+                "BTCUSDT",
+                guarded,
+                decision="OPENED",
+                created_at_ms=1_234,
+            )
+
+            summary = store.signal_audit_summary("BTCUSDT")
+
+        contexts = {item["key"]: item for item in summary["by_profile_dps_slot"]}
+        self.assertEqual(
+            contexts[f"{complete_key}|DPS-1|FIRST"]["signals"],
+            1,
+        )
+        self.assertNotIn(
+            "drop_reclaim|LONG|WD-08|DPS-1|FIRST",
+            contexts,
+        )
+
     def test_signal_audit_v2_aggregates_only_identical_ordinary_heartbeats(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -4154,6 +4186,59 @@ class AtomicDecisionBundleTest(unittest.TestCase):
 
         self.assertEqual([item.observation_key for item in full], [legacy.observation_key])
         self.assertEqual([item.observation_key for item in exact], [legacy.observation_key])
+
+    def test_observation_profile_paths_share_complete_structured_identity(self):
+        evaluated_at = 1_800_000_000_000
+        complete_key = (
+            "10|short_extension|normal_down_short_extension_observe|SHORT|WD-02"
+        )
+        rows = [
+            replace(
+                observation(
+                    "adaptive-empty-profile-key",
+                    opened_at=evaluated_at - 12 * 60_000,
+                ),
+                profile_key="",
+            ),
+            replace(
+                observation(
+                    "adaptive-three-part-profile-key",
+                    opened_at=evaluated_at - 11 * 60_000,
+                ),
+                profile_key="short_extension|SHORT|WD-02",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observations(rows, "BTCUSDT")
+
+            adaptive = store.load_adaptive_profile_observations(
+                "BTCUSDT",
+                lookback_days=15,
+                evaluated_at=evaluated_at,
+                profile_keys={complete_key},
+            )
+            page = store.page_observations(
+                "BTCUSDT",
+                profile=complete_key,
+            )
+            store.close()
+
+        expected_keys = {row.observation_key for row in rows}
+        self.assertEqual(
+            {item.observation_key for item in adaptive},
+            expected_keys,
+        )
+        self.assertEqual(
+            {item["observation_key"] for item in page["observations"]},
+            expected_keys,
+        )
+        self.assertEqual(page["total"], 2)
+        self.assertIn(complete_key.upper(), page["filter_options"]["profile"])
+        self.assertNotIn(
+            "SHORT_EXTENSION|SHORT|WD-02",
+            page["filter_options"]["profile"],
+        )
 
     def test_adaptive_loader_uses_settled_at_range_index(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -176,7 +176,7 @@ _OBSERVATION_CANONICAL_FILTER_SQL = {
     "family": _OBSERVATION_CANONICAL_FAMILY_SQL,
     "tag": _OBSERVATION_CANONICAL_TAG_SQL,
     "segment": _OBSERVATION_CANONICAL_SEGMENT_SQL,
-    "profile": "coalesce(nullif(decision_contexts.profile_key, ''), nullif(json_extract(decision_contexts.input_payload, '$.identity.profile_key'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.profile_key'), ''), nullif(json_extract(observation_signals.payload, '$.profile_key'), ''), '')",
+    "profile": _OBSERVATION_CANONICAL_PROFILE_SQL,
     "origin": "coalesce(decision_contexts.candidate_origin, observation_signals.candidate_origin, '')",
     "qualification_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.qualification_state'), observation_signals.qualification_state, '')",
     "adaptive_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.state'), json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.status'), observation_signals.adaptive_state, '')",
@@ -5171,12 +5171,20 @@ class SQLiteMonitorStore:
                 or identity.get("profile_key")
                 or ""
             )
-            if not profile_key:
+            if not profile_key or len(profile_key.split("|")) == 3:
                 profile_key = "|".join(
                     [
                         str(int(row["timeframe_minutes"] or 0)),
-                        str(payload.get("strategy_family") or "unknown"),
-                        str(payload.get("strategy_tag") or "unknown"),
+                        str(
+                            identity.get("strategy_family")
+                            or payload.get("strategy_family")
+                            or "unknown"
+                        ),
+                        str(
+                            identity.get("strategy_tag")
+                            or payload.get("strategy_tag")
+                            or "unknown"
+                        ),
                         str(row["direction"] or "").upper(),
                         str(row["threshold_segment"] or "GLOBAL").upper(),
                     ]

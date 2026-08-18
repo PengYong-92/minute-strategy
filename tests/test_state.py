@@ -2249,10 +2249,13 @@ class MonitorStateTest(unittest.TestCase):
                 min_order_gap_ms=0,
             )
             states.append(state)
+            long_profile_key = (
+                "10|canonical_long_family|canonical_long_tag|LONG|WD-08"
+            )
             long_signal = replace(
                 selected_profile_signal(
                     119_999,
-                    profile_key="canonical-long-profile",
+                    profile_key=long_profile_key,
                     reason="canonical long observation",
                 ),
                 strategy_family="canonical_long_family",
@@ -2361,7 +2364,7 @@ class MonitorStateTest(unittest.TestCase):
             )
             self.assertEqual(
                 store.page_observations(
-                    "BTCUSDT", profile="canonical-long-profile"
+                    "BTCUSDT", profile=long_profile_key
                 )["total"],
                 1,
             )
