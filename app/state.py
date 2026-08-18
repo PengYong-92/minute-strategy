@@ -3065,13 +3065,15 @@ class MonitorState:
         latest = self.daily_profile_selection
         if (
             latest is None
+            or not self._daily_profile_snapshot_is_safe(latest, target, current_time)
             or int(latest.get("effective_from", -1)) != target["effective_from"]
             or not self._daily_profile_config_matches(latest, config)
-            or not self._daily_profile_snapshot_is_safe(latest, target, current_time)
         ):
             previous = self._load_daily_profile_selection_as_of(
                 target["lookback_end"],
                 current_time,
+                target["effective_from"],
+                target["effective_until"],
             )
             try:
                 next_snapshot = build_daily_selection(
@@ -3092,12 +3094,12 @@ class MonitorState:
             self.active_daily_profile_selection = latest
             return
         if (
-            self._selection_is_effective(self.active_daily_profile_selection, current_time)
-            and self._daily_profile_snapshot_is_safe(
+            self._daily_profile_snapshot_is_safe(
                 self.active_daily_profile_selection,
                 target,
                 current_time,
             )
+            and self._selection_is_effective(self.active_daily_profile_selection, current_time)
         ):
             return
         self.active_daily_profile_selection = None
@@ -3212,32 +3214,69 @@ class MonitorState:
         self,
         evaluation_key: int,
         evaluated_at: int,
+        effective_from: int,
+        effective_until: int,
     ) -> dict | None:
         if not self.storage:
             candidate = self.daily_profile_selection
         else:
             loader = getattr(self.storage, "load_daily_profile_selection_as_of", None)
             if loader is not None:
-                return loader(
+                candidate = loader(
                     self.symbol,
                     evaluation_key,
                     evaluated_at_ms=evaluated_at,
                 )
-            candidate = self._load_latest_daily_profile_selection()
-        marker = self._daily_profile_evaluation_marker(candidate)
-        return candidate if marker is not None and marker <= evaluation_key else None
+            else:
+                candidate = self._load_latest_daily_profile_selection()
+        return (
+            candidate
+            if self._is_snapshot_as_of(
+                candidate,
+                evaluation_key=evaluation_key,
+                evaluated_at=evaluated_at,
+                effective_from=effective_from,
+                effective_until=effective_until,
+            )
+            else None
+        )
 
     @staticmethod
-    def _daily_profile_evaluation_marker(snapshot: dict | None) -> int | None:
-        if not snapshot:
-            return None
-        for field in ("evaluation_key", "lookback_end", "evaluated_at"):
+    def _is_snapshot_as_of(
+        snapshot: dict | None,
+        *,
+        evaluation_key: int,
+        evaluated_at: int,
+        effective_from: int,
+        effective_until: int,
+    ) -> bool:
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False
+        limits = (
+            ("evaluation_key", evaluation_key),
+            ("lookback_start", evaluation_key),
+            ("lookback_end", evaluation_key),
+            ("evaluated_at", evaluated_at),
+            ("evaluation_time", evaluated_at),
+            ("effective_from", effective_from),
+            ("effective_until", effective_until),
+        )
+        found = False
+        for field, limit in limits:
+            value = snapshot.get(field)
+            if value is None:
+                continue
+            found = True
+            if isinstance(value, bool) or (
+                isinstance(value, float) and not value.is_integer()
+            ):
+                return False
             try:
-                if snapshot.get(field) is not None:
-                    return int(snapshot[field])
+                if int(value) > limit:
+                    return False
             except (TypeError, ValueError):
-                return None
-        return None
+                return False
+        return found
 
     @classmethod
     def _daily_profile_snapshot_is_safe(
@@ -3246,30 +3285,13 @@ class MonitorState:
         target: dict,
         evaluated_at: int,
     ) -> bool:
-        if not snapshot:
-            return False
-        limits = {
-            "evaluation_key": target["lookback_end"],
-            "lookback_end": target["lookback_end"],
-            "evaluated_at": evaluated_at,
-        }
-        found = False
-        for field, limit in limits.items():
-            value = snapshot.get(field)
-            if value is None:
-                continue
-            found = True
-            try:
-                if int(value) > limit:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        if found:
-            return True
-        try:
-            return int(snapshot.get("effective_from", -1)) <= target["effective_from"]
-        except (TypeError, ValueError):
-            return False
+        return cls._is_snapshot_as_of(
+            snapshot,
+            evaluation_key=target["lookback_end"],
+            evaluated_at=evaluated_at,
+            effective_from=target["effective_from"],
+            effective_until=target["effective_until"],
+        )
 
     @staticmethod
     def _selection_is_effective(snapshot: dict | None, current_time: int) -> bool:

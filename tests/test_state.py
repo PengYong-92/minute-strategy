@@ -694,6 +694,21 @@ class FailingDailySelectionStorage(RecordingStorage):
         raise OSError("database unavailable")
 
 
+class LegacyFailingDailySelectionStorage(FailingDailySelectionStorage):
+    def __getattribute__(self, name):
+        if name == "load_daily_profile_selection_as_of":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+    def load_daily_profile_selection(self, symbol, effective_at_ms):
+        matching = [
+            snapshot
+            for item_symbol, snapshot in self.daily_profile_selections
+            if item_symbol == symbol
+        ]
+        return matching[-1] if matching else None
+
+
 class MonitorStateTest(unittest.TestCase):
     def test_decision_trace_names_first_decisive_branch_without_changing_decision(self):
         now = 119_999
@@ -7209,6 +7224,156 @@ class MonitorStateTest(unittest.TestCase):
             [{"key": "nearest"}],
         )
         self.assertLessEqual(state.daily_profile_selection["evaluation_key"], cutoff)
+
+    def test_legacy_daily_selector_rejects_same_key_future_evaluation_before_save_fallback(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        storage = LegacyFailingDailySelectionStorage()
+        future = {
+            "version": "SAME-KEY-FUTURE",
+            "status": "READY",
+            "evaluation_key": cutoff,
+            "lookback_end": cutoff,
+            "evaluated_at": current + 1,
+            "effective_from": current,
+            "effective_until": current + 86_400_000,
+            "selected_profiles": [{"key": "future-without-row-time"}],
+            "selected_count": 1,
+        }
+        storage.daily_profile_selections.append(("BTCUSDT", future))
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+        )
+        self.addCleanup(state.close)
+
+        with patch("app.state.build_daily_selection", wraps=build_daily_selection) as builder:
+            state._refresh_daily_profile_selection(current)
+
+        self.assertIsNone(builder.call_args.kwargs["previous_snapshot"])
+        self.assertEqual(state.daily_profile_selection["status"], "ERROR")
+        self.assertEqual(state.daily_profile_selection["selected_profiles"], [])
+        self.assertIsNone(state.active_daily_profile_selection)
+
+    def test_legacy_daily_selector_rejects_any_future_or_unparseable_top_level_time(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        cases = {
+            "future lookback start": {"lookback_start": cutoff + 1},
+            "future lookback": {"lookback_end": cutoff + 1},
+            "future effective": {"effective_from": current + 1},
+            "future effective until": {"effective_until": current + 86_400_001},
+            "future evaluation time": {"evaluation_time": current + 1},
+            "fractional future evaluation": {"evaluated_at": current + 0.5},
+            "boolean evaluation": {"evaluated_at": True},
+            "unparseable evaluated at": {"evaluated_at": "not-a-timestamp"},
+            "unparseable effective until": {"effective_until": "not-a-timestamp"},
+        }
+        for label, override in cases.items():
+            with self.subTest(label=label):
+                storage = LegacyFailingDailySelectionStorage()
+                snapshot = {
+                    "version": "UNSAFE",
+                    "status": "READY",
+                    "evaluation_key": cutoff,
+                    "lookback_end": cutoff,
+                    "evaluated_at": cutoff,
+                    "effective_from": current,
+                    "effective_until": current + 86_400_000,
+                    "selected_profiles": [{"key": "unsafe-without-row-time"}],
+                    "selected_count": 1,
+                    **override,
+                }
+                storage.daily_profile_selections.append(("BTCUSDT", snapshot))
+                state = MonitorState(
+                    symbol="BTCUSDT",
+                    storage=storage,
+                    enable_daily_profile_selector=True,
+                )
+                self.addCleanup(state.close)
+
+                with patch(
+                    "app.state.build_daily_selection",
+                    wraps=build_daily_selection,
+                ) as builder:
+                    state._refresh_daily_profile_selection(current)
+
+                self.assertIsNone(builder.call_args.kwargs["previous_snapshot"])
+                self.assertEqual(state.daily_profile_selection["status"], "ERROR")
+                self.assertEqual(state.daily_profile_selection["selected_profiles"], [])
+                self.assertIsNone(state.active_daily_profile_selection)
+
+    def test_legacy_daily_selector_accepts_provably_past_latest_snapshot(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        previous_key = cutoff - 86_400_000
+        storage = LegacyFailingDailySelectionStorage()
+        previous = {
+            "version": "PAST",
+            "status": "READY",
+            "evaluation_key": previous_key,
+            "lookback_end": previous_key,
+            "evaluated_at": previous_key,
+            "evaluation_time": previous_key,
+            "effective_from": current - 86_400_000,
+            "effective_until": current,
+            "selected_profiles": [{"key": "past-without-row-time"}],
+            "selected_count": 1,
+        }
+        storage.daily_profile_selections.append(("BTCUSDT", previous))
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+        )
+        self.addCleanup(state.close)
+
+        with patch("app.state.build_daily_selection", wraps=build_daily_selection) as builder:
+            state._refresh_daily_profile_selection(current)
+
+        self.assertIs(builder.call_args.kwargs["previous_snapshot"], previous)
+        self.assertEqual(state.daily_profile_selection["status"], "FALLBACK")
+        self.assertEqual(
+            state.daily_profile_selection["selected_profiles"],
+            [{"key": "past-without-row-time"}],
+        )
+
+    def test_legacy_daily_selector_with_only_future_latest_snapshot_fails_empty(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        future_key = cutoff + 86_400_000
+        storage = LegacyFailingDailySelectionStorage()
+        storage.daily_profile_selections.append(
+            (
+                "BTCUSDT",
+                {
+                    "version": "ONLY-FUTURE",
+                    "status": "READY",
+                    "evaluation_key": future_key,
+                    "lookback_end": future_key,
+                    "evaluated_at": future_key,
+                    "effective_from": current + 86_400_000,
+                    "effective_until": current + 2 * 86_400_000,
+                    "selected_profiles": [{"key": "future-without-row-time"}],
+                    "selected_count": 1,
+                },
+            )
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+        )
+        self.addCleanup(state.close)
+
+        with patch("app.state.build_daily_selection", wraps=build_daily_selection) as builder:
+            state._refresh_daily_profile_selection(current)
+
+        self.assertIsNone(builder.call_args.kwargs["previous_snapshot"])
+        self.assertEqual(state.daily_profile_selection["status"], "ERROR")
+        self.assertEqual(state.daily_profile_selection["selected_profiles"], [])
+        self.assertIsNone(state.active_daily_profile_selection)
 
     def test_state_restores_persisted_orders_from_sqlite(self):
         with tempfile.TemporaryDirectory() as temp_dir:
