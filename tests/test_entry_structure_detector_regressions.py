@@ -609,6 +609,34 @@ class RoundCandidateRegressionTest(unittest.TestCase):
         )
         self.assertLessEqual(len(levels), 30)
 
+    def test_zone_candidate_accepts_only_rounding_over_boundary(self):
+        boundary_zone_price = 100.4 - (100.0 + 0.1 + 0.05) + 100.0
+        config = StructureConfig(cluster_atr=0.25)
+
+        levels = _round_candidates(
+            "BTCUSDT",
+            make_bars(2, price=100.0),
+            1.0,
+            config,
+            [
+                pivot_level(
+                    "boundary-zone",
+                    boundary_zone_price,
+                    boundary_zone_price,
+                )
+            ],
+        )
+
+        self.assertGreater(boundary_zone_price - 100.0, 0.25)
+        boundary_round = next(
+            item
+            for item in levels
+            if item["kind"] == "SUPPORT"
+            and item["round_level_price"] == 100.0
+        )
+        self.assertFalse(boundary_round["_independently_qualified"])
+        self.assertFalse(boundary_round["_emit_independently"])
+
     def test_nearest_independently_qualified_resistance_survives_pruning(self):
         rng = random.Random(819)
         groups = []
@@ -934,6 +962,59 @@ class RoundMergeRegressionTest(unittest.TestCase):
         }
 
         self.assertEqual(merged, {"p1": 100.05, "p2": 100.15})
+
+    def test_boundary_rounding_edge_preserves_maximum_cardinality(self):
+        config = StructureConfig(cluster_atr=0.25)
+        boundary_round_price = 100.0 + 0.1 + 0.05
+        pivots = [
+            pivot_level("p1", 100.0, 100.0),
+            pivot_level("p2", 100.40, 100.40),
+        ]
+        rounds = [
+            round_level(
+                "r1",
+                boundary_round_price,
+                independently_qualified=True,
+            ),
+            round_level("r2", 99.9, independently_qualified=True),
+        ]
+
+        levels = _merge_round_levels(pivots, rounds, 1.0, config)
+        merged = {
+            item["id"]: item["round_level_price"]
+            for item in levels
+            if item["source"] == "MERGED"
+        }
+
+        self.assertAlmostEqual(boundary_round_price, 100.15)
+        self.assertGreater(100.40 - boundary_round_price, 0.25)
+        self.assertEqual(
+            merged,
+            {"p1": 99.9, "p2": boundary_round_price},
+        )
+
+    def test_boundary_tolerance_only_covers_floating_point_rounding(self):
+        from app.entry_structure_shadow import _within_distance_limit
+
+        maximum_distance = 0.25
+        rounding_distance = 100.40 - (100.0 + 0.1 + 0.05)
+
+        self.assertGreater(rounding_distance, maximum_distance)
+        self.assertTrue(_within_distance_limit(rounding_distance, maximum_distance))
+        self.assertFalse(
+            _within_distance_limit(maximum_distance + 1e-9, maximum_distance)
+        )
+
+        tiny_maximum = 1e-15
+        self.assertTrue(
+            _within_distance_limit(
+                math.nextafter(tiny_maximum, math.inf),
+                tiny_maximum,
+            )
+        )
+        self.assertFalse(
+            _within_distance_limit(tiny_maximum * 2.0, tiny_maximum)
+        )
 
     def test_merge_is_repeatable_and_does_not_mutate_inputs(self):
         config = StructureConfig()

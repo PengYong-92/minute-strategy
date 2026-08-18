@@ -410,7 +410,10 @@ def _round_candidates(
         price = float(level["round_level_price"])
         kind = str(level["kind"])
         if price in merge_candidates and any(
-            _price_to_zone_distance(price, zone) <= maximum_merge_distance
+            _within_distance_limit(
+                _price_to_zone_distance(price, zone),
+                maximum_merge_distance,
+            )
             for zone in zones_by_kind[kind]
         ):
             selected[(kind, price)] = level
@@ -433,6 +436,24 @@ def _price_to_zone_distance(price: float, level: dict[str, object]) -> float:
     if price > upper:
         return price - upper
     return 0.0
+
+
+def _within_distance_limit(distance: float, maximum_distance: float) -> bool:
+    if (
+        not math.isfinite(distance)
+        or not math.isfinite(maximum_distance)
+        or distance < 0
+        or maximum_distance < 0
+    ):
+        return False
+    if distance <= maximum_distance:
+        return True
+    return math.isclose(
+        distance,
+        maximum_distance,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    )
 
 
 def _zero_cost() -> tuple[float, int, int, int, int]:
@@ -501,7 +522,7 @@ def _maximum_round_matching(
                 continue
             price = float(round_level["round_level_price"])
             distance = _price_to_zone_distance(price, level)
-            if distance > maximum_distance:
+            if not _within_distance_limit(distance, maximum_distance):
                 continue
             cost = (
                 distance,
