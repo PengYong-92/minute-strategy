@@ -10,8 +10,7 @@ from app.models import Kline
 
 ENTRY_STRUCTURE_VERSION = "ENTRY_STRUCTURE_SHADOW_V1"
 MAX_STRUCTURE_BARS = 240
-MAX_PIVOT_LEVELS_PER_KIND = 24
-MAX_ROUND_CANDIDATES = 96
+MAX_QUALIFIED_ROUND_LEVELS_PER_KIND = 96
 
 
 @dataclass(frozen=True)
@@ -258,11 +257,10 @@ def _cluster_pivots(
         )
         if not overlaps:
             dominant.append(candidate)
-    limited = []
-    for kind in ("SUPPORT", "RESISTANCE"):
-        same_kind = [item for item in dominant if item["kind"] == kind]
-        limited.extend(same_kind[:MAX_PIVOT_LEVELS_PER_KIND])
-    return sorted(limited, key=lambda item: (item["kind"], item["lower"], item["id"]))
+    return sorted(
+        dominant,
+        key=lambda item: (item["kind"], item["lower"], item["id"]),
+    )
 
 
 def _independent_rejections(
@@ -289,15 +287,18 @@ def _round_candidates(
     klines: Sequence[Kline],
     atr: float,
     config: StructureConfig,
+    pivot_levels: Sequence[dict[str, object]] = (),
 ) -> list[dict[str, object]]:
     if not klines:
         return []
 
     buffer = config.rejection_atr * atr
     latest_close = float(klines[-1].close)
-    candidates: dict[float, dict[str, float | int]] = {}
+    maximum_merge_distance = config.cluster_atr * atr
+    candidates: dict[float, float] = {}
+    merge_candidates = set()
 
-    def add_nearby(anchor: float, step: float) -> None:
+    def add_nearby(anchor: float, step: float, *, merge_candidate: bool = False) -> None:
         if not math.isfinite(anchor):
             return
         quotient = anchor / step
@@ -311,17 +312,15 @@ def _round_candidates(
                 continue
             if not math.isfinite(price) or price <= 0:
                 continue
-            existing = candidates.get(price)
-            if existing is None:
-                candidates[price] = {"step": step, "occurrences": 1}
-            else:
-                existing["step"] = max(float(existing["step"]), step)
-                existing["occurrences"] = int(existing["occurrences"]) + 1
+            candidates[price] = max(candidates.get(price, 0.0), step)
+            if merge_candidate:
+                merge_candidates.add(price)
 
     for step in round_steps(symbol):
+        add_nearby(latest_close, step)
         for item in klines:
-            # Rejection counts change only at these interval boundaries. Sampling
-            # adjacent multiples keeps work bounded even for malformed price spans.
+            # Rejection truth changes only at these interval boundaries. The
+            # current close contributes the nearest discrete level on each side.
             for anchor in (
                 float(item.low),
                 float(item.close) - buffer,
@@ -331,19 +330,23 @@ def _round_candidates(
             ):
                 add_nearby(anchor, step)
 
-    ranked_candidates = sorted(
-        candidates.items(),
-        key=lambda item: (
-            -int(item[1]["occurrences"]),
-            _safe_ratio(abs(item[0] - latest_close), latest_close),
-            -float(item[1]["step"]),
-            item[0],
-        ),
-    )[:MAX_ROUND_CANDIDATES]
+        for level in pivot_levels:
+            kind = str(level.get("kind", ""))
+            if kind not in ("SUPPORT", "RESISTANCE"):
+                continue
+            lower = float(level["lower"])
+            upper = float(level["upper"])
+            for anchor in (
+                lower - maximum_merge_distance,
+                lower,
+                (lower + upper) / 2.0,
+                upper,
+                upper + maximum_merge_distance,
+            ):
+                add_nearby(anchor, step, merge_candidate=True)
 
     levels = []
-    for price, metadata in sorted(ranked_candidates):
-        step = float(metadata["step"])
+    for price, step in sorted(candidates.items()):
         for kind in ("SUPPORT", "RESISTANCE"):
             count, indexes = _independent_rejections(
                 klines,
@@ -354,7 +357,7 @@ def _round_candidates(
             )
             levels.append(
                 {
-                    "id": f"round-{kind.lower()}-{price:g}",
+                    "id": f"round-{kind.lower()}-{format(price, '.15g')}",
                     "kind": kind,
                     "source": "ROUND",
                     "lower": price,
@@ -376,7 +379,58 @@ def _round_candidates(
                     "_independently_qualified": count >= config.min_pivots,
                 }
             )
-    return levels
+
+    selected: dict[tuple[str, float], dict[str, object]] = {}
+    for kind in ("SUPPORT", "RESISTANCE"):
+        qualified = sorted(
+            (
+                level
+                for level in levels
+                if level["kind"] == kind
+                and level["_independently_qualified"]
+            ),
+            key=lambda level: (
+                abs(float(level["round_level_price"]) - latest_close),
+                -int(level["touch_count"]),
+                -int(level["last_confirmed_at"]),
+                -float(level["round_level_step"]),
+                float(level["round_level_price"]),
+            ),
+        )[:MAX_QUALIFIED_ROUND_LEVELS_PER_KIND]
+        for level in qualified:
+            selected[(kind, float(level["round_level_price"]))] = level
+
+    zones_by_kind = {
+        kind: [level for level in pivot_levels if level.get("kind") == kind]
+        for kind in ("SUPPORT", "RESISTANCE")
+    }
+    for level in levels:
+        price = float(level["round_level_price"])
+        kind = str(level["kind"])
+        if price in merge_candidates and any(
+            _price_to_zone_distance(price, zone) <= maximum_merge_distance
+            for zone in zones_by_kind[kind]
+        ):
+            selected[(kind, price)] = level
+
+    return sorted(
+        selected.values(),
+        key=lambda level: (
+            str(level["kind"]),
+            float(level["round_level_price"]),
+            str(level["id"]),
+        ),
+    )
+
+
+def _price_to_zone_distance(price: float, level: dict[str, object]) -> float:
+    lower = float(level["lower"])
+    upper = float(level["upper"])
+    if price < lower:
+        return lower - price
+    if price > upper:
+        return price - upper
+    return 0.0
 
 
 def _zero_cost() -> tuple[float, int, int, int, int]:
@@ -444,13 +498,7 @@ def _maximum_round_matching(
             if round_level["kind"] != level["kind"]:
                 continue
             price = float(round_level["round_level_price"])
-            distance = (
-                float(level["lower"]) - price
-                if price < float(level["lower"])
-                else price - float(level["upper"])
-                if price > float(level["upper"])
-                else 0.0
-            )
+            distance = _price_to_zone_distance(price, level)
             if distance > maximum_distance:
                 continue
             cost = (
@@ -589,11 +637,15 @@ def _valid_scoped_klines(klines: Sequence[Kline]) -> bool:
             or item.open_time < 0
             or item.open_time >= item.close_time
             or item.high < item.low
+            or not item.low <= item.open <= item.high
+            or not item.low <= item.close <= item.high
         ):
             return False
         if previous_open_time is not None and item.open_time <= previous_open_time:
             return False
         if previous_close_time is not None and item.close_time <= previous_close_time:
+            return False
+        if previous_close_time is not None and item.open_time < previous_close_time:
             return False
         previous_open_time = item.open_time
         previous_close_time = item.close_time
@@ -644,7 +696,13 @@ class StructureDetector:
 
         pivots = _confirmed_pivots(scoped, self.config)
         pivot_levels = _cluster_pivots(scoped, pivots, atr, self.config)
-        round_levels = _round_candidates(symbol, scoped, atr, self.config)
+        round_levels = _round_candidates(
+            symbol,
+            scoped,
+            atr,
+            self.config,
+            pivot_levels,
+        )
         levels = _merge_round_levels(
             pivot_levels,
             round_levels,

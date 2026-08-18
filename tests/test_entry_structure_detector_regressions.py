@@ -251,6 +251,22 @@ class StructureInputSafetyTest(unittest.TestCase):
             24,
         )
 
+    def test_open_and_close_must_stay_inside_high_low_range(self):
+        for overrides in (
+            {"open": 102.0},
+            {"open": 98.0},
+            {"close": 102.0},
+            {"close": 98.0},
+        ):
+            bars = make_bars()
+            bars[10] = replace_bar(bars[10], **overrides)
+
+            with self.subTest(overrides=overrides):
+                self.assert_safe_insufficient(
+                    StructureDetector().detect("BTCUSDT", bars),
+                    len(bars),
+                )
+
     def test_time_axis_must_be_integral_ordered_and_causal(self):
         cases = []
         unordered_close = make_bars()
@@ -280,6 +296,13 @@ class StructureInputSafetyTest(unittest.TestCase):
             close_time=fractional_time[10].close_time + 0.5,
         )
         cases.append(fractional_time)
+
+        overlapping = make_bars()
+        overlapping[10] = replace_bar(
+            overlapping[10],
+            open_time=overlapping[9].close_time - 1,
+        )
+        cases.append(overlapping)
 
         for bars in cases:
             with self.subTest(bad_bar=bars[10]):
@@ -415,6 +438,36 @@ class StructureClusteringRegressionTest(unittest.TestCase):
         self.assertNotEqual(before_level["pivot_indexes"], after_level["pivot_indexes"])
         self.assertEqual(before_level["id"], after_level["id"])
 
+    def test_more_than_twenty_four_zones_keep_nearest_current_price_zone(self):
+        config = StructureConfig(
+            bars=240,
+            atr_period=1,
+            pivot_left=1,
+            pivot_right=1,
+            min_pivots=2,
+            min_pivot_gap=2,
+            minimum_bars=8,
+        )
+        bars = make_bars(240, price=100.0)
+        pivots = []
+        for zone in range(25):
+            price = 100.0 + zone * 10.0
+            first_index = 2 + zone * 8
+            pivots.extend(
+                (
+                    pivot(first_index, price),
+                    pivot(first_index + 2, price),
+                )
+            )
+
+        levels = _cluster_pivots(bars, pivots, 1.0, config)
+
+        self.assertGreater(len(levels), 24)
+        self.assertTrue(
+            any(level["lower"] == 100.0 for level in levels),
+            levels,
+        )
+
 
 class RoundCandidateRegressionTest(unittest.TestCase):
     def test_overlapping_round_steps_keep_largest_step_without_duplicates(self):
@@ -428,7 +481,23 @@ class RoundCandidateRegressionTest(unittest.TestCase):
                 Kline(60_000, low, high, low, (low + high) / 2, 1.0, 120_000),
             ]
             with self.subTest(symbol=symbol):
-                levels = _round_candidates(symbol, bars, 20.0, StructureConfig())
+                pivot_levels = [
+                    pivot_level(
+                        f"{kind.lower()}-{price:g}",
+                        price,
+                        price,
+                        kind=kind,
+                    )
+                    for price in expected
+                    for kind in ("SUPPORT", "RESISTANCE")
+                ]
+                levels = _round_candidates(
+                    symbol,
+                    bars,
+                    20.0,
+                    StructureConfig(),
+                    pivot_levels,
+                )
                 keys = [
                     (item["kind"], item["round_level_price"])
                     for item in levels
@@ -464,8 +533,147 @@ class RoundCandidateRegressionTest(unittest.TestCase):
         levels = _round_candidates("BTCUSDT", bars, 10.0, StructureConfig())
         elapsed = time.perf_counter() - started
 
-        self.assertLessEqual(len(levels), 192)
+        self.assertEqual(levels, [])
         self.assertLess(elapsed, 0.5)
+
+    def test_unqualified_merge_candidates_are_bounded_by_zone_anchors(self):
+        bars = [
+            Kline(
+                index * 60_000,
+                20_000.0 + index * 1_000.0 + 50.0,
+                20_000.0 + index * 1_000.0 + 60.0,
+                20_000.0 + index * 1_000.0 + 40.0,
+                20_000.0 + index * 1_000.0 + 50.0,
+                1.0,
+                (index + 1) * 60_000,
+            )
+            for index in range(240)
+        ]
+        config = StructureConfig(cluster_atr=1_000.0)
+
+        levels = _round_candidates(
+            "BTCUSDT",
+            bars,
+            1_000.0,
+            config,
+            [pivot_level("wide-zone", 500_000.0, 500_000.0)],
+        )
+
+        self.assertTrue(levels)
+        self.assertTrue(
+            all(not item["_independently_qualified"] for item in levels)
+        )
+        self.assertLessEqual(len(levels), 30)
+
+    def test_nearest_independently_qualified_resistance_survives_pruning(self):
+        rng = random.Random(819)
+        groups = []
+        for _ in range(3):
+            bases = [20_000.0 + index * 100.0 for index in range(240)]
+            rng.shuffle(bases)
+            bars = []
+            for index, base in enumerate(bases):
+                close = base + 50.0
+                bars.append(
+                    Kline(
+                        index * 60_000,
+                        close,
+                        base + 60.0,
+                        base + 40.0,
+                        close,
+                        1.0,
+                        (index + 1) * 60_000,
+                    )
+                )
+            groups.append(bars)
+        bars = groups[-1]
+        bars[233] = Kline(
+            233 * 60_000,
+            50_200.0,
+            50_350.0,
+            50_150.0,
+            50_200.0,
+            1.0,
+            234 * 60_000,
+        )
+        bars[239] = Kline(
+            239 * 60_000,
+            49_800.0,
+            50_350.0,
+            49_500.0,
+            49_650.0,
+            1.0,
+            240 * 60_000,
+        )
+
+        levels = _round_candidates(
+            "BTCUSDT",
+            bars,
+            500.0,
+            StructureConfig(),
+        )
+        qualified_resistance = [
+            item
+            for item in levels
+            if item["kind"] == "RESISTANCE"
+            and item["_independently_qualified"]
+            and item["round_level_price"] > bars[-1].close
+        ]
+
+        self.assertTrue(qualified_resistance)
+        nearest = min(
+            qualified_resistance,
+            key=lambda item: item["round_level_price"] - bars[-1].close,
+        )
+        self.assertEqual(nearest["round_level_price"], 50_300.0)
+        self.assertEqual(nearest["touch_indexes"], (233, 239))
+
+    def test_large_round_prices_have_collision_free_stable_ids(self):
+        bars = [
+            Kline(
+                index * 60_000,
+                123_456_750.0,
+                123_456_850.0,
+                123_456_650.0,
+                123_456_750.0,
+                1.0,
+                (index + 1) * 60_000,
+            )
+            for index in range(2)
+        ]
+
+        levels = _round_candidates(
+            "BTCUSDT",
+            bars,
+            100.0,
+            StructureConfig(),
+            [
+                pivot_level(
+                    f"support-{price:.15g}",
+                    price,
+                    price,
+                )
+                for price in (123_456_700.0, 123_456_800.0)
+            ],
+        )
+        round_ids = {
+            item["round_level_price"]: item["id"]
+            for item in levels
+            if item["kind"] == "SUPPORT"
+            and item["round_level_price"]
+            in (123_456_700.0, 123_456_800.0)
+        }
+
+        self.assertEqual(len(round_ids), 2)
+        self.assertEqual(len(set(round_ids.values())), 2)
+        self.assertEqual(
+            round_ids[123_456_700.0],
+            "round-support-123456700",
+        )
+        self.assertEqual(
+            round_ids[123_456_800.0],
+            "round-support-123456800",
+        )
 
 
 class RoundMergeRegressionTest(unittest.TestCase):
