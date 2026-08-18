@@ -304,7 +304,403 @@ def atomic_bundle_counts(db_path: Path) -> dict[str, int]:
         }
 
 
+ENTRY_STRUCTURE_FIXTURE = {
+    "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+    "entry_structure_mode": "SHADOW_ONLY",
+    "entry_structure_state": "SUPPORT_REJECTED",
+    "entry_structure_bias": "CONFIRMED",
+    "entry_structure_reason_code": "SUPPORT_HELD",
+    "candidate_origin": "NATIVE_ACTIONABLE",
+    "active_level_source": "RECENT_SWING",
+    "detail": {
+        "levels": [99.0, 100.0],
+        "retest": {"status": "CONFIRMED", "bars": [1, 2]},
+    },
+}
+
+
+def structured_atomic_bundle(
+    *,
+    include_observation: bool = True,
+    legacy_without_top_level: bool = False,
+):
+    config, context, order, audit, entry_snapshot, observed = atomic_bundle_fixture(
+        include_observation=include_observation
+    )
+    structure = json.loads(json.dumps(ENTRY_STRUCTURE_FIXTURE))
+    order = replace(
+        order,
+        opened_at=context.closed_kline_at_ms,
+        expires_at=context.closed_kline_at_ms + 600_000,
+    )
+    signal_payload = audit.signal.to_dict()
+    signal_payload["entry_structure_shadow"] = json.loads(json.dumps(structure))
+    inputs = {
+        **context.to_dict()["inputs"],
+        "identity": {
+            "direction": order.direction,
+            "profile_key": order.profile_key,
+            "strategy_family": order.strategy_family,
+            "strategy_tag": order.strategy_tag,
+            "order_slot": order.order_slot,
+            "order_slot_scope": order.order_slot_scope,
+            "timeframe_minutes": order.timeframe_minutes,
+            "threshold_segment": order.threshold_segment,
+            "level": order.level,
+        },
+        "market": {
+            "close": order.entry_price,
+            "candidate_time_ms": order.opened_at,
+            "entry_price": order.entry_price,
+        },
+        "score": {
+            "edge": abs(order.score) - order.threshold,
+            "quality_score": order.quality_score,
+            "quality_score_version": order.quality_score_version,
+            "quality_score_mode": order.quality_score_mode,
+            "quality_score_context": order.quality_score_context,
+            "quality_score_components": order.quality_score_components,
+            "quality_score_inputs": order.quality_score_inputs,
+        },
+        "signal": signal_payload,
+    }
+    if not legacy_without_top_level:
+        inputs["entry_structure"] = json.loads(json.dumps(structure))
+    context = replace(
+        context,
+        inputs=inputs,
+        selected_order_terms={
+            "stake": order.stake,
+            "win_return": order.win_return,
+            "progression_step": order.stake_progression_step,
+            "progression_source_order_id": order.stake_progression_source_order_id,
+            "progression_version": order.stake_progression_version,
+            "expires_at": order.expires_at,
+            "timeframe_minutes": order.timeframe_minutes,
+            "order_slot": order.order_slot,
+            "order_slot_scope": order.order_slot_scope,
+            "direction": order.direction,
+            "entry_price": order.entry_price,
+        },
+    )
+    metadata = {
+        "entry_structure_shadow": json.loads(json.dumps(structure)),
+        "decision_inputs": context.to_dict()["inputs"],
+    }
+    audit = replace(audit, signal=replace(audit.signal, **metadata))
+    order = replace(order, **metadata)
+    if observed is not None:
+        observed = replace(
+            observed,
+            opened_at=order.opened_at,
+            expires_at=order.expires_at,
+            **metadata,
+        )
+    entry_snapshot = {
+        **entry_snapshot,
+        "signal": audit.signal.to_dict(),
+    }
+    return config, context, order, audit, entry_snapshot, observed
+
+
 class SQLiteMonitorStoreTest(unittest.TestCase):
+    def test_top_level_structure_is_authoritative_without_signal_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                structured_atomic_bundle()
+            )
+            inputs = context.to_dict()["inputs"]
+            inputs["signal"].pop("entry_structure_shadow")
+            context = replace(context, inputs=inputs)
+            audit = replace(
+                audit,
+                signal=replace(
+                    audit.signal,
+                    decision_inputs=context.to_dict()["inputs"],
+                ),
+            )
+            order = replace(order, decision_inputs=context.to_dict()["inputs"])
+            observed = replace(observed, decision_inputs=context.to_dict()["inputs"])
+
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+                observation=observed,
+            )
+
+            restored = SQLiteMonitorStore(db_path).load_orders(context.symbol)[0]
+            self.assertEqual(restored.entry_structure_shadow, ENTRY_STRUCTURE_FIXTURE)
+
+    def test_structure_snapshot_roundtrips_and_reopens_with_canonical_denormalization(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, observed = (
+                    structured_atomic_bundle(legacy_without_top_level=legacy)
+                )
+                store.save_open_order_decision(
+                    config=config,
+                    context=context,
+                    order=order,
+                    credit=None,
+                    entry_snapshot=entry_snapshot,
+                    audit=audit,
+                    observation=observed,
+                )
+
+                reopened = SQLiteMonitorStore(db_path)
+                restored_order = reopened.load_orders(context.symbol)[0]
+                restored_observation = reopened.load_observations(context.symbol)[0]
+                restored_context = reopened.load_decision_context(
+                    context.symbol,
+                    context.decision_id,
+                )
+                restored_snapshot = reopened.load_order_entry_snapshots(
+                    context.symbol
+                )[0]["entry_payload"]
+
+                self.assertEqual(
+                    restored_order.entry_structure_shadow,
+                    ENTRY_STRUCTURE_FIXTURE,
+                )
+                self.assertEqual(
+                    restored_observation.entry_structure_shadow,
+                    ENTRY_STRUCTURE_FIXTURE,
+                )
+                self.assertEqual(
+                    restored_snapshot["signal"]["entry_structure_shadow"],
+                    ENTRY_STRUCTURE_FIXTURE,
+                )
+                self.assertEqual(
+                    restored_context["inputs"]["signal"]["entry_structure_shadow"],
+                    ENTRY_STRUCTURE_FIXTURE,
+                )
+                if legacy:
+                    self.assertNotIn("entry_structure", restored_context["inputs"])
+                else:
+                    self.assertEqual(
+                        restored_context["inputs"]["entry_structure"],
+                        ENTRY_STRUCTURE_FIXTURE,
+                    )
+                with closing(sqlite3.connect(db_path)) as connection:
+                    denormalized = connection.execute(
+                        "select candidate_origin, entry_structure_state, "
+                        "entry_structure_bias, active_level_source "
+                        "from observation_signals"
+                    ).fetchone()
+                self.assertEqual(
+                    denormalized,
+                    (
+                        context.candidate_origin,
+                        ENTRY_STRUCTURE_FIXTURE["entry_structure_state"],
+                        ENTRY_STRUCTURE_FIXTURE["entry_structure_bias"],
+                        ENTRY_STRUCTURE_FIXTURE["active_level_source"],
+                    ),
+                )
+
+    def test_structure_context_aliases_must_be_deeply_equal(self):
+        cases = {
+            "nested list differs": {
+                **ENTRY_STRUCTURE_FIXTURE,
+                "detail": {
+                    **ENTRY_STRUCTURE_FIXTURE["detail"],
+                    "levels": [99.0, 101.0],
+                },
+            },
+            "explicit None is not empty": None,
+            "explicit empty is not populated": {},
+        }
+        for label, nested_structure in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, observed = (
+                    structured_atomic_bundle()
+                )
+                context = replace(
+                    context,
+                    inputs={
+                        **context.inputs,
+                        "signal": {
+                            **context.inputs["signal"],
+                            "entry_structure_shadow": nested_structure,
+                        },
+                    },
+                )
+
+                with self.assertRaisesRegex(ValueError, "structure"):
+                    store.save_open_order_decision(
+                        config=config,
+                        context=context,
+                        order=order,
+                        credit=None,
+                        entry_snapshot=entry_snapshot,
+                        audit=audit,
+                        observation=observed,
+                    )
+                self.assertEqual(
+                    atomic_bundle_counts(db_path),
+                    {key: 0 for key in atomic_bundle_counts(db_path)},
+                )
+
+    def test_open_bundle_rejects_each_mutated_structure_without_partial_rows(self):
+        mutations = {
+            "audit signal": lambda values: {
+                **values,
+                "audit": replace(
+                    values["audit"],
+                    signal=replace(
+                        values["audit"].signal,
+                        entry_structure_shadow={"entry_structure_state": "MUTATED"},
+                    ),
+                ),
+            },
+            "order": lambda values: {
+                **values,
+                "order": replace(
+                    values["order"],
+                    entry_structure_shadow={"entry_structure_state": "MUTATED"},
+                ),
+            },
+            "observation": lambda values: {
+                **values,
+                "observation": replace(
+                    values["observation"],
+                    entry_structure_shadow={"entry_structure_state": "MUTATED"},
+                ),
+            },
+            "entry snapshot": lambda values: {
+                **values,
+                "entry_snapshot": {
+                    **values["entry_snapshot"],
+                    "signal": {
+                        **values["entry_snapshot"]["signal"],
+                        "entry_structure_shadow": {
+                            "entry_structure_state": "MUTATED"
+                        },
+                    },
+                },
+            },
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, observed = (
+                    structured_atomic_bundle()
+                )
+                arguments = mutate(
+                    {
+                        "config": config,
+                        "context": context,
+                        "order": order,
+                        "credit": None,
+                        "entry_snapshot": entry_snapshot,
+                        "audit": audit,
+                        "observation": observed,
+                    }
+                )
+
+                with self.assertRaisesRegex(ValueError, "structure"):
+                    store.save_open_order_decision(**arguments)
+                self.assertEqual(
+                    atomic_bundle_counts(db_path),
+                    {key: 0 for key in atomic_bundle_counts(db_path)},
+                )
+
+    def test_blocked_bundle_structure_mismatch_rolls_back_every_member(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, _order, audit, _entry_snapshot, observed = (
+                structured_atomic_bundle()
+            )
+            decision_trace = (
+                {
+                    "stage": "profile",
+                    "result": "BLOCK",
+                    "decisive_values": {"status": "PAUSED"},
+                    "reason_code": "PROFILE_BLOCKED",
+                },
+            )
+            context = replace(
+                context,
+                decision_trace=decision_trace,
+                first_decisive_block="profile",
+                final_decision="PROFILE_BLOCKED",
+                final_reason="blocked",
+                open_allowed=False,
+                selected_order_terms={},
+            )
+            audit = replace(
+                audit,
+                signal=replace(
+                    audit.signal,
+                    decision_trace=list(decision_trace),
+                    first_decisive_block="profile",
+                    entry_structure_shadow={"entry_structure_state": "MUTATED"},
+                ),
+                decision="PROFILE_BLOCKED",
+            )
+            observed = replace(
+                observed,
+                decision_trace=list(decision_trace),
+                first_decisive_block="profile",
+                source_decision="PROFILE_BLOCKED",
+            )
+
+            with self.assertRaisesRegex(ValueError, "structure"):
+                store.save_decision_bundle(
+                    config=config,
+                    context=context,
+                    audit=audit,
+                    observation=observed,
+                )
+            self.assertEqual(
+                atomic_bundle_counts(db_path),
+                {key: 0 for key in atomic_bundle_counts(db_path)},
+            )
+
+    def test_old_decision_payload_without_structure_remains_read_only_compatible(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+                observation=observed,
+            )
+
+            reopened = SQLiteMonitorStore(db_path)
+            self.assertEqual(
+                reopened.load_orders(context.symbol)[0].entry_structure_shadow,
+                {},
+            )
+            self.assertEqual(
+                reopened.load_observations(context.symbol)[0].entry_structure_shadow,
+                {},
+            )
+            persisted_context = reopened.load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            self.assertNotIn("entry_structure", persisted_context["inputs"])
+            self.assertNotIn("signal", persisted_context["inputs"])
+
     def test_profile_summary_generated_at_marks_completed_calculation(self):
         original_summary = order_profile._summary
         delayed = False
@@ -3282,18 +3678,13 @@ class AtomicDecisionBundleTest(unittest.TestCase):
             db_path = Path(temp_dir) / "monitor.sqlite3"
             store = SQLiteMonitorStore(db_path)
             config, context, order, audit, entry_snapshot, observed = (
-                atomic_bundle_fixture()
+                structured_atomic_bundle()
             )
             observed = replace(
                 observed,
                 adaptive_profile_state={
                     "qualification_state": "QUALIFIED",
                     "status": "RESIDENT",
-                },
-                entry_structure_shadow={
-                    "entry_structure_state": "SUPPORT_RECLAIM",
-                    "entry_structure_bias": "LONG",
-                    "active_level_source": "RECENT_SWING",
                 },
             )
 
@@ -3356,9 +3747,9 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                     context.candidate_origin,
                     "QUALIFIED",
                     "RESIDENT",
-                    "SUPPORT_RECLAIM",
-                    "LONG",
-                    "RECENT_SWING",
+                    ENTRY_STRUCTURE_FIXTURE["entry_structure_state"],
+                    ENTRY_STRUCTURE_FIXTURE["entry_structure_bias"],
+                    ENTRY_STRUCTURE_FIXTURE["active_level_source"],
                 ),
             )
 

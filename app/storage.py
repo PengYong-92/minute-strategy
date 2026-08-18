@@ -231,6 +231,60 @@ def _require_matching_field(
         raise ValueError(f"persisted {field} does not match decision context")
 
 
+def _plain_entry_structure(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain_entry_structure(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_entry_structure(item) for item in value]
+    return value
+
+
+def _canonical_entry_structure(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(inputs, Mapping):
+        raise ValueError("linked decision structure inputs are malformed")
+    signal = inputs.get("signal", {})
+    if not isinstance(signal, Mapping):
+        raise ValueError("linked decision signal structure is malformed")
+
+    has_top_level = "entry_structure" in inputs
+    has_signal_view = "entry_structure_shadow" in signal
+    if has_top_level:
+        top_level = inputs["entry_structure"]
+        if not isinstance(top_level, Mapping):
+            raise ValueError("linked decision entry structure must be an object")
+        canonical = _plain_entry_structure(top_level)
+        if not isinstance(canonical, dict):
+            raise ValueError("linked decision entry structure must be an object")
+        if has_signal_view:
+            signal_view = signal["entry_structure_shadow"]
+            if not isinstance(signal_view, Mapping):
+                raise ValueError("linked signal entry structure must be an object")
+            if canonical != _plain_entry_structure(signal_view):
+                raise ValueError("linked decision entry structure views do not match")
+        return canonical
+
+    if not has_signal_view:
+        return {}
+    signal_view = signal["entry_structure_shadow"]
+    if not isinstance(signal_view, Mapping):
+        raise ValueError("legacy signal entry structure must be an object")
+    canonical = _plain_entry_structure(signal_view)
+    if not isinstance(canonical, dict):
+        raise ValueError("legacy signal entry structure must be an object")
+    return canonical
+
+
+def _require_matching_entry_structure(
+    value: object,
+    expected: Mapping[str, Any],
+    name: str,
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} entry structure must be an object")
+    if _plain_entry_structure(value) != _plain_entry_structure(expected):
+        raise ValueError(f"{name} entry structure must match decision context")
+
+
 def _canonical_model_fields(
     payload: Mapping[str, Any],
     context: Mapping[str, Any],
@@ -242,6 +296,7 @@ def _canonical_model_fields(
     market = inputs.get("market", {})
     if not all(isinstance(item, Mapping) for item in (identity, signal, score, market)):
         raise ValueError("linked canonical model inputs are malformed")
+    entry_structure = _canonical_entry_structure(inputs)
 
     is_order = "id" in payload
     is_observation = "observation_key" in payload
@@ -295,9 +350,7 @@ def _canonical_model_fields(
             "adaptive_profile_state": deepcopy(
                 signal.get("adaptive_profile_state", {})
             ),
-            "entry_structure_shadow": deepcopy(
-                signal.get("entry_structure_shadow", {})
-            ),
+            "entry_structure_shadow": deepcopy(entry_structure),
         }
     )
     opened_at = (
@@ -1714,10 +1767,16 @@ class SQLiteMonitorStore:
             raise ValueError("config build must match decision context")
         if context.symbol != context.symbol.upper():
             raise ValueError("decision context symbol must be uppercase")
+        canonical_structure = _canonical_entry_structure(context.inputs)
         if not isinstance(audit.signal, Signal):
             raise TypeError("audit signal must be a Signal")
         SQLiteMonitorStore._validate_decision_metadata(
             audit.signal, context, "audit signal"
+        )
+        _require_matching_entry_structure(
+            audit.signal.entry_structure_shadow,
+            canonical_structure,
+            "audit signal",
         )
         if str(audit.decision or "").upper() != context.final_decision.upper():
             raise ValueError("audit decision must match final decision")
@@ -1727,6 +1786,11 @@ class SQLiteMonitorStore:
             if not isinstance(order, SimulatedOrder):
                 raise TypeError("order must be a SimulatedOrder")
             SQLiteMonitorStore._validate_decision_metadata(order, context, "order")
+            _require_matching_entry_structure(
+                order.entry_structure_shadow,
+                canonical_structure,
+                "order",
+            )
             if order.status != "OPEN":
                 raise ValueError("open decision bundle requires an OPEN order")
             if order.direction != audit.signal.direction:
@@ -1737,6 +1801,11 @@ class SQLiteMonitorStore:
             SQLiteMonitorStore._validate_decision_metadata(
                 observation, context, "observation"
             )
+            _require_matching_entry_structure(
+                observation.entry_structure_shadow,
+                canonical_structure,
+                "observation",
+            )
             if observation.direction != audit.signal.direction:
                 raise ValueError("observation direction must match audit signal")
         if entry_snapshot is not None:
@@ -1745,6 +1814,18 @@ class SQLiteMonitorStore:
             snapshot_signal = entry_snapshot.get("signal")
             if not isinstance(snapshot_signal, Mapping):
                 raise ValueError("entry_snapshot must contain signal metadata")
+            if "entry_structure_shadow" in snapshot_signal:
+                _require_matching_entry_structure(
+                    snapshot_signal["entry_structure_shadow"],
+                    canonical_structure,
+                    "entry_snapshot signal",
+                )
+            if "entry_structure_shadow" in entry_snapshot:
+                _require_matching_entry_structure(
+                    entry_snapshot["entry_structure_shadow"],
+                    canonical_structure,
+                    "entry_snapshot",
+                )
             for field_name in (
                 "decision_id",
                 "context_version",
@@ -2785,11 +2866,25 @@ class SQLiteMonitorStore:
             if isinstance(observation.adaptive_profile_state, Mapping)
             else {}
         )
-        structure = (
-            observation.entry_structure_shadow
-            if isinstance(observation.entry_structure_shadow, Mapping)
-            else {}
+        decision_inputs = observation.decision_inputs
+        has_linked_inputs = bool(
+            observation.decision_id
+            and isinstance(decision_inputs, Mapping)
+            and isinstance(decision_inputs.get("identity"), Mapping)
         )
+        if has_linked_inputs:
+            structure = _canonical_entry_structure(decision_inputs)
+            _require_matching_entry_structure(
+                observation.entry_structure_shadow,
+                structure,
+                "observation",
+            )
+        else:
+            structure = (
+                observation.entry_structure_shadow
+                if isinstance(observation.entry_structure_shadow, Mapping)
+                else {}
+            )
         qualification_state = str(
             adaptive.get("qualification_state")
             or adaptive.get("qualification_status")
