@@ -10,7 +10,7 @@ def bars_from_ranges(ranges):
         result.append(
             Kline(
                 open_time=index * 60_000,
-                open=previous_close,
+                open=min(max(previous_close, float(low)), float(high)),
                 high=float(high),
                 low=float(low),
                 close=float(close),
