@@ -2136,6 +2136,92 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(latest["version"], "DPS-2")
         self.assertIsNone(missing)
 
+    def test_loads_daily_profile_snapshot_as_of_evaluation_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+
+            def snapshot(version, evaluation_key):
+                return {
+                    "version": version,
+                    "status": "READY",
+                    "evaluated_at": evaluation_key + 5,
+                    "evaluation_key": evaluation_key,
+                    "lookback_end": evaluation_key,
+                    "effective_from": evaluation_key + 10 * 60_000,
+                    "effective_until": evaluation_key + 86_400_000,
+                    "selected_profiles": [{"key": version}],
+                }
+
+            store.save_daily_profile_selection("BTCUSDT", snapshot("PAST", 1_000))
+            store.save_daily_profile_selection("BTCUSDT", snapshot("CURRENT", 2_000))
+            store.save_daily_profile_selection("BTCUSDT", snapshot("FUTURE", 3_000))
+            future_same_evaluation = snapshot("FUTURE-SAME-EVALUATION", 2_000)
+            future_same_evaluation["evaluated_at"] = 2_500
+            future_same_evaluation["effective_from"] += 1
+            future_same_evaluation["effective_until"] += 1
+            store.save_daily_profile_selection("BTCUSDT", future_same_evaluation)
+
+            current = store.load_daily_profile_selection_as_of(
+                "BTCUSDT",
+                2_000,
+                evaluated_at_ms=2_300,
+            )
+            between = store.load_daily_profile_selection_as_of("BTCUSDT", 1_500)
+            before_all = store.load_daily_profile_selection_as_of("BTCUSDT", 999)
+            latest = store.load_latest_daily_profile_selection("BTCUSDT")
+            store.close()
+
+        self.assertEqual(current["version"], "CURRENT")
+        self.assertEqual(between["version"], "PAST")
+        self.assertIsNone(before_all)
+        self.assertEqual(latest["version"], "FUTURE")
+
+    def test_as_of_loader_migrates_legacy_rows_using_payload_lookback_end(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            payload = {
+                "version": "LEGACY",
+                "status": "READY",
+                "evaluated_at": 1_500,
+                "lookback_end": 1_000,
+                "effective_from": 2_000,
+                "effective_until": 3_000,
+                "selected_profiles": [],
+            }
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    """
+                    create table daily_profile_selections (
+                        symbol text not null,
+                        effective_from integer not null,
+                        effective_until integer not null,
+                        status text not null,
+                        evaluated_at integer not null,
+                        payload text not null,
+                        updated_at_ms integer not null default 0,
+                        primary key(symbol, effective_from)
+                    )
+                    """
+                )
+                connection.execute(
+                    "insert into daily_profile_selections values (?, ?, ?, ?, ?, ?, ?)",
+                    ("BTCUSDT", 2_000, 3_000, "READY", 1_500, json.dumps(payload), 0),
+                )
+
+            store = SQLiteMonitorStore(db_path)
+            restored = store.load_daily_profile_selection_as_of("BTCUSDT", 1_000)
+            with sqlite3.connect(db_path) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "pragma table_info(daily_profile_selections)"
+                    )
+                }
+            store.close()
+
+        self.assertEqual(restored["version"], "LEGACY")
+        self.assertIn("evaluation_key", columns)
+
     def test_loads_complete_latest_observation_profile_window(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")

@@ -3063,17 +3063,25 @@ class SQLiteMonitorStore:
 
     def save_daily_profile_selection(self, symbol: str, snapshot: dict[str, Any]) -> None:
         payload = json.dumps(snapshot, ensure_ascii=False)
+        evaluation_key = int(
+            snapshot.get(
+                "evaluation_key",
+                snapshot.get("lookback_end", snapshot.get("evaluated_at", 0)),
+            )
+        )
         with self._connect() as connection:
             connection.execute(
                 """
                 insert into daily_profile_selections(
-                    symbol, effective_from, effective_until, status, evaluated_at, payload
+                    symbol, effective_from, effective_until, status, evaluated_at,
+                    evaluation_key, payload
                 )
-                values (?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?)
                 on conflict(symbol, effective_from) do update set
                     effective_until=excluded.effective_until,
                     status=excluded.status,
                     evaluated_at=excluded.evaluated_at,
+                    evaluation_key=excluded.evaluation_key,
                     payload=excluded.payload,
                     updated_at_ms=strftime('%s','now') * 1000
                 """,
@@ -3083,6 +3091,7 @@ class SQLiteMonitorStore:
                     int(snapshot["effective_until"]),
                     str(snapshot.get("status", "READY")),
                     int(snapshot.get("evaluated_at", 0)),
+                    evaluation_key,
                     payload,
                 ),
             )
@@ -3112,6 +3121,33 @@ class SQLiteMonitorStore:
                 limit 1
                 """,
                 (symbol.upper(),),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_daily_profile_selection_as_of(
+        self,
+        symbol: str,
+        evaluation_key: int,
+        *,
+        evaluated_at_ms: int | None = None,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select payload
+                from daily_profile_selections
+                where symbol = ?
+                  and evaluation_key <= ?
+                  and (? is null or evaluated_at <= ?)
+                order by evaluation_key desc, evaluated_at desc
+                limit 1
+                """,
+                (
+                    symbol.upper(),
+                    int(evaluation_key),
+                    evaluated_at_ms,
+                    evaluated_at_ms,
+                ),
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 
@@ -5265,15 +5301,44 @@ class SQLiteMonitorStore:
                     effective_until integer not null,
                     status text not null,
                     evaluated_at integer not null,
+                    evaluation_key integer,
                     payload text not null,
                     updated_at_ms integer not null default (strftime('%s','now') * 1000),
                     primary key(symbol, effective_from)
                 )
                 """
             )
+            daily_profile_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "pragma table_info(daily_profile_selections)"
+                ).fetchall()
+            }
+            if "evaluation_key" not in daily_profile_columns:
+                connection.execute(
+                    "alter table daily_profile_selections add column evaluation_key integer"
+                )
+            connection.execute(
+                """
+                update daily_profile_selections
+                set evaluation_key = case
+                    when json_valid(payload) then coalesce(
+                        cast(json_extract(payload, '$.evaluation_key') as integer),
+                        cast(json_extract(payload, '$.lookback_end') as integer),
+                        evaluated_at
+                    )
+                    else evaluated_at
+                end
+                where evaluation_key is null
+                """
+            )
             connection.execute(
                 "create index if not exists idx_daily_profile_selections_symbol_effective "
                 "on daily_profile_selections(symbol, effective_from, effective_until)"
+            )
+            connection.execute(
+                "create index if not exists idx_daily_profile_selections_symbol_evaluation "
+                "on daily_profile_selections(symbol, evaluation_key, evaluated_at)"
             )
             connection.execute(
                 """

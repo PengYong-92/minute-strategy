@@ -36,6 +36,7 @@ def replay_daily_profile_selection(
     max_open_orders: int = 5,
     min_order_gap_ms: int = 2 * 60_000,
 ) -> dict[str, Any]:
+    config = config.normalized()
     settled = sorted(
         (
             item
@@ -124,7 +125,7 @@ def replay_daily_profile_selection(
 
     compact_schedule = [_compact_snapshot(item) for item in snapshots]
     return {
-        "config": config.normalized().__dict__,
+        "config": _config_snapshot(config),
         "execution": {
             "max_open_orders": max_open_orders,
             "min_order_gap_ms": min_order_gap_ms,
@@ -194,6 +195,7 @@ def _build_schedule(
     *,
     require_full_lookback: bool,
 ) -> list[dict[str, Any]]:
+    config = config.normalized()
     first_opened_at = observations[0].opened_at
     last_opened_at = observations[-1].opened_at
     current_date = datetime.fromtimestamp(first_opened_at / 1000, tz=SHANGHAI).date()
@@ -211,7 +213,7 @@ def _build_schedule(
         )
         window = selection_window(
             evaluated_at,
-            lookback_days=config.lookback_days,
+            lookback_days=config.effective_stable_lookback_days,
             evaluation_hour=config.evaluation_hour,
             evaluation_minute=config.evaluation_minute,
             activation_hour=config.activation_hour,
@@ -380,6 +382,16 @@ def _iso(timestamp_ms: int | None) -> str | None:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=SHANGHAI).isoformat(timespec="seconds")
 
 
+def _config_snapshot(config: DailyProfileSelectorConfig) -> dict[str, Any]:
+    normalized = config.normalized()
+    return {
+        **normalized.__dict__,
+        "effective_stable_lookback_days": normalized.effective_stable_lookback_days,
+        "stable_lookback_source": normalized.stable_lookback_source,
+        "effective_joint_failures_to_exit": normalized.joint_failures_to_exit,
+    }
+
+
 def _empty_replay(
     config: DailyProfileSelectorConfig,
     *,
@@ -387,7 +399,7 @@ def _empty_replay(
     min_order_gap_ms: int,
 ) -> dict[str, Any]:
     return {
-        "config": config.normalized().__dict__,
+        "config": _config_snapshot(config),
         "execution": {
             "max_open_orders": max(1, int(max_open_orders)),
             "min_order_gap_ms": max(0, int(min_order_gap_ms)),
@@ -410,23 +422,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="严格走前回放每日观察画像选择器")
     parser.add_argument("--db-path", type=Path, required=True)
     parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--lookback-days", type=int, default=7, help="快速画像回看天数，默认: 7")
+    parser.add_argument(
+        "--stable-lookback-days",
+        type=int,
+        help="稳定画像回看天数；未指定时取 14 与快速窗口天数的较大值",
+    )
     parser.add_argument("--min-samples", type=int, default=20)
     parser.add_argument("--min-win-rate", type=float, default=0.60)
     parser.add_argument("--min-ev", type=float, default=0.0)
+    parser.add_argument(
+        "--degraded-runs-to-exit",
+        type=int,
+        default=2,
+        help="兼容连续退化退出次数，默认: 2",
+    )
+    parser.add_argument(
+        "--joint-failures-to-exit",
+        type=int,
+        help="双窗口同时失败退出次数；未指定时沿用兼容连续退化次数",
+    )
     parser.add_argument("--max-open-orders", type=int, default=5)
     parser.add_argument("--min-order-gap-minutes", type=float, default=2.0)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--allow-partial-lookback", action="store_true")
     args = parser.parse_args(argv)
     config = DailyProfileSelectorConfig(
+        lookback_days=args.lookback_days,
+        stable_lookback_days=args.stable_lookback_days,
         min_samples=args.min_samples,
         min_win_rate=args.min_win_rate,
         min_ev=args.min_ev,
         exit_win_rate=args.min_win_rate,
         exit_ev=args.min_ev,
-        degraded_runs_to_exit=1,
+        degraded_runs_to_exit=args.degraded_runs_to_exit,
+        joint_failures_to_exit=args.joint_failures_to_exit,
         max_active_profiles=0,
-    )
+    ).normalized()
     result = replay_daily_profile_selection(
         load_observations(args.db_path, args.symbol),
         config,

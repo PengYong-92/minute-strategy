@@ -643,6 +643,42 @@ class RecordingStorage:
         matching = [snapshot for item_symbol, snapshot in self.daily_profile_selections if item_symbol == symbol]
         return matching[-1] if matching else None
 
+    def load_daily_profile_selection_as_of(
+        self,
+        symbol,
+        evaluation_key,
+        evaluated_at_ms=None,
+    ):
+        matching = [
+            snapshot
+            for item_symbol, snapshot in self.daily_profile_selections
+            if item_symbol == symbol
+            and int(
+                snapshot.get(
+                    "evaluation_key",
+                    snapshot.get("lookback_end", snapshot.get("evaluated_at", -1)),
+                )
+            )
+            <= evaluation_key
+            and (
+                evaluated_at_ms is None
+                or int(snapshot.get("evaluated_at", -1)) <= evaluated_at_ms
+            )
+        ]
+        return max(
+            matching,
+            key=lambda snapshot: (
+                int(
+                    snapshot.get(
+                        "evaluation_key",
+                        snapshot.get("lookback_end", snapshot.get("evaluated_at", -1)),
+                    )
+                ),
+                int(snapshot.get("evaluated_at", -1)),
+            ),
+            default=None,
+        )
+
     def load_daily_profile_selection(self, symbol, effective_at_ms):
         matching = [
             snapshot
@@ -7038,6 +7074,141 @@ class MonitorStateTest(unittest.TestCase):
             "10|family|tag|LONG|WD-01",
         )
         self.assertIn("database unavailable", state.daily_profile_selection["reason"])
+
+    def test_daily_selector_fallback_uses_current_as_of_snapshot_not_future_latest(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        storage = FailingDailySelectionStorage()
+
+        def snapshot(version, evaluation_key, selected_key):
+            return {
+                "version": version,
+                "status": "READY",
+                "evaluated_at": evaluation_key,
+                "evaluation_key": evaluation_key,
+                "lookback_end": evaluation_key,
+                "effective_from": evaluation_key + 10 * 60_000,
+                "effective_until": evaluation_key + 86_400_000 + 10 * 60_000,
+                "selected_profiles": [{"key": selected_key}],
+                "selected_count": 1,
+            }
+
+        storage.daily_profile_selections.extend(
+            [
+                ("BTCUSDT", snapshot("PAST", cutoff - 86_400_000, "past")),
+                ("BTCUSDT", snapshot("CURRENT", cutoff, "current")),
+                ("BTCUSDT", snapshot("FUTURE", cutoff + 86_400_000, "future")),
+            ]
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+        )
+        self.addCleanup(state.close)
+        state._refresh_daily_profile_selection(current)
+
+        self.assertEqual(state.daily_profile_selection["status"], "FALLBACK")
+        self.assertEqual(state.daily_profile_selection["evaluation_key"], cutoff)
+        self.assertEqual(
+            state.daily_profile_selection["selected_profiles"],
+            [{"key": "current"}],
+        )
+        self.assertNotIn("future", json.dumps(state.daily_profile_selection))
+
+    def test_daily_selector_save_failure_with_only_future_snapshot_is_empty_error(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        future_key = cutoff + 86_400_000
+        storage = FailingDailySelectionStorage()
+        storage.daily_profile_selections.append(
+            (
+                "BTCUSDT",
+                {
+                    "version": "FUTURE",
+                    "status": "READY",
+                    "evaluated_at": future_key,
+                    "evaluation_key": future_key,
+                    "lookback_end": future_key,
+                    "effective_from": current + 86_400_000,
+                    "effective_until": current + 2 * 86_400_000,
+                    "selected_profiles": [{"key": "future"}],
+                    "selected_count": 1,
+                },
+            )
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+        )
+        self.addCleanup(state.close)
+        state.active_daily_profile_selection = {
+            **storage.daily_profile_selections[-1][1],
+            "effective_from": current,
+            "effective_until": current + 86_400_000,
+        }
+
+        state._refresh_daily_profile_selection(current)
+
+        self.assertEqual(state.daily_profile_selection["status"], "ERROR")
+        self.assertEqual(state.daily_profile_selection["evaluation_key"], cutoff)
+        self.assertEqual(state.daily_profile_selection["selected_profiles"], [])
+        self.assertIsNone(state.active_daily_profile_selection)
+
+    def test_daily_selector_clock_rollback_uses_nearest_snapshot_before_replayed_day(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        storage = FailingDailySelectionStorage()
+        for day_offset, version in ((-2, "OLDER"), (-1, "NEAREST")):
+            evaluation_key = cutoff + day_offset * 86_400_000
+            storage.daily_profile_selections.append(
+                (
+                    "BTCUSDT",
+                    {
+                        "version": version,
+                        "status": "READY",
+                        "evaluated_at": evaluation_key,
+                        "evaluation_key": evaluation_key,
+                        "lookback_end": evaluation_key,
+                        "effective_from": evaluation_key + 10 * 60_000,
+                        "effective_until": evaluation_key + 86_400_000 + 10 * 60_000,
+                        "selected_profiles": [{"key": version.lower()}],
+                        "selected_count": 1,
+                    },
+                )
+            )
+        storage.daily_profile_selections.append(
+            (
+                "BTCUSDT",
+                {
+                    "version": "FUTURE-SAME-EVALUATION",
+                    "status": "READY",
+                    "evaluated_at": current + 60 * 60_000,
+                    "evaluation_key": cutoff,
+                    "lookback_end": cutoff,
+                    "effective_from": current,
+                    "effective_until": current + 86_400_000,
+                    "selected_profiles": [{"key": "future"}],
+                    "selected_count": 1,
+                },
+            )
+        )
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            enable_daily_profile_selector=True,
+        )
+        self.addCleanup(state.close)
+
+        state._refresh_daily_profile_selection(current)
+
+        self.assertTrue(state.daily_profile_selection["version"].startswith("NEAREST"))
+        self.assertEqual(
+            state.daily_profile_selection["selected_profiles"],
+            [{"key": "nearest"}],
+        )
+        self.assertLessEqual(state.daily_profile_selection["evaluation_key"], cutoff)
 
     def test_state_restores_persisted_orders_from_sqlite(self):
         with tempfile.TemporaryDirectory() as temp_dir:

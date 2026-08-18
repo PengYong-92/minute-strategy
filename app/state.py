@@ -3067,8 +3067,12 @@ class MonitorState:
             latest is None
             or int(latest.get("effective_from", -1)) != target["effective_from"]
             or not self._daily_profile_config_matches(latest, config)
+            or not self._daily_profile_snapshot_is_safe(latest, target, current_time)
         ):
-            previous = latest or self._load_latest_daily_profile_selection()
+            previous = self._load_daily_profile_selection_as_of(
+                target["lookback_end"],
+                current_time,
+            )
             try:
                 next_snapshot = build_daily_selection(
                     self.observations,
@@ -3087,11 +3091,23 @@ class MonitorState:
         if self._selection_is_effective(latest, current_time):
             self.active_daily_profile_selection = latest
             return
-        if self._selection_is_effective(self.active_daily_profile_selection, current_time):
+        if (
+            self._selection_is_effective(self.active_daily_profile_selection, current_time)
+            and self._daily_profile_snapshot_is_safe(
+                self.active_daily_profile_selection,
+                target,
+                current_time,
+            )
+        ):
             return
+        self.active_daily_profile_selection = None
         loader = getattr(self.storage, "load_daily_profile_selection", None) if self.storage else None
         active = loader(self.symbol, current_time) if loader is not None else None
-        self.active_daily_profile_selection = active
+        self.active_daily_profile_selection = (
+            active
+            if self._daily_profile_snapshot_is_safe(active, target, current_time)
+            else None
+        )
 
     @staticmethod
     def _daily_profile_config_matches(
@@ -3192,6 +3208,69 @@ class MonitorState:
         loader = getattr(self.storage, "load_latest_daily_profile_selection", None)
         return loader(self.symbol) if loader is not None else None
 
+    def _load_daily_profile_selection_as_of(
+        self,
+        evaluation_key: int,
+        evaluated_at: int,
+    ) -> dict | None:
+        if not self.storage:
+            candidate = self.daily_profile_selection
+        else:
+            loader = getattr(self.storage, "load_daily_profile_selection_as_of", None)
+            if loader is not None:
+                return loader(
+                    self.symbol,
+                    evaluation_key,
+                    evaluated_at_ms=evaluated_at,
+                )
+            candidate = self._load_latest_daily_profile_selection()
+        marker = self._daily_profile_evaluation_marker(candidate)
+        return candidate if marker is not None and marker <= evaluation_key else None
+
+    @staticmethod
+    def _daily_profile_evaluation_marker(snapshot: dict | None) -> int | None:
+        if not snapshot:
+            return None
+        for field in ("evaluation_key", "lookback_end", "evaluated_at"):
+            try:
+                if snapshot.get(field) is not None:
+                    return int(snapshot[field])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @classmethod
+    def _daily_profile_snapshot_is_safe(
+        cls,
+        snapshot: dict | None,
+        target: dict,
+        evaluated_at: int,
+    ) -> bool:
+        if not snapshot:
+            return False
+        limits = {
+            "evaluation_key": target["lookback_end"],
+            "lookback_end": target["lookback_end"],
+            "evaluated_at": evaluated_at,
+        }
+        found = False
+        for field, limit in limits.items():
+            value = snapshot.get(field)
+            if value is None:
+                continue
+            found = True
+            try:
+                if int(value) > limit:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if found:
+            return True
+        try:
+            return int(snapshot.get("effective_from", -1)) <= target["effective_from"]
+        except (TypeError, ValueError):
+            return False
+
     @staticmethod
     def _selection_is_effective(snapshot: dict | None, current_time: int) -> bool:
         if not snapshot:
@@ -3212,21 +3291,55 @@ class MonitorState:
         if not previous:
             return {
                 "version": "DPS-FAILED",
-                "status": "FAILED",
+                "status": "ERROR",
                 "evaluated_at": evaluated_at,
+                "evaluation_key": target["lookback_end"],
                 **target,
                 "selected_profiles": [],
                 "selected_count": 0,
                 "reason": f"每日画像评估失败，沿用静态基准：{error}",
                 "error": error,
             }
+
+        def safe_rows(name: str) -> list[dict]:
+            rows = previous.get(name, [])
+            if not isinstance(rows, list):
+                return []
+
+            def is_safe(item: dict) -> bool:
+                for field, limit in (
+                    ("evaluation_key", target["lookback_end"]),
+                    ("lookback_end", target["lookback_end"]),
+                    ("evaluated_at", evaluated_at),
+                ):
+                    if item.get(field) is None:
+                        continue
+                    try:
+                        if int(item[field]) > limit:
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                return True
+
+            return [
+                dict(item)
+                for item in rows
+                if isinstance(item, dict)
+                and is_safe(item)
+            ]
+
         fallback = dict(previous)
+        selected_profiles = safe_rows("selected_profiles")
         fallback.update(
             {
                 "version": f"{previous.get('version', 'DPS')}-FALLBACK",
                 "status": "FALLBACK",
                 "evaluated_at": evaluated_at,
+                "evaluation_key": target["lookback_end"],
                 **target,
+                "candidates": safe_rows("candidates"),
+                "selected_profiles": selected_profiles,
+                "selected_count": len(selected_profiles),
                 "reason": f"每日画像评估失败，沿用上一版本：{error}",
                 "error": error,
             }
