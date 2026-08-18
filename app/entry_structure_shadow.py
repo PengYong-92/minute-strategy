@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import sys
 from typing import Sequence
 
 from app.models import Kline
 
 
 ENTRY_STRUCTURE_VERSION = "ENTRY_STRUCTURE_SHADOW_V1"
+MAX_STRUCTURE_BARS = 240
+MAX_PIVOT_LEVELS_PER_KIND = 24
+MAX_ROUND_CANDIDATES = 96
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,8 @@ class StructureConfig:
             )
         if self.bars < self.minimum_bars:
             raise ValueError("bars must be at least minimum_bars")
+        if self.bars > MAX_STRUCTURE_BARS:
+            raise ValueError(f"bars must be at most {MAX_STRUCTURE_BARS}")
 
 
 def round_steps(symbol: str) -> tuple[float, float, float]:
@@ -138,23 +144,14 @@ def _optimal_independent_pivots(
     if not ordered:
         return []
 
-    def selection_key(selection: tuple[dict[str, object], ...]) -> tuple:
-        return (
-            len(selection),
-            int(selection[-1]["confirmed_at"]),
-            tuple(int(item["index"]) for item in selection),
-            tuple(float(item["price"]) for item in selection),
-        )
-
-    best_ending_at: list[tuple[dict[str, object], ...]] = []
-    for index, current in enumerate(ordered):
-        candidates = [(current,)]
-        for previous_index in range(index):
-            previous = ordered[previous_index]
-            if int(current["index"]) - int(previous["index"]) >= minimum_gap:
-                candidates.append((*best_ending_at[previous_index], current))
-        best_ending_at.append(max(candidates, key=selection_key))
-    return list(max(best_ending_at, key=selection_key))
+    selected = []
+    for current in reversed(ordered):
+        if (
+            not selected
+            or int(selected[-1]["index"]) - int(current["index"]) >= minimum_gap
+        ):
+            selected.append(current)
+    return list(reversed(selected))
 
 
 def _touch_count(
@@ -215,11 +212,14 @@ def _cluster_pivots(
                 upper,
                 config.min_pivot_gap,
             )
+            price_token = "-".join(format(price, ".15g") for price in prices)
+            confirmation_token = "-".join(
+                str(int(item["confirmed_at"])) for item in independent
+            )
             candidates.append(
                 {
                     "id": (
-                        f"{level_kind.lower()}-"
-                        f"{independent[0]['index']}-{independent[-1]['index']}"
+                        f"{level_kind.lower()}-{price_token}-{confirmation_token}"
                     ),
                     "kind": level_kind,
                     "source": "PIVOT",
@@ -258,10 +258,11 @@ def _cluster_pivots(
         )
         if not overlaps:
             dominant.append(candidate)
-    return sorted(
-        dominant,
-        key=lambda item: (item["kind"], item["lower"], item["id"]),
-    )
+    limited = []
+    for kind in ("SUPPORT", "RESISTANCE"):
+        same_kind = [item for item in dominant if item["kind"] == kind]
+        limited.extend(same_kind[:MAX_PIVOT_LEVELS_PER_KIND])
+    return sorted(limited, key=lambda item: (item["kind"], item["lower"], item["id"]))
 
 
 def _independent_rejections(
@@ -289,19 +290,60 @@ def _round_candidates(
     atr: float,
     config: StructureConfig,
 ) -> list[dict[str, object]]:
-    minimum = min(item.low for item in klines)
-    maximum = max(item.high for item in klines)
-    candidates: dict[float, float] = {}
+    if not klines:
+        return []
+
+    buffer = config.rejection_atr * atr
+    latest_close = float(klines[-1].close)
+    candidates: dict[float, dict[str, float | int]] = {}
+
+    def add_nearby(anchor: float, step: float) -> None:
+        if not math.isfinite(anchor):
+            return
+        quotient = anchor / step
+        if not math.isfinite(quotient):
+            return
+        lower_multiple = math.floor(quotient)
+        for multiple in (lower_multiple, lower_multiple + 1):
+            try:
+                price = float(multiple * step)
+            except OverflowError:
+                continue
+            if not math.isfinite(price) or price <= 0:
+                continue
+            existing = candidates.get(price)
+            if existing is None:
+                candidates[price] = {"step": step, "occurrences": 1}
+            else:
+                existing["step"] = max(float(existing["step"]), step)
+                existing["occurrences"] = int(existing["occurrences"]) + 1
+
     for step in round_steps(symbol):
-        first = int(minimum // step) - 1
-        last = int(maximum // step) + 1
-        for multiple in range(first, last + 1):
-            price = float(multiple * step)
-            if minimum - atr <= price <= maximum + atr:
-                candidates.setdefault(price, step)
+        for item in klines:
+            # Rejection counts change only at these interval boundaries. Sampling
+            # adjacent multiples keeps work bounded even for malformed price spans.
+            for anchor in (
+                float(item.low),
+                float(item.close) - buffer,
+                float(item.close),
+                float(item.close) + buffer,
+                float(item.high),
+            ):
+                add_nearby(anchor, step)
+
+    ranked_candidates = sorted(
+        candidates.items(),
+        key=lambda item: (
+            -int(item[1]["occurrences"]),
+            _safe_ratio(abs(item[0] - latest_close), latest_close),
+            -float(item[1]["step"]),
+            item[0],
+        ),
+    )[:MAX_ROUND_CANDIDATES]
 
     levels = []
-    for price, step in sorted(candidates.items()):
+    for price, metadata in sorted(ranked_candidates):
+        step = float(metadata["step"])
         for kind in ("SUPPORT", "RESISTANCE"):
             count, indexes = _independent_rejections(
                 klines,
@@ -337,16 +379,68 @@ def _round_candidates(
     return levels
 
 
-def _merge_round_levels(
-    pivot_levels: list[dict[str, object]],
-    round_levels: list[dict[str, object]],
+def _zero_cost() -> tuple[float, int, int, int, int]:
+    return (0.0, 0, 0, 0, 0)
+
+
+def _add_cost(
+    left: tuple[float, int, int, int, int],
+    right: tuple[float, int, int, int, int],
+) -> tuple[float, int, int, int, int]:
+    return tuple(a + b for a, b in zip(left, right))  # type: ignore[return-value]
+
+
+def _negate_cost(
+    cost: tuple[float, int, int, int, int],
+) -> tuple[float, int, int, int, int]:
+    return tuple(-value for value in cost)  # type: ignore[return-value]
+
+
+def _maximum_round_matching(
+    pivot_levels: Sequence[dict[str, object]],
+    round_levels: Sequence[dict[str, object]],
     atr: float,
     config: StructureConfig,
-) -> list[dict[str, object]]:
-    result = [dict(item) for item in pivot_levels]
-    matches = []
-    for pivot_index, level in enumerate(result):
-        for round_index, round_level in enumerate(round_levels):
+) -> dict[int, int]:
+    pivot_order = sorted(
+        range(len(pivot_levels)),
+        key=lambda index: str(pivot_levels[index]["id"]),
+    )
+    round_order = sorted(
+        range(len(round_levels)),
+        key=lambda index: str(round_levels[index]["id"]),
+    )
+    pivot_rank = {index: rank for rank, index in enumerate(pivot_order)}
+    round_rank = {index: rank for rank, index in enumerate(round_order)}
+
+    source = 0
+    pivot_offset = 1
+    round_offset = pivot_offset + len(pivot_levels)
+    sink = round_offset + len(round_levels)
+    graph: list[list[list[object]]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(
+        start: int,
+        end: int,
+        cost: tuple[float, int, int, int, int],
+    ) -> list[object]:
+        forward: list[object] = [end, len(graph[end]), 1, cost]
+        reverse: list[object] = [start, len(graph[start]), 0, _negate_cost(cost)]
+        graph[start].append(forward)
+        graph[end].append(reverse)
+        return forward
+
+    for pivot_index in pivot_order:
+        add_edge(source, pivot_offset + pivot_index, _zero_cost())
+    for round_index in round_order:
+        add_edge(round_offset + round_index, sink, _zero_cost())
+
+    match_edges: list[tuple[int, int, list[object]]] = []
+    maximum_distance = config.cluster_atr * atr
+    for pivot_index in pivot_order:
+        level = pivot_levels[pivot_index]
+        for round_index in round_order:
+            round_level = round_levels[round_index]
             if round_level["kind"] != level["kind"]:
                 continue
             price = float(round_level["round_level_price"])
@@ -357,26 +451,82 @@ def _merge_round_levels(
                 if price > float(level["upper"])
                 else 0.0
             )
-            if distance <= config.cluster_atr * atr:
-                matches.append(
-                    (
-                        distance,
-                        -int(level["pivot_count"]),
-                        -int(level["last_confirmed_at"]),
-                        str(level["id"]),
-                        str(round_level["id"]),
-                        pivot_index,
-                        round_index,
-                    )
-                )
+            if distance > maximum_distance:
+                continue
+            cost = (
+                distance,
+                -int(level["pivot_count"]),
+                -int(level["last_confirmed_at"]),
+                pivot_rank[pivot_index],
+                round_rank[round_index],
+            )
+            edge = add_edge(
+                pivot_offset + pivot_index,
+                round_offset + round_index,
+                cost,
+            )
+            match_edges.append((pivot_index, round_index, edge))
 
-    matched_pivots = set()
-    matched_rounds = set()
-    for *_, pivot_index, round_index in sorted(matches):
-        if pivot_index in matched_pivots or round_index in matched_rounds:
-            continue
+    node_count = len(graph)
+    while True:
+        distances: list[tuple[float, int, int, int, int] | None] = [
+            None
+        ] * node_count
+        previous: list[tuple[int, int] | None] = [None] * node_count
+        distances[source] = _zero_cost()
+        for _ in range(node_count - 1):
+            changed = False
+            for start, edges in enumerate(graph):
+                if distances[start] is None:
+                    continue
+                for edge_index, edge in enumerate(edges):
+                    if int(edge[2]) <= 0:
+                        continue
+                    end = int(edge[0])
+                    candidate = _add_cost(distances[start], edge[3])  # type: ignore[arg-type]
+                    if distances[end] is None or candidate < distances[end]:
+                        distances[end] = candidate
+                        previous[end] = (start, edge_index)
+                        changed = True
+            if not changed:
+                break
+        if previous[sink] is None:
+            break
+
+        node = sink
+        while node != source:
+            start, edge_index = previous[node]  # type: ignore[misc]
+            edge = graph[start][edge_index]
+            edge[2] = int(edge[2]) - 1
+            reverse = graph[node][int(edge[1])]
+            reverse[2] = int(reverse[2]) + 1
+            node = start
+
+    return {
+        pivot_index: round_index
+        for pivot_index, round_index, edge in match_edges
+        if int(edge[2]) == 0
+    }
+
+
+def _merge_round_levels(
+    pivot_levels: list[dict[str, object]],
+    round_levels: list[dict[str, object]],
+    atr: float,
+    config: StructureConfig,
+) -> list[dict[str, object]]:
+    result = [dict(item) for item in pivot_levels]
+    copied_round_levels = [dict(item) for item in round_levels]
+    matching = _maximum_round_matching(
+        result,
+        copied_round_levels,
+        atr,
+        config,
+    )
+    matched_rounds = set(matching.values())
+    for pivot_index, round_index in matching.items():
         level = result[pivot_index]
-        round_level = round_levels[round_index]
+        round_level = copied_round_levels[round_index]
         level["source"] = "MERGED"
         level["round_level_price"] = round_level["round_level_price"]
         level["round_level_step"] = round_level["round_level_step"]
@@ -384,14 +534,12 @@ def _merge_round_levels(
             int(level["touch_count"]), int(round_level["touch_count"])
         )
         result[pivot_index] = level
-        matched_pivots.add(pivot_index)
-        matched_rounds.add(round_index)
 
     result.extend(
-        item
-        for index, item in enumerate(round_levels)
+        dict(item)
+        for index, item in enumerate(copied_round_levels)
         if index not in matched_rounds
-        and item["_independently_qualified"]
+        and item.get("_independently_qualified", False)
     )
     for item in result:
         item.pop("_independently_qualified", None)
@@ -420,25 +568,45 @@ def _safe_snapshot(
 
 
 def _valid_scoped_klines(klines: Sequence[Kline]) -> bool:
+    previous_open_time = None
+    previous_close_time = None
     for item in klines:
         if not isinstance(item, Kline):
             return False
-        values = (item.open, item.high, item.low, item.close, item.close_time)
+        values = (item.open, item.high, item.low, item.close)
         if any(
             type(value) not in (int, float) or not math.isfinite(value)
             for value in values
         ):
+            return False
+        if type(item.open_time) is not int or type(item.close_time) is not int:
             return False
         if (
             item.open <= 0
             or item.high <= 0
             or item.low <= 0
             or item.close <= 0
-            or item.close_time < 0
+            or item.open_time < 0
+            or item.open_time >= item.close_time
             or item.high < item.low
         ):
             return False
+        if previous_open_time is not None and item.open_time <= previous_open_time:
+            return False
+        if previous_close_time is not None and item.close_time <= previous_close_time:
+            return False
+        previous_open_time = item.open_time
+        previous_close_time = item.close_time
     return True
+
+
+def _safe_ratio(numerator: float, denominator: float, scale: float = 1.0) -> float:
+    if numerator <= 0 or denominator <= 0:
+        return 0.0
+    value = numerator / denominator
+    if not math.isfinite(value) or value > sys.float_info.max / scale:
+        return sys.float_info.max
+    return value * scale
 
 
 def _distance(close: float, level: dict[str, object], atr: float) -> dict[str, float]:
@@ -452,8 +620,8 @@ def _distance(close: float, level: dict[str, object], atr: float) -> dict[str, f
         price = 0.0
     return {
         "distance_price": price,
-        "distance_bps": price / close * 10_000 if close > 0 else 0.0,
-        "distance_atr": price / atr if atr > 0 else 0.0,
+        "distance_bps": _safe_ratio(price, close, 10_000.0),
+        "distance_atr": _safe_ratio(price, atr),
     }
 
 

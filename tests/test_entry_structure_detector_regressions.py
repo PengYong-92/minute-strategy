@@ -1,6 +1,8 @@
+from copy import deepcopy
 import itertools
 import math
 import random
+import time
 import unittest
 from unittest.mock import patch
 
@@ -8,7 +10,9 @@ from app.entry_structure_shadow import (
     StructureConfig,
     StructureDetector,
     _cluster_pivots,
+    _distance,
     _merge_round_levels,
+    _round_candidates,
 )
 from app.models import Kline
 
@@ -92,6 +96,35 @@ def round_level(
     }
 
 
+def replace_bar(bar, **overrides):
+    values = {
+        "open_time": bar.open_time,
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+        "close_time": bar.close_time,
+    }
+    values.update(overrides)
+    return Kline(**values)
+
+
+def assert_finite_numbers(test_case, value, path="root"):
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return
+    if isinstance(value, (int, float)):
+        test_case.assertTrue(math.isfinite(value), f"non-finite value at {path}")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert_finite_numbers(test_case, item, f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            assert_finite_numbers(test_case, item, f"{path}[{index}]")
+
+
 class StructureConfigValidationTest(unittest.TestCase):
     def test_accepts_exact_minimum_viable_boundaries(self):
         config = StructureConfig(
@@ -147,6 +180,10 @@ class StructureConfigValidationTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaises(ValueError):
                     StructureConfig(**overrides)
+
+    def test_rejects_history_windows_above_causal_240_bar_limit(self):
+        with self.assertRaises(ValueError):
+            StructureConfig(bars=241)
 
 
 class StructureInputSafetyTest(unittest.TestCase):
@@ -212,6 +249,73 @@ class StructureInputSafetyTest(unittest.TestCase):
         self.assert_safe_insufficient(
             StructureDetector().detect("BTCUSDT", inverted),
             24,
+        )
+
+    def test_time_axis_must_be_integral_ordered_and_causal(self):
+        cases = []
+        unordered_close = make_bars()
+        unordered_close[10] = replace_bar(
+            unordered_close[10],
+            close_time=unordered_close[9].close_time,
+        )
+        cases.append(unordered_close)
+
+        unordered_open = make_bars()
+        unordered_open[10] = replace_bar(
+            unordered_open[10],
+            open_time=unordered_open[9].open_time,
+        )
+        cases.append(unordered_open)
+
+        open_after_close = make_bars()
+        open_after_close[10] = replace_bar(
+            open_after_close[10],
+            open_time=open_after_close[10].close_time,
+        )
+        cases.append(open_after_close)
+
+        fractional_time = make_bars()
+        fractional_time[10] = replace_bar(
+            fractional_time[10],
+            close_time=fractional_time[10].close_time + 0.5,
+        )
+        cases.append(fractional_time)
+
+        for bars in cases:
+            with self.subTest(bad_bar=bars[10]):
+                self.assert_safe_insufficient(
+                    StructureDetector().detect("BTCUSDT", bars),
+                    len(bars),
+                )
+
+    def test_ready_snapshot_contains_only_finite_numbers_for_tiny_close(self):
+        bars = make_bars(price=2.0)
+        bars[5] = replace_bar(bars[5], low=0.5)
+        bars[10] = replace_bar(bars[10], low=0.5)
+        bars[-1] = replace_bar(
+            bars[-1],
+            open=1e-320,
+            high=2e-320,
+            low=1e-320,
+            close=1e-320,
+        )
+        config = StructureConfig(
+            bars=24,
+            atr_period=1,
+            pivot_left=1,
+            pivot_right=1,
+            min_pivots=2,
+            min_pivot_gap=5,
+            minimum_bars=8,
+        )
+
+        snapshot = StructureDetector(config).detect("BTCUSDT", bars)
+
+        self.assertEqual(snapshot["status"], "READY")
+        assert_finite_numbers(self, snapshot)
+        assert_finite_numbers(
+            self,
+            _distance(1e-320, {"lower": 1.0, "upper": 1.0}, 1e-320),
         )
 
 
@@ -289,6 +393,80 @@ class StructureClusteringRegressionTest(unittest.TestCase):
                         )
                     )
 
+    def test_pivot_level_id_is_stable_when_window_rolls_one_bar(self):
+        bars = make_bars(241, price=100.0)
+        bars[100] = replace_bar(bars[100], low=95.0)
+        bars[110] = replace_bar(bars[110], low=95.0)
+        detector = StructureDetector()
+
+        before = detector.detect("BTCUSDT", bars[:240])
+        after = detector.detect("BTCUSDT", bars[1:])
+        before_level = next(
+            item
+            for item in before["support"]
+            if item["pivot_count"] >= 2 and item["lower"] == 95.0
+        )
+        after_level = next(
+            item
+            for item in after["support"]
+            if item["pivot_count"] >= 2 and item["lower"] == 95.0
+        )
+
+        self.assertNotEqual(before_level["pivot_indexes"], after_level["pivot_indexes"])
+        self.assertEqual(before_level["id"], after_level["id"])
+
+
+class RoundCandidateRegressionTest(unittest.TestCase):
+    def test_overlapping_round_steps_keep_largest_step_without_duplicates(self):
+        cases = (
+            ("BTCUSDT", 64_900.0, 65_600.0, {65_000.0: 1000.0, 65_500.0: 500.0}),
+            ("ETHUSDT", 3_450.0, 3_550.0, {3_500.0: 100.0}),
+        )
+        for symbol, low, high, expected in cases:
+            bars = [
+                Kline(0, low, high, low, (low + high) / 2, 1.0, 60_000),
+                Kline(60_000, low, high, low, (low + high) / 2, 1.0, 120_000),
+            ]
+            with self.subTest(symbol=symbol):
+                levels = _round_candidates(symbol, bars, 20.0, StructureConfig())
+                keys = [
+                    (item["kind"], item["round_level_price"])
+                    for item in levels
+                ]
+                self.assertEqual(len(keys), len(set(keys)))
+                for price, step in expected.items():
+                    matching = [
+                        item
+                        for item in levels
+                        if item["round_level_price"] == price
+                    ]
+                    self.assertEqual(len(matching), 2)
+                    self.assertEqual(
+                        {item["round_level_step"] for item in matching},
+                        {step},
+                    )
+
+    def test_large_historical_span_has_bounded_candidate_count_and_runtime(self):
+        bars = [
+            Kline(0, 100.0, 101.0, 99.0, 100.0, 1.0, 60_000),
+            Kline(
+                60_000,
+                1_000_000.0,
+                1_000_001.0,
+                999_999.0,
+                1_000_000.0,
+                1.0,
+                120_000,
+            ),
+        ]
+
+        started = time.perf_counter()
+        levels = _round_candidates("BTCUSDT", bars, 10.0, StructureConfig())
+        elapsed = time.perf_counter() - started
+
+        self.assertLessEqual(len(levels), 192)
+        self.assertLess(elapsed, 0.5)
+
 
 class RoundMergeRegressionTest(unittest.TestCase):
     def test_round_merges_with_only_one_pivot_zone_by_documented_priority(self):
@@ -325,6 +503,63 @@ class RoundMergeRegressionTest(unittest.TestCase):
             [item["id"] for item in levels if item["source"] == "ROUND"],
             ["round-support-99.8"],
         )
+
+    def test_matching_maximizes_cardinality_before_distance(self):
+        config = StructureConfig()
+        pivots = [
+            pivot_level("p1", 100.0, 100.0),
+            pivot_level("p2", 100.2, 100.2),
+        ]
+        rounds = [
+            round_level("r1", 100.05, independently_qualified=True),
+            round_level("r2", 99.9, independently_qualified=True),
+        ]
+
+        levels = _merge_round_levels(pivots, rounds, 1.0, config)
+        merged = {
+            item["id"]: item["round_level_price"]
+            for item in levels
+            if item["source"] == "MERGED"
+        }
+
+        self.assertEqual(merged, {"p1": 99.9, "p2": 100.05})
+
+    def test_matching_minimizes_total_distance_after_cardinality(self):
+        config = StructureConfig()
+        pivots = [
+            pivot_level("p1", 100.0, 100.0),
+            pivot_level("p2", 100.2, 100.2),
+        ]
+        rounds = [
+            round_level("r1", 100.05, independently_qualified=True),
+            round_level("r2", 100.15, independently_qualified=True),
+        ]
+
+        levels = _merge_round_levels(pivots, rounds, 1.0, config)
+        merged = {
+            item["id"]: item["round_level_price"]
+            for item in levels
+            if item["source"] == "MERGED"
+        }
+
+        self.assertEqual(merged, {"p1": 100.05, "p2": 100.15})
+
+    def test_merge_is_repeatable_and_does_not_mutate_inputs(self):
+        config = StructureConfig()
+        pivots = [pivot_level("zone", 100.0, 100.0)]
+        rounds = [
+            round_level("matched", 100.0),
+            round_level("unmatched", 101.0, independently_qualified=True),
+        ]
+        original_pivots = deepcopy(pivots)
+        original_rounds = deepcopy(rounds)
+
+        first = _merge_round_levels(pivots, rounds, 1.0, config)
+        second = _merge_round_levels(pivots, rounds, 1.0, config)
+
+        self.assertEqual(first, second)
+        self.assertEqual(pivots, original_pivots)
+        self.assertEqual(rounds, original_rounds)
 
 
 if __name__ == "__main__":
