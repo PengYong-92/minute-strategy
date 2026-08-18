@@ -1826,14 +1826,99 @@ class MonitorStateTest(unittest.TestCase):
                         exit_price=observed.entry_price + 1.0,
                         pnl=8.0,
                     )
+                    credit = StakeProgressionCredit(
+                        source_order_id=settled_order.id,
+                        created_at=settled_order.settled_at,
+                        version=settled_order.stake_progression_version,
+                        direction=settled_order.direction,
+                    )
                     store.save_settled_order_with_credit(
                         settled_order,
                         "BTCUSDT",
-                        None,
+                        credit,
                     )
-                    store.save_observation(settled_observation, "BTCUSDT")
+                    store.save_observations((settled_observation,), "BTCUSDT")
                     rewrite(settled_order, settled_observation)
                     settled_counts = atomic_sqlite_bundle_counts(db_path)
+                    with closing(sqlite3.connect(db_path)) as connection:
+                        settled_revision = connection.execute(
+                            "select revision from profile_summary_revisions "
+                            "where symbol = 'BTCUSDT'"
+                        ).fetchone()[0]
+                        settled_credit = connection.execute(
+                            "select version, credit_id, source_order_id, status, "
+                            "created_at, consumed_order_id, consumed_at, direction "
+                            "from stake_progression_credits where symbol = 'BTCUSDT'"
+                        ).fetchall()
+
+                    store.save_settled_order_with_credit(
+                        settled_order,
+                        "BTCUSDT",
+                        credit,
+                    )
+                    store.save_observations((settled_observation,), "BTCUSDT")
+                    self.assertEqual(atomic_sqlite_bundle_counts(db_path), settled_counts)
+                    with closing(sqlite3.connect(db_path)) as connection:
+                        self.assertEqual(
+                            connection.execute(
+                                "select revision from profile_summary_revisions "
+                                "where symbol = 'BTCUSDT'"
+                            ).fetchone()[0],
+                            settled_revision,
+                        )
+                        self.assertEqual(
+                            connection.execute(
+                                "select version, credit_id, source_order_id, status, "
+                                "created_at, consumed_order_id, consumed_at, direction "
+                                "from stake_progression_credits where symbol = 'BTCUSDT'"
+                            ).fetchall(),
+                            settled_credit,
+                        )
+
+                    order_conflicts = (
+                        replace(settled_order, result="LOSS"),
+                        replace(settled_order, exit_price=settled_order.exit_price + 1.0),
+                        replace(settled_order, settled_at=settled_order.settled_at + 1),
+                        replace(settled_order, pnl=settled_order.pnl + 1.0),
+                    )
+                    for conflict in order_conflicts:
+                        with self.assertRaisesRegex(ValueError, "terminal order"):
+                            store.save_settled_order_with_credit(
+                                conflict,
+                                "BTCUSDT",
+                                credit,
+                            )
+                    observation_conflicts = (
+                        replace(settled_observation, result="LOSS"),
+                        replace(
+                            settled_observation,
+                            exit_price=settled_observation.exit_price + 1.0,
+                        ),
+                        replace(
+                            settled_observation,
+                            settled_at=settled_observation.settled_at + 1,
+                        ),
+                        replace(settled_observation, pnl=settled_observation.pnl + 1.0),
+                    )
+                    for conflict in observation_conflicts:
+                        with self.assertRaisesRegex(ValueError, "terminal observation"):
+                            store.save_observations((conflict,), "BTCUSDT")
+                    with self.assertRaisesRegex(ValueError, "frozen order"):
+                        store.save_settled_order_with_credit(
+                            replace(settled_order, direction="SHORT"),
+                            "BTCUSDT",
+                            None,
+                        )
+                    with self.assertRaisesRegex(ValueError, "frozen observation"):
+                        store.save_observations(
+                            (
+                                replace(
+                                    settled_observation,
+                                    strategy_family="tampered-family",
+                                ),
+                            ),
+                            "BTCUSDT",
+                        )
 
                     self.assertFalse(store.save_open_order_decision(**arguments))
                     self.assertFalse(store.save_open_order_decision(**arguments))

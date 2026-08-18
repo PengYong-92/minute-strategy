@@ -466,6 +466,18 @@ def _canonical_storage_projection(
     return decision_linked_storage_payload(model)
 
 
+def _decision_linked_validation_payload(
+    model: SimulatedOrder | ObservationSignal,
+    storage_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = model.to_dict()
+    if "decision_context_ref" in storage_payload:
+        payload["decision_context_ref"] = deepcopy(
+            storage_payload["decision_context_ref"]
+        )
+    return payload
+
+
 def _profile_key_for_signal(signal: Signal) -> str:
     profile_key = str(signal.profile_key or "")
     if profile_key:
@@ -2369,30 +2381,25 @@ class SQLiteMonitorStore:
             stored_payload = json.loads(row["payload"])
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("stored order payload is malformed") from error
-        accepted = {field.name for field in fields(SimulatedOrder)}
         try:
-            stored_payload = _hydrate_decision_linked_payload(stored_payload, row)
+            stored_payload = _canonical_storage_projection(
+                stored_payload,
+                row,
+                apply_lifecycle_authority=True,
+            )
         except ValueError as error:
             raise ValueError(
                 f"settlement conflicts with frozen order identity: {error}"
             ) from error
-        stored_values = {
-            key: value for key, value in stored_payload.items() if key in accepted
-        }
-        if "calculated_threshold" not in stored_values:
-            stored_values["calculated_threshold"] = float(
-                stored_values.get("threshold", 0.0)
-            )
-        try:
-            stored_order = SimulatedOrder(**stored_values)
-        except (TypeError, ValueError) as error:
-            raise ValueError("stored order payload is malformed") from error
 
         mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
         incoming_storage_payload = decision_linked_storage_payload(order)
         try:
-            incoming_payload = _hydrate_decision_linked_payload(
-                incoming_storage_payload,
+            incoming_payload = _canonical_storage_projection(
+                _decision_linked_validation_payload(
+                    order,
+                    incoming_storage_payload,
+                ),
                 row,
                 apply_lifecycle_authority=False,
             )
@@ -2420,10 +2427,9 @@ class SQLiteMonitorStore:
 
         expected_payload = json.dumps(incoming_storage_payload, ensure_ascii=False)
         if row["status"] == "SETTLED":
-            if (
-                row["result"] != order.result
-                or row["settled_at"] != order.settled_at
-                or row["payload"] != expected_payload
+            if any(
+                stored_payload.get(field) != incoming_payload.get(field)
+                for field in mutable_fields
             ):
                 raise ValueError("settlement conflicts with terminal order state")
             return
@@ -2680,28 +2686,24 @@ class SQLiteMonitorStore:
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("stored observation payload is malformed") from error
         try:
-            stored_payload = _hydrate_decision_linked_payload(stored_payload, row)
+            stored_payload = _canonical_storage_projection(
+                stored_payload,
+                row,
+                apply_lifecycle_authority=True,
+            )
         except ValueError as error:
             raise ValueError(
                 f"settlement conflicts with frozen observation data: {error}"
             ) from error
-        accepted = {field.name for field in fields(ObservationSignal)}
-        try:
-            stored = ObservationSignal(
-                **{
-                    key: value
-                    for key, value in stored_payload.items()
-                    if key in accepted
-                }
-            )
-        except (TypeError, ValueError) as error:
-            raise ValueError("stored observation payload is malformed") from error
 
         mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
         incoming_storage_payload = decision_linked_storage_payload(observation)
         try:
-            incoming_payload = _hydrate_decision_linked_payload(
-                incoming_storage_payload,
+            incoming_payload = _canonical_storage_projection(
+                _decision_linked_validation_payload(
+                    observation,
+                    incoming_storage_payload,
+                ),
                 row,
                 apply_lifecycle_authority=False,
             )
@@ -2724,18 +2726,16 @@ class SQLiteMonitorStore:
 
         expected_payload = json.dumps(incoming_storage_payload, ensure_ascii=False)
         if row["status"] == "SETTLED":
-            if (
-                observation.status != "SETTLED"
-                or row["result"] != observation.result
-                or row["settled_at"] != observation.settled_at
-                or row["payload"] != expected_payload
+            if any(
+                stored_payload.get(field) != incoming_payload.get(field)
+                for field in mutable_fields
             ):
                 raise ValueError("settlement conflicts with terminal observation state")
             return
         if row["status"] != "OPEN":
             raise ValueError("only an open observation can be settled")
         if observation.status == "OPEN":
-            if row["payload"] != expected_payload:
+            if stored_payload != incoming_payload:
                 raise ValueError("open observation conflicts with frozen observation data")
             return
         if observation.status != "SETTLED" or observation.result not in {"WIN", "LOSS"}:
