@@ -1541,7 +1541,17 @@ class SQLiteMonitorStore:
                 normalized_symbol,
                 row["decision_id"],
             )
-            if context is not None and context["inputs"].get("identity") == expected_identity:
+            stored_identity = (
+                context["inputs"].get("identity")
+                if context is not None
+                else None
+            )
+            comparable_identity = (
+                stored_identity.get("candidate_identity", stored_identity)
+                if isinstance(stored_identity, Mapping)
+                else stored_identity
+            )
+            if context is not None and comparable_identity == expected_identity:
                 matches.append(context)
         if not matches:
             return None

@@ -3,11 +3,15 @@ import time
 from bisect import bisect_left
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Sequence
 
-from app.decision_context import DecisionContextBuilder, runtime_config_snapshot
+from app.decision_context import (
+    CONTEXT_VERSION,
+    DecisionContextBuilder,
+    runtime_config_snapshot,
+)
 
 from app.daily_profile_selector import (
     DailyProfileSelectorConfig,
@@ -76,7 +80,33 @@ from app.wave_batch_guard import (
 
 DAY_MS = 86_400_000
 REALTIME_PRICE_STALE_MS = 5_000
-TRANSITIONAL_DECISION_BUILD_ID = "TASK7_TRANSITIONAL_V1"
+ORDER_GATE_TRACE_VERSION = "ORDER_GATE_TRACE_V1"
+
+
+@dataclass
+class _DecisionRun:
+    builder: DecisionContextBuilder
+    identity: dict[str, object]
+    trace_records: list[dict[str, object]] = field(default_factory=list)
+
+    def trace(
+        self,
+        stage: str,
+        result: str,
+        reason_code: str,
+        decisive_values: object = None,
+    ) -> None:
+        self.trace_records.append(
+            {
+                "stage": stage,
+                "result": result,
+                "reason_code": reason_code,
+                "decisive_values": deepcopy(decisive_values),
+            }
+        )
+
+    def extend(self, records: Sequence[dict[str, object]]) -> None:
+        self.trace_records.extend(deepcopy(list(records)))
 
 def strategy_source_build_id(
     paths: Sequence[Path] | None = None,
@@ -833,7 +863,7 @@ class MonitorState:
                 "trade_score_threshold": self.trade_score_threshold,
                 "module_versions": {
                     "decision_context": "DECISION_CONTEXT_V2",
-                    "transitional_trace": TRANSITIONAL_DECISION_BUILD_ID,
+                    "order_gate_trace": ORDER_GATE_TRACE_VERSION,
                 },
             }
             self._decision_runtime_config_cache = runtime_config_snapshot(
@@ -896,6 +926,382 @@ class MonitorState:
             "threshold_segment": str(signal.threshold_segment or ""),
         }
 
+    def _new_decision_run(
+        self,
+        signal: Signal,
+        latest: Kline,
+        *,
+        candidate_origin: str,
+        candidate_ordinal: int,
+    ) -> _DecisionRun:
+        config = self._decision_runtime_config()
+        candidate_identity = self._candidate_identity(
+            signal,
+            candidate_ordinal=candidate_ordinal,
+            candidate_origin=candidate_origin,
+            closed_kline_at_ms=latest.close_time,
+        )
+        builder = DecisionContextBuilder.new(
+            self.symbol,
+            int(latest.close_time),
+            candidate_origin,
+            config.hash,
+            strategy_build_id=config.strategy_build_id,
+            profile_key=str(signal.profile_key or ""),
+            candidate_ordinal=int(candidate_ordinal),
+            candidate_identity=candidate_identity,
+        )
+        identity = {
+            **candidate_identity,
+            "candidate_identity": deepcopy(candidate_identity),
+            "symbol": self.symbol,
+            "decision_id": builder.decision_id,
+            "context_version": CONTEXT_VERSION,
+            "runtime_config_hash": config.hash,
+            "strategy_build_id": config.strategy_build_id,
+            "level": str(signal.level or ""),
+        }
+        return _DecisionRun(builder=builder, identity=identity)
+
+    @staticmethod
+    def _signal_context_payload(signal: Signal) -> dict[str, object]:
+        payload = signal.to_dict()
+        for key in (
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "decision_inputs",
+            "decision_trace",
+            "first_decisive_block",
+            "quality_score_inputs",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    def _canonical_decision_inputs(
+        self,
+        run: _DecisionRun,
+        signal: Signal,
+        latest: Kline,
+        *,
+        audit_context: dict,
+        selected_order_terms: dict[str, object] | None,
+    ) -> dict[str, object]:
+        strategy_inputs = (
+            signal.decision_inputs
+            if isinstance(signal.decision_inputs, dict)
+            else {}
+        )
+        strategy_score = deepcopy(strategy_inputs.get("score", {}))
+        thresholds = deepcopy(strategy_inputs.get("thresholds", {}))
+        volume_price = deepcopy(strategy_inputs.get("volume_price", {}))
+        indicators = deepcopy(strategy_inputs.get("indicators", {}))
+
+        bounded_window_size = max(
+            10,
+            min(60, int(signal.analysis_window_minutes or 0)),
+            min(60, int(signal.threshold_window_minutes or 0)),
+        )
+        recent = list(self.klines[-bounded_window_size:])
+        if not recent or recent[-1].close_time != latest.close_time:
+            recent = [item for item in recent if item.close_time < latest.close_time]
+            recent.append(latest)
+        analysis_window = recent[-10:]
+        threshold_window_size = max(1, min(60, int(signal.threshold_window_minutes or 10)))
+        threshold_window = recent[-threshold_window_size:]
+
+        score_components = {
+            key: value
+            for key, value in strategy_score.items()
+            if key
+            not in {
+                "raw_direction",
+                "raw_score",
+                "signed_score",
+                "score_abs",
+                "edge",
+                "final_direction",
+                "actionable",
+            }
+        }
+        score = {
+            "signed_score": strategy_score.get("signed_score", signal.score),
+            "raw_score": strategy_score.get("raw_score", abs(signal.score)),
+            "score_abs": strategy_score.get("score_abs", abs(signal.score)),
+            "base_threshold": thresholds.get("base_threshold", signal.threshold),
+            "dynamic_threshold": thresholds.get(
+                "pre_override_threshold",
+                signal.threshold,
+            ),
+            "calculated_threshold": thresholds.get(
+                "calculated_threshold",
+                signal.calculated_threshold or signal.threshold,
+            ),
+            "edge": strategy_score.get(
+                "edge",
+                abs(signal.score) - signal.threshold,
+            ),
+            "threshold_adjustments": {
+                key: value
+                for key, value in thresholds.items()
+                if "adjustment" in key or key.endswith("_applied")
+            },
+            "components": score_components,
+            "quality_score": signal.quality_score,
+            "quality_score_version": signal.quality_score_version,
+            "quality_score_mode": signal.quality_score_mode,
+            "quality_score_context": signal.quality_score_context,
+            "quality_score_components": deepcopy(signal.quality_score_components),
+            "quality_score_inputs": deepcopy(signal.quality_score_inputs),
+        }
+        volume_price = {
+            "current_volume": volume_price.get("current_volume", latest.volume),
+            "volume_baseline": volume_price.get("volume_baseline", 0.0),
+            "volume_ratio": volume_price.get("volume_ratio", signal.volume_ratio),
+            "high_volume_threshold": volume_price.get(
+                "high_volume_threshold",
+                signal.volume_threshold,
+            ),
+            "low_volume_threshold": volume_price.get("low_volume_threshold", 0.0),
+            "move_threshold_pct": volume_price.get(
+                "move_threshold_pct",
+                signal.move_threshold_pct,
+            ),
+            **volume_price,
+        }
+        indicators = {
+            "macd_line": indicators.get("macd_line", 0.0),
+            "macd_signal_line": indicators.get("macd_signal_line", 0.0),
+            "macd_histogram": indicators.get(
+                "macd_histogram",
+                signal.macd_histogram,
+            ),
+            "macd_histogram_delta": indicators.get(
+                "macd_histogram_delta",
+                signal.macd_histogram_delta,
+            ),
+            "atr14": indicators.get("atr", 0.0),
+            "macd_histogram_atr": indicators.get("macd_histogram_atr", 0.0),
+            "macd_delta_atr": indicators.get("macd_delta_atr", 0.0),
+            "macd_histogram_threshold": indicators.get(
+                "macd_histogram_threshold",
+                signal.macd_histogram_threshold,
+            ),
+            "macd_delta_threshold": indicators.get(
+                "macd_delta_threshold",
+                signal.macd_delta_threshold,
+            ),
+            "rsi": indicators.get("rsi", signal.rsi),
+            "rsi_lower_threshold": indicators.get(
+                "rsi_lower_threshold",
+                signal.rsi_lower_threshold,
+            ),
+            "rsi_upper_threshold": indicators.get(
+                "rsi_upper_threshold",
+                signal.rsi_upper_threshold,
+            ),
+            "bollinger_position": indicators.get(
+                "bollinger_position",
+                signal.bollinger_position,
+            ),
+            "bollinger_width": indicators.get(
+                "bollinger_width",
+                signal.bollinger_width,
+            ),
+            "bollinger_lower_threshold": indicators.get(
+                "bollinger_lower_threshold",
+                signal.bollinger_lower_threshold,
+            ),
+            "bollinger_upper_threshold": indicators.get(
+                "bollinger_upper_threshold",
+                signal.bollinger_upper_threshold,
+            ),
+            "indicator_profile_segment": indicators.get(
+                "indicator_profile_segment",
+                signal.indicator_profile_segment,
+            ),
+            "indicator_profile_sample_size": indicators.get(
+                "indicator_profile_sample_size",
+                signal.indicator_profile_sample_size,
+            ),
+            "indicator_profile_version": indicators.get(
+                "indicator_profile_version",
+                "INDICATOR_PROFILE_V1",
+            ),
+            "indicator_profile_match_codes": deepcopy(
+                indicators.get("indicator_profile_match_codes", [])
+            ),
+        }
+
+        fear_greed = (
+            self.fear_greed.to_dict()
+            if self.fear_greed is not None
+            else {
+                "value": signal.fear_greed_value,
+                "classification": signal.fear_greed_classification,
+                "average_30d": signal.fear_greed_average_30d,
+                "trend": signal.fear_greed_trend,
+                "updated_at_ms": 0,
+                "source": "signal",
+            }
+        )
+        fear_greed["adjustment"] = signal.fear_greed_adjustment
+        adaptive = deepcopy(signal.adaptive_profile_state)
+        n12_n20 = deepcopy(adaptive.get("n12_n20", adaptive)) if adaptive else {}
+        n12_n20.setdefault("version", "ADAPTIVE_PROFILE_PENDING")
+        n12_n20.setdefault("status", "NOT_AVAILABLE")
+        n12_n20.setdefault("evaluated_at", 0)
+        n12_n20.setdefault("n12", {"status": "NOT_AVAILABLE", "sample_size": 0})
+        n12_n20.setdefault("n20", {"status": "NOT_AVAILABLE", "sample_size": 0})
+
+        structure = deepcopy(signal.entry_structure_shadow)
+        structure.setdefault("version", "ENTRY_STRUCTURE_SHADOW_V1")
+        structure.setdefault("status", "NOT_AVAILABLE")
+        structure.setdefault("audit_only", True)
+        structure.setdefault("evaluated_at", int(latest.close_time))
+        structure.setdefault("reason", "entry structure shadow is not evaluated yet")
+
+        direction = self._signal_direction(signal)
+        trace_by_stage = {
+            str(record["stage"]): record
+            for record in run.trace_records
+        }
+        capacity_values = trace_by_stage.get("CAPACITY", {}).get(
+            "decisive_values",
+            {},
+        )
+        direction_capacity_values = trace_by_stage.get(
+            "DIRECTION_CAPACITY",
+            {},
+        ).get("decisive_values", {})
+        guard_stages = (
+            "WAVE_GUARD",
+            "DAILY_PROFILE",
+            "PROFILE_HEALTH_SHORT_WINDOW",
+            "SCORE",
+            "SESSION",
+            "CAPACITY",
+            "COOLDOWN",
+            "DIRECTION_CAPACITY",
+            "DUPLICATE",
+            "SHORT_MODE",
+            "WAVE_BATCH",
+            "PROFILE_DEGRADATION",
+            "RESULT_SEQUENCE",
+            "ROLLING_EDGE",
+            "PROFILE_HEALTH",
+            "TIME_PERIOD",
+            "PROFILE_HEALTH_SECOND_ORDER",
+        )
+        admission = {
+            "guards": deepcopy(audit_context),
+            "guard_results": {
+                stage: deepcopy(
+                    trace_by_stage.get(
+                        stage,
+                        {
+                            "stage": stage,
+                            "result": "NOT_EVALUATED",
+                            "reason_code": "NOT_EVALUATED",
+                            "decisive_values": {},
+                        },
+                    )
+                )
+                for stage in guard_stages
+            },
+            "trace_snapshot": deepcopy(run.trace_records),
+            "global_open_count": capacity_values.get("open_count"),
+            "global_open_limit": self.order_policy.max_open_orders,
+            "direction": direction,
+            "direction_open_count": direction_capacity_values.get("open_count"),
+            "direction_open_limit": (
+                self.order_policy.max_open_long_orders
+                if direction == "LONG"
+                else self.order_policy.max_open_short_orders
+            ),
+            "cooldown": {
+                "last_opened_at": (
+                    self._last_order_opened_at.get(direction)
+                    if isinstance(self._last_order_opened_at, dict)
+                    else self._last_order_opened_at
+                ),
+                "candidate_time": latest.close_time,
+                "minimum_gap_ms": self.order_policy.min_order_gap_ms,
+            },
+            "stake": {
+                "amount": self.stake,
+                "win_return": self.win_return,
+                "progression_enabled": self.enable_stake_progression,
+                "progression_max_orders": self.stake_progression_max_orders,
+                "progression_max_active": self.stake_progression_max_active,
+                "progression_status": self._stake_progression_status(),
+                "selected_order_terms": deepcopy(selected_order_terms or {}),
+            },
+            "storage_capacity": {
+                "status": "ENFORCED_AT_ATOMIC_WRITE" if self.storage else "IN_MEMORY",
+                "core_write_allowed": True if not self.storage else None,
+                "sampled_on_hot_path": False,
+            },
+        }
+        return {
+            "identity": deepcopy(run.identity),
+            "market": {
+                "closed_kline_at_ms": int(latest.close_time),
+                "candidate_time_ms": int(latest.close_time),
+                "entry_price": float(latest.close),
+                "closed_kline": latest.to_dict(),
+                "analysis_10m_window": [item.to_dict() for item in analysis_window],
+                "threshold_window": [item.to_dict() for item in threshold_window],
+                "analysis_window_minutes": signal.analysis_window_minutes,
+                "threshold_window_minutes": signal.threshold_window_minutes,
+                "price_change_pct": signal.price_change_pct,
+                "price_position": signal.price_position,
+                "window_close_strength": signal.close_strength,
+                "candle_strength": volume_price.get("candle_strength", 0.0),
+                "upper_wick_ratio": volume_price.get("upper_wick_ratio", 0.0),
+                "lower_wick_ratio": volume_price.get("lower_wick_ratio", 0.0),
+            },
+            "score": score,
+            "volume_price": volume_price,
+            "indicators": indicators,
+            "context": {
+                "mtf_10m_bias": signal.mtf_10m_bias,
+                "regime": signal.regime,
+                "fear_greed": fear_greed,
+                "daily_7d_14d": {
+                    "version": signal.daily_profile_version,
+                    "selected": signal.daily_profile_selected,
+                    "selection": deepcopy(self.active_daily_profile_selection),
+                    "7d": deepcopy(adaptive.get("7d", {"status": "NOT_AVAILABLE"})),
+                    "14d": deepcopy(adaptive.get("14d", {"status": "NOT_AVAILABLE"})),
+                },
+                "n12_n20": n12_n20,
+                "wave": {
+                    "state": signal.wave_state,
+                    "raw_state": signal.wave_raw_state,
+                    "window": signal.wave_window,
+                    "efficiency": signal.wave_efficiency,
+                    "direction_ratio": signal.wave_direction_ratio,
+                    "atr_strength": signal.wave_atr_strength,
+                    "confirmations": signal.wave_confirmations,
+                    "confirmed_at": signal.wave_confirmed_at,
+                    "batch_id": signal.wave_batch_id,
+                },
+                "direction_pulse": deepcopy(signal.direction_pulse_shadow),
+                "profile_summary_cache": {
+                    "source_revision": self.profile_guard_audit.get("source_revision"),
+                    "current_revision": self.profile_guard_audit.get("current_revision"),
+                    "stale": bool(self.profile_guard_audit.get("stale", False)),
+                    "cache_status": self.profile_guard_audit.get("cache_status", "UNKNOWN"),
+                },
+            },
+            "admission": admission,
+            "entry_structure": structure,
+            "signal": self._signal_context_payload(signal),
+            "audit_snapshot": deepcopy(audit_context),
+        }
+
     def _reuse_committed_decision(
         self,
         signal: Signal,
@@ -951,16 +1357,21 @@ class MonitorState:
             self._set_storage_error("已提交决策信号读取失败", exc)
             return "STORAGE_ERROR"
         frozen_identity = context["inputs"].get("identity")
+        frozen_candidate_identity = (
+            frozen_identity.get("candidate_identity", frozen_identity)
+            if isinstance(frozen_identity, dict)
+            else None
+        )
         if (
             not isinstance(frozen_identity, dict)
-            or frozen_identity != candidate_identity
+            or frozen_candidate_identity != candidate_identity
             or self._candidate_identity(
                 frozen_signal,
-                candidate_ordinal=int(frozen_identity.get("candidate_ordinal", -1)),
-                candidate_origin=str(frozen_identity.get("candidate_origin", "")),
+                candidate_ordinal=int(candidate_identity.get("candidate_ordinal", -1)),
+                candidate_origin=str(candidate_identity.get("candidate_origin", "")),
                 closed_kline_at_ms=context["closed_kline_at_ms"],
             )
-            != frozen_identity
+            != frozen_candidate_identity
         ):
             self._decision_storage_failed = True
             self._set_storage_error(
@@ -1007,6 +1418,11 @@ class MonitorState:
                         restored.direction,
                     )
                 )
+        canonical_inputs = deepcopy(context["inputs"])
+        quality_score_inputs = canonical_inputs.get("score", {}).get(
+            "quality_score_inputs",
+            {},
+        )
         enriched_signal = replace(
             frozen_signal,
             decision_id=str(context["decision_id"]),
@@ -1014,7 +1430,8 @@ class MonitorState:
             runtime_config_hash=str(context["runtime_config_hash"]),
             strategy_build_id=str(context["strategy_build_id"]),
             candidate_origin=str(context["candidate_origin"]),
-            decision_inputs=deepcopy(context["inputs"]),
+            quality_score_inputs=quality_score_inputs,
+            decision_inputs=canonical_inputs,
             decision_trace=deepcopy(context["decision_trace"]),
             first_decisive_block=str(context["first_decisive_block"]),
         )
@@ -1052,55 +1469,66 @@ class MonitorState:
         observation_allowed: bool,
         audit_context: dict,
         event_kind: str,
+        run: _DecisionRun | None = None,
+        selected_order_terms: dict[str, object] | None = None,
     ):
         config = self._decision_runtime_config()
         direction = self._signal_direction(signal)
-        profile_key = str(signal.profile_key or "")
-        candidate_identity = self._candidate_identity(
-            signal,
-            candidate_ordinal=candidate_ordinal,
-            candidate_origin=candidate_origin,
-            closed_kline_at_ms=latest.close_time,
-        )
-        builder = DecisionContextBuilder.new(
-            self.symbol,
-            int(latest.close_time),
-            candidate_origin,
-            config.hash,
-            strategy_build_id=config.strategy_build_id,
-            profile_key=profile_key,
-            candidate_ordinal=int(candidate_ordinal),
-            candidate_identity=candidate_identity,
-        )
-        builder.capture_inputs(
-            {
-                "identity": candidate_identity,
-                "market": {"latest_closed_kline": latest.to_dict()},
-                "signal": signal.to_dict(),
-                "strategy_inputs": deepcopy(signal.decision_inputs),
-                "audit_snapshot": deepcopy(audit_context),
-                "transition": {
-                    "version": TRANSITIONAL_DECISION_BUILD_ID,
-                    "complete_gate_trace": False,
-                },
-            }
-        )
         normalized_decision = str(decision or "UNKNOWN").upper()
         open_allowed = normalized_decision == "OPENED"
-        is_block = not open_allowed and normalized_decision != "RESEARCH_OBSERVE"
-        builder.trace(
-            "TRANSITIONAL_OUTCOME",
-            "BLOCK" if is_block else "PASS",
-            {"final_decision": normalized_decision},
-            normalized_decision,
+        if run is None:
+            run = self._new_decision_run(
+                signal,
+                latest,
+                candidate_origin=candidate_origin,
+                candidate_ordinal=candidate_ordinal,
+            )
+        if not run.trace_records:
+            if normalized_decision == "OPENED":
+                run.trace(
+                    "ADMISSION",
+                    "PASS",
+                    "OPENED",
+                    {"selected_order_terms": deepcopy(selected_order_terms or {})},
+                )
+            elif normalized_decision == "RESEARCH_OBSERVE":
+                run.trace(
+                    "OBSERVATION",
+                    "PASS",
+                    "RESEARCH_OBSERVE",
+                    {"observation_allowed": bool(observation_allowed)},
+                )
+            else:
+                run.trace(
+                    self._trace_stage_for_decision(normalized_decision),
+                    "BLOCK",
+                    normalized_decision,
+                    {"final_decision": normalized_decision},
+                )
+        inputs = self._canonical_decision_inputs(
+            run,
+            signal,
+            latest,
+            audit_context=audit_context,
+            selected_order_terms=selected_order_terms,
         )
-        context = builder.finish(
+        run.builder.capture_inputs(inputs)
+        for record in run.trace_records:
+            run.builder.trace(
+                str(record["stage"]),
+                str(record["result"]),
+                record["decisive_values"],
+                str(record["reason_code"]),
+            )
+        context = run.builder.finish(
             normalized_decision,
             str(final_reason or ""),
             open_allowed,
             bool(observation_allowed),
         )
         context_payload = context.to_dict()
+        canonical_inputs = context_payload["inputs"]
+        quality_score_inputs = canonical_inputs["score"]["quality_score_inputs"]
         enriched_signal = replace(
             signal,
             direction=direction or signal.direction,
@@ -1109,7 +1537,8 @@ class MonitorState:
             runtime_config_hash=context.runtime_config_hash,
             strategy_build_id=context.strategy_build_id,
             candidate_origin=context.candidate_origin,
-            decision_inputs=context_payload["inputs"],
+            quality_score_inputs=quality_score_inputs,
+            decision_inputs=canonical_inputs,
             decision_trace=context_payload["decision_trace"],
             first_decisive_block=context.first_decisive_block,
         )
@@ -1121,6 +1550,20 @@ class MonitorState:
             event_kind=event_kind,
         )
         return config, context, enriched_signal, audit
+
+    @staticmethod
+    def _trace_stage_for_decision(decision: str) -> str:
+        return {
+            "BELOW_THRESHOLD": "SCORE",
+            "OVERHEATED": "SCORE",
+            "EDGE_TOO_SMALL": "SCORE",
+            "SESSION_BLOCKED": "SESSION",
+            "DAILY_PROFILE_NOT_SELECTED": "DAILY_PROFILE",
+            "WAVE_DIRECTION_BLOCKED": "WAVE_GUARD",
+            "PROFILE_GUARD_BLOCKED": "PROFILE_HEALTH",
+            "HOLD_OPEN_ORDER": "CAPACITY",
+            "COOLDOWN": "COOLDOWN",
+        }.get(decision, "ADMISSION")
 
     def _maybe_open_order(
         self,
@@ -1160,6 +1603,12 @@ class MonitorState:
         reused_decision = self._reuse_committed_decision(signal, latest)
         if reused_decision is not None:
             return reused_decision
+        run = self._new_decision_run(
+            signal,
+            latest,
+            candidate_origin=candidate_origin,
+            candidate_ordinal=0,
+        )
         time_period_decision = evaluate_time_period_guard(
             latest.close_time,
             self.time_period_guard_config,
@@ -1202,21 +1651,67 @@ class MonitorState:
         else:
             self._wave_bootstrap_cancel_pending = False
         if signal.wave_guard_mode == "DIRECTION_BLOCKED":
+            run.trace(
+                "WAVE_GUARD",
+                "BLOCK",
+                "WAVE_BLOCKED",
+                {
+                    "mode": signal.wave_guard_mode,
+                    "state": signal.wave_state,
+                    "direction": signal.observe_direction,
+                    "status": signal.wave_guard_status,
+                },
+            )
             return self._block_order(
                 signal,
                 latest,
                 "WAVE_DIRECTION_BLOCKED",
                 f"1分钟波段 {signal.wave_state} 不允许 {signal.observe_direction}",
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "WAVE_GUARD",
+            "PASS",
+            "WAVE_ALLOWED",
+            {
+                "mode": signal.wave_guard_mode,
+                "state": signal.wave_state,
+                "direction": self._signal_direction(signal),
+                "status": signal.wave_guard_status,
+            },
+        )
         if daily_profile_required and not signal.daily_profile_selected:
+            run.trace(
+                "DAILY_PROFILE",
+                "BLOCK",
+                "PROFILE_NOT_SELECTED",
+                {
+                    "required": daily_profile_required,
+                    "selected": signal.daily_profile_selected,
+                    "profile_key": signal.profile_key,
+                    "version": signal.daily_profile_version,
+                },
+            )
             return self._block_order(
                 signal,
                 latest,
                 "DAILY_PROFILE_NOT_SELECTED",
                 "当前信号未进入今日启用画像，仅记录观察",
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "DAILY_PROFILE",
+            "PASS",
+            "DAILY_PROFILE_ALLOWED",
+            {
+                "required": daily_profile_required,
+                "selected": signal.daily_profile_selected,
+                "profile_key": signal.profile_key,
+                "version": signal.daily_profile_version,
+            },
+        )
 
         health_decision = self._refresh_profile_health_guard(
             signal,
@@ -1232,15 +1727,29 @@ class MonitorState:
         )
         self.selected_signal = signal
         if health_decision.blocked:
+            run.trace(
+                "PROFILE_HEALTH_SHORT_WINDOW",
+                "BLOCK",
+                "PROFILE_HEALTH_BLOCKED",
+                health_decision.to_dict(),
+            )
             return self._block_order(
                 signal,
                 latest,
                 "PROFILE_HEALTH_BLOCKED",
                 health_decision.reason,
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "PROFILE_HEALTH_SHORT_WINDOW",
+            "PASS",
+            "PROFILE_HEALTH_ALLOWED",
+            health_decision.to_dict(),
+        )
 
         signal, gate = self._admit_order_candidate(signal, latest)
+        run.extend(gate.decision_trace)
         if not gate.open_allowed:
             if not self._persist_blocked_decision(
                 signal,
@@ -1248,6 +1757,7 @@ class MonitorState:
                 gate.code,
                 signal.reason,
                 should_observe=should_observe,
+                run=run,
             ):
                 return "STORAGE_ERROR"
             return gate.code
@@ -1256,13 +1766,35 @@ class MonitorState:
             and not signal.daily_profile_selected
             and signal.threshold_segment.upper() not in self.live_short_segments
         ):
+            run.trace(
+                "SHORT_MODE",
+                "BLOCK",
+                "SHORT_OBSERVE_ONLY",
+                {
+                    "direction": signal.direction,
+                    "segment": signal.threshold_segment,
+                    "daily_profile_selected": signal.daily_profile_selected,
+                    "live_short_segments": sorted(self.live_short_segments),
+                },
+            )
             return self._block_order(
                 signal,
                 latest,
                 "SHORT_OBSERVE_ONLY",
                 "SHORT观察模式：仅记录信号，不开模拟订单，不推送Webhook",
                 should_observe=True,
+                run=run,
             )
+        run.trace(
+            "SHORT_MODE",
+            "PASS",
+            "SHORT_MODE_ALLOWED",
+            {
+                "direction": signal.direction,
+                "segment": signal.threshold_segment,
+                "daily_profile_selected": signal.daily_profile_selected,
+            },
+        )
         if signal.direction == "SHORT" and signal.observe_only:
             signal = replace(
                 signal,
@@ -1277,24 +1809,50 @@ class MonitorState:
         )
         self.selected_signal = signal
         if batch_decision.blocked:
+            run.trace(
+                "WAVE_BATCH",
+                "BLOCK",
+                batch_decision.code,
+                self.wave_batch_guard,
+            )
             return self._block_order(
                 signal,
                 latest,
                 batch_decision.code,
                 batch_decision.reason,
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "WAVE_BATCH",
+            "PASS",
+            batch_decision.code,
+            self.wave_batch_guard,
+        )
         if batch_decision.mode == "RECOVERY":
             signal = replace(signal, wave_guard_mode="RECOVERY")
             self.selected_signal = signal
         if profile_decision.status in {"COOLDOWN", "RECOVERY_PENDING"}:
+            run.trace(
+                "PROFILE_DEGRADATION",
+                "BLOCK",
+                "PROFILE_DEGRADATION_BLOCKED",
+                self.profile_degradation_guard,
+            )
             return self._block_order(
                 signal,
                 latest,
                 "PROFILE_DEGRADATION_BLOCKED",
                 profile_decision.reason,
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "PROFILE_DEGRADATION",
+            "PASS",
+            "PROFILE_DEGRADATION_ALLOWED",
+            self.profile_degradation_guard,
+        )
         if profile_decision.status == "RECOVERY_READY":
             signal = replace(
                 signal,
@@ -1311,14 +1869,33 @@ class MonitorState:
         )
         self.result_sequence_guard = self._result_sequence_guard_to_dict(sequence_decision)
         if sequence_decision.blocked:
+            run.trace(
+                "RESULT_SEQUENCE",
+                "BLOCK",
+                "RESULT_SEQUENCE_GUARD_BLOCKED",
+                self.result_sequence_guard,
+            )
             return self._block_order(
                 signal,
                 latest,
                 "RESULT_SEQUENCE_GUARD_BLOCKED",
                 sequence_decision.reason,
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "RESULT_SEQUENCE",
+            "PASS",
+            "RESULT_SEQUENCE_ALLOWED",
+            self.result_sequence_guard,
+        )
         if self.enable_rolling_edge_guard and self.rolling_edge["status"] == "DEGRADED":
+            run.trace(
+                "ROLLING_EDGE",
+                "BLOCK",
+                "ROLLING_EDGE_BLOCKED",
+                self.rolling_edge,
+            )
             return self._block_order(
                 signal,
                 latest,
@@ -1330,7 +1907,14 @@ class MonitorState:
                     f"EV {self.rolling_edge['ev']:.2f}，暂停开单"
                 ),
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "ROLLING_EDGE",
+            "PASS",
+            "ROLLING_EDGE_ALLOWED",
+            self.rolling_edge,
+        )
         if self.enable_profile_guard:
             try:
                 profile_guard = self._profile_guard_shadow(signal)
@@ -1358,6 +1942,12 @@ class MonitorState:
                 "stale": bool(profile_guard.get("stale", False)),
             }
             if profile_guard["status"] == "WOULD_BLOCK":
+                run.trace(
+                    "PROFILE_HEALTH",
+                    "BLOCK",
+                    "PROFILE_GUARD_BLOCKED",
+                    self.profile_guard_audit,
+                )
                 return self._block_order(
                     signal,
                     latest,
@@ -1369,25 +1959,66 @@ class MonitorState:
                         f"G{profile_guard['min_group_size']}，暂停开单"
                     ),
                     should_observe=should_observe,
+                    run=run,
                 )
+        run.trace(
+            "PROFILE_HEALTH",
+            "PASS",
+            (
+                "PROFILE_GUARD_PASS"
+                if self.enable_profile_guard
+                else "PROFILE_GUARD_DISABLED"
+            ),
+            self.profile_guard_audit,
+        )
 
         if time_period_decision.blocked:
+            run.trace(
+                "TIME_PERIOD",
+                "BLOCK",
+                time_period_decision.code,
+                time_period_decision.to_dict(),
+            )
             return self._block_order(
                 signal,
                 latest,
                 time_period_decision.code,
                 time_period_decision.reason,
                 should_observe=True,
+                run=run,
             )
+        run.trace(
+            "TIME_PERIOD",
+            "PASS",
+            time_period_decision.code,
+            time_period_decision.to_dict(),
+        )
 
         if signal.order_slot == "SECOND" and not health_decision.allow_second_order:
+            run.trace(
+                "PROFILE_HEALTH_SECOND_ORDER",
+                "BLOCK",
+                "PROFILE_HEALTH_SECOND_ORDER_BLOCKED",
+                health_decision.to_dict(),
+            )
             return self._block_order(
                 signal,
                 latest,
                 "PROFILE_HEALTH_SECOND_ORDER_BLOCKED",
                 health_decision.reason,
                 should_observe=should_observe,
+                run=run,
             )
+        run.trace(
+            "PROFILE_HEALTH_SECOND_ORDER",
+            "PASS",
+            "PROFILE_HEALTH_SECOND_ORDER_ALLOWED",
+            {
+                "order_slot": signal.order_slot,
+                "allow_second_order": health_decision.allow_second_order,
+                "status": health_decision.status,
+            },
+        )
 
         return self._execute_open_order(
             signal,
@@ -1399,6 +2030,7 @@ class MonitorState:
                 and profile_decision.allow_progression
                 and health_decision.allow_progression
             ),
+            run=run,
         )
 
     def _block_order(
@@ -1409,6 +2041,7 @@ class MonitorState:
         reason: str,
         *,
         should_observe: bool,
+        run: _DecisionRun,
     ) -> str:
         if not self._persist_blocked_decision(
             signal,
@@ -1416,6 +2049,7 @@ class MonitorState:
             code,
             reason,
             should_observe=should_observe,
+            run=run,
         ):
             return "STORAGE_ERROR"
         self.risk_pause = reason
@@ -1429,8 +2063,23 @@ class MonitorState:
         reason: str,
         *,
         should_observe: bool,
+        run: _DecisionRun,
     ) -> bool:
         if not signal.actionable and not should_observe:
+            audit_context = self._current_signal_audit_context()
+            _config, _context, enriched_signal, _audit = self._decision_artifacts(
+                signal,
+                latest,
+                code,
+                final_reason=reason,
+                candidate_origin=self._formal_candidate_origin(signal),
+                candidate_ordinal=0,
+                observation_allowed=False,
+                audit_context=audit_context,
+                event_kind="DECISIVE_BLOCK",
+                run=run,
+            )
+            self.selected_signal = enriched_signal
             return True
         if should_observe:
             recorded = self._record_observation(
@@ -1441,13 +2090,12 @@ class MonitorState:
                 candidate_ordinal=0,
                 primary_decision=True,
                 final_reason=reason,
+                run=run,
             )
             if self._decision_storage_failed:
                 return False
             if recorded:
                 return True
-        if not self.storage:
-            return True
         audit_context = self._current_signal_audit_context()
         config, context, enriched_signal, audit = self._decision_artifacts(
             signal,
@@ -1459,7 +2107,11 @@ class MonitorState:
             observation_allowed=should_observe,
             audit_context=audit_context,
             event_kind="DECISIVE_BLOCK",
+            run=run,
         )
+        self.selected_signal = enriched_signal
+        if not self.storage:
+            return True
         try:
             self.storage.save_decision_bundle(
                 config=config,
@@ -1471,7 +2123,6 @@ class MonitorState:
             self._set_storage_error("决策持久化失败", exc)
             return False
         self._bundled_decision_ids.add(context.decision_id)
-        self.selected_signal = enriched_signal
         return True
 
     def _admit_order_candidate(self, signal: Signal, latest: Kline) -> tuple[Signal, OrderGate]:
@@ -1509,6 +2160,7 @@ class MonitorState:
         *,
         should_observe: bool,
         allow_progression: bool,
+        run: _DecisionRun,
     ) -> str:
         audit_context = self._current_signal_audit_context()
         pending_observation = (
@@ -1516,18 +2168,53 @@ class MonitorState:
             if should_observe
             else None
         )
-        config, context, signal, audit = self._decision_artifacts(
+        order, consumed_credit = self.simulator.open_order_with_credit(
             signal,
-            latest,
-            "OPENED",
-            final_reason=signal.reason,
-            candidate_origin=self._formal_candidate_origin(signal),
-            candidate_ordinal=0,
-            observation_allowed=pending_observation is not None,
-            audit_context=audit_context,
-            event_kind="ORDER_OPENED",
+            entry_price=latest.close,
+            opened_at=latest.close_time,
+            allow_progression=allow_progression,
         )
+        selected_order_terms = {
+            "stake": order.stake,
+            "win_return": order.win_return,
+            "progression_step": order.stake_progression_step,
+            "progression_source_order_id": order.stake_progression_source_order_id,
+            "progression_version": order.stake_progression_version,
+            "allow_progression": allow_progression,
+        }
+        run.trace(
+            "ADMISSION",
+            "PASS",
+            "OPENED",
+            {"selected_order_terms": selected_order_terms},
+        )
+        try:
+            config, context, signal, audit = self._decision_artifacts(
+                signal,
+                latest,
+                "OPENED",
+                final_reason=signal.reason,
+                candidate_origin=self._formal_candidate_origin(signal),
+                candidate_ordinal=0,
+                observation_allowed=pending_observation is not None,
+                audit_context=audit_context,
+                event_kind="ORDER_OPENED",
+                run=run,
+                selected_order_terms=selected_order_terms,
+            )
+        except Exception:
+            self.simulator.rollback_open_order(order.id)
+            raise
         self.selected_signal = signal
+        order.decision_id = signal.decision_id
+        order.context_version = signal.context_version
+        order.runtime_config_hash = signal.runtime_config_hash
+        order.strategy_build_id = signal.strategy_build_id
+        order.candidate_origin = signal.candidate_origin
+        order.decision_inputs = deepcopy(signal.decision_inputs)
+        order.decision_trace = deepcopy(signal.decision_trace)
+        order.first_decisive_block = signal.first_decisive_block
+        order.quality_score_inputs = deepcopy(signal.quality_score_inputs)
         if pending_observation is not None:
             context_payload = context.to_dict()
             pending_observation = replace(
@@ -1537,16 +2224,11 @@ class MonitorState:
                 runtime_config_hash=context.runtime_config_hash,
                 strategy_build_id=context.strategy_build_id,
                 candidate_origin=context.candidate_origin,
+                quality_score_inputs=deepcopy(signal.quality_score_inputs),
                 decision_inputs=context_payload["inputs"],
                 decision_trace=context_payload["decision_trace"],
                 first_decisive_block=context.first_decisive_block,
             )
-        order, consumed_credit = self.simulator.open_order_with_credit(
-            signal,
-            entry_price=latest.close,
-            opened_at=latest.close_time,
-            allow_progression=allow_progression,
-        )
         if pending_observation is not None:
             self.observations.append(pending_observation)
         if self.storage:
@@ -2139,6 +2821,7 @@ class MonitorState:
         candidate_ordinal: int = 1,
         primary_decision: bool = False,
         final_reason: str | None = None,
+        run: _DecisionRun | None = None,
     ) -> bool:
         observation = self._new_observation(signal, latest, decision)
         if observation is None:
@@ -2160,6 +2843,7 @@ class MonitorState:
             observation_allowed=True,
             audit_context=audit_context,
             event_kind=event_kind,
+            run=run,
         )
         context_payload = context.to_dict()
         observation = replace(

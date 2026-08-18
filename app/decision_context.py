@@ -274,6 +274,10 @@ class DecisionContextBuilder:
         self._first_decisive_block = ""
         self._finished = False
 
+    @property
+    def decision_id(self) -> str:
+        return self._decision_id
+
     @classmethod
     def new(
         cls,

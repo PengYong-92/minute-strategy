@@ -14,9 +14,10 @@ from zoneinfo import ZoneInfo
 from app import storage as storage_module
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal, SimulatedOrder
+from app.order_policy import OrderGate
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
 from app.profile_degradation_guard import MINUTE_MS, ProfileDegradationGuardConfig
-from app.profile_health_guard import ProfileHealthGuardConfig
+from app.profile_health_guard import ProfileHealthGuardConfig, ProfileHealthGuardDecision
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.rolling_edge import RollingEdgeConfig
 from app.state import MonitorState
@@ -545,6 +546,406 @@ class FailingDailySelectionStorage(RecordingStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_decision_trace_names_first_decisive_branch_without_changing_decision(self):
+        now = 119_999
+
+        def run_case(label):
+            storage = RecordingStorage()
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=storage,
+                min_order_gap_ms=0,
+                enable_rolling_edge_guard=False,
+                enable_observation_profile_promotion=False,
+                result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+            )
+            candidate = selected_profile_signal(now)
+            case_now = now
+            kwargs = {}
+            context = None
+            if label == "below threshold":
+                candidate = replace(
+                    candidate,
+                    direction="WAIT",
+                    observe_direction="LONG",
+                    daily_profile_selected=False,
+                    score=69.0,
+                    session_allowed=True,
+                )
+            elif label == "session blocked":
+                candidate = replace(
+                    candidate,
+                    direction="WAIT",
+                    observe_direction="LONG",
+                    daily_profile_selected=False,
+                    session_allowed=False,
+                )
+            elif label == "daily profile":
+                candidate = replace(candidate, daily_profile_selected=False)
+                kwargs["daily_profile_required"] = True
+            elif label == "wave direction":
+                candidate = replace(
+                    candidate,
+                    direction="WAIT",
+                    observe_direction="LONG",
+                    wave_guard_mode="DIRECTION_BLOCKED",
+                    wave_state="DOWN_LEG",
+                )
+            elif label == "profile summary":
+                state.enable_profile_guard = True
+                context = patch.object(
+                    state,
+                    "_profile_guard_shadow",
+                    return_value={
+                        "status": "WOULD_BLOCK",
+                        "hit_keys": ["segment"],
+                        "min_history": 15,
+                        "min_group_size": 2,
+                        "cache_status": "FRESH",
+                        "source_revision": 4,
+                        "current_revision": 4,
+                        "stale": False,
+                    },
+                )
+            elif label == "profile health":
+                context = patch.object(
+                    state,
+                    "_refresh_profile_health_guard",
+                    return_value=ProfileHealthGuardDecision(
+                        enabled=True,
+                        status="DEGRADED",
+                        direction="LONG",
+                        evaluated_at=now,
+                        next_evaluation_at=now + 1,
+                        lookback_start=0,
+                        lookback_end=now,
+                        blocked=True,
+                        reason="degraded profile health",
+                    ),
+                )
+            elif label == "capacity":
+                state.order_policy = replace(state.order_policy, max_open_orders=1)
+                state.simulator.open_order(
+                    replace(candidate, direction="SHORT", observe_direction="SHORT"),
+                    entry_price=100.0,
+                    opened_at=0,
+                )
+            elif label == "cooldown":
+                state.order_policy = replace(state.order_policy, min_order_gap_ms=120_000)
+                state._last_order_opened_at = {
+                    "LONG": now - 60_000,
+                    "SHORT": None,
+                }
+            elif label == "short observe only":
+                candidate = replace(
+                    candidate,
+                    direction="SHORT",
+                    observe_direction="SHORT",
+                    score=-90.0,
+                    threshold_segment="WD-12",
+                    profile_key="",
+                    daily_profile_selected=False,
+                    daily_profile_version="",
+                )
+            elif label == "wave batch":
+                state.wave_batch_guard_config = WaveBatchGuardConfig()
+                candidate = replace(candidate, wave_batch_id="wave-a")
+                state.simulator.orders.append(
+                    SimulatedOrder(
+                        id=1,
+                        direction="LONG",
+                        timeframe_minutes=10,
+                        level="A",
+                        reason="wave loss",
+                        entry_price=100.0,
+                        opened_at=0,
+                        expires_at=60_000,
+                        status="SETTLED",
+                        result="LOSS",
+                        settled_at=60_000,
+                        pnl=-10.0,
+                        wave_batch_id="wave-a",
+                    )
+                )
+            elif label == "profile degradation":
+                case_now = 33 * MINUTE_MS
+                candidate = selected_profile_signal(case_now)
+                settle_profile_losses(state)
+            elif label == "result sequence":
+                case_now = 120_000
+                state.result_sequence_guard_config = ResultSequenceGuardConfig(
+                    enabled=True,
+                    loss_streak=1,
+                    cooldown_minutes=20,
+                )
+                state.simulator.orders.append(
+                    SimulatedOrder(
+                        id=1,
+                        direction="LONG",
+                        timeframe_minutes=1,
+                        level="A",
+                        reason="sequence loss",
+                        entry_price=100.0,
+                        opened_at=0,
+                        expires_at=60_000,
+                        status="SETTLED",
+                        result="LOSS",
+                        settled_at=60_000,
+                        pnl=-10.0,
+                    )
+                )
+                candidate = selected_profile_signal(case_now)
+            elif label == "rolling edge":
+                state.enable_rolling_edge_guard = True
+                context = patch.object(
+                    state,
+                    "_rolling_edge_status",
+                    return_value={
+                        "status": "DEGRADED",
+                        "key": "10|WD-08|selected live profile",
+                        "sample_size": 5,
+                        "wins": 2,
+                        "losses": 3,
+                        "win_rate": 0.4,
+                        "pnl": -14.0,
+                        "ev": -2.8,
+                    },
+                )
+            elif label == "time period":
+                case_now = shanghai_timestamp("2026-08-18T12:30:00")
+                state.time_period_guard_config = TimePeriodGuardConfig(enabled=True)
+                candidate = selected_profile_signal(case_now)
+            elif label == "profile health second order":
+                state.order_policy = replace(
+                    state.order_policy,
+                    max_open_long_orders=2,
+                )
+                state.simulator.open_order(
+                    candidate,
+                    entry_price=100.0,
+                    opened_at=0,
+                )
+                context = patch.object(
+                    state,
+                    "_refresh_profile_health_guard",
+                    return_value=ProfileHealthGuardDecision(
+                        enabled=True,
+                        status="WATCH",
+                        direction="LONG",
+                        evaluated_at=now,
+                        next_evaluation_at=now + 1,
+                        lookback_start=0,
+                        lookback_end=now,
+                        allow_second_order=False,
+                        allow_progression=False,
+                        reason="watch permits first order only",
+                    ),
+                )
+
+            if context is None:
+                decision = state._maybe_open_order(
+                    candidate,
+                    latest_kline(case_now),
+                    **kwargs,
+                )
+            else:
+                with context:
+                    decision = state._maybe_open_order(
+                        candidate,
+                        latest_kline(case_now),
+                        **kwargs,
+                    )
+            return decision, state.selected_signal
+
+        cases = (
+            ("below threshold", "BELOW_THRESHOLD", "SCORE", "BELOW_THRESHOLD"),
+            ("session blocked", "SESSION_BLOCKED", "SESSION", "SESSION_BLOCKED"),
+            (
+                "daily profile",
+                "DAILY_PROFILE_NOT_SELECTED",
+                "DAILY_PROFILE",
+                "PROFILE_NOT_SELECTED",
+            ),
+            (
+                "wave direction",
+                "WAVE_DIRECTION_BLOCKED",
+                "WAVE_GUARD",
+                "WAVE_BLOCKED",
+            ),
+            (
+                "profile summary",
+                "PROFILE_GUARD_BLOCKED",
+                "PROFILE_HEALTH",
+                "PROFILE_GUARD_BLOCKED",
+            ),
+            (
+                "profile health",
+                "PROFILE_HEALTH_BLOCKED",
+                "PROFILE_HEALTH_SHORT_WINDOW",
+                "PROFILE_HEALTH_BLOCKED",
+            ),
+            ("capacity", "HOLD_OPEN_ORDER", "CAPACITY", "MAX_OPEN_ORDERS"),
+            ("cooldown", "COOLDOWN", "COOLDOWN", "DIRECTION_COOLDOWN"),
+            (
+                "short observe only",
+                "SHORT_OBSERVE_ONLY",
+                "SHORT_MODE",
+                "SHORT_OBSERVE_ONLY",
+            ),
+            (
+                "wave batch",
+                "WAVE_BATCH_LOSS_LOCKED",
+                "WAVE_BATCH",
+                "WAVE_BATCH_LOSS_LOCKED",
+            ),
+            (
+                "profile degradation",
+                "PROFILE_DEGRADATION_BLOCKED",
+                "PROFILE_DEGRADATION",
+                "PROFILE_DEGRADATION_BLOCKED",
+            ),
+            (
+                "result sequence",
+                "RESULT_SEQUENCE_GUARD_BLOCKED",
+                "RESULT_SEQUENCE",
+                "RESULT_SEQUENCE_GUARD_BLOCKED",
+            ),
+            (
+                "rolling edge",
+                "ROLLING_EDGE_BLOCKED",
+                "ROLLING_EDGE",
+                "ROLLING_EDGE_BLOCKED",
+            ),
+            (
+                "time period",
+                "TIME_PERIOD_SHADOW_ONLY",
+                "TIME_PERIOD",
+                "TIME_PERIOD_SHADOW_ONLY",
+            ),
+            (
+                "profile health second order",
+                "PROFILE_HEALTH_SECOND_ORDER_BLOCKED",
+                "PROFILE_HEALTH_SECOND_ORDER",
+                "PROFILE_HEALTH_SECOND_ORDER_BLOCKED",
+            ),
+        )
+
+        for label, expected_decision, expected_stage, expected_reason in cases:
+            with self.subTest(label=label):
+                decision, selected = run_case(label)
+
+                self.assertEqual(decision, expected_decision)
+                self.assertEqual(selected.first_decisive_block, expected_stage)
+                self.assertEqual(selected.decision_trace[-1]["result"], "BLOCK")
+                self.assertEqual(selected.decision_trace[-1]["reason_code"], expected_reason)
+                self.assertTrue(
+                    all(
+                        record["result"] == "PASS"
+                        for record in selected.decision_trace[:-1]
+                    )
+                )
+
+    def test_open_decision_freezes_complete_canonical_input_and_ordered_pass_trace(self):
+        storage = RecordingStorage()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            min_order_gap_ms=0,
+            enable_rolling_edge_guard=False,
+            enable_observation_profile_promotion=False,
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        )
+        state.klines = [kline(index, 100.0 + index / 100.0, 100 + index) for index in range(20)]
+        latest = state.klines[-1]
+        now = latest.close_time
+        state.fear_greed = FearGreedContext(
+            value=23,
+            classification="Fear",
+            average_30d=31.5,
+            trend="rising",
+            updated_at_ms=now - 1_000,
+        )
+        signal = replace(
+            selected_profile_signal(now),
+            decision_inputs={
+                "score": {
+                    "raw_direction": "LONG",
+                    "raw_score": 90.0,
+                    "signed_score": 90.0,
+                    "edge": 20.0,
+                    "volume_points": 8.0,
+                },
+                "thresholds": {
+                    "base_threshold": 68.0,
+                    "calculated_threshold": 70.0,
+                    "fear_greed_adjustment": 2.0,
+                },
+                "volume_price": {"current_volume": 119.0, "volume_baseline": 100.0},
+                "indicators": {"macd_line": 1.0, "macd_signal_line": 0.8, "atr": 2.0},
+            },
+            entry_structure_shadow={
+                "version": "ENTRY_STRUCTURE_SHADOW_V1",
+                "status": "READY",
+                "audit_only": True,
+                "state": "BREAKOUT",
+            },
+        )
+
+        decision = state._maybe_open_order(signal, latest)
+
+        self.assertEqual(decision, "OPENED")
+        selected = state.selected_signal
+        canonical = selected.decision_inputs
+        self.assertEqual(
+            set(canonical),
+            {
+                "identity",
+                "market",
+                "score",
+                "volume_price",
+                "indicators",
+                "context",
+                "admission",
+                "entry_structure",
+                "signal",
+                "audit_snapshot",
+            },
+        )
+        self.assertEqual(canonical["identity"]["symbol"], "BTCUSDT")
+        self.assertEqual(canonical["identity"]["decision_id"], selected.decision_id)
+        self.assertEqual(canonical["market"]["closed_kline"]["close_time"], now)
+        self.assertEqual(len(canonical["market"]["analysis_10m_window"]), 10)
+        self.assertEqual(canonical["score"]["raw_score"], 90.0)
+        self.assertEqual(canonical["volume_price"]["current_volume"], 119.0)
+        self.assertEqual(canonical["indicators"]["macd_line"], 1.0)
+        self.assertEqual(canonical["context"]["fear_greed"]["value"], 23)
+        self.assertIn("daily_7d_14d", canonical["context"])
+        self.assertIn("n12_n20", canonical["context"])
+        self.assertIn("profile_summary_cache", canonical["context"])
+        self.assertIn("storage_capacity", canonical["admission"])
+        self.assertEqual(
+            canonical["entry_structure"]["version"],
+            "ENTRY_STRUCTURE_SHADOW_V1",
+        )
+        self.assertTrue(canonical["entry_structure"]["audit_only"])
+        self.assertIs(
+            selected.quality_score_inputs,
+            selected.decision_inputs["score"]["quality_score_inputs"],
+        )
+        self.assertEqual(selected.first_decisive_block, "")
+        self.assertTrue(
+            all(record["result"] == "PASS" for record in selected.decision_trace)
+        )
+        self.assertEqual(selected.decision_trace[-1]["stage"], "ADMISSION")
+        self.assertEqual(
+            selected.decision_trace[-1]["decisive_values"]["selected_order_terms"]["stake"],
+            10.0,
+        )
+        order = state.simulator.orders[-1]
+        self.assertEqual(order.decision_id, selected.decision_id)
+        self.assertEqual(order.decision_inputs, canonical)
+        self.assertEqual(order.decision_trace, selected.decision_trace)
+
     def test_opened_main_and_actual_observations_write_distinct_signal_audits(self):
         storage = RecordingStorage()
         state = MonitorState(
@@ -1381,6 +1782,42 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(storage.entry_snapshots, [])
         self.assertEqual(webhook.calls, [])
 
+    def test_decision_freeze_failure_rolls_back_provisional_order(self):
+        webhook = RecordingWebhook()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            webhook=webhook,
+            now_ms=lambda: 1_000,
+        )
+        signal = Signal(
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="freeze failure",
+            price=100.0,
+            open_time=1_000,
+            score=80.0,
+            threshold=70.0,
+            threshold_segment="WD-08",
+            session_allowed=True,
+            observe_direction="LONG",
+        )
+        latest = Kline(0, 100.0, 100.0, 100.0, 100.0, 1.0, 1_000)
+
+        with patch.object(
+            state,
+            "_decision_artifacts",
+            side_effect=ValueError("freeze failed"),
+        ):
+            with self.assertRaisesRegex(ValueError, "freeze failed"):
+                state._maybe_open_order(signal, latest)
+
+        self.assertEqual(state.simulator.orders, [])
+        self.assertEqual(state.simulator.stake_progression.pending_credits(), [])
+        self.assertEqual(state.observations, [])
+        self.assertEqual(state._opened_signal_keys, set())
+        self.assertEqual(webhook.calls, [])
+
     def test_post_commit_profile_maintenance_failure_keeps_open_and_dispatches_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
@@ -1569,10 +2006,12 @@ class MonitorStateTest(unittest.TestCase):
             latest = latest_kline(119_999)
 
             first = state._maybe_open_order(signal, latest)
+            first_page = state.snapshot()
             second = state._maybe_open_order(
                 replace(signal, reason="recomputed reason", score=95.0),
                 latest,
             )
+            replay_page = state.snapshot()
 
             self.assertEqual((first, second), ("OPENED", "OPENED"))
             self.assertEqual(state.selected_signal.reason, "frozen first reason")
@@ -1581,6 +2020,16 @@ class MonitorStateTest(unittest.TestCase):
             self.assertEqual(len(store.load_orders("BTCUSDT")), 1)
             self.assertEqual(len(store.load_recent_signals("BTCUSDT")), 1)
             self.assertEqual(len(webhook.calls), 1)
+            for key in (
+                "selected_signal",
+                "rolling_edge",
+                "result_sequence_guard",
+                "wave_batch_guard",
+                "profile_degradation_guard",
+                "profile_health_guard",
+                "time_period_guard",
+            ):
+                self.assertEqual(first_page[key], replay_page[key], key)
 
     def test_two_state_instances_reuse_same_committed_open_decision(self):
         with tempfile.TemporaryDirectory() as temp_dir:
