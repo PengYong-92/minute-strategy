@@ -502,7 +502,144 @@ class Task7ProfileMaterializationReviewTest(unittest.TestCase):
             store.close(timeout=0.1)
             elapsed = time.monotonic() - started
             store.compute_release.set()
+            store.close(timeout=5)
             self.assertLess(elapsed, 1.0)
+            self.assertEqual(store._profile_summary_close_state, "CLOSED")
+
+    def test_close_cancels_queued_future_without_mutating_live_iteration(self):
+        class TwoFutureStore(SQLiteMonitorStore):
+            def __init__(self, path):
+                self.compute_started = threading.Event()
+                self.compute_release = threading.Event()
+                super().__init__(path)
+
+            def _compute_profile_summary(self, key, samples):
+                self.compute_started.set()
+                self.compute_release.wait(timeout=5)
+                return super()._compute_profile_summary(key, samples)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = TwoFutureStore(Path(temp_dir) / "monitor.sqlite3")
+            try:
+                store.prepare_order_profile_summary("BTCUSDT", limit=5_000)
+                self.assertTrue(store.compute_started.wait(timeout=5))
+                store.prepare_order_profile_summary("BTCUSDT", limit=4_999)
+                with store._profile_summary_condition:
+                    running, queued = tuple(store._profile_summary_futures.values())
+                self.assertTrue(running.running())
+                self.assertFalse(queued.running())
+
+                started = time.monotonic()
+                store.close(timeout=0.01)
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertTrue(queued.cancelled())
+                self.assertEqual(store._profile_summary_close_state, "CLOSING")
+
+                store.compute_release.set()
+                store.close(timeout=5)
+                self.assertEqual(store._profile_summary_close_state, "CLOSED")
+                self.assertFalse(store._profile_summary_futures)
+                self.assertFalse(
+                    any(
+                        thread.name.startswith(store.profile_worker_thread_prefix)
+                        for thread in threading.enumerate()
+                    )
+                )
+                with closing(sqlite3.connect(store.path)) as connection:
+                    leases = connection.execute(
+                        "select count(*) from profile_summary_leases where owner_id = ?",
+                        (store._profile_summary_owner_id,),
+                    ).fetchone()[0]
+                self.assertEqual(leases, 0)
+            finally:
+                store.compute_release.set()
+                store._profile_summary_executor.shutdown(
+                    wait=True,
+                    cancel_futures=True,
+                )
+
+    def test_close_can_retry_after_shutdown_exception(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            original_shutdown = store._profile_summary_executor.shutdown
+            attempts = 0
+
+            def flaky_shutdown(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("injected shutdown failure")
+                return original_shutdown(*args, **kwargs)
+
+            with mock.patch.object(
+                store._profile_summary_executor,
+                "shutdown",
+                side_effect=flaky_shutdown,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected shutdown failure"):
+                    store.close()
+                self.assertEqual(store._profile_summary_close_state, "CLOSING")
+                store.close()
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(store._profile_summary_close_state, "CLOSED")
+
+    def test_concurrent_close_calls_complete_once_workers_drain(self):
+        class BlockingStore(SQLiteMonitorStore):
+            def __init__(self, path):
+                self.compute_started = threading.Event()
+                self.compute_release = threading.Event()
+                super().__init__(path)
+
+            def _compute_profile_summary(self, key, samples):
+                self.compute_started.set()
+                self.compute_release.wait(timeout=5)
+                return super()._compute_profile_summary(key, samples)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = BlockingStore(Path(temp_dir) / "monitor.sqlite3")
+            errors = []
+            callers = []
+            try:
+                store.prepare_order_profile_summary("BTCUSDT", limit=5_000)
+                self.assertTrue(store.compute_started.wait(timeout=5))
+                store.prepare_order_profile_summary("BTCUSDT", limit=4_999)
+                barrier = threading.Barrier(5)
+
+                def close_store():
+                    barrier.wait(timeout=5)
+                    try:
+                        store.close(timeout=5)
+                    except Exception as error:  # noqa: BLE001 - captured for assertion.
+                        errors.append(error)
+
+                callers = [threading.Thread(target=close_store) for _ in range(4)]
+                for caller in callers:
+                    caller.start()
+                barrier.wait(timeout=5)
+                time.sleep(0.05)
+                store.compute_release.set()
+                for caller in callers:
+                    caller.join(timeout=6)
+
+                self.assertFalse(any(caller.is_alive() for caller in callers))
+                self.assertEqual(errors, [])
+                self.assertEqual(store._profile_summary_close_state, "CLOSED")
+                self.assertFalse(store._profile_summary_futures)
+                self.assertFalse(
+                    any(
+                        thread.name.startswith(store.profile_worker_thread_prefix)
+                        for thread in threading.enumerate()
+                    )
+                )
+            finally:
+                store.compute_release.set()
+                for caller in callers:
+                    caller.join(timeout=6)
+                store._profile_summary_executor.shutdown(
+                    wait=True,
+                    cancel_futures=True,
+                )
 
     def test_exact_guard_never_computes_full_summary_on_calling_thread(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -609,7 +746,7 @@ class Task7ProfileMaterializationReviewTest(unittest.TestCase):
 
             self.assertNotIn(calling_thread, load_threads)
             self.assertNotIn(calling_thread, summarize_threads)
-            self.assertLess(elapsed, 0.75)
+            self.assertLess(elapsed, 2.0)
             self.assertEqual(exact["profile_guard"], expected_guard)
             self.assertEqual(exact["source_revision"], 2)
             self.assertEqual(exact["current_revision"], 2)

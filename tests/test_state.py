@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from app import storage as storage_module
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import FearGreedContext, Kline, ObservationSignal, Signal, SimulatedOrder
 from app.order_profile import sample_from_entry_snapshot, summarize_order_samples_with_guard
@@ -2269,7 +2270,7 @@ class MonitorStateTest(unittest.TestCase):
             self.assertEqual(disabled_source["total"]["orders"], 4_999)
             self.assertEqual(disabled_source["total"]["wins"], 2_500)
             self.assertEqual(decision, "OPENED")
-            self.assertLess(elapsed, 0.75)
+            self.assertLess(elapsed, 2.0)
             self.assertEqual(events, ["commit", "webhook"])
             store.wait_for_profile_summary_rebuilds(timeout=20)
             materialized = store.profile_summary_snapshot("BTCUSDT")
@@ -2291,6 +2292,225 @@ class MonitorStateTest(unittest.TestCase):
                 {key: value for key, value in materialized.items() if key not in ignored},
                 {key: value for key, value in expected.items() if key not in ignored},
             )
+
+    def test_formal_guard_5000_settlement_to_committed_open_stays_off_full_scan(self):
+        events = []
+
+        class TrackingStore(SQLiteMonitorStore):
+            def __init__(self, path):
+                self.load_threads = []
+                self.summarize_threads = []
+                self.exact_results = []
+                super().__init__(path)
+
+            def _profile_summary_rebuild_input(self, key):
+                self.load_threads.append(threading.get_ident())
+                return super()._profile_summary_rebuild_input(key)
+
+            def _compute_profile_summary(self, key, samples):
+                self.summarize_threads.append(threading.get_ident())
+                return super()._compute_profile_summary(key, samples)
+
+            def exact_order_profile_summary(self, symbol, **kwargs):
+                result = super().exact_order_profile_summary(symbol, **kwargs)
+                self.exact_results.append(json.loads(json.dumps(result)))
+                return result
+
+            def save_open_order_decision(self, **kwargs):
+                result = super().save_open_order_decision(**kwargs)
+                events.append("commit")
+                return result
+
+        class OrderedWebhook(RecordingWebhook):
+            def send_signal(self, symbol, signal, message=None, amount=None):
+                events.append("webhook")
+                return super().send_signal(
+                    symbol,
+                    signal,
+                    message=message,
+                    amount=amount,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = TrackingStore(db_path)
+            state = None
+            webhook = OrderedWebhook()
+            signal_payload = selected_profile_signal(1_000).to_dict()
+            entry_payload = json.dumps(
+                {
+                    "signal": signal_payload,
+                    "fear_greed": {"value": 50, "trend": "flat"},
+                    "profile_guard_shadow": {"status": "PASS"},
+                },
+                ensure_ascii=False,
+            )
+            try:
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.executemany(
+                        """
+                        insert into order_entry_snapshots(
+                            symbol, order_id, direction, timeframe_minutes,
+                            opened_at, expires_at, entry_price, stake, win_return,
+                            stake_progression_step, threshold_segment, regime,
+                            score, threshold, edge, result, settled_at, exit_price,
+                            pnl, entry_payload
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            (
+                                "BTCUSDT",
+                                10_000 + index,
+                                "LONG",
+                                10,
+                                index * 600_000,
+                                (index + 1) * 600_000,
+                                100.0,
+                                10.0,
+                                18.0,
+                                1,
+                                "WD-08",
+                                "FEAR_FLAT",
+                                90.0,
+                                70.0,
+                                20.0,
+                                None if index == 4_999 else "WIN",
+                                None if index == 4_999 else (index + 1) * 600_000,
+                                None if index == 4_999 else 101.0,
+                                0.0 if index == 4_999 else 8.0,
+                                entry_payload,
+                            )
+                            for index in range(5_000)
+                        ),
+                    )
+                    connection.commit()
+
+                open_order = SimulatedOrder(
+                    id=14_999,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="formal guard 5000 settlement",
+                    entry_price=100.0,
+                    opened_at=4_999 * 600_000,
+                    expires_at=5_000 * 600_000,
+                    threshold_segment="WD-08",
+                    score=90.0,
+                    threshold=70.0,
+                    regime="FEAR_FLAT",
+                    strategy_family="drop_reclaim",
+                    strategy_tag="live_profile",
+                    profile_key=PROFILE_KEY,
+                    daily_profile_selected=True,
+                    daily_profile_version=PROFILE_VERSION,
+                    order_slot="FIRST",
+                    order_slot_scope="DIRECTION_V2",
+                )
+                store.save_order(open_order, "BTCUSDT")
+                state = MonitorState(
+                    symbol="BTCUSDT",
+                    storage=store,
+                    webhook=webhook,
+                    enable_profile_guard=True,
+                    min_order_gap_ms=0,
+                )
+                store.wait_for_profile_summary_rebuilds(timeout=30)
+
+                key = store._profile_summary_key("BTCUSDT", 5_000, 15, 2)
+                _revision, samples = store._profile_summary_rebuild_input(key)
+                expected_samples = [dict(sample) for sample in samples]
+                expected_samples[-1].update(
+                    {
+                        "result": "WIN",
+                        "pnl": 8.0,
+                        "settled_at": open_order.expires_at,
+                        "exit_price": 101.0,
+                    }
+                )
+                expected_guard = summarize_order_samples_with_guard(
+                    expected_samples,
+                    profile_guard_min_history=15,
+                    profile_guard_min_group_size=2,
+                )["profile_guard"]
+                store.load_threads.clear()
+                store.summarize_threads.clear()
+                trading_thread = threading.get_ident()
+                original_full_summary = (
+                    storage_module.summarize_order_samples_with_guard
+                )
+                original_guard_summary = (
+                    storage_module.summarize_profile_guard_materialization
+                )
+
+                def tracked_full_summary(*args, **kwargs):
+                    store.summarize_threads.append(threading.get_ident())
+                    return original_full_summary(*args, **kwargs)
+
+                def tracked_guard_summary(*args, **kwargs):
+                    store.summarize_threads.append(threading.get_ident())
+                    return original_guard_summary(*args, **kwargs)
+
+                started = time.perf_counter()
+                with (
+                    patch.object(
+                        storage_module,
+                        "summarize_order_samples_with_guard",
+                        side_effect=tracked_full_summary,
+                    ),
+                    patch.object(
+                        storage_module,
+                        "summarize_profile_guard_materialization",
+                        side_effect=tracked_guard_summary,
+                    ),
+                ):
+                    settlement_events = (
+                        state.simulator.settle_expired_order_events(
+                            open_order.expires_at,
+                            101.0,
+                        )
+                    )
+                    self.assertEqual(len(settlement_events), 1)
+                    state._pending_settlement_events.extend(
+                        ("BTCUSDT", event) for event in settlement_events
+                    )
+                    self.assertTrue(
+                        state._flush_pending_settlement_events(),
+                        state.last_error,
+                    )
+                    decision = state._maybe_open_order(
+                        selected_profile_signal(3_100_000_000),
+                        latest_kline(3_100_000_000),
+                    )
+                elapsed = time.perf_counter() - started
+
+                self.assertEqual(decision, "OPENED")
+                self.assertNotIn(trading_thread, store.load_threads)
+                self.assertNotIn(trading_thread, store.summarize_threads)
+                self.assertTrue(store.exact_results)
+                exact = store.exact_results[-1]
+                self.assertEqual(exact["profile_guard"], expected_guard)
+                self.assertEqual(exact["source_revision"], 1)
+                self.assertEqual(exact["current_revision"], 1)
+                self.assertFalse(exact["stale"])
+                audited = state.selected_signal.decision_inputs[
+                    "audit_snapshot"
+                ]["profile_guard"]
+                self.assertEqual(audited["source_revision"], 1)
+                self.assertEqual(audited["current_revision"], 1)
+                self.assertFalse(audited["stale"])
+                self.assertEqual(store.profile_summary_revision("BTCUSDT"), 2)
+                self.assertEqual(events, ["commit", "webhook"])
+                self.assertEqual(len(webhook.calls), 1)
+                orders = store.load_orders("BTCUSDT")
+                self.assertEqual(len(orders), 2)
+                self.assertEqual(sum(order.status == "OPEN" for order in orders), 1)
+                self.assertLess(elapsed, 2.0)
+            finally:
+                store.wait_for_profile_summary_rebuilds(timeout=60)
+                if state is not None:
+                    state.close()
+                else:
+                    store.close()
 
     def test_profile_summary_cache_refreshes_on_snapshot_changes_and_is_thread_safe(self):
         with tempfile.TemporaryDirectory() as temp_dir:

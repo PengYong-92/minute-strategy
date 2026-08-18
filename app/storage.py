@@ -1091,6 +1091,8 @@ class SQLiteMonitorStore:
             thread_name_prefix=self.profile_worker_thread_prefix,
         )
         self._profile_summary_closed = False
+        self._profile_summary_close_state = "OPEN"
+        self._profile_summary_shutdown_in_progress = False
         self._init_schema()
 
     def _maintain_profile_summary_after_commit(
@@ -1113,22 +1115,69 @@ class SQLiteMonitorStore:
     def close(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._profile_summary_condition:
-            if self._profile_summary_closed:
+            if self._profile_summary_close_state == "CLOSED":
                 return
-            self._profile_summary_closed = True
-            self._profile_summary_stop.set()
-            for future in self._profile_summary_futures.values():
-                future.cancel()
+            if self._profile_summary_close_state == "OPEN":
+                self._profile_summary_close_state = "CLOSING"
+                self._profile_summary_closed = True
+                self._profile_summary_stop.set()
+            futures = tuple(self._profile_summary_futures.values())
+
+        # Future.cancel() runs callbacks synchronously, so it must not run while
+        # iterating the live mapping or while holding the callback's lock.
+        for future in futures:
+            future.cancel()
+
+        with self._profile_summary_condition:
             while self._profile_summary_futures:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    break
+                    return
                 self._profile_summary_condition.wait(timeout=remaining)
-            drained = not self._profile_summary_futures
-        self._profile_summary_executor.shutdown(
-            wait=drained,
-            cancel_futures=True,
-        )
+            while self._profile_summary_shutdown_in_progress:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._profile_summary_condition.wait(timeout=remaining)
+                if self._profile_summary_close_state == "CLOSED":
+                    return
+            if self._profile_summary_close_state == "CLOSED":
+                return
+            if deadline - time.monotonic() <= 0:
+                return
+            self._profile_summary_shutdown_in_progress = True
+
+        try:
+            self._profile_summary_executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._release_profile_summary_owner_leases(timeout=remaining)
+        except Exception:
+            with self._profile_summary_condition:
+                self._profile_summary_shutdown_in_progress = False
+                self._profile_summary_condition.notify_all()
+            raise
+        else:
+            with self._profile_summary_condition:
+                self._profile_summary_close_state = "CLOSED"
+                self._profile_summary_shutdown_in_progress = False
+                self._profile_summary_condition.notify_all()
+        finally:
+            with self._profile_summary_condition:
+                if self._profile_summary_close_state != "CLOSED":
+                    self._profile_summary_shutdown_in_progress = False
+                    self._profile_summary_condition.notify_all()
+
+    def _release_profile_summary_owner_leases(self, *, timeout: float) -> None:
+        with self._connect(timeout=max(0.001, float(timeout))) as connection:
+            connection.execute(
+                "delete from profile_summary_leases where owner_id = ?",
+                (self._profile_summary_owner_id,),
+            )
 
     def wait_for_profile_summary_rebuilds(self, timeout: float | None = None) -> None:
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
@@ -4509,8 +4558,8 @@ class SQLiteMonitorStore:
         return _summarize_signal_audit(records)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+    def _connect(self, *, timeout: float = 5.0) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path, timeout=max(0.0, float(timeout)))
         try:
             configure_max_page_count(connection)
             connection.row_factory = sqlite3.Row
