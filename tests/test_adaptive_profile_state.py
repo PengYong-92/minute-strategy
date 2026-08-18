@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 import unittest
 from dataclasses import FrozenInstanceError
@@ -113,6 +114,17 @@ def production_rows(sample_size: int) -> list[ObservationSignal]:
     ]
 
 
+def delayed_production_rows(sample_size: int) -> list[ObservationSignal]:
+    settlement_start = CUTOFF - sample_size - 1
+    opened_start = settlement_start - (sample_size + 2) * 20 * MINUTE_MS
+    rows = production_rows(sample_size)
+    for index, item in enumerate(rows):
+        item.opened_at = opened_start + index * 20 * MINUTE_MS
+        item.expires_at = item.opened_at + 10 * MINUTE_MS
+        item.settled_at = settlement_start + (sample_size - 1 - index)
+    return rows
+
+
 def state_trace_item(key: str, result: dict) -> tuple:
     return (
         key,
@@ -124,7 +136,7 @@ def state_trace_item(key: str, result: dict) -> tuple:
     )
 
 
-def trusted_reference_rebuild(
+def progressive_reference_rebuild(
     rows: list[ObservationSignal],
     evaluated_at: int,
 ) -> tuple[dict[str, dict], list[tuple]]:
@@ -140,9 +152,9 @@ def trusted_reference_rebuild(
                 item.threshold_segment,
             ),
             item.opened_at,
-            item.expires_at,
             item.observation_key,
             item.decision_id,
+            item.expires_at,
             item.result,
             float(item.pnl).hex(),
         ),
@@ -162,7 +174,7 @@ def trusted_reference_rebuild(
         prefix = prefixes.setdefault(key, [])
         prefix.append(event)
         event_cutoff = event.settled_at + 1
-        samples = independent_settled_samples(prefix, key, event_cutoff)[-20:]
+        samples = independent_settled_samples(prefix, key, event_cutoff)
         signature = tuple(
             (
                 item.observation_key,
@@ -515,7 +527,7 @@ class AdaptiveProfileStateTest(unittest.TestCase):
             decision_id="duplicate-reference-decision",
         )
         mixed = list(reversed(rows + other_key_rows + [overlap, duplicate]))
-        expected, expected_trace = trusted_reference_rebuild(mixed, CUTOFF)
+        expected, expected_trace = progressive_reference_rebuild(mixed, CUTOFF)
         actual_trace = []
         real_classify = adaptive_module.classify_profile_state
 
@@ -534,33 +546,191 @@ class AdaptiveProfileStateTest(unittest.TestCase):
         self.assertEqual(actual_trace, expected_trace)
         self.assertEqual(actual, expected)
 
-    def test_rebuild_skips_out_of_order_interval_without_consuming_identity(self):
-        start = CUTOFF - 60 * MINUTE_MS
-        first = observation("first", "WIN", start, decision_id="first-decision")
-        out_of_order = observation(
-            "shared-out-of-order",
+    def test_rebuild_includes_delayed_settlement_and_matches_public_state(self):
+        start = CUTOFF - 60 * 20 * MINUTE_MS
+        results = ["LOSS"] * 9 + ["WIN"] * 5 + ["LOSS"] * 6
+        rows = [
+            observation(
+                f"causal-{index:02d}",
+                result,
+                start + index * 20 * MINUTE_MS,
+                decision_id=f"causal-decision-{index:02d}",
+            )
+            for index, result in enumerate(results)
+        ]
+        delayed = observation(
+            "delayed-win",
+            "WIN",
+            start - 20 * MINUTE_MS,
+            settled_at=rows[-1].settled_at + MINUTE_MS,
+            decision_id="delayed-win-decision",
+        )
+        mixed = list(reversed(rows + [delayed]))
+
+        before_delayed = rebuild_adaptive_profile_states(mixed, delayed.settled_at)
+        rebuilt = rebuild_adaptive_profile_states(mixed, CUTOFF)
+        public = evaluate_adaptive_profile_state(
+            mixed,
+            PROFILE_KEY,
+            CUTOFF,
+            previous="PAUSED",
+        )
+
+        self.assertEqual(before_delayed[PROFILE_KEY]["status"], "PAUSED")
+        self.assertEqual(rebuilt[PROFILE_KEY]["status"], "WATCH")
+        self.assertEqual(rebuilt[PROFILE_KEY]["previous"], "PAUSED")
+        self.assertEqual(rebuilt[PROFILE_KEY]["transition"], "PAUSED->WATCH")
+        self.assertEqual(rebuilt[PROFILE_KEY]["n12"], public["n12"])
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"], public["n20"])
+
+    def test_rebuild_delayed_duplicate_at_n20_boundary_matches_reference(self):
+        start = CUTOFF - 60 * 20 * MINUTE_MS
+        results = ["LOSS"] * 8 + ["WIN"] * 6 + ["LOSS"] * 5 + ["WIN"]
+        rows = [
+            observation(
+                f"boundary-{index:02d}",
+                result,
+                start + index * 20 * MINUTE_MS,
+                pnl=0.0,
+                decision_id=f"boundary-decision-{index:02d}",
+            )
+            for index, result in enumerate(results)
+        ]
+        delayed = observation(
+            rows[-1].observation_key,
             "LOSS",
             start - 20 * MINUTE_MS,
-            settled_at=start + 20 * MINUTE_MS,
-            decision_id="shared-out-of-order-decision",
+            settled_at=rows[-1].settled_at + MINUTE_MS,
+            pnl=0.0,
+            decision_id="delayed-boundary-decision",
         )
-        later_valid = observation(
-            "shared-out-of-order",
+        mixed = list(reversed(rows + [delayed]))
+
+        expected, _ = progressive_reference_rebuild(mixed, CUTOFF)
+        actual = rebuild_adaptive_profile_states(mixed, CUTOFF)
+
+        self.assertEqual(expected[PROFILE_KEY]["status"], "WATCH")
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 6)
+        self.assertEqual(actual, expected)
+
+    def test_rebuild_same_time_overlap_uses_public_observation_key_tie_break(self):
+        opened_at = CUTOFF - 40 * MINUTE_MS
+        settled_at = opened_at + 10 * MINUTE_MS
+        rows = [
+            observation(
+                "z-short-win",
+                "WIN",
+                opened_at,
+                expires_at=opened_at + 5 * MINUTE_MS,
+                settled_at=settled_at,
+                decision_id="z-short-decision",
+            ),
+            observation(
+                "a-long-loss",
+                "LOSS",
+                opened_at,
+                expires_at=opened_at + 10 * MINUTE_MS,
+                settled_at=settled_at,
+                decision_id="a-long-decision",
+            ),
+        ]
+
+        expected, _ = progressive_reference_rebuild(rows, CUTOFF)
+        actual = rebuild_adaptive_profile_states(list(reversed(rows)), CUTOFF)
+        public = independent_settled_samples(rows, PROFILE_KEY, CUTOFF)
+
+        self.assertEqual([item.observation_key for item in public], ["a-long-loss"])
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[PROFILE_KEY]["n12"]["wins"], 0)
+
+    def test_rebuild_random_legal_delayed_duplicate_overlap_matches_reference(self):
+        for seed in range(20):
+            rng = random.Random(seed)
+            start = CUTOFF - 3_000 * MINUTE_MS
+            rows = []
+            for index in range(28):
+                opened_at = start + index * 20 * MINUTE_MS
+                expires_at = opened_at + 10 * MINUTE_MS
+                rows.append(
+                    observation(
+                        f"random-{seed:02d}-{index:02d}",
+                        rng.choice(("WIN", "LOSS")),
+                        opened_at,
+                        settled_at=max(
+                            expires_at,
+                            CUTOFF - rng.randint(1, 300) * MINUTE_MS,
+                        ),
+                        decision_id=f"random-decision-{seed:02d}-{index:02d}",
+                    )
+                )
+            for duplicate_index in range(5):
+                target = rows[rng.randrange(4, len(rows) - 4)]
+                opened_at = target.opened_at - rng.randint(1, 9) * MINUTE_MS
+                rows.append(
+                    observation(
+                        target.observation_key,
+                        rng.choice(("WIN", "LOSS")),
+                        opened_at,
+                        settled_at=CUTOFF - rng.randint(1, 120) * MINUTE_MS,
+                        decision_id=f"duplicate-decision-{seed:02d}-{duplicate_index:02d}",
+                    )
+                )
+            for overlap_index in range(5):
+                target = rows[rng.randrange(2, 26)]
+                opened_at = target.opened_at + rng.randint(1, 9) * MINUTE_MS
+                rows.append(
+                    observation(
+                        f"overlap-{seed:02d}-{overlap_index:02d}",
+                        rng.choice(("WIN", "LOSS")),
+                        opened_at,
+                        settled_at=CUTOFF - rng.randint(1, 120) * MINUTE_MS,
+                        decision_id=f"overlap-decision-{seed:02d}-{overlap_index:02d}",
+                    )
+                )
+            rng.shuffle(rows)
+
+            expected, _ = progressive_reference_rebuild(rows, CUTOFF)
+            actual = rebuild_adaptive_profile_states(rows, CUTOFF)
+
+            with self.subTest(seed=seed):
+                self.assertEqual(actual, expected)
+
+    def test_rebuild_progressive_overlap_replacement_preserves_transition_history(self):
+        start = CUTOFF - 60 * 20 * MINUTE_MS
+        results = ["LOSS"] * 8 + ["WIN"] * 5 + ["LOSS"] * 7
+        rows = [
+            observation(
+                f"replacement-{index:02d}",
+                result,
+                start + index * 20 * MINUTE_MS,
+                pnl=0.0 if result == "WIN" else -1.0,
+                decision_id=f"replacement-decision-{index:02d}",
+            )
+            for index, result in enumerate(results)
+        ]
+        rows[-1].observation_key = "z-replaced-loss"
+        delayed = observation(
+            "a-delayed-win",
             "WIN",
-            start + 40 * MINUTE_MS,
-            decision_id="shared-out-of-order-decision",
+            rows[-1].opened_at,
+            expires_at=rows[-1].expires_at,
+            settled_at=rows[-1].settled_at + MINUTE_MS,
+            pnl=0.0,
+            decision_id="a-delayed-win-decision",
         )
+        mixed = list(reversed(rows + [delayed]))
 
-        rebuilt = rebuild_adaptive_profile_states(
-            [later_valid, out_of_order, first],
-            CUTOFF,
-        )
+        expected, _ = progressive_reference_rebuild(mixed, CUTOFF)
+        actual = rebuild_adaptive_profile_states(mixed, CUTOFF)
 
-        self.assertEqual(rebuilt[PROFILE_KEY]["n12"]["sample_size"], 2)
-        self.assertEqual(rebuilt[PROFILE_KEY]["n12"]["wins"], 2)
+        self.assertEqual(expected[PROFILE_KEY]["status"], "WATCH")
+        self.assertEqual(expected[PROFILE_KEY]["previous"], "PAUSED")
+        self.assertEqual(expected[PROFILE_KEY]["transition"], "PAUSED->WATCH")
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 6)
+        self.assertEqual(actual, expected)
 
     def test_rebuild_handles_ten_thousand_events_with_one_linear_filter_pass(self):
-        rows = production_rows(10_000)
+        rows = delayed_production_rows(10_000)
         started = time.perf_counter()
         with patch.object(
             adaptive_module,

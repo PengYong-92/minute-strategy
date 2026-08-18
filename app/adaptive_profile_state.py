@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections import deque
+from bisect import bisect_left
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -45,11 +46,52 @@ class AdaptiveProfileStateConfig:
 @dataclass
 class _ProfileReplay:
     samples: deque[ObservationSignal]
+    interval_index: _IntervalOverlapIndex
+    candidates: list[ObservationSignal]
+    selected_counts: Counter[tuple]
     seen_observation_keys: set[str]
     seen_decision_ids: set[str]
-    last_opened_at: int | None = None
-    independent_until: int = 0
     previous_status: str | None = None
+
+
+class _IntervalOverlapIndex:
+    def __init__(self, candidates: Sequence[ObservationSignal]) -> None:
+        self._opened_at = sorted({item.opened_at for item in candidates})
+        size = 1
+        while size < len(self._opened_at):
+            size *= 2
+        self._size = size
+        self._max_expires = [-1] * (2 * size)
+
+    def overlaps(self, item: ObservationSignal) -> bool:
+        right = bisect_left(self._opened_at, item.expires_at)
+        left = self._size
+        right += self._size
+        max_expires = -1
+        while left < right:
+            if left % 2:
+                max_expires = max(max_expires, self._max_expires[left])
+                left += 1
+            if right % 2:
+                right -= 1
+                max_expires = max(max_expires, self._max_expires[right])
+            left //= 2
+            right //= 2
+        return max_expires > item.opened_at
+
+    def add(self, item: ObservationSignal) -> None:
+        position = self._size + bisect_left(self._opened_at, item.opened_at)
+        self._max_expires[position] = max(
+            self._max_expires[position],
+            item.expires_at,
+        )
+        position //= 2
+        while position:
+            self._max_expires[position] = max(
+                self._max_expires[2 * position],
+                self._max_expires[2 * position + 1],
+            )
+            position //= 2
 
 
 def evaluate_adaptive_profile_state(
@@ -64,7 +106,7 @@ def evaluate_adaptive_profile_state(
     _validate_profile_key(profile_key)
     samples = independent_settled_samples(observations, profile_key, cutoff)
     return classify_profile_state(
-        samples[-resolved.full_window_samples :],
+        samples,
         profile_key,
         cutoff,
         previous=previous,
@@ -160,12 +202,20 @@ def independent_settled_samples(
         prepared = _prepare_event(item, cutoff)
         if prepared is not None and prepared[0] == profile_key:
             candidates.append(item)
-    candidates.sort(key=_opened_sort_key)
+
+    return _canonical_independent_samples(candidates, cutoff)
+
+
+def _canonical_independent_samples(
+    candidates: Sequence[ObservationSignal],
+    evaluated_at: int,
+) -> list[ObservationSignal]:
+    ordered = sorted(candidates, key=_opened_sort_key)
 
     deduplicated = []
     seen_observation_keys: set[str] = set()
     seen_decision_ids: set[str] = set()
-    for item in candidates:
+    for item in ordered:
         observation_identity = item.observation_key
         decision_identity = item.decision_id
         if observation_identity and observation_identity in seen_observation_keys:
@@ -180,7 +230,7 @@ def independent_settled_samples(
 
     # The daily selector owns the opened/expires overlap boundary: touching
     # intervals are independent, while opened_at < previous expires_at overlaps.
-    return _independent_samples(deduplicated, -(2**63), cutoff)
+    return _independent_samples(deduplicated, -(2**63), evaluated_at)
 
 
 def rebuild_adaptive_profile_states(
@@ -190,43 +240,65 @@ def rebuild_adaptive_profile_states(
 ) -> dict[str, dict]:
     resolved = _resolve_config(config)
     cutoff = _validated_evaluated_at(evaluated_at)
-    events = []
+    events: list[tuple[str, ObservationSignal]] = []
     for item in observations:
         prepared = _prepare_event(item, cutoff)
         if prepared is not None:
             events.append(prepared)
     events.sort(key=_prepared_event_sort_key)
 
+    candidates_by_profile: dict[str, list[ObservationSignal]] = {}
+    for key, event in events:
+        candidates_by_profile.setdefault(key, []).append(event)
+
     states: dict[str, dict] = {}
-    profiles: dict[str, _ProfileReplay] = {}
+    profiles = {
+        key: _ProfileReplay(
+            samples=deque(maxlen=resolved.full_window_samples),
+            interval_index=_IntervalOverlapIndex(candidates),
+            candidates=[],
+            selected_counts=Counter(),
+            seen_observation_keys=set(),
+            seen_decision_ids=set(),
+        )
+        for key, candidates in candidates_by_profile.items()
+    }
 
     for key, event in events:
-        replay = profiles.get(key)
-        if replay is None:
-            replay = _ProfileReplay(
-                samples=deque(maxlen=resolved.full_window_samples),
-                seen_observation_keys=set(),
-                seen_decision_ids=set(),
-            )
-            profiles[key] = replay
-
+        replay = profiles[key]
         observation_identity = event.observation_key
         decision_identity = event.decision_id
-        if observation_identity and observation_identity in replay.seen_observation_keys:
-            continue
-        if decision_identity and decision_identity in replay.seen_decision_ids:
-            continue
-        if replay.last_opened_at is not None and event.opened_at < replay.last_opened_at:
-            continue
-        replay.last_opened_at = event.opened_at
+        identity_conflict = bool(
+            (observation_identity and observation_identity in replay.seen_observation_keys)
+            or (decision_identity and decision_identity in replay.seen_decision_ids)
+        )
+        interval_conflict = replay.interval_index.overlaps(event)
+
+        replay.candidates.append(event)
+        replay.interval_index.add(event)
         if observation_identity:
             replay.seen_observation_keys.add(observation_identity)
         if decision_identity:
             replay.seen_decision_ids.add(decision_identity)
-        if event.opened_at < replay.independent_until:
-            continue
-        replay.independent_until = event.expires_at
-        replay.samples.append(event)
+
+        if identity_conflict or interval_conflict:
+            selected = _canonical_independent_samples(
+                replay.candidates,
+                int(event.settled_at) + 1,
+            )
+            selected_counts = Counter(_observation_signature(item) for item in selected)
+            if selected_counts == replay.selected_counts:
+                continue
+            replay.selected_counts = selected_counts
+            replay.samples = deque(
+                sorted(selected, key=_settlement_sort_key)[
+                    -resolved.full_window_samples :
+                ],
+                maxlen=resolved.full_window_samples,
+            )
+        else:
+            replay.selected_counts[_observation_signature(event)] += 1
+            replay.samples.append(event)
 
         event_cutoff = int(event.settled_at) + 1
         states[key] = classify_profile_state(
@@ -241,6 +313,18 @@ def rebuild_adaptive_profile_states(
     for state in states.values():
         state["evaluated_at"] = cutoff
     return states
+
+
+def _observation_signature(item: ObservationSignal) -> tuple:
+    return (
+        item.observation_key,
+        item.decision_id,
+        item.opened_at,
+        item.expires_at,
+        item.settled_at,
+        item.result,
+        float(item.pnl).hex(),
+    )
 
 
 def _resolve_config(config: AdaptiveProfileStateConfig | None) -> AdaptiveProfileStateConfig:
@@ -406,9 +490,9 @@ def _settlement_sort_key(item: ObservationSignal) -> tuple:
     return (
         int(item.settled_at),
         item.opened_at,
-        item.expires_at,
         item.observation_key,
         item.decision_id,
+        item.expires_at,
         str(item.result),
         float(item.pnl),
     )
@@ -420,9 +504,9 @@ def _prepared_event_sort_key(prepared: tuple[str, ObservationSignal]) -> tuple:
         item.settled_at,
         key,
         item.opened_at,
-        item.expires_at,
         item.observation_key,
         item.decision_id,
+        item.expires_at,
         item.result,
         float(item.pnl).hex(),
     )
