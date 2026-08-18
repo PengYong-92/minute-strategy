@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from bisect import bisect_left
-from collections import Counter, deque
+from bisect import bisect_left, bisect_right
+from collections import deque
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -46,52 +46,205 @@ class AdaptiveProfileStateConfig:
 @dataclass
 class _ProfileReplay:
     samples: deque[ObservationSignal]
-    interval_index: _IntervalOverlapIndex
-    candidates: list[ObservationSignal]
-    selected_counts: Counter[tuple]
-    seen_observation_keys: set[str]
-    seen_decision_ids: set[str]
+    selection: _IncrementalCanonicalSelection
     previous_status: str | None = None
 
 
-class _IntervalOverlapIndex:
-    def __init__(self, candidates: Sequence[ObservationSignal]) -> None:
-        self._opened_at = sorted({item.opened_at for item in candidates})
-        size = 1
-        while size < len(self._opened_at):
-            size *= 2
-        self._size = size
-        self._max_expires = [-1] * (2 * size)
+@dataclass(frozen=True)
+class _ReplayCandidate:
+    event: ObservationSignal
+    order_key: tuple
+    serial: int
 
-    def overlaps(self, item: ObservationSignal) -> bool:
-        right = bisect_left(self._opened_at, item.expires_at)
-        left = self._size
-        right += self._size
-        max_expires = -1
-        while left < right:
-            if left % 2:
-                max_expires = max(max_expires, self._max_expires[left])
-                left += 1
-            if right % 2:
-                right -= 1
-                max_expires = max(max_expires, self._max_expires[right])
-            left //= 2
-            right //= 2
-        return max_expires > item.opened_at
 
-    def add(self, item: ObservationSignal) -> None:
-        position = self._size + bisect_left(self._opened_at, item.opened_at)
-        self._max_expires[position] = max(
-            self._max_expires[position],
-            item.expires_at,
+@dataclass(frozen=True)
+class _SelectionUpdate:
+    changed: bool
+    append_only: ObservationSignal | None = None
+
+
+class _IncrementalCanonicalSelection:
+    def __init__(self) -> None:
+        self._serial = 0
+        self._ordered: list[_ReplayCandidate] = []
+        self._ordered_keys: list[tuple] = []
+        self._identity_selected: list[_ReplayCandidate] = []
+        self._identity_keys: list[tuple] = []
+        self._interval_selected: list[_ReplayCandidate] = []
+        self._interval_keys: list[tuple] = []
+        self._observation_owners: dict[str, _ReplayCandidate] = {}
+        self._decision_owners: dict[str, _ReplayCandidate] = {}
+
+    @property
+    def selected_events(self) -> list[ObservationSignal]:
+        return [candidate.event for candidate in self._interval_selected]
+
+    def add(self, event: ObservationSignal) -> _SelectionUpdate:
+        candidate = _ReplayCandidate(
+            event=event,
+            order_key=(*_opened_sort_key(event), self._serial),
+            serial=self._serial,
         )
-        position //= 2
-        while position:
-            self._max_expires[position] = max(
-                self._max_expires[2 * position],
-                self._max_expires[2 * position + 1],
+        self._serial += 1
+        position = bisect_right(self._ordered_keys, candidate.order_key)
+        self._ordered_keys.insert(position, candidate.order_key)
+        self._ordered.insert(position, candidate)
+
+        observation_owner = (
+            self._observation_owners.get(event.observation_key)
+            if event.observation_key
+            else None
+        )
+        decision_owner = (
+            self._decision_owners.get(event.decision_id)
+            if event.decision_id
+            else None
+        )
+        owners = [owner for owner in (observation_owner, decision_owner) if owner]
+        if any(owner.order_key < candidate.order_key for owner in owners):
+            return _SelectionUpdate(False)
+
+        if not owners:
+            self._insert_identity_candidate(candidate)
+            return self._add_unique_interval_candidate(candidate)
+
+        owner = owners[0]
+        exact_owner_replacement = (
+            all(item is owner for item in owners)
+            and owner.event.observation_key == event.observation_key
+            and owner.event.decision_id == event.decision_id
+        )
+        before = self._canonical_signature()
+        if exact_owner_replacement:
+            self._replace_identity_candidate(owner, candidate)
+            self._repair_interval_suffix(
+                min(owner.order_key, candidate.order_key),
+                convergence_after=owner.order_key,
             )
-            position //= 2
+        else:
+            self._rebuild_identity_suffix(candidate.order_key)
+            self._repair_interval_suffix(candidate.order_key)
+        return _SelectionUpdate(self._canonical_signature() != before)
+
+    def _insert_identity_candidate(self, candidate: _ReplayCandidate) -> None:
+        position = bisect_right(self._identity_keys, candidate.order_key)
+        self._identity_keys.insert(position, candidate.order_key)
+        self._identity_selected.insert(position, candidate)
+        self._set_owner(candidate)
+
+    def _replace_identity_candidate(
+        self,
+        owner: _ReplayCandidate,
+        candidate: _ReplayCandidate,
+    ) -> None:
+        position = bisect_left(self._identity_keys, owner.order_key)
+        self._identity_keys.pop(position)
+        self._identity_selected.pop(position)
+        self._insert_identity_candidate(candidate)
+
+    def _rebuild_identity_suffix(self, affected_key: tuple) -> None:
+        prefix_end = bisect_left(self._identity_keys, affected_key)
+        selected = self._identity_selected[:prefix_end]
+        seen_observation_keys = {
+            candidate.event.observation_key
+            for candidate in selected
+            if candidate.event.observation_key
+        }
+        seen_decision_ids = {
+            candidate.event.decision_id
+            for candidate in selected
+            if candidate.event.decision_id
+        }
+        ordered_start = bisect_left(self._ordered_keys, affected_key)
+        for candidate in self._ordered[ordered_start:]:
+            observation_identity = candidate.event.observation_key
+            decision_identity = candidate.event.decision_id
+            if observation_identity and observation_identity in seen_observation_keys:
+                continue
+            if decision_identity and decision_identity in seen_decision_ids:
+                continue
+            selected.append(candidate)
+            if observation_identity:
+                seen_observation_keys.add(observation_identity)
+            if decision_identity:
+                seen_decision_ids.add(decision_identity)
+
+        self._identity_selected = selected
+        self._identity_keys = [candidate.order_key for candidate in selected]
+        self._observation_owners.clear()
+        self._decision_owners.clear()
+        for candidate in selected:
+            self._set_owner(candidate)
+
+    def _set_owner(self, candidate: _ReplayCandidate) -> None:
+        if candidate.event.observation_key:
+            self._observation_owners[candidate.event.observation_key] = candidate
+        if candidate.event.decision_id:
+            self._decision_owners[candidate.event.decision_id] = candidate
+
+    def _add_unique_interval_candidate(
+        self,
+        candidate: _ReplayCandidate,
+    ) -> _SelectionUpdate:
+        successor = bisect_left(self._interval_keys, candidate.order_key)
+        if successor:
+            predecessor = self._interval_selected[successor - 1]
+            if candidate.event.opened_at < predecessor.event.expires_at:
+                return _SelectionUpdate(False)
+        if (
+            successor == len(self._interval_selected)
+            or candidate.event.expires_at
+            <= self._interval_selected[successor].event.opened_at
+        ):
+            self._interval_keys.insert(successor, candidate.order_key)
+            self._interval_selected.insert(successor, candidate)
+            return _SelectionUpdate(True, append_only=candidate.event)
+
+        before = self._canonical_signature()
+        self._repair_interval_suffix(
+            candidate.order_key,
+            convergence_after=candidate.order_key,
+        )
+        return _SelectionUpdate(self._canonical_signature() != before)
+
+    def _repair_interval_suffix(
+        self,
+        affected_key: tuple,
+        *,
+        convergence_after: tuple | None = None,
+    ) -> None:
+        old_selected = self._interval_selected
+        old_keys = self._interval_keys
+        prefix_end = bisect_left(old_keys, affected_key)
+        selected = old_selected[:prefix_end]
+        next_independent_at = selected[-1].event.expires_at if selected else 0
+        old_positions = {
+            candidate.serial: index for index, candidate in enumerate(old_selected)
+        }
+        identity_start = bisect_left(self._identity_keys, affected_key)
+
+        for candidate in self._identity_selected[identity_start:]:
+            if candidate.event.opened_at >= next_independent_at:
+                selected.append(candidate)
+                next_independent_at = candidate.event.expires_at
+            old_position = old_positions.get(candidate.serial)
+            if (
+                convergence_after is not None
+                and candidate.order_key >= convergence_after
+                and old_position is not None
+                and next_independent_at == candidate.event.expires_at
+            ):
+                selected.extend(old_selected[old_position + 1 :])
+                break
+
+        self._interval_selected = selected
+        self._interval_keys = [candidate.order_key for candidate in selected]
+
+    def _canonical_signature(self) -> tuple:
+        return tuple(
+            _observation_signature(candidate.event)
+            for candidate in self._interval_selected
+        )
 
 
 def evaluate_adaptive_profile_state(
@@ -247,58 +400,30 @@ def rebuild_adaptive_profile_states(
             events.append(prepared)
     events.sort(key=_prepared_event_sort_key)
 
-    candidates_by_profile: dict[str, list[ObservationSignal]] = {}
-    for key, event in events:
-        candidates_by_profile.setdefault(key, []).append(event)
-
     states: dict[str, dict] = {}
-    profiles = {
-        key: _ProfileReplay(
-            samples=deque(maxlen=resolved.full_window_samples),
-            interval_index=_IntervalOverlapIndex(candidates),
-            candidates=[],
-            selected_counts=Counter(),
-            seen_observation_keys=set(),
-            seen_decision_ids=set(),
-        )
-        for key, candidates in candidates_by_profile.items()
-    }
+    profiles: dict[str, _ProfileReplay] = {}
 
     for key, event in events:
-        replay = profiles[key]
-        observation_identity = event.observation_key
-        decision_identity = event.decision_id
-        identity_conflict = bool(
-            (observation_identity and observation_identity in replay.seen_observation_keys)
-            or (decision_identity and decision_identity in replay.seen_decision_ids)
-        )
-        interval_conflict = replay.interval_index.overlaps(event)
-
-        replay.candidates.append(event)
-        replay.interval_index.add(event)
-        if observation_identity:
-            replay.seen_observation_keys.add(observation_identity)
-        if decision_identity:
-            replay.seen_decision_ids.add(decision_identity)
-
-        if identity_conflict or interval_conflict:
-            selected = _canonical_independent_samples(
-                replay.candidates,
-                int(event.settled_at) + 1,
+        replay = profiles.get(key)
+        if replay is None:
+            replay = _ProfileReplay(
+                samples=deque(maxlen=resolved.full_window_samples),
+                selection=_IncrementalCanonicalSelection(),
             )
-            selected_counts = Counter(_observation_signature(item) for item in selected)
-            if selected_counts == replay.selected_counts:
-                continue
-            replay.selected_counts = selected_counts
+            profiles[key] = replay
+
+        update = replay.selection.add(event)
+        if not update.changed:
+            continue
+        if update.append_only is not None:
+            replay.samples.append(update.append_only)
+        else:
             replay.samples = deque(
-                sorted(selected, key=_settlement_sort_key)[
+                sorted(replay.selection.selected_events, key=_settlement_sort_key)[
                     -resolved.full_window_samples :
                 ],
                 maxlen=resolved.full_window_samples,
             )
-        else:
-            replay.selected_counts[_observation_signature(event)] += 1
-            replay.samples.append(event)
 
         event_cutoff = int(event.settled_at) + 1
         states[key] = classify_profile_state(

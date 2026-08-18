@@ -125,6 +125,37 @@ def delayed_production_rows(sample_size: int) -> list[ObservationSignal]:
     return rows
 
 
+def all_overlap_rows(sample_size: int) -> list[ObservationSignal]:
+    opened_at = CUTOFF - 40 * MINUTE_MS
+    expires_at = opened_at + 10 * MINUTE_MS
+    return [
+        observation(
+            f"all-overlap-{index:05d}",
+            "WIN" if index % 2 == 0 else "LOSS",
+            opened_at,
+            expires_at=expires_at,
+            settled_at=expires_at + index,
+            decision_id=f"all-overlap-decision-{index:05d}",
+        )
+        for index in range(sample_size)
+    ]
+
+
+def duplicate_replacement_rows(sample_size: int) -> list[ObservationSignal]:
+    settlement_start = CUTOFF - sample_size - 1
+    opened_start = settlement_start - (sample_size + 2) * 20 * MINUTE_MS
+    return [
+        observation(
+            "duplicate-heavy-observation",
+            "WIN" if index % 2 == 0 else "LOSS",
+            opened_start + index * 20 * MINUTE_MS,
+            settled_at=settlement_start + (sample_size - 1 - index),
+            decision_id="duplicate-heavy-decision",
+        )
+        for index in range(sample_size)
+    ]
+
+
 def state_trace_item(key: str, result: dict) -> tuple:
     return (
         key,
@@ -689,11 +720,115 @@ class AdaptiveProfileStateTest(unittest.TestCase):
                 )
             rng.shuffle(rows)
 
-            expected, _ = progressive_reference_rebuild(rows, CUTOFF)
-            actual = rebuild_adaptive_profile_states(rows, CUTOFF)
+            expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+            actual_trace = []
+            real_classify = adaptive_module.classify_profile_state
+
+            def recording_classify(*args, **kwargs):
+                result = real_classify(*args, **kwargs)
+                actual_trace.append(state_trace_item(args[1], result))
+                return result
+
+            with patch.object(
+                adaptive_module,
+                "classify_profile_state",
+                side_effect=recording_classify,
+            ):
+                actual = rebuild_adaptive_profile_states(rows, CUTOFF)
 
             with self.subTest(seed=seed):
+                self.assertEqual(actual_trace, expected_trace)
                 self.assertEqual(actual, expected)
+
+    def test_rebuild_cross_linked_identities_release_skipped_successor(self):
+        start = CUTOFF - 100 * MINUTE_MS
+        delayed = observation(
+            "shared-observation",
+            "WIN",
+            start,
+            settled_at=start + 80 * MINUTE_MS,
+            decision_id="first-decision",
+        )
+        initially_selected = observation(
+            "shared-observation",
+            "LOSS",
+            start + 20 * MINUTE_MS,
+            settled_at=start + 40 * MINUTE_MS,
+            decision_id="shared-decision",
+        )
+        released_successor = observation(
+            "released-observation",
+            "WIN",
+            start + 40 * MINUTE_MS,
+            settled_at=start + 60 * MINUTE_MS,
+            decision_id="shared-decision",
+        )
+        rows = [released_successor, delayed, initially_selected]
+        expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+        actual_trace = []
+        real_classify = adaptive_module.classify_profile_state
+
+        def recording_classify(*args, **kwargs):
+            result = real_classify(*args, **kwargs)
+            actual_trace.append(state_trace_item(args[1], result))
+            return result
+
+        with patch.object(
+            adaptive_module,
+            "classify_profile_state",
+            side_effect=recording_classify,
+        ):
+            actual = rebuild_adaptive_profile_states(rows, CUTOFF)
+
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["sample_size"], 2)
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 2)
+        self.assertEqual(actual_trace, expected_trace)
+        self.assertEqual(actual, expected)
+
+    def test_rebuild_partial_identity_replacement_releases_old_decision(self):
+        start = CUTOFF - 100 * MINUTE_MS
+        delayed = observation(
+            "shared-observation",
+            "WIN",
+            start,
+            settled_at=start + 80 * MINUTE_MS,
+            decision_id="",
+        )
+        old_owner = observation(
+            "shared-observation",
+            "LOSS",
+            start + 20 * MINUTE_MS,
+            settled_at=start + 40 * MINUTE_MS,
+            decision_id="released-decision",
+        )
+        released_successor = observation(
+            "released-observation",
+            "WIN",
+            start + 40 * MINUTE_MS,
+            settled_at=start + 60 * MINUTE_MS,
+            decision_id="released-decision",
+        )
+        rows = [released_successor, delayed, old_owner]
+        expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+        actual_trace = []
+        real_classify = adaptive_module.classify_profile_state
+
+        def recording_classify(*args, **kwargs):
+            result = real_classify(*args, **kwargs)
+            actual_trace.append(state_trace_item(args[1], result))
+            return result
+
+        with patch.object(
+            adaptive_module,
+            "classify_profile_state",
+            side_effect=recording_classify,
+        ):
+            actual = rebuild_adaptive_profile_states(rows, CUTOFF)
+
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["sample_size"], 2)
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 2)
+        self.assertEqual(actual_trace, expected_trace)
+        self.assertEqual(actual, expected)
 
     def test_rebuild_progressive_overlap_replacement_preserves_transition_history(self):
         start = CUTOFF - 60 * 20 * MINUTE_MS
@@ -742,6 +877,47 @@ class AdaptiveProfileStateTest(unittest.TestCase):
 
         self.assertEqual(eligibility.call_count, 10_000)
         self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 20)
+        self.assertLess(elapsed, 5.0)
+
+    def test_rebuild_ten_thousand_all_overlap_never_rescans_prefix(self):
+        rows = all_overlap_rows(10_000)
+        started = time.perf_counter()
+        with patch.object(
+            adaptive_module,
+            "_canonical_independent_samples",
+            side_effect=AssertionError("rebuild must maintain canonical selection"),
+        ):
+            with patch.object(
+                adaptive_module,
+                "classify_profile_state",
+                wraps=adaptive_module.classify_profile_state,
+            ) as classify:
+                rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(classify.call_count, 1)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 1)
+        self.assertLess(elapsed, 5.0)
+
+    def test_rebuild_ten_thousand_duplicate_replacements_never_rescan_prefix(self):
+        rows = duplicate_replacement_rows(10_000)
+        started = time.perf_counter()
+        with patch.object(
+            adaptive_module,
+            "_canonical_independent_samples",
+            side_effect=AssertionError("rebuild must maintain canonical selection"),
+        ):
+            with patch.object(
+                adaptive_module,
+                "classify_profile_state",
+                wraps=adaptive_module.classify_profile_state,
+            ) as classify:
+                rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(classify.call_count, 10_000)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 1)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["wins"], 1)
         self.assertLess(elapsed, 5.0)
 
     def test_rebuild_replays_paused_then_watch_without_future_leak(self):
