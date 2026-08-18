@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -12,12 +13,6 @@ from app.models import ObservationSignal
 ADAPTIVE_PROFILE_STATE_VERSION = "ADAPTIVE_PROFILE_STATE_V1"
 _PROFILE_SEGMENT = re.compile(r"(?:WD|WE)-(?:0[0-9]|1[0-9]|2[0-3])\Z")
 _KNOWN_STATES = {"WARMUP", "ACTIVE", "WATCH", "PAUSED"}
-_LEGACY_STATES = {
-    "HEALTHY": "ACTIVE",
-    "DEGRADED": "PAUSED",
-    "QUALIFICATION_WATCH": "WATCH",
-    "INSUFFICIENT_SAMPLES": "WARMUP",
-}
 
 
 @dataclass(frozen=True)
@@ -45,6 +40,16 @@ class AdaptiveProfileStateConfig:
             raise ValueError("paused_n12_max_wins must be below active_n12_wins")
         if self.full_window_samples <= self.warmup_samples:
             raise ValueError("full_window_samples must be longer than the warmup window")
+
+
+@dataclass
+class _ProfileReplay:
+    samples: deque[ObservationSignal]
+    seen_observation_keys: set[str]
+    seen_decision_ids: set[str]
+    last_opened_at: int | None = None
+    independent_until: int = 0
+    previous_status: str | None = None
 
 
 def evaluate_adaptive_profile_state(
@@ -82,7 +87,11 @@ def classify_profile_state(
     n12_rows = recent[-resolved.warmup_samples :]
     n12 = _summary(n12_rows)
     n20 = _summary(recent)
-    previous_status = _normalize_previous(previous)
+    previous_status, previous_ignored_reason = _resolve_previous(
+        previous,
+        profile_key_value,
+        cutoff,
+    )
 
     mature = n12["sample_size"] >= resolved.warmup_samples
     full = n20["sample_size"] >= resolved.full_window_samples
@@ -120,6 +129,8 @@ def classify_profile_state(
     else:
         status = "WATCH"
         reason = "Mature profile satisfies neither ACTIVE nor PAUSED conditions"
+    if previous_ignored_reason:
+        reason = f"{reason}; {previous_ignored_reason}"
 
     _remove_raw_metrics(n12)
     _remove_raw_metrics(n20)
@@ -133,6 +144,7 @@ def classify_profile_state(
         "n20": n20,
         "previous": previous_status,
         "transition": f"{previous_status or 'NONE'}->{status}",
+        "previous_ignored_reason": previous_ignored_reason,
     }
 
 
@@ -143,20 +155,19 @@ def independent_settled_samples(
 ) -> list[ObservationSignal]:
     cutoff = _validated_evaluated_at(evaluated_at)
     _validate_profile_key(profile_key)
-    candidates = [
-        item
-        for item in observations
-        if _eligible_observation(item, cutoff)
-        and _observation_profile_key(item) == profile_key
-    ]
+    candidates = []
+    for item in observations:
+        prepared = _prepare_event(item, cutoff)
+        if prepared is not None and prepared[0] == profile_key:
+            candidates.append(item)
     candidates.sort(key=_opened_sort_key)
 
     deduplicated = []
     seen_observation_keys: set[str] = set()
     seen_decision_ids: set[str] = set()
     for item in candidates:
-        observation_identity = str(item.observation_key or "")
-        decision_identity = str(item.decision_id or "")
+        observation_identity = item.observation_key
+        decision_identity = item.decision_id
         if observation_identity and observation_identity in seen_observation_keys:
             continue
         if decision_identity and decision_identity in seen_decision_ids:
@@ -179,49 +190,53 @@ def rebuild_adaptive_profile_states(
 ) -> dict[str, dict]:
     resolved = _resolve_config(config)
     cutoff = _validated_evaluated_at(evaluated_at)
-    events = [item for item in observations if _eligible_observation(item, cutoff)]
-    events.sort(key=_event_sort_key)
+    events = []
+    for item in observations:
+        prepared = _prepare_event(item, cutoff)
+        if prepared is not None:
+            events.append(prepared)
+    events.sort(key=_prepared_event_sort_key)
 
     states: dict[str, dict] = {}
-    prefixes: dict[str, list[ObservationSignal]] = {}
-    sample_signatures: dict[str, tuple] = {}
-    seen_observation_keys: dict[str, set[str]] = {}
-    seen_decision_ids: dict[str, set[str]] = {}
+    profiles: dict[str, _ProfileReplay] = {}
 
-    for event in events:
-        key = _observation_profile_key(event)
-        try:
-            _validate_profile_key(key)
-        except ValueError:
+    for key, event in events:
+        replay = profiles.get(key)
+        if replay is None:
+            replay = _ProfileReplay(
+                samples=deque(maxlen=resolved.full_window_samples),
+                seen_observation_keys=set(),
+                seen_decision_ids=set(),
+            )
+            profiles[key] = replay
+
+        observation_identity = event.observation_key
+        decision_identity = event.decision_id
+        if observation_identity and observation_identity in replay.seen_observation_keys:
             continue
-        observation_identity = str(event.observation_key or "")
-        decision_identity = str(event.decision_id or "")
-        key_observations = seen_observation_keys.setdefault(key, set())
-        key_decisions = seen_decision_ids.setdefault(key, set())
-        if observation_identity and observation_identity in key_observations:
+        if decision_identity and decision_identity in replay.seen_decision_ids:
             continue
-        if decision_identity and decision_identity in key_decisions:
+        if replay.last_opened_at is not None and event.opened_at < replay.last_opened_at:
             continue
+        replay.last_opened_at = event.opened_at
         if observation_identity:
-            key_observations.add(observation_identity)
+            replay.seen_observation_keys.add(observation_identity)
         if decision_identity:
-            key_decisions.add(decision_identity)
-
-        prefix = prefixes.setdefault(key, [])
-        prefix.append(event)
-        event_cutoff = int(event.settled_at) + 1
-        samples = independent_settled_samples(prefix, key, event_cutoff)
-        signature = tuple(_sample_signature(item) for item in samples[-resolved.full_window_samples :])
-        if signature == sample_signatures.get(key):
+            replay.seen_decision_ids.add(decision_identity)
+        if event.opened_at < replay.independent_until:
             continue
-        sample_signatures[key] = signature
+        replay.independent_until = event.expires_at
+        replay.samples.append(event)
+
+        event_cutoff = int(event.settled_at) + 1
         states[key] = classify_profile_state(
-            samples[-resolved.full_window_samples :],
+            replay.samples,
             key,
             event_cutoff,
-            previous=states.get(key),
+            previous=replay.previous_status,
             config=resolved,
         )
+        replay.previous_status = states[key]["status"]
 
     for state in states.values():
         state["evaluated_at"] = cutoff
@@ -269,11 +284,14 @@ def _eligible_observation(item: ObservationSignal, evaluated_at: int) -> bool:
         item.status != "SETTLED"
         or item.result not in {"WIN", "LOSS"}
         or item.opened_at < 0
-        or item.expires_at <= item.opened_at
+        or not item.opened_at < item.expires_at <= item.settled_at
         or item.opened_at >= evaluated_at
-        or item.settled_at <= 0
         or item.settled_at >= evaluated_at
+        or not isinstance(item.observation_key, str)
+        or not isinstance(item.decision_id, str)
     ):
+        return False
+    if isinstance(item.pnl, bool):
         return False
     try:
         return math.isfinite(float(item.pnl))
@@ -281,25 +299,69 @@ def _eligible_observation(item: ObservationSignal, evaluated_at: int) -> bool:
         return False
 
 
-def _observation_profile_key(item: ObservationSignal) -> str:
-    return build_profile_key(
+def _prepare_event(
+    item: ObservationSignal,
+    evaluated_at: int,
+) -> tuple[str, ObservationSignal] | None:
+    if not _eligible_observation(item, evaluated_at):
+        return None
+    key = _safe_observation_profile_key(item)
+    return None if key is None else (key, item)
+
+
+def _safe_observation_profile_key(item: ObservationSignal) -> str | None:
+    if type(item.timeframe_minutes) is not int or item.timeframe_minutes != 10:
+        return None
+    if not isinstance(item.strategy_family, str) or not item.strategy_family:
+        return None
+    if not isinstance(item.strategy_tag, str) or not item.strategy_tag:
+        return None
+    if item.direction not in {"LONG", "SHORT"}:
+        return None
+    if not isinstance(item.threshold_segment, str):
+        return None
+    if _PROFILE_SEGMENT.fullmatch(item.threshold_segment) is None:
+        return None
+    key = build_profile_key(
         item.timeframe_minutes,
         item.strategy_family,
         item.strategy_tag,
         item.direction,
         item.threshold_segment,
     )
+    try:
+        _validate_profile_key(key)
+    except (TypeError, ValueError):
+        return None
+    return key
 
 
-def _normalize_previous(previous: str | dict | None) -> str | None:
-    if isinstance(previous, dict):
-        value = previous.get("status", previous.get("state"))
-    else:
-        value = previous
-    normalized = str(value or "").upper()
-    if normalized in _KNOWN_STATES:
-        return normalized
-    return _LEGACY_STATES.get(normalized)
+def _resolve_previous(
+    previous: str | dict | None,
+    target_profile_key: str,
+    evaluated_at: int,
+) -> tuple[str | None, str]:
+    if previous is None:
+        return None, ""
+    if isinstance(previous, str):
+        if previous in _KNOWN_STATES:
+            return previous, ""
+        return None, "PREVIOUS_STATUS_INVALID"
+    if not isinstance(previous, dict):
+        return None, "PREVIOUS_FORMAT_INVALID"
+    if previous.get("version") != ADAPTIVE_PROFILE_STATE_VERSION:
+        return None, "PREVIOUS_VERSION_INCOMPATIBLE"
+    if previous.get("profile_key") != target_profile_key:
+        return None, "PREVIOUS_PROFILE_KEY_MISMATCH"
+    previous_evaluated_at = previous.get("evaluated_at")
+    if type(previous_evaluated_at) is not int or previous_evaluated_at < 0:
+        return None, "PREVIOUS_EVALUATED_AT_INVALID"
+    if previous_evaluated_at >= evaluated_at:
+        return None, "PREVIOUS_EVALUATED_AT_NOT_PAST"
+    previous_status = previous.get("status")
+    if previous_status not in _KNOWN_STATES:
+        return None, "PREVIOUS_STATUS_INVALID"
+    return previous_status, ""
 
 
 def _summary(rows: Sequence[ObservationSignal]) -> dict:
@@ -331,8 +393,8 @@ def _display_number(value: float, digits: int) -> float:
 def _opened_sort_key(item: ObservationSignal) -> tuple:
     return (
         item.opened_at,
-        str(item.observation_key or ""),
-        str(item.decision_id or ""),
+        item.observation_key,
+        item.decision_id,
         item.expires_at,
         int(item.settled_at),
         str(item.result),
@@ -345,33 +407,22 @@ def _settlement_sort_key(item: ObservationSignal) -> tuple:
         int(item.settled_at),
         item.opened_at,
         item.expires_at,
-        str(item.observation_key or ""),
-        str(item.decision_id or ""),
+        item.observation_key,
+        item.decision_id,
         str(item.result),
         float(item.pnl),
     )
 
 
-def _event_sort_key(item: ObservationSignal) -> tuple:
+def _prepared_event_sort_key(prepared: tuple[str, ObservationSignal]) -> tuple:
+    key, item = prepared
     return (
-        int(item.settled_at),
-        _observation_profile_key(item),
+        item.settled_at,
+        key,
         item.opened_at,
         item.expires_at,
-        str(item.observation_key or ""),
-        str(item.decision_id or ""),
-        str(item.result),
-        float(item.pnl),
-    )
-
-
-def _sample_signature(item: ObservationSignal) -> tuple:
-    return (
-        str(item.observation_key or ""),
-        str(item.decision_id or ""),
-        item.opened_at,
-        item.expires_at,
-        int(item.settled_at),
-        str(item.result),
-        float(item.pnl),
+        item.observation_key,
+        item.decision_id,
+        item.result,
+        float(item.pnl).hex(),
     )

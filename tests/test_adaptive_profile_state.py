@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import math
+import time
 import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
+from unittest.mock import patch
 
+import app.adaptive_profile_state as adaptive_module
 from app.adaptive_profile_state import (
     ADAPTIVE_PROFILE_STATE_VERSION,
     AdaptiveProfileStateConfig,
+    classify_profile_state,
     evaluate_adaptive_profile_state,
     independent_settled_samples,
     rebuild_adaptive_profile_states,
@@ -94,6 +98,97 @@ def adaptive_rows(
         target_pnl = n20_ev * sample_size
         rows[-1].pnl += target_pnl - math.fsum(item.pnl for item in rows)
     return rows
+
+
+def production_rows(sample_size: int) -> list[ObservationSignal]:
+    start = CUTOFF - (sample_size + 2) * 20 * MINUTE_MS
+    return [
+        observation(
+            f"production-{index:05d}",
+            "WIN" if index % 2 == 0 else "LOSS",
+            start + index * 20 * MINUTE_MS,
+            decision_id=f"production-decision-{index:05d}",
+        )
+        for index in range(sample_size)
+    ]
+
+
+def state_trace_item(key: str, result: dict) -> tuple:
+    return (
+        key,
+        result["status"],
+        result["previous"],
+        result["transition"],
+        result["n12"],
+        result["n20"],
+    )
+
+
+def trusted_reference_rebuild(
+    rows: list[ObservationSignal],
+    evaluated_at: int,
+) -> tuple[dict[str, dict], list[tuple]]:
+    events = sorted(
+        rows,
+        key=lambda item: (
+            item.settled_at,
+            profile_key(
+                item.timeframe_minutes,
+                item.strategy_family,
+                item.strategy_tag,
+                item.direction,
+                item.threshold_segment,
+            ),
+            item.opened_at,
+            item.expires_at,
+            item.observation_key,
+            item.decision_id,
+            item.result,
+            float(item.pnl).hex(),
+        ),
+    )
+    prefixes: dict[str, list[ObservationSignal]] = {}
+    signatures: dict[str, tuple] = {}
+    states: dict[str, dict] = {}
+    trace = []
+    for event in events:
+        key = profile_key(
+            event.timeframe_minutes,
+            event.strategy_family,
+            event.strategy_tag,
+            event.direction,
+            event.threshold_segment,
+        )
+        prefix = prefixes.setdefault(key, [])
+        prefix.append(event)
+        event_cutoff = event.settled_at + 1
+        samples = independent_settled_samples(prefix, key, event_cutoff)[-20:]
+        signature = tuple(
+            (
+                item.observation_key,
+                item.decision_id,
+                item.opened_at,
+                item.expires_at,
+                item.settled_at,
+                item.result,
+                item.pnl,
+            )
+            for item in samples
+        )
+        if signature == signatures.get(key):
+            continue
+        signatures[key] = signature
+        result = classify_profile_state(
+            samples,
+            key,
+            event_cutoff,
+            previous=states.get(key, {}).get("status"),
+        )
+        states[key] = result
+        trace.append(state_trace_item(key, result))
+    for state in states.values():
+        state["evaluated_at"] = evaluated_at
+    return states, trace
 
 
 class AdaptiveProfileStateTest(unittest.TestCase):
@@ -251,21 +346,233 @@ class AdaptiveProfileStateTest(unittest.TestCase):
             1,
         )
 
-    def test_unknown_previous_is_stateless_and_legacy_degraded_is_paused(self):
+    def test_previous_accepts_legacy_four_state_string_and_valid_structured_state(self):
         rows = adaptive_rows(20, 7, n20_ev=0.0)
-        unknown = evaluate_adaptive_profile_state(rows, PROFILE_KEY, CUTOFF, "OLD_UNKNOWN")
-        legacy = evaluate_adaptive_profile_state(
+        legacy = evaluate_adaptive_profile_state(rows, PROFILE_KEY, CUTOFF, "PAUSED")
+        structured = evaluate_adaptive_profile_state(
             rows,
             PROFILE_KEY,
             CUTOFF,
-            {"status": "DEGRADED"},
+            {
+                "version": ADAPTIVE_PROFILE_STATE_VERSION,
+                "status": "PAUSED",
+                "profile_key": PROFILE_KEY,
+                "evaluated_at": CUTOFF - 1,
+            },
         )
 
-        self.assertEqual(unknown["status"], "ACTIVE")
-        self.assertIsNone(unknown["previous"])
         self.assertEqual(legacy["status"], "WATCH")
         self.assertEqual(legacy["previous"], "PAUSED")
         self.assertEqual(legacy["transition"], "PAUSED->WATCH")
+        self.assertEqual(structured["status"], "WATCH")
+        self.assertEqual(structured["previous"], "PAUSED")
+        self.assertEqual(structured["previous_ignored_reason"], "")
+
+    def test_structured_previous_future_equal_other_key_invalid_and_unknown_are_ignored(self):
+        rows = adaptive_rows(20, 7, n20_ev=0.0)
+        valid = {
+            "version": ADAPTIVE_PROFILE_STATE_VERSION,
+            "status": "PAUSED",
+            "profile_key": PROFILE_KEY,
+            "evaluated_at": CUTOFF - 1,
+        }
+        cases = [
+            ({**valid, "evaluated_at": CUTOFF + 1}, "PREVIOUS_EVALUATED_AT_NOT_PAST"),
+            ({**valid, "evaluated_at": CUTOFF}, "PREVIOUS_EVALUATED_AT_NOT_PAST"),
+            ({**valid, "evaluated_at": "bad"}, "PREVIOUS_EVALUATED_AT_INVALID"),
+            ({**valid, "evaluated_at": True}, "PREVIOUS_EVALUATED_AT_INVALID"),
+            ({**valid, "profile_key": profile_key(10, "other", "tag", "LONG", "WE-23")}, "PREVIOUS_PROFILE_KEY_MISMATCH"),
+            ({**valid, "version": "ADAPTIVE_PROFILE_STATE_V0"}, "PREVIOUS_VERSION_INCOMPATIBLE"),
+            ({**valid, "status": "DEGRADED"}, "PREVIOUS_STATUS_INVALID"),
+            ({**valid, "status": "active"}, "PREVIOUS_STATUS_INVALID"),
+            ("DEGRADED", "PREVIOUS_STATUS_INVALID"),
+            ("OLD_UNKNOWN", "PREVIOUS_STATUS_INVALID"),
+        ]
+        for previous, ignored_reason in cases:
+            with self.subTest(previous=previous):
+                result = evaluate_adaptive_profile_state(
+                    rows,
+                    PROFILE_KEY,
+                    CUTOFF,
+                    previous,
+                )
+                self.assertEqual(result["status"], "ACTIVE")
+                self.assertIsNone(result["previous"])
+                self.assertEqual(result["previous_ignored_reason"], ignored_reason)
+                self.assertIn(ignored_reason, result["reason"])
+
+    def test_malformed_profiles_and_time_invariant_violations_are_skipped_before_identity(self):
+        start = CUTOFF - 10 * 60 * MINUTE_MS
+        valid = observation(
+            "shared-key",
+            "WIN",
+            start + 8 * MINUTE_MS,
+            decision_id="shared-decision",
+        )
+        malformed_profile_rows = []
+        for index, (field, value) in enumerate(
+            [
+                ("timeframe_minutes", None),
+                ("timeframe_minutes", "10"),
+                ("timeframe_minutes", True),
+                ("strategy_family", None),
+                ("strategy_family", ""),
+                ("strategy_family", "bad|family"),
+                ("strategy_tag", None),
+                ("strategy_tag", ""),
+                ("strategy_tag", "bad|tag"),
+                ("direction", None),
+                ("direction", "SIDEWAYS"),
+                ("threshold_segment", None),
+                ("threshold_segment", "WE-24"),
+            ]
+        ):
+            item = observation(
+                f"malformed-profile-{index}",
+                "LOSS",
+                start - (index + 1) * 20 * MINUTE_MS,
+            )
+            setattr(item, field, value)
+            malformed_profile_rows.append(item)
+
+        invalid_shared = observation(
+            "shared-key",
+            "LOSS",
+            start,
+            expires_at=start + 10 * MINUTE_MS,
+            settled_at=start + 5 * MINUTE_MS,
+            decision_id="shared-decision",
+        )
+        invalid_times = [
+            invalid_shared,
+            observation("future-expiry", "LOSS", start, expires_at=CUTOFF + 1, settled_at=CUTOFF - 1),
+            observation("settled-before-open", "LOSS", start, settled_at=start - 1),
+            observation("settled-before-expiry", "LOSS", start, settled_at=start + 5 * MINUTE_MS),
+            observation("equal-cutoff", "LOSS", start, settled_at=CUTOFF),
+        ]
+        non_integer_time = observation("bad-time", "LOSS", start)
+        non_integer_time.opened_at = float("nan")
+        bool_time = observation("bool-time", "LOSS", start)
+        bool_time.expires_at = True
+        rows = malformed_profile_rows + invalid_times + [non_integer_time, bool_time, valid]
+        original = repr(rows)
+
+        samples = independent_settled_samples(rows, PROFILE_KEY, CUTOFF)
+        rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+
+        self.assertEqual([item.observation_key for item in samples], ["shared-key"])
+        self.assertEqual(samples[0].result, "WIN")
+        self.assertEqual(set(rebuilt), {PROFILE_KEY})
+        self.assertEqual(rebuilt[PROFILE_KEY]["n12"]["sample_size"], 1)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n12"]["wins"], 1)
+        self.assertEqual(repr(rows), original)
+
+    def test_rebuild_filters_once_and_never_rescans_complete_prefixes(self):
+        scan_counts = []
+        for sample_size in (50, 100, 200):
+            rows = production_rows(sample_size)
+            with patch.object(
+                adaptive_module,
+                "_eligible_observation",
+                wraps=adaptive_module._eligible_observation,
+            ) as eligibility:
+                with patch.object(
+                    adaptive_module,
+                    "independent_settled_samples",
+                    side_effect=AssertionError("rebuild must not rescan prefixes"),
+                ):
+                    rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+            scan_counts.append(eligibility.call_count)
+            self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 20)
+
+        self.assertEqual(scan_counts, [50, 100, 200])
+
+    def test_rebuild_matches_quadratic_reference_after_every_independent_event(self):
+        rows = production_rows(32)
+        other_key_rows = [
+            observation(
+                f"other-{index:02d}",
+                "WIN" if index % 3 else "LOSS",
+                rows[index * 3].opened_at,
+                family="other-family",
+                tag="other-tag",
+                direction="LONG",
+                segment="WE-23",
+                decision_id=f"other-decision-{index:02d}",
+            )
+            for index in range(10)
+        ]
+        overlap = observation(
+            "overlap-reference",
+            "WIN",
+            rows[4].opened_at + 5 * MINUTE_MS,
+            decision_id="overlap-reference-decision",
+        )
+        duplicate = observation(
+            rows[8].observation_key,
+            "WIN",
+            rows[20].opened_at,
+            decision_id="duplicate-reference-decision",
+        )
+        mixed = list(reversed(rows + other_key_rows + [overlap, duplicate]))
+        expected, expected_trace = trusted_reference_rebuild(mixed, CUTOFF)
+        actual_trace = []
+        real_classify = adaptive_module.classify_profile_state
+
+        def recording_classify(*args, **kwargs):
+            result = real_classify(*args, **kwargs)
+            actual_trace.append(state_trace_item(args[1], result))
+            return result
+
+        with patch.object(
+            adaptive_module,
+            "classify_profile_state",
+            side_effect=recording_classify,
+        ):
+            actual = rebuild_adaptive_profile_states(mixed, CUTOFF)
+
+        self.assertEqual(actual_trace, expected_trace)
+        self.assertEqual(actual, expected)
+
+    def test_rebuild_skips_out_of_order_interval_without_consuming_identity(self):
+        start = CUTOFF - 60 * MINUTE_MS
+        first = observation("first", "WIN", start, decision_id="first-decision")
+        out_of_order = observation(
+            "shared-out-of-order",
+            "LOSS",
+            start - 20 * MINUTE_MS,
+            settled_at=start + 20 * MINUTE_MS,
+            decision_id="shared-out-of-order-decision",
+        )
+        later_valid = observation(
+            "shared-out-of-order",
+            "WIN",
+            start + 40 * MINUTE_MS,
+            decision_id="shared-out-of-order-decision",
+        )
+
+        rebuilt = rebuild_adaptive_profile_states(
+            [later_valid, out_of_order, first],
+            CUTOFF,
+        )
+
+        self.assertEqual(rebuilt[PROFILE_KEY]["n12"]["sample_size"], 2)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n12"]["wins"], 2)
+
+    def test_rebuild_handles_ten_thousand_events_with_one_linear_filter_pass(self):
+        rows = production_rows(10_000)
+        started = time.perf_counter()
+        with patch.object(
+            adaptive_module,
+            "_eligible_observation",
+            wraps=adaptive_module._eligible_observation,
+        ) as eligibility:
+            rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(eligibility.call_count, 10_000)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 20)
+        self.assertLess(elapsed, 5.0)
 
     def test_rebuild_replays_paused_then_watch_without_future_leak(self):
         start = CUTOFF - 30 * 20 * MINUTE_MS
