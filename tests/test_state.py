@@ -4,7 +4,8 @@ import threading
 import time
 import unittest
 import sqlite3
-from contextlib import closing
+from copy import deepcopy
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -153,6 +154,31 @@ def settled_observation(
 
 PROFILE_KEY = "10|drop_reclaim|live_profile|LONG|WD-08"
 PROFILE_VERSION = "DPS-20260810-0800"
+
+
+@contextmanager
+def managed_sqlite_states():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "monitor.sqlite3"
+        store = SQLiteMonitorStore(db_path)
+        states = []
+        try:
+            yield db_path, store, states
+        finally:
+            first_error = None
+            for state in states:
+                try:
+                    state.close()
+                except Exception as error:  # noqa: BLE001 - 仍需释放其余测试资源。
+                    if first_error is None:
+                        first_error = error
+            try:
+                store.close()
+            except Exception as error:  # noqa: BLE001 - 保留首个关闭错误。
+                if first_error is None:
+                    first_error = error
+            if first_error is not None:
+                raise first_error
 
 
 def selected_profile_signal(
@@ -615,6 +641,7 @@ class MonitorStateTest(unittest.TestCase):
                 enable_observation_profile_promotion=False,
                 result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
             )
+            self.addCleanup(state.close)
             candidate = selected_profile_signal(now)
             case_now = now
             kwargs = {}
@@ -911,6 +938,7 @@ class MonitorStateTest(unittest.TestCase):
             enable_observation_profile_promotion=False,
             result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
         )
+        self.addCleanup(state.close)
         state.klines = [kline(index, 100.0 + index / 100.0, 100 + index) for index in range(20)]
         latest = state.klines[-1]
         now = latest.close_time
@@ -1031,6 +1059,7 @@ class MonitorStateTest(unittest.TestCase):
                     enable_rolling_edge_guard=False,
                     enable_observation_profile_promotion=False,
                 )
+                self.addCleanup(state.close)
                 state.klines = list(klines)
                 state.fear_greed = fear_greed
                 candidate = replace(
@@ -1075,14 +1104,18 @@ class MonitorStateTest(unittest.TestCase):
         conflict = replace(
             base,
             entry_structure_shadow={
+                "entry_structure_evaluated_at": 118_000,
                 "entry_structure_state": "BREAKDOWN",
                 "entry_structure_bias": "SHORT",
+                "entry_structure_reason_code": "TASK12_BREAKDOWN_CONFIRMED",
                 "breakout_direction": "SHORT",
                 "retest_status": "FAILED",
             },
         )
         control_state = MonitorState(symbol="BTCUSDT", min_order_gap_ms=0)
         conflict_state = MonitorState(symbol="BTCUSDT", min_order_gap_ms=0)
+        self.addCleanup(conflict_state.close)
+        self.addCleanup(control_state.close)
 
         control_decision = control_state._maybe_open_order(base, latest)
         conflict_decision = conflict_state._maybe_open_order(conflict, latest)
@@ -1096,6 +1129,10 @@ class MonitorStateTest(unittest.TestCase):
         required = {
             "entry_structure_version",
             "entry_structure_mode",
+            "entry_structure_evaluated_at",
+            "entry_structure_state",
+            "entry_structure_bias",
+            "entry_structure_reason_code",
             "evaluated_at",
             "state",
             "bias",
@@ -1125,18 +1162,179 @@ class MonitorStateTest(unittest.TestCase):
             "audit_only",
         }
         self.assertTrue(required.issubset(structure))
+        self.assertEqual(
+            structure["entry_structure_evaluated_at"],
+            structure["evaluated_at"],
+        )
+        self.assertEqual(structure["entry_structure_state"], structure["state"])
+        self.assertEqual(structure["entry_structure_bias"], structure["bias"])
+        self.assertEqual(
+            structure["entry_structure_reason_code"],
+            structure["reason_code"],
+        )
+        default_structure = control_state.selected_signal.decision_inputs["entry_structure"]
+        for canonical, alias in (
+            ("entry_structure_evaluated_at", "evaluated_at"),
+            ("entry_structure_state", "state"),
+            ("entry_structure_bias", "bias"),
+            ("entry_structure_reason_code", "reason_code"),
+        ):
+            self.assertIn(canonical, default_structure)
+            self.assertEqual(default_structure[canonical], default_structure[alias])
         self.assertEqual(structure["state"], "BREAKDOWN")
         self.assertEqual(structure["bias"], "SHORT")
         self.assertTrue(structure["audit_only"])
 
-    def test_selected_order_terms_persist_replay_and_reject_frozen_conflict(self):
+    def test_admission_observation_allowed_matches_final_outcome_and_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            states = []
+            try:
+                scenarios = (
+                    ("BTCUSDT", True, False, "OPENED", 1),
+                    ("ETHUSDT", False, False, "OPENED", 0),
+                    (
+                        "SOLUSDT",
+                        True,
+                        True,
+                        "DAILY_PROFILE_NOT_SELECTED",
+                        1,
+                    ),
+                )
+                for index, (
+                    symbol,
+                    should_observe,
+                    block_profile,
+                    expected_decision,
+                    expected_rows,
+                ) in enumerate(scenarios):
+                    current_time = 119_999 + index * 60_000
+                    state = MonitorState(
+                        symbol=symbol,
+                        storage=store,
+                        min_order_gap_ms=0,
+                    )
+                    states.append(state)
+                    candidate = selected_profile_signal(
+                        current_time,
+                        profile_key=f"profile-{symbol}",
+                        reason=f"observation semantics {symbol}",
+                    )
+                    if not should_observe:
+                        candidate = replace(candidate, observe_direction="")
+                    if block_profile:
+                        candidate = replace(candidate, daily_profile_selected=False)
+
+                    decision = state._maybe_open_order(
+                        candidate,
+                        latest_kline(current_time),
+                        daily_profile_required=block_profile,
+                    )
+                    context = store.load_decision_context(
+                        symbol,
+                        state.selected_signal.decision_id,
+                    )
+                    with closing(sqlite3.connect(store.path)) as connection:
+                        row_count = connection.execute(
+                            "select count(*) from observation_signals where symbol = ?",
+                            (symbol,),
+                        ).fetchone()[0]
+
+                    self.assertEqual(decision, expected_decision)
+                    self.assertEqual(row_count, expected_rows)
+                    self.assertEqual(
+                        state.selected_signal.decision_inputs["admission"][
+                            "observation_allowed"
+                        ],
+                        bool(expected_rows),
+                    )
+                    self.assertEqual(context["observation_allowed"], bool(expected_rows))
+                    self.assertEqual(
+                        context["inputs"]["admission"]["observation_allowed"],
+                        context["observation_allowed"],
+                    )
+
+                overlap_time = 299_999
+                overlap_candidate = replace(
+                    selected_profile_signal(
+                        overlap_time,
+                        profile_key="profile-SOLUSDT",
+                        reason="blocked overlapping observation",
+                    ),
+                    daily_profile_selected=False,
+                )
+                overlap_state = states[2]
+                overlap_decision = overlap_state._maybe_open_order(
+                    overlap_candidate,
+                    latest_kline(overlap_time),
+                    daily_profile_required=True,
+                )
+                overlap_context = store.load_decision_context(
+                    "SOLUSDT",
+                    overlap_state.selected_signal.decision_id,
+                )
+                with closing(sqlite3.connect(store.path)) as connection:
+                    overlap_rows = connection.execute(
+                        "select count(*) from observation_signals "
+                        "where symbol = 'SOLUSDT' and decision_id = ?",
+                        (overlap_context["decision_id"],),
+                    ).fetchone()[0]
+                self.assertEqual(
+                    overlap_decision,
+                    "DAILY_PROFILE_NOT_SELECTED",
+                )
+                self.assertEqual(overlap_rows, 0)
+                self.assertFalse(overlap_context["observation_allowed"])
+                self.assertFalse(
+                    overlap_context["inputs"]["admission"]["observation_allowed"]
+                )
+
+                failed = MonitorState(
+                    symbol="ADAUSDT",
+                    storage=store,
+                    min_order_gap_ms=0,
+                )
+                states.append(failed)
+                with patch.object(
+                    store,
+                    "save_open_order_decision",
+                    side_effect=RuntimeError("injected persistence failure"),
+                ):
+                    decision = failed._maybe_open_order(
+                        selected_profile_signal(
+                            359_999,
+                            profile_key="profile-ADAUSDT",
+                        ),
+                        latest_kline(359_999),
+                    )
+                with closing(sqlite3.connect(store.path)) as connection:
+                    observation_rows = connection.execute(
+                        "select count(*) from observation_signals where symbol = 'ADAUSDT'"
+                    ).fetchone()[0]
+                    context_rows = connection.execute(
+                        "select count(*) from decision_contexts where symbol = 'ADAUSDT'"
+                    ).fetchone()[0]
+                self.assertEqual(decision, "STORAGE_ERROR")
+                self.assertEqual((observation_rows, context_rows), (0, 0))
+                self.assertFalse(
+                    failed.selected_signal.decision_inputs["admission"][
+                        "observation_allowed"
+                    ]
+                )
+                self.assertEqual(failed.observations, [])
+            finally:
+                for state in states:
+                    state.close()
+                store.close()
+
+    def test_selected_order_terms_persist_replay_and_reject_frozen_conflict(self):
+        with managed_sqlite_states() as (_db_path, store, states):
             state = MonitorState(
                 symbol="BTCUSDT",
                 storage=store,
                 min_order_gap_ms=0,
             )
+            states.append(state)
             signal = selected_profile_signal(119_999, reason="terms outcome")
             latest = latest_kline(119_999)
 
@@ -1180,6 +1378,7 @@ class MonitorStateTest(unittest.TestCase):
                 storage=store,
                 min_order_gap_ms=0,
             )
+            states.append(blocked_state)
             blocked_signal = replace(
                 selected_profile_signal(179_999),
                 daily_profile_selected=False,
@@ -1198,14 +1397,13 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_quality_inputs_are_one_canonical_persisted_source_across_models_and_restart(self):
         marker = "TASK8-QUALITY-INPUT-UNIQUE-MARKER"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "monitor.sqlite3"
-            store = SQLiteMonitorStore(db_path)
+        with managed_sqlite_states() as (db_path, store, states):
             state = MonitorState(
                 symbol="BTCUSDT",
                 storage=store,
                 min_order_gap_ms=0,
             )
+            states.append(state)
             signal = selected_profile_signal(119_999, reason="canonical quality")
             latest = latest_kline(119_999)
             original_attach = state._attach_quality_score
@@ -1304,7 +1502,7 @@ class MonitorStateTest(unittest.TestCase):
                 page_item["decision_inputs"]["score"]["quality_score_inputs"],
             )
 
-    def test_open_bundle_payload_size_and_5000_projection_fit_capacity_contract(self):
+    def test_context_is_authoritative_and_rejects_tampered_model_provenance(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
             store = SQLiteMonitorStore(db_path)
@@ -1313,6 +1511,169 @@ class MonitorStateTest(unittest.TestCase):
                 storage=store,
                 min_order_gap_ms=0,
             )
+            restart_store = None
+            state_closed = False
+            try:
+                decision = state._maybe_open_order(
+                    selected_profile_signal(119_999, reason="provenance control"),
+                    latest_kline(119_999),
+                )
+                self.assertEqual(decision, "OPENED")
+                order = state.simulator.orders[0]
+                observed = state.observations[0]
+                context = store.load_decision_context(
+                    "BTCUSDT",
+                    state.selected_signal.decision_id,
+                )
+                with closing(sqlite3.connect(db_path)) as connection:
+                    compact_order = json.loads(
+                        connection.execute("select payload from orders").fetchone()[0]
+                    )
+                    compact_observation = json.loads(
+                        connection.execute(
+                            "select payload from observation_signals"
+                        ).fetchone()[0]
+                    )
+                required_marker = {
+                    "decision_id",
+                    "context_version",
+                    "runtime_config_hash",
+                    "strategy_build_id",
+                    "candidate_origin",
+                    "canonical_identity_hash",
+                }
+                self.assertEqual(
+                    set(compact_order["decision_context_ref"]),
+                    required_marker,
+                )
+                self.assertEqual(
+                    compact_order["decision_context_ref"],
+                    compact_observation["decision_context_ref"],
+                )
+
+                legacy_order = order.to_dict()
+                legacy_observation = observed.to_dict()
+
+                def write_payload(table, payload):
+                    with closing(sqlite3.connect(db_path)) as connection:
+                        connection.execute(
+                            f"update {table} set payload = ?",
+                            (json.dumps(payload, ensure_ascii=False),),
+                        )
+                        connection.commit()
+
+                state.close()
+                state_closed = True
+                store.close()
+                restart_store = SQLiteMonitorStore(db_path)
+
+                write_payload("orders", legacy_order)
+                write_payload("observation_signals", legacy_observation)
+                restored_order = restart_store.load_orders("BTCUSDT")[0]
+                restored_observation = restart_store.load_observations("BTCUSDT")[0]
+                for model in (restored_order, restored_observation):
+                    self.assertEqual(model.decision_inputs, context["inputs"])
+                    self.assertIs(
+                        model.quality_score_inputs,
+                        model.decision_inputs["score"]["quality_score_inputs"],
+                    )
+                    self.assertEqual(
+                        model.adaptive_profile_state,
+                        context["inputs"]["signal"]["adaptive_profile_state"],
+                    )
+                    self.assertEqual(
+                        model.entry_structure_shadow,
+                        context["inputs"]["signal"]["entry_structure_shadow"],
+                    )
+
+                tampered_order = deepcopy(legacy_order)
+                tampered_order["quality_score_inputs"] = {"tampered": True}
+                write_payload("orders", tampered_order)
+                with self.assertRaisesRegex(ValueError, "quality_score_inputs"):
+                    restart_store.load_orders("BTCUSDT")
+
+                tampered_order = deepcopy(legacy_order)
+                tampered_order["strategy_tag"] = "tampered-strategy"
+                write_payload("orders", tampered_order)
+                with self.assertRaisesRegex(ValueError, "strategy_tag"):
+                    restart_store.load_orders("BTCUSDT")
+
+                for field, value in (
+                    ("runtime_config_hash", "tampered-config"),
+                    ("strategy_build_id", "tampered-build"),
+                    ("candidate_origin", "TAMPERED_ORIGIN"),
+                ):
+                    tampered_ref = deepcopy(compact_order)
+                    tampered_ref[field] = value
+                    write_payload("orders", tampered_ref)
+                    with self.assertRaisesRegex(ValueError, field):
+                        restart_store.load_orders("BTCUSDT")
+
+                incomplete_ref = deepcopy(compact_order)
+                incomplete_ref["decision_context_ref"].pop("strategy_build_id")
+                write_payload("orders", incomplete_ref)
+                with self.assertRaisesRegex(ValueError, "reference"):
+                    restart_store.load_orders("BTCUSDT")
+
+                tampered_observation = deepcopy(legacy_observation)
+                tampered_observation["direction"] = "SHORT"
+                write_payload("observation_signals", tampered_observation)
+                with self.assertRaisesRegex(ValueError, "direction"):
+                    restart_store.load_observations("BTCUSDT")
+
+                tampered_observation = deepcopy(legacy_observation)
+                tampered_observation["decision_inputs"]["score"][
+                    "quality_score_inputs"
+                ] = {"tampered": "canonical-copy"}
+                write_payload("observation_signals", tampered_observation)
+                with self.assertRaisesRegex(ValueError, "decision_inputs"):
+                    restart_store.load_observations("BTCUSDT")
+
+                write_payload("orders", tampered_order)
+                settled_order = replace(
+                    order,
+                    status="SETTLED",
+                    result="WIN",
+                    settled_at=order.expires_at,
+                    exit_price=order.entry_price + 1.0,
+                    pnl=order.win_return - order.stake,
+                )
+                with self.assertRaisesRegex(ValueError, "strategy_tag"):
+                    restart_store.save_settled_order_with_credit(
+                        settled_order,
+                        "BTCUSDT",
+                        None,
+                    )
+
+                write_payload("observation_signals", tampered_observation)
+                settled_observation = replace(
+                    observed,
+                    status="SETTLED",
+                    result="WIN",
+                    settled_at=observed.expires_at,
+                    exit_price=observed.entry_price + 1.0,
+                    pnl=8.0,
+                )
+                with self.assertRaisesRegex(ValueError, "decision_inputs"):
+                    restart_store.save_observation(
+                        settled_observation,
+                        "BTCUSDT",
+                    )
+            finally:
+                if not state_closed:
+                    state.close()
+                store.close()
+                if restart_store is not None:
+                    restart_store.close()
+
+    def test_open_bundle_payload_size_and_5000_projection_fit_capacity_contract(self):
+        with managed_sqlite_states() as (db_path, store, states):
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                min_order_gap_ms=0,
+            )
+            states.append(state)
 
             decision = state._maybe_open_order(
                 selected_profile_signal(119_999, reason="payload sizing"),
@@ -1355,8 +1716,7 @@ class MonitorStateTest(unittest.TestCase):
             )
 
     def test_early_wave_block_samples_complete_admission_and_sqlite_capacity_once(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+        with managed_sqlite_states() as (_db_path, store, states):
             state = MonitorState(
                 symbol="BTCUSDT",
                 storage=store,
@@ -1364,6 +1724,7 @@ class MonitorStateTest(unittest.TestCase):
                 max_open_long_orders=3,
                 min_order_gap_ms=1_000,
             )
+            states.append(state)
             state.simulator.orders = [
                 SimulatedOrder(
                     id=1,
@@ -1439,6 +1800,7 @@ class MonitorStateTest(unittest.TestCase):
         storage = RecordingStorage()
         storage.storage_capacity = lambda: (_ for _ in ()).throw(OSError("capacity unavailable"))
         state = MonitorState(symbol="BTCUSDT", storage=storage)
+        self.addCleanup(state.close)
         latest = latest_kline(119_999)
         signal = replace(
             selected_profile_signal(119_999),
@@ -1904,9 +2266,9 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(guard["pause_until"], 162 * MINUTE_MS)
 
     def test_profile_degradation_rebuilds_identically_after_sqlite_restart(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+        with managed_sqlite_states() as (_db_path, store, states):
             running = profile_guard_state(storage=store, now_ms=lambda: 0)
+            states.append(running)
             settle_profile_losses(running)
             for order in running.simulator.orders:
                 store.save_order(order, "BTCUSDT")
@@ -1919,6 +2281,7 @@ class MonitorStateTest(unittest.TestCase):
             running.wait_for_storage_writes()
 
             restarted = profile_guard_state(storage=store, now_ms=lambda: 0)
+            states.append(restarted)
             restart_empty_guard = dict(
                 restarted.snapshot()["profile_degradation_guard"]
             )
@@ -2217,6 +2580,7 @@ class MonitorStateTest(unittest.TestCase):
             webhook=webhook,
             now_ms=lambda: 1_000,
         )
+        self.addCleanup(state.close)
         storage.state = state
         signal = Signal(
             direction="LONG",
@@ -2261,6 +2625,7 @@ class MonitorStateTest(unittest.TestCase):
             webhook=webhook,
             now_ms=lambda: 1_000,
         )
+        self.addCleanup(state.close)
         signal = Signal(
             direction="LONG",
             timeframe_minutes=10,
@@ -2292,9 +2657,7 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(webhook.calls, [])
 
     def test_real_sqlite_open_bundle_failure_rebuilds_persistence_block_outcome(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "monitor.sqlite3"
-            store = SQLiteMonitorStore(db_path)
+        with managed_sqlite_states() as (db_path, store, states):
             webhook = RecordingWebhook()
             state = MonitorState(
                 symbol="BTCUSDT",
@@ -2304,6 +2667,7 @@ class MonitorStateTest(unittest.TestCase):
                 enable_rolling_edge_guard=False,
                 enable_observation_profile_promotion=False,
             )
+            states.append(state)
             signal = selected_profile_signal(119_999, reason="sqlite rollback")
             latest = latest_kline(119_999)
 
@@ -2363,6 +2727,7 @@ class MonitorStateTest(unittest.TestCase):
             storage=storage,
             min_order_gap_ms=0,
         )
+        self.addCleanup(state.close)
         signal = selected_profile_signal(119_999, reason="replay failure")
         latest = latest_kline(119_999)
         storage.load_decision_context_for_candidate = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -2386,6 +2751,7 @@ class MonitorStateTest(unittest.TestCase):
             storage=storage,
             min_order_gap_ms=0,
         )
+        self.addCleanup(state.close)
         signal = replace(
             selected_profile_signal(119_999, reason="profile rejected"),
             daily_profile_selected=False,
@@ -2414,6 +2780,7 @@ class MonitorStateTest(unittest.TestCase):
             webhook=webhook,
             now_ms=lambda: 1_000,
         )
+        self.addCleanup(state.close)
         signal = Signal(
             direction="LONG",
             timeframe_minutes=10,
@@ -2459,6 +2826,7 @@ class MonitorStateTest(unittest.TestCase):
             webhook=webhook,
             now_ms=lambda: 1_000,
         )
+        self.addCleanup(state.close)
         signal = Signal(
             direction="LONG",
             timeframe_minutes=10,
@@ -2890,9 +3258,7 @@ class MonitorStateTest(unittest.TestCase):
             )
 
     def test_same_kline_opposite_directions_create_independent_decisions(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "monitor.sqlite3"
-            store = SQLiteMonitorStore(db_path)
+        with managed_sqlite_states() as (_db_path, store, states):
             webhook = RecordingWebhook()
             state = MonitorState(
                 symbol="BTCUSDT",
@@ -2903,6 +3269,7 @@ class MonitorStateTest(unittest.TestCase):
                 max_open_short_orders=1,
                 min_order_gap_ms=0,
             )
+            states.append(state)
             latest = latest_kline(119_999)
             long_signal = replace(
                 selected_profile_signal(119_999),
@@ -3168,8 +3535,11 @@ class MonitorStateTest(unittest.TestCase):
 
     def test_profile_promoted_wait_origin_reaches_open_and_blocked_bundles(self):
         for blocked in (False, True):
-            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as temp_dir:
-                store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            with self.subTest(blocked=blocked), managed_sqlite_states() as (
+                _db_path,
+                store,
+                states,
+            ):
                 state = MonitorState(
                     symbol="BTCUSDT",
                     storage=store,
@@ -3177,6 +3547,7 @@ class MonitorStateTest(unittest.TestCase):
                     max_open_orders=1,
                     min_order_gap_ms=0,
                 )
+                states.append(state)
                 state.active_daily_profile_selection = {
                     "version": PROFILE_VERSION,
                     "status": "READY",

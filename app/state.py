@@ -1120,6 +1120,7 @@ class MonitorState:
         *,
         audit_context: dict,
         selected_order_terms: dict[str, object] | None,
+        observation_allowed: bool,
     ) -> dict[str, object]:
         strategy_inputs = (
             signal.decision_inputs
@@ -1313,13 +1314,19 @@ class MonitorState:
             "entry_structure_reason_code",
             source_structure.get("reason_code", "NOT_EVALUATED"),
         )
+        structure_evaluated_at = int(
+            source_structure.get(
+                "entry_structure_evaluated_at",
+                source_structure.get("evaluated_at", latest.close_time),
+            )
+        )
         structure = {
             "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
             "entry_structure_mode": "SHADOW_ONLY",
-            "evaluated_at": int(latest.close_time),
-            "state": structure_state,
-            "bias": structure_bias,
-            "reason_code": structure_reason,
+            "entry_structure_evaluated_at": structure_evaluated_at,
+            "entry_structure_state": structure_state,
+            "entry_structure_bias": structure_bias,
+            "entry_structure_reason_code": structure_reason,
             "candidate_origin": str(run.identity["candidate_origin"]),
             "active_level_source": "NOT_AVAILABLE",
             "active_level_lower": None,
@@ -1357,14 +1364,20 @@ class MonitorState:
                 source_structure.get("mode", "SHADOW_ONLY"),
             )
         )
+        structure["entry_structure_evaluated_at"] = structure_evaluated_at
+        structure["entry_structure_state"] = structure_state
+        structure["entry_structure_bias"] = structure_bias
+        structure["entry_structure_reason_code"] = structure_reason
+        structure["evaluated_at"] = structure_evaluated_at
         structure["state"] = structure_state
         structure["bias"] = structure_bias
         structure["reason_code"] = structure_reason
         structure["candidate_origin"] = str(run.identity["candidate_origin"])
         structure["audit_only"] = True
-        structure.setdefault("version", structure["entry_structure_version"])
-        structure.setdefault("status", structure["state"])
-        structure.setdefault("reason", structure["reason_code"])
+        structure["version"] = structure["entry_structure_version"]
+        structure["mode"] = structure["entry_structure_mode"]
+        structure["status"] = structure["entry_structure_state"]
+        structure["reason"] = structure["entry_structure_reason_code"]
 
         trace_by_stage = {
             str(record["stage"]): record
@@ -1408,7 +1421,7 @@ class MonitorState:
             },
             "trace_snapshot": deepcopy(run.trace_records),
             "open_allowed": bool(selected_order_terms),
-            "observation_allowed": False,
+            "observation_allowed": bool(observation_allowed),
             "stake": {
                 "amount": self.stake,
                 "win_return": self.win_return,
@@ -1720,6 +1733,7 @@ class MonitorState:
                     latest,
                     audit_context=self._current_signal_audit_context(),
                     selected_order_terms=None,
+                    observation_allowed=False,
                 )
             except Exception as freeze_error:  # noqa: BLE001 - 错误 outcome 本身必须可冻结。
                 inputs = self._fallback_candidate_error_inputs(
@@ -1843,10 +1857,10 @@ class MonitorState:
         entry_structure = {
             "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
             "entry_structure_mode": "SHADOW_ONLY",
-            "evaluated_at": int(latest.close_time),
-            "state": "NOT_AVAILABLE",
-            "bias": "NOT_AVAILABLE",
-            "reason_code": "NOT_EVALUATED",
+            "entry_structure_evaluated_at": int(latest.close_time),
+            "entry_structure_state": "NOT_AVAILABLE",
+            "entry_structure_bias": "NOT_AVAILABLE",
+            "entry_structure_reason_code": "NOT_EVALUATED",
             "candidate_origin": str(run.identity["candidate_origin"]),
             "active_level_source": "NOT_AVAILABLE",
             "active_level_lower": None,
@@ -1870,7 +1884,12 @@ class MonitorState:
             "round_level_price": None,
             "round_level_step": None,
             "audit_only": True,
+            "evaluated_at": int(latest.close_time),
+            "state": "NOT_AVAILABLE",
+            "bias": "NOT_AVAILABLE",
+            "reason_code": "NOT_EVALUATED",
             "version": "ENTRY_STRUCTURE_SHADOW_V1",
+            "mode": "SHADOW_ONLY",
             "status": "NOT_AVAILABLE",
             "reason": "NOT_EVALUATED",
         }
@@ -2005,6 +2024,7 @@ class MonitorState:
             latest,
             audit_context=audit_context,
             selected_order_terms=selected_order_terms,
+            observation_allowed=bool(observation_allowed),
         )
         run.builder.capture_inputs(inputs)
         for record in run.trace_records:
@@ -2623,7 +2643,7 @@ class MonitorState:
             final_reason=reason,
             candidate_origin=self._formal_candidate_origin(signal),
             candidate_ordinal=0,
-            observation_allowed=should_observe,
+            observation_allowed=False,
             audit_context=audit_context,
             event_kind="DECISIVE_BLOCK",
             run=run,
@@ -3952,7 +3972,10 @@ class MonitorState:
         captured: dict,
     ) -> dict:
         snapshot = deepcopy(captured)
-        snapshot["signal"] = decision_linked_storage_payload(signal)
+        snapshot["signal"] = decision_linked_storage_payload(
+            signal,
+            retain_extended_views=True,
+        )
         snapshot["latest_kline"] = latest.to_dict()
         snapshot["stake_progression_source_order_id"] = (
             order.stake_progression_source_order_id

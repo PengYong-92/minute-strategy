@@ -1,14 +1,55 @@
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
+import hashlib
+import json
 from typing import Optional
 
 
-_DECISION_CONTEXT_COMPAT_FIELDS = {
+_DECISION_CONTEXT_CORE_COMPAT_FIELDS = {
     "decision_inputs",
     "decision_trace",
     "first_decisive_block",
     "quality_score_inputs",
 }
+
+_DECISION_CONTEXT_EXTENDED_COMPAT_FIELDS = {
+    "quality_score",
+    "quality_score_version",
+    "quality_score_mode",
+    "quality_score_context",
+    "quality_score_components",
+    "adaptive_profile_state",
+    "entry_structure_shadow",
+}
+
+
+def canonical_identity_hash(identity: dict[str, object]) -> str:
+    payload = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def decision_context_reference(
+    *,
+    decision_id: str,
+    context_version: str,
+    runtime_config_hash: str,
+    strategy_build_id: str,
+    candidate_origin: str,
+    identity: dict[str, object],
+) -> dict[str, str]:
+    return {
+        "decision_id": str(decision_id),
+        "context_version": str(context_version),
+        "runtime_config_hash": str(runtime_config_hash),
+        "strategy_build_id": str(strategy_build_id),
+        "candidate_origin": str(candidate_origin),
+        "canonical_identity_hash": canonical_identity_hash(identity),
+    }
 
 
 def bind_canonical_quality_score_inputs(model):
@@ -27,23 +68,39 @@ def bind_canonical_quality_score_inputs(model):
     return model
 
 
-def decision_linked_storage_payload(model) -> dict[str, object]:
+def decision_linked_storage_payload(
+    model,
+    *,
+    retain_extended_views: bool = False,
+) -> dict[str, object]:
     decision_inputs = getattr(model, "decision_inputs", None)
+    identity = (
+        decision_inputs.get("identity")
+        if isinstance(decision_inputs, dict)
+        else None
+    )
     linked = bool(
         getattr(model, "decision_id", "")
         and isinstance(decision_inputs, dict)
-        and "identity" in decision_inputs
+        and isinstance(identity, dict)
     )
+    omitted = set(_DECISION_CONTEXT_CORE_COMPAT_FIELDS)
+    if not retain_extended_views:
+        omitted.update(_DECISION_CONTEXT_EXTENDED_COMPAT_FIELDS)
     payload = {
         item.name: deepcopy(getattr(model, item.name))
         for item in fields(model)
-        if not (linked and item.name in _DECISION_CONTEXT_COMPAT_FIELDS)
+        if not (linked and item.name in omitted)
     }
     if linked:
-        payload["decision_context_ref"] = {
-            "decision_id": str(model.decision_id),
-            "context_version": str(model.context_version),
-        }
+        payload["decision_context_ref"] = decision_context_reference(
+            decision_id=model.decision_id,
+            context_version=model.context_version,
+            runtime_config_hash=model.runtime_config_hash,
+            strategy_build_id=model.strategy_build_id,
+            candidate_origin=model.candidate_origin,
+            identity=identity,
+        )
     return payload
 
 

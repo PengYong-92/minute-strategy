@@ -3470,6 +3470,35 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                 restored_observation.decision_inputs,
                 context.to_dict()["inputs"],
             )
+            settled_order = replace(
+                restored_order,
+                status="SETTLED",
+                result="WIN",
+                settled_at=restored_order.expires_at,
+                exit_price=restored_order.entry_price + 1.0,
+                pnl=8.0,
+            )
+            settled_observation = replace(
+                restored_observation,
+                status="SETTLED",
+                result="WIN",
+                settled_at=restored_observation.expires_at,
+                exit_price=restored_observation.entry_price + 1.0,
+                pnl=8.0,
+            )
+
+            store.save_settled_order_with_credit(
+                settled_order,
+                context.symbol,
+                None,
+            )
+            store.save_observation(settled_observation, context.symbol)
+
+            self.assertEqual(store.load_orders(context.symbol)[0].status, "SETTLED")
+            self.assertEqual(
+                store.load_observations(context.symbol)[0].status,
+                "SETTLED",
+            )
 
     def test_open_bundle_rejects_frozen_redundant_column_collisions(self):
         cases = (

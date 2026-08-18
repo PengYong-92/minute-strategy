@@ -22,6 +22,7 @@ from app.models import (
     ObservationSignal,
     Signal,
     SimulatedOrder,
+    decision_context_reference,
     decision_linked_storage_payload,
 )
 from app.order_profile import (
@@ -116,43 +117,151 @@ def _compact_json(value: object) -> str:
     )
 
 
-def _hydrate_decision_linked_payload(
-    payload: dict[str, Any],
-    row: Mapping[str, Any],
-) -> dict[str, Any]:
+_LINKED_CONTEXT_COLUMNS = """
+decision_contexts.decision_id as linked_decision_id,
+decision_contexts.context_version as linked_context_version,
+decision_contexts.runtime_config_hash as linked_runtime_config_hash,
+decision_contexts.strategy_build_id as linked_strategy_build_id,
+decision_contexts.symbol as linked_symbol,
+decision_contexts.closed_kline_at_ms as linked_closed_kline_at_ms,
+decision_contexts.candidate_origin as linked_candidate_origin,
+decision_contexts.input_payload as linked_input_payload,
+decision_contexts.outcome_payload as linked_outcome_payload
+"""
+
+
+def _joined_decision_context(row: Mapping[str, Any]) -> dict[str, Any] | None:
     row = dict(row)
-    marker = payload.pop("decision_context_ref", None)
-    if marker is None:
-        return payload
-    if not isinstance(marker, Mapping):
-        raise ValueError("decision context reference is malformed")
-    decision_id = str(marker.get("decision_id") or "")
-    context_version = str(marker.get("context_version") or "")
-    if (
-        not decision_id
-        or decision_id != str(payload.get("decision_id") or "")
-        or decision_id != str(row.get("linked_decision_id") or "")
-        or context_version != str(row.get("linked_context_version") or "")
-    ):
-        raise ValueError("decision context reference does not match persisted metadata")
+    decision_id = row.get("linked_decision_id")
+    if decision_id is None:
+        return None
     input_payload = row.get("linked_input_payload")
     outcome_payload = row.get("linked_outcome_payload")
     if not isinstance(input_payload, str) or not isinstance(outcome_payload, str):
-        raise ValueError("decision context reference cannot be resolved")
+        raise ValueError("linked decision context payload is missing")
     inputs = _parse_canonical_json(input_payload, "input_payload")
     outcome = _parse_canonical_json(outcome_payload, "outcome_payload")
     if not isinstance(inputs, dict) or not isinstance(outcome, dict):
         raise ValueError("linked decision context payload is malformed")
-    trace = outcome.get("decision_trace")
-    if not isinstance(trace, list):
-        raise ValueError("linked decision trace is malformed")
-    payload["decision_inputs"] = inputs
-    payload["decision_trace"] = trace
-    payload["first_decisive_block"] = str(outcome.get("first_decisive_block") or "")
-    quality_inputs = inputs.get("score", {}).get("quality_score_inputs", {})
-    payload["quality_score_inputs"] = (
-        quality_inputs if isinstance(quality_inputs, dict) else {}
+    try:
+        context = DecisionContext(
+            decision_id=str(decision_id),
+            context_version=str(row.get("linked_context_version") or ""),
+            runtime_config_hash=str(row.get("linked_runtime_config_hash") or ""),
+            strategy_build_id=str(row.get("linked_strategy_build_id") or ""),
+            symbol=str(row.get("linked_symbol") or ""),
+            closed_kline_at_ms=int(row.get("linked_closed_kline_at_ms")),
+            candidate_origin=str(row.get("linked_candidate_origin") or ""),
+            inputs=inputs,
+            decision_trace=outcome["decision_trace"],
+            first_decisive_block=outcome["first_decisive_block"],
+            final_decision=outcome["final_decision"],
+            final_reason=outcome["final_reason"],
+            open_allowed=outcome["open_allowed"],
+            observation_allowed=outcome["observation_allowed"],
+            selected_order_terms=outcome.get("selected_order_terms", {}),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("linked decision context is invalid") from error
+    return context.to_dict()
+
+
+def _require_matching_field(
+    payload: Mapping[str, Any],
+    field: str,
+    expected: object,
+) -> None:
+    if field in payload and payload[field] != expected:
+        raise ValueError(f"persisted {field} does not match decision context")
+
+
+def _hydrate_decision_linked_payload(
+    payload: dict[str, Any],
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    context = _joined_decision_context(row)
+    marker = payload.get("decision_context_ref")
+    if context is None:
+        if marker is not None:
+            raise ValueError("decision context reference cannot be resolved")
+        return payload
+
+    inputs = context["inputs"]
+    identity = inputs.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("linked decision identity is malformed")
+    expected_reference = decision_context_reference(
+        decision_id=context["decision_id"],
+        context_version=context["context_version"],
+        runtime_config_hash=context["runtime_config_hash"],
+        strategy_build_id=context["strategy_build_id"],
+        candidate_origin=context["candidate_origin"],
+        identity=identity,
     )
+    if marker is not None:
+        if not isinstance(marker, Mapping) or dict(marker) != expected_reference:
+            raise ValueError("decision context reference does not match persisted metadata")
+
+    for field in (
+        "decision_id",
+        "context_version",
+        "runtime_config_hash",
+        "strategy_build_id",
+        "candidate_origin",
+    ):
+        _require_matching_field(payload, field, context[field])
+
+    identity_fields = (
+        "direction",
+        "profile_key",
+        "strategy_family",
+        "strategy_tag",
+        "order_slot",
+        "order_slot_scope",
+        "timeframe_minutes",
+        "threshold_segment",
+        "level",
+    )
+    for field in identity_fields:
+        if field in identity:
+            _require_matching_field(payload, field, identity[field])
+
+    score = inputs.get("score", {})
+    signal = inputs.get("signal", {})
+    if not isinstance(score, dict) or not isinstance(signal, dict):
+        raise ValueError("linked canonical model views are malformed")
+    canonical_views = {
+        "decision_inputs": inputs,
+        "decision_trace": context["decision_trace"],
+        "first_decisive_block": context["first_decisive_block"],
+        "quality_score": score.get("quality_score", 0.0),
+        "quality_score_version": score.get("quality_score_version", ""),
+        "quality_score_mode": score.get("quality_score_mode", ""),
+        "quality_score_context": score.get("quality_score_context", ""),
+        "quality_score_components": score.get("quality_score_components", {}),
+        "quality_score_inputs": score.get("quality_score_inputs", {}),
+        "adaptive_profile_state": signal.get("adaptive_profile_state", {}),
+        "entry_structure_shadow": signal.get("entry_structure_shadow", {}),
+    }
+    if marker is None:
+        for field, expected in canonical_views.items():
+            _require_matching_field(payload, field, expected)
+
+    payload = dict(payload)
+    payload.pop("decision_context_ref", None)
+    for field, expected in canonical_views.items():
+        payload[field] = deepcopy(expected)
+    for field in identity_fields:
+        if field in identity and field in payload:
+            payload[field] = deepcopy(identity[field])
+    for field in (
+        "decision_id",
+        "context_version",
+        "runtime_config_hash",
+        "strategy_build_id",
+        "candidate_origin",
+    ):
+        payload[field] = context[field]
     return payload
 
 
@@ -168,6 +277,13 @@ def _normalize_stored_model_payload(
         "decision_trace",
         "first_decisive_block",
         "quality_score_inputs",
+        "quality_score",
+        "quality_score_version",
+        "quality_score_mode",
+        "quality_score_context",
+        "quality_score_components",
+        "adaptive_profile_state",
+        "entry_structure_shadow",
     ):
         normalized.pop(key, None)
     normalized["decision_context_ref"] = deepcopy(incoming["decision_context_ref"])
@@ -2032,11 +2148,15 @@ class SQLiteMonitorStore:
             raise ValueError("settlement requires a settled WIN or LOSS order")
         normalized_symbol = symbol.upper()
         row = connection.execute(
-            """
-            select status, result, settled_at, payload, decision_id,
-                   runtime_config_hash
+            f"""
+            select orders.status, orders.result, orders.settled_at,
+                   orders.payload, orders.decision_id, orders.runtime_config_hash,
+                   {_LINKED_CONTEXT_COLUMNS}
             from orders
-            where symbol = ? and order_id = ?
+            left join decision_contexts
+              on decision_contexts.symbol = orders.symbol
+             and decision_contexts.decision_id = orders.decision_id
+            where orders.symbol = ? and orders.order_id = ?
             """,
             (normalized_symbol, order.id),
         ).fetchone()
@@ -2047,6 +2167,12 @@ class SQLiteMonitorStore:
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("stored order payload is malformed") from error
         accepted = {field.name for field in fields(SimulatedOrder)}
+        try:
+            stored_payload = _hydrate_decision_linked_payload(stored_payload, row)
+        except ValueError as error:
+            raise ValueError(
+                f"settlement conflicts with frozen order identity: {error}"
+            ) from error
         stored_values = {
             key: value for key, value in stored_payload.items() if key in accepted
         }
@@ -2060,11 +2186,16 @@ class SQLiteMonitorStore:
             raise ValueError("stored order payload is malformed") from error
 
         mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
-        incoming_payload = decision_linked_storage_payload(order)
-        stored_payload = _normalize_stored_model_payload(
-            stored_payload,
-            incoming_payload,
-        )
+        incoming_storage_payload = decision_linked_storage_payload(order)
+        try:
+            incoming_payload = _hydrate_decision_linked_payload(
+                incoming_storage_payload,
+                row,
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"settlement conflicts with frozen order identity: {error}"
+            ) from error
         stored_frozen = {
             key: value
             for key, value in stored_payload.items()
@@ -2083,7 +2214,7 @@ class SQLiteMonitorStore:
         ):
             raise ValueError("settlement conflicts with frozen order identity")
 
-        expected_payload = json.dumps(incoming_payload, ensure_ascii=False)
+        expected_payload = json.dumps(incoming_storage_payload, ensure_ascii=False)
         if row["status"] == "SETTLED":
             if (
                 row["result"] != order.result
@@ -2261,12 +2392,9 @@ class SQLiteMonitorStore:
         accepted = {field.name for field in fields(SimulatedOrder)}
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 select orders.payload,
-                       decision_contexts.decision_id as linked_decision_id,
-                       decision_contexts.context_version as linked_context_version,
-                       decision_contexts.input_payload as linked_input_payload,
-                       decision_contexts.outcome_payload as linked_outcome_payload
+                       {_LINKED_CONTEXT_COLUMNS}
                 from orders
                 left join decision_contexts
                   on decision_contexts.symbol = orders.symbol
@@ -2323,15 +2451,33 @@ class SQLiteMonitorStore:
     ) -> None:
         normalized_symbol = symbol.upper()
         row = connection.execute(
-            "select status, result, settled_at, payload "
-            "from observation_signals where symbol = ? and observation_key = ?",
+            f"""
+            select observation_signals.status, observation_signals.result,
+                   observation_signals.settled_at, observation_signals.payload,
+                   {_LINKED_CONTEXT_COLUMNS}
+            from observation_signals
+            left join decision_contexts
+              on decision_contexts.symbol = observation_signals.symbol
+             and decision_contexts.decision_id = observation_signals.decision_id
+            where observation_signals.symbol = ?
+              and observation_signals.observation_key = ?
+            """,
             (normalized_symbol, observation.observation_key),
         ).fetchone()
         if row is None:
             raise ValueError("observation settlement requires an existing observation")
         try:
             stored_payload = json.loads(row["payload"])
-            accepted = {field.name for field in fields(ObservationSignal)}
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("stored observation payload is malformed") from error
+        try:
+            stored_payload = _hydrate_decision_linked_payload(stored_payload, row)
+        except ValueError as error:
+            raise ValueError(
+                f"settlement conflicts with frozen observation data: {error}"
+            ) from error
+        accepted = {field.name for field in fields(ObservationSignal)}
+        try:
             stored = ObservationSignal(
                 **{
                     key: value
@@ -2339,15 +2485,20 @@ class SQLiteMonitorStore:
                     if key in accepted
                 }
             )
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError) as error:
             raise ValueError("stored observation payload is malformed") from error
 
         mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
-        incoming_payload = decision_linked_storage_payload(observation)
-        stored_payload = _normalize_stored_model_payload(
-            stored_payload,
-            incoming_payload,
-        )
+        incoming_storage_payload = decision_linked_storage_payload(observation)
+        try:
+            incoming_payload = _hydrate_decision_linked_payload(
+                incoming_storage_payload,
+                row,
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"settlement conflicts with frozen observation data: {error}"
+            ) from error
         stored_frozen = {
             key: value
             for key, value in stored_payload.items()
@@ -2361,7 +2512,7 @@ class SQLiteMonitorStore:
         if stored_frozen != requested_frozen:
             raise ValueError("settlement conflicts with frozen observation data")
 
-        expected_payload = json.dumps(incoming_payload, ensure_ascii=False)
+        expected_payload = json.dumps(incoming_storage_payload, ensure_ascii=False)
         if row["status"] == "SETTLED":
             if (
                 observation.status != "SETTLED"
@@ -2599,12 +2750,9 @@ class SQLiteMonitorStore:
         accepted = {field.name for field in fields(ObservationSignal)}
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 select observation_signals.payload,
-                       decision_contexts.decision_id as linked_decision_id,
-                       decision_contexts.context_version as linked_context_version,
-                       decision_contexts.input_payload as linked_input_payload,
-                       decision_contexts.outcome_payload as linked_outcome_payload
+                       {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
                   on decision_contexts.symbol = observation_signals.symbol
@@ -2641,12 +2789,9 @@ class SQLiteMonitorStore:
                 return []
             cutoff = int(latest) - (max(1, int(lookback_days)) + 1) * 86_400_000
             rows = connection.execute(
-                """
+                f"""
                 select observation_signals.payload,
-                       decision_contexts.decision_id as linked_decision_id,
-                       decision_contexts.context_version as linked_context_version,
-                       decision_contexts.input_payload as linked_input_payload,
-                       decision_contexts.outcome_payload as linked_outcome_payload
+                       {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
                   on decision_contexts.symbol = observation_signals.symbol
@@ -2799,10 +2944,7 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 f"""
                 select observation_signals.payload,
-                       decision_contexts.decision_id as linked_decision_id,
-                       decision_contexts.context_version as linked_context_version,
-                       decision_contexts.input_payload as linked_input_payload,
-                       decision_contexts.outcome_payload as linked_outcome_payload
+                       {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
                   on decision_contexts.symbol = observation_signals.symbol
@@ -3542,7 +3684,10 @@ class SQLiteMonitorStore:
                 lease is None
                 or int(lease["expires_at_ms"]) <= int(time.time() * 1000)
             ):
-                return False
+                current, source, _payload = self._read_profile_summary_materialization(
+                    key
+                )
+                return current == revision and source == current
             if time.monotonic() >= deadline:
                 return False
         return False

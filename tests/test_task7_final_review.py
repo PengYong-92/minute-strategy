@@ -389,6 +389,45 @@ class Task7ProfileMaterializationReviewTest(unittest.TestCase):
             first.close()
             second.close()
 
+    def test_external_rebuild_completion_is_rechecked_after_lease_disappears(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            owner = SQLiteMonitorStore(db_path)
+            waiter = SQLiteMonitorStore(db_path)
+            key = owner._profile_summary_key("BTCUSDT", 5000, 15, 2)
+            self.assertTrue(owner._claim_profile_summary_lease(key, 0))
+            original_read = waiter._read_profile_summary_materialization
+            reads = 0
+
+            def complete_between_read_and_lease_query(requested_key):
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    stale = original_read(requested_key)
+                    self.assertTrue(
+                        owner._write_profile_summary_materialization(
+                            key,
+                            0,
+                            {"profiles": [], "profile_guard": {}},
+                        )
+                    )
+                    owner._release_profile_summary_lease(key, 0)
+                    return stale
+                return original_read(requested_key)
+
+            try:
+                with mock.patch.object(
+                    waiter,
+                    "_read_profile_summary_materialization",
+                    side_effect=complete_between_read_and_lease_query,
+                ):
+                    completed = waiter._wait_for_external_profile_summary(key, 0)
+                self.assertTrue(completed)
+                self.assertEqual(reads, 2)
+            finally:
+                owner.close()
+                waiter.close()
+
     def test_expired_database_lease_is_recovered_without_waiting_full_lease_ttl(self):
         class CountingStore(SQLiteMonitorStore):
             def __init__(self, path):
