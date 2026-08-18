@@ -81,6 +81,52 @@ class DecisionContextTest(unittest.TestCase):
                         self.assertIsNot(parameter.annotation, inspect.Parameter.empty)
                 self.assertIsNot(signature.return_annotation, inspect.Signature.empty)
 
+    def test_selected_order_terms_are_a_frozen_explicit_outcome(self):
+        builder = self.new_builder()
+        builder.capture_inputs({"identity": {"direction": "LONG"}})
+        builder.trace("ADMISSION", "PASS", {}, "OPENED")
+        terms = {
+            "stake": 10.0,
+            "win_return": 18.0,
+            "progression_step": 1,
+            "progression_limits": {"max_orders": 2, "max_active": 1},
+        }
+
+        context = builder.finish(
+            final_decision="OPENED",
+            final_reason="accepted",
+            open_allowed=True,
+            observation_allowed=False,
+            selected_order_terms=terms,
+        )
+        terms["stake"] = 999.0
+
+        self.assertEqual(context.selected_order_terms["stake"], 10.0)
+        self.assertEqual(context.to_dict()["selected_order_terms"], {
+            "progression_limits": {"max_active": 1, "max_orders": 2},
+            "progression_step": 1,
+            "stake": 10.0,
+            "win_return": 18.0,
+        })
+        with self.assertRaises(TypeError):
+            context.selected_order_terms["stake"] = 20.0
+
+    def test_blocked_outcome_rejects_selected_order_terms(self):
+        with self.assertRaisesRegex(ValueError, "blocked outcome"):
+            self.direct_context(
+                final_decision="STORAGE_ERROR",
+                open_allowed=False,
+                selected_order_terms={"stake": 10.0},
+                decision_trace=(
+                    self.trace_record(
+                        stage="PERSISTENCE",
+                        result="BLOCK",
+                        reason_code="STORAGE_ERROR",
+                    ),
+                ),
+                first_decisive_block="PERSISTENCE",
+            )
+
     def test_config_key_order_does_not_affect_hash(self):
         first = runtime_config_snapshot(
             {"threshold": 1.5, "guard": {"enabled": True, "window": 20}},

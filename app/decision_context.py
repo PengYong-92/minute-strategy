@@ -1,7 +1,7 @@
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from types import MappingProxyType
 
 
@@ -161,6 +161,7 @@ class DecisionContext:
     final_reason: str
     open_allowed: bool
     observation_allowed: bool
+    selected_order_terms: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in (
@@ -196,6 +197,12 @@ class DecisionContext:
             self.observation_allowed,
             "observation_allowed",
         )
+        selected_order_terms = _normalize_mapping(
+            self.selected_order_terms,
+            "selected_order_terms",
+        )
+        if not open_allowed and selected_order_terms:
+            raise ValueError("blocked outcome must not contain selected order terms")
 
         expected_first_block = next(
             (
@@ -215,6 +222,7 @@ class DecisionContext:
         object.__setattr__(self, "final_reason", final_reason)
         object.__setattr__(self, "open_allowed", open_allowed)
         object.__setattr__(self, "observation_allowed", observation_allowed)
+        object.__setattr__(self, "selected_order_terms", selected_order_terms)
         _canonical_json(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
@@ -233,6 +241,7 @@ class DecisionContext:
             "final_reason": self.final_reason,
             "open_allowed": self.open_allowed,
             "observation_allowed": self.observation_allowed,
+            "selected_order_terms": _thaw(self.selected_order_terms),
         }
 
 
@@ -348,6 +357,7 @@ class DecisionContextBuilder:
         final_reason: str,
         open_allowed: bool,
         observation_allowed: bool,
+        selected_order_terms: Mapping[str, object] | None = None,
     ) -> DecisionContext:
         if self._finished:
             raise RuntimeError("decision context may be finished exactly once")
@@ -379,6 +389,9 @@ class DecisionContextBuilder:
             final_reason=final_reason,
             open_allowed=open_allowed,
             observation_allowed=observation_allowed,
+            selected_order_terms=(
+                {} if selected_order_terms is None else selected_order_terms
+            ),
         )
         self._finished = True
         return context

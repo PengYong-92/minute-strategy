@@ -774,6 +774,7 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                 "final_reason",
                 "open_allowed",
                 "observation_allowed",
+                "selected_order_terms",
             },
         )
 
@@ -3430,6 +3431,45 @@ class AtomicDecisionBundleTest(unittest.TestCase):
             self.assertEqual(counts["order_entry_snapshots"], 1)
             self.assertEqual(counts["signal_audit"], 1)
             self.assertEqual(counts["observation_signals"], 1)
+
+    def test_open_bundle_retry_accepts_legacy_full_order_and_observation_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                atomic_bundle_fixture()
+            )
+            arguments = {
+                "config": config,
+                "context": context,
+                "order": order,
+                "credit": None,
+                "entry_snapshot": entry_snapshot,
+                "audit": audit,
+                "observation": observed,
+            }
+            store.save_open_order_decision(**arguments)
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "update orders set payload = ?",
+                    (json.dumps(order.to_dict(), ensure_ascii=False),),
+                )
+                connection.execute(
+                    "update observation_signals set payload = ?",
+                    (json.dumps(observed.to_dict(), ensure_ascii=False),),
+                )
+                connection.commit()
+
+            created = store.save_open_order_decision(**arguments)
+            restored_order = store.load_orders(context.symbol)[0]
+            restored_observation = store.load_observations(context.symbol)[0]
+
+            self.assertFalse(created)
+            self.assertEqual(restored_order.decision_inputs, context.to_dict()["inputs"])
+            self.assertEqual(
+                restored_observation.decision_inputs,
+                context.to_dict()["inputs"],
+            )
 
     def test_open_bundle_rejects_frozen_redundant_column_collisions(self):
         cases = (

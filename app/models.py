@@ -1,5 +1,50 @@
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields
 from typing import Optional
+
+
+_DECISION_CONTEXT_COMPAT_FIELDS = {
+    "decision_inputs",
+    "decision_trace",
+    "first_decisive_block",
+    "quality_score_inputs",
+}
+
+
+def bind_canonical_quality_score_inputs(model):
+    decision_inputs = getattr(model, "decision_inputs", None)
+    if not isinstance(decision_inputs, dict) or "identity" not in decision_inputs:
+        return model
+    score = decision_inputs.get("score")
+    if not isinstance(score, dict):
+        return model
+    canonical = score.get("quality_score_inputs")
+    if not isinstance(canonical, dict):
+        legacy = getattr(model, "quality_score_inputs", None)
+        canonical = legacy if isinstance(legacy, dict) else {}
+        score["quality_score_inputs"] = canonical
+    object.__setattr__(model, "quality_score_inputs", canonical)
+    return model
+
+
+def decision_linked_storage_payload(model) -> dict[str, object]:
+    decision_inputs = getattr(model, "decision_inputs", None)
+    linked = bool(
+        getattr(model, "decision_id", "")
+        and isinstance(decision_inputs, dict)
+        and "identity" in decision_inputs
+    )
+    payload = {
+        item.name: deepcopy(getattr(model, item.name))
+        for item in fields(model)
+        if not (linked and item.name in _DECISION_CONTEXT_COMPAT_FIELDS)
+    }
+    if linked:
+        payload["decision_context_ref"] = {
+            "decision_id": str(model.decision_id),
+            "context_version": str(model.context_version),
+        }
+    return payload
 
 
 @dataclass(frozen=True)
@@ -122,6 +167,9 @@ class Signal:
     adaptive_profile_state: dict[str, object] = field(default_factory=dict)
     entry_structure_shadow: dict[str, object] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        bind_canonical_quality_score_inputs(self)
+
     @property
     def actionable(self) -> bool:
         return self.direction in {"LONG", "SHORT"} and (
@@ -206,6 +254,9 @@ class SimulatedOrder:
     adaptive_profile_state: dict[str, object] = field(default_factory=dict)
     entry_structure_shadow: dict[str, object] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        bind_canonical_quality_score_inputs(self)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -272,6 +323,9 @@ class ObservationSignal:
     first_decisive_block: str = ""
     adaptive_profile_state: dict[str, object] = field(default_factory=dict)
     entry_structure_shadow: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        bind_canonical_quality_score_inputs(self)
 
     def to_dict(self) -> dict:
         return asdict(self)

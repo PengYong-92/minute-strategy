@@ -18,7 +18,12 @@ from app.decision_context import (
     RuntimeConfigSnapshot,
     _CREDENTIAL_KEYS as DECISION_CONTEXT_CREDENTIAL_KEYS,
 )
-from app.models import ObservationSignal, Signal, SimulatedOrder
+from app.models import (
+    ObservationSignal,
+    Signal,
+    SimulatedOrder,
+    decision_linked_storage_payload,
+)
 from app.order_profile import (
     PROFILE_SUMMARY_SCHEMA_VERSION,
     order_profile_algorithm_fingerprint,
@@ -66,6 +71,7 @@ _DECISION_CONTEXT_KEYS = {
     "final_reason",
     "open_allowed",
     "observation_allowed",
+    "selected_order_terms",
 }
 _DECISION_OUTCOME_KEYS = {
     "decision_trace",
@@ -74,6 +80,7 @@ _DECISION_OUTCOME_KEYS = {
     "final_reason",
     "open_allowed",
     "observation_allowed",
+    "selected_order_terms",
 }
 _DECISION_CONTEXT_COLUMNS = (
     "symbol",
@@ -107,6 +114,64 @@ def _compact_json(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _hydrate_decision_linked_payload(
+    payload: dict[str, Any],
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    row = dict(row)
+    marker = payload.pop("decision_context_ref", None)
+    if marker is None:
+        return payload
+    if not isinstance(marker, Mapping):
+        raise ValueError("decision context reference is malformed")
+    decision_id = str(marker.get("decision_id") or "")
+    context_version = str(marker.get("context_version") or "")
+    if (
+        not decision_id
+        or decision_id != str(payload.get("decision_id") or "")
+        or decision_id != str(row.get("linked_decision_id") or "")
+        or context_version != str(row.get("linked_context_version") or "")
+    ):
+        raise ValueError("decision context reference does not match persisted metadata")
+    input_payload = row.get("linked_input_payload")
+    outcome_payload = row.get("linked_outcome_payload")
+    if not isinstance(input_payload, str) or not isinstance(outcome_payload, str):
+        raise ValueError("decision context reference cannot be resolved")
+    inputs = _parse_canonical_json(input_payload, "input_payload")
+    outcome = _parse_canonical_json(outcome_payload, "outcome_payload")
+    if not isinstance(inputs, dict) or not isinstance(outcome, dict):
+        raise ValueError("linked decision context payload is malformed")
+    trace = outcome.get("decision_trace")
+    if not isinstance(trace, list):
+        raise ValueError("linked decision trace is malformed")
+    payload["decision_inputs"] = inputs
+    payload["decision_trace"] = trace
+    payload["first_decisive_block"] = str(outcome.get("first_decisive_block") or "")
+    quality_inputs = inputs.get("score", {}).get("quality_score_inputs", {})
+    payload["quality_score_inputs"] = (
+        quality_inputs if isinstance(quality_inputs, dict) else {}
+    )
+    return payload
+
+
+def _normalize_stored_model_payload(
+    stored: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    if "decision_context_ref" not in incoming or "decision_context_ref" in stored:
+        return stored
+    normalized = dict(stored)
+    for key in (
+        "decision_inputs",
+        "decision_trace",
+        "first_decisive_block",
+        "quality_score_inputs",
+    ):
+        normalized.pop(key, None)
+    normalized["decision_context_ref"] = deepcopy(incoming["decision_context_ref"])
+    return normalized
 
 
 def _profile_key_for_signal(signal: Signal) -> str:
@@ -664,6 +729,7 @@ def _decision_context_values(context: DecisionContext) -> dict[str, Any]:
         "final_reason": normalized["final_reason"],
         "open_allowed": normalized["open_allowed"],
         "observation_allowed": normalized["observation_allowed"],
+        "selected_order_terms": normalized["selected_order_terms"],
     }
     if not isinstance(outcome["decision_trace"], list):
         raise TypeError("decision_trace must be a list")
@@ -1453,8 +1519,13 @@ class SQLiteMonitorStore:
             raise ValueError("stored decision context JSON is malformed") from error
         if not isinstance(inputs, dict):
             raise ValueError("stored decision context inputs must be an object")
-        if not isinstance(outcome, dict) or set(outcome) != _DECISION_OUTCOME_KEYS:
+        legacy_outcome_keys = _DECISION_OUTCOME_KEYS - {"selected_order_terms"}
+        if not isinstance(outcome, dict) or frozenset(outcome) not in {
+            frozenset(_DECISION_OUTCOME_KEYS),
+            frozenset(legacy_outcome_keys),
+        }:
             raise ValueError("stored decision context outcome has an invalid shape")
+        outcome.setdefault("selected_order_terms", {})
         if not isinstance(outcome["decision_trace"], list):
             raise ValueError("stored decision trace must be a list")
 
@@ -1474,6 +1545,7 @@ class SQLiteMonitorStore:
                 final_reason=outcome["final_reason"],
                 open_allowed=outcome["open_allowed"],
                 observation_allowed=outcome["observation_allowed"],
+                selected_order_terms=outcome["selected_order_terms"],
             )
             expected = _decision_context_values(restored_context)
         except (KeyError, TypeError, ValueError) as error:
@@ -1665,7 +1737,7 @@ class SQLiteMonitorStore:
                 order.result,
                 order.opened_at,
                 order.settled_at,
-                json.dumps(order.to_dict(), ensure_ascii=False),
+                json.dumps(decision_linked_storage_payload(order), ensure_ascii=False),
                 order.decision_id or None,
                 order.runtime_config_hash or None,
             ),
@@ -1678,7 +1750,8 @@ class SQLiteMonitorStore:
         symbol: str,
     ) -> None:
         normalized_symbol = symbol.upper()
-        payload = json.dumps(order.to_dict(), ensure_ascii=False)
+        incoming = decision_linked_storage_payload(order)
+        payload = json.dumps(incoming, ensure_ascii=False)
         bound_order = connection.execute(
             """
             select order_id, status, result, opened_at, settled_at, payload,
@@ -1695,8 +1768,8 @@ class SQLiteMonitorStore:
                 persisted = json.loads(bound_order["payload"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise ValueError("stored order payload is malformed") from error
+            persisted = _normalize_stored_model_payload(persisted, incoming)
             mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
-            incoming = order.to_dict()
             persisted_frozen = {
                 key: value for key, value in persisted.items() if key not in mutable_fields
             }
@@ -1716,7 +1789,7 @@ class SQLiteMonitorStore:
                 bound_order["status"] == order.status
                 and bound_order["result"] == order.result
                 and bound_order["settled_at"] == order.settled_at
-                and bound_order["payload"] == payload
+                and persisted == incoming
             ):
                 return
             raise ValueError("order id collides with different frozen decision data")
@@ -1987,14 +2060,19 @@ class SQLiteMonitorStore:
             raise ValueError("stored order payload is malformed") from error
 
         mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
+        incoming_payload = decision_linked_storage_payload(order)
+        stored_payload = _normalize_stored_model_payload(
+            stored_payload,
+            incoming_payload,
+        )
         stored_frozen = {
             key: value
-            for key, value in stored_order.to_dict().items()
+            for key, value in stored_payload.items()
             if key not in mutable_fields
         }
         requested_frozen = {
             key: value
-            for key, value in order.to_dict().items()
+            for key, value in incoming_payload.items()
             if key not in mutable_fields
         }
         if stored_frozen != requested_frozen:
@@ -2005,7 +2083,7 @@ class SQLiteMonitorStore:
         ):
             raise ValueError("settlement conflicts with frozen order identity")
 
-        expected_payload = json.dumps(order.to_dict(), ensure_ascii=False)
+        expected_payload = json.dumps(incoming_payload, ensure_ascii=False)
         if row["status"] == "SETTLED":
             if (
                 row["result"] != order.result
@@ -2183,12 +2261,27 @@ class SQLiteMonitorStore:
         accepted = {field.name for field in fields(SimulatedOrder)}
         with self._connect() as connection:
             rows = connection.execute(
-                "select payload from orders where symbol = ? order by order_id",
+                """
+                select orders.payload,
+                       decision_contexts.decision_id as linked_decision_id,
+                       decision_contexts.context_version as linked_context_version,
+                       decision_contexts.input_payload as linked_input_payload,
+                       decision_contexts.outcome_payload as linked_outcome_payload
+                from orders
+                left join decision_contexts
+                  on decision_contexts.symbol = orders.symbol
+                 and decision_contexts.decision_id = orders.decision_id
+                where orders.symbol = ?
+                order by orders.order_id
+                """,
                 (symbol.upper(),),
             ).fetchall()
         orders = []
         for row in rows:
-            payload = json.loads(row["payload"])
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
             clean_payload = {key: value for key, value in payload.items() if key in accepted}
             if "calculated_threshold" not in payload:
                 clean_payload["calculated_threshold"] = float(
@@ -2250,20 +2343,25 @@ class SQLiteMonitorStore:
             raise ValueError("stored observation payload is malformed") from error
 
         mutable_fields = {"status", "result", "settled_at", "exit_price", "pnl"}
+        incoming_payload = decision_linked_storage_payload(observation)
+        stored_payload = _normalize_stored_model_payload(
+            stored_payload,
+            incoming_payload,
+        )
         stored_frozen = {
             key: value
-            for key, value in stored.to_dict().items()
+            for key, value in stored_payload.items()
             if key not in mutable_fields
         }
         requested_frozen = {
             key: value
-            for key, value in observation.to_dict().items()
+            for key, value in incoming_payload.items()
             if key not in mutable_fields
         }
         if stored_frozen != requested_frozen:
             raise ValueError("settlement conflicts with frozen observation data")
 
-        expected_payload = json.dumps(observation.to_dict(), ensure_ascii=False)
+        expected_payload = json.dumps(incoming_payload, ensure_ascii=False)
         if row["status"] == "SETTLED":
             if (
                 observation.status != "SETTLED"
@@ -2303,7 +2401,7 @@ class SQLiteMonitorStore:
         observation: ObservationSignal,
         symbol: str,
     ) -> dict[str, Any]:
-        payload = observation.to_dict()
+        payload = decision_linked_storage_payload(observation)
         adaptive = (
             observation.adaptive_profile_state
             if isinstance(observation.adaptive_profile_state, Mapping)
@@ -2452,6 +2550,10 @@ class SQLiteMonitorStore:
                 requested_payload = json.loads(values["payload"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise ValueError("stored observation payload is malformed") from error
+            persisted_payload = _normalize_stored_model_payload(
+                persisted_payload,
+                requested_payload,
+            )
             mutable_payload_fields = {
                 "status",
                 "result",
@@ -2479,7 +2581,14 @@ class SQLiteMonitorStore:
                 )
             if existing["status"] == "SETTLED" and values["status"] == "OPEN":
                 return
-            if tuple(existing) != tuple(values[column] for column in columns):
+            non_payload_columns = tuple(
+                column for column in columns if column != "payload"
+            )
+            if (
+                tuple(existing[column] for column in non_payload_columns)
+                != tuple(values[column] for column in non_payload_columns)
+                or persisted_payload != requested_payload
+            ):
                 raise ValueError(
                     "observation key collides with different frozen decision data"
                 )
@@ -2491,17 +2600,27 @@ class SQLiteMonitorStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                select payload
+                select observation_signals.payload,
+                       decision_contexts.decision_id as linked_decision_id,
+                       decision_contexts.context_version as linked_context_version,
+                       decision_contexts.input_payload as linked_input_payload,
+                       decision_contexts.outcome_payload as linked_outcome_payload
                 from observation_signals
-                where symbol = ?
-                order by opened_at desc
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                where observation_signals.symbol = ?
+                order by observation_signals.opened_at desc
                 limit ?
                 """,
                 (symbol.upper(), limit),
             ).fetchall()
         observations = []
         for row in rows:
-            payload = json.loads(row["payload"])
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
             clean_payload = {key: value for key, value in payload.items() if key in accepted}
             observations.append(ObservationSignal(**clean_payload))
         return observations
@@ -2523,17 +2642,29 @@ class SQLiteMonitorStore:
             cutoff = int(latest) - (max(1, int(lookback_days)) + 1) * 86_400_000
             rows = connection.execute(
                 """
-                select payload
+                select observation_signals.payload,
+                       decision_contexts.decision_id as linked_decision_id,
+                       decision_contexts.context_version as linked_context_version,
+                       decision_contexts.input_payload as linked_input_payload,
+                       decision_contexts.outcome_payload as linked_outcome_payload
                 from observation_signals
-                where symbol = ? and (status = 'OPEN' or opened_at >= ?)
-                order by opened_at desc
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                where observation_signals.symbol = ?
+                  and (observation_signals.status = 'OPEN'
+                       or observation_signals.opened_at >= ?)
+                order by observation_signals.opened_at desc
                 """,
                 (normalized_symbol, cutoff),
             ).fetchall()
         accepted = {field.name for field in fields(ObservationSignal)}
         observations = []
         for row in rows:
-            payload = json.loads(row["payload"])
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
             clean_payload = {key: value for key, value in payload.items() if key in accepted}
             observations.append(ObservationSignal(**clean_payload))
         return observations
@@ -2633,7 +2764,7 @@ class SQLiteMonitorStore:
             "segment": _clean_filter(segment),
             "result": _clean_filter(result),
         }
-        clauses = ["symbol = ?"]
+        clauses = ["observation_signals.symbol = ?"]
         parameters: list[object] = [normalized_symbol]
         column_filters = (
             ("direction", "direction"),
@@ -2643,12 +2774,12 @@ class SQLiteMonitorStore:
         )
         for filter_name, column_name in column_filters:
             if filters[filter_name]:
-                clauses.append(f"upper({column_name}) = ?")
+                clauses.append(f"upper(observation_signals.{column_name}) = ?")
                 parameters.append(filters[filter_name])
         if filters["result"] == "OPEN":
-            clauses.append("upper(status) = 'OPEN'")
+            clauses.append("upper(observation_signals.status) = 'OPEN'")
         elif filters["result"]:
-            clauses.append("upper(coalesce(result, '')) = ?")
+            clauses.append("upper(coalesce(observation_signals.result, '')) = ?")
             parameters.append(filters["result"])
         where_sql = " and ".join(clauses)
         normalized_page_size = _normalize_page_size(page_size)
@@ -2667,10 +2798,18 @@ class SQLiteMonitorStore:
             offset = (normalized_page - 1) * normalized_page_size
             rows = connection.execute(
                 f"""
-                select payload
+                select observation_signals.payload,
+                       decision_contexts.decision_id as linked_decision_id,
+                       decision_contexts.context_version as linked_context_version,
+                       decision_contexts.input_payload as linked_input_payload,
+                       decision_contexts.outcome_payload as linked_outcome_payload
                 from observation_signals
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
                 where {where_sql}
-                order by opened_at desc, observation_key desc
+                order by observation_signals.opened_at desc,
+                         observation_signals.observation_key desc
                 limit ? offset ?
                 """,
                 [*parameters, normalized_page_size, offset],
@@ -2682,7 +2821,10 @@ class SQLiteMonitorStore:
         accepted = {field.name for field in fields(ObservationSignal)}
         observations = []
         for row in rows:
-            payload = json.loads(row["payload"])
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
             clean_payload = {
                 key: value for key, value in payload.items() if key in accepted
             }
