@@ -93,6 +93,7 @@ def round_level(
         "round_level_price": price,
         "round_level_step": 100.0,
         "_independently_qualified": independently_qualified,
+        "_emit_independently": independently_qualified,
     }
 
 
@@ -468,6 +469,49 @@ class StructureClusteringRegressionTest(unittest.TestCase):
             levels,
         )
 
+    def test_high_price_pivot_ids_are_distinct_and_stable_when_indexes_roll(self):
+        config = StructureConfig(
+            bars=240,
+            atr_period=1,
+            pivot_left=1,
+            pivot_right=1,
+            min_pivots=2,
+            min_pivot_gap=5,
+            minimum_bars=8,
+        )
+        prices = (1e17, 1e17 + 100.0)
+
+        def clustered(index_offset):
+            pivots = [
+                {
+                    "kind": "LOW",
+                    "index": index + index_offset,
+                    "price": price,
+                    "confirmed_at": confirmed_at,
+                }
+                for price, indexes in zip(
+                    prices,
+                    ((50, 60), (70, 80)),
+                )
+                for index, confirmed_at in zip(indexes, (60_000, 70_000))
+            ]
+            return _cluster_pivots(
+                make_bars(240, price=1e17),
+                pivots,
+                100.0,
+                config,
+            )
+
+        before = clustered(0)
+        after = clustered(-1)
+        before_ids = {level["lower"]: level["id"] for level in before}
+        after_ids = {level["lower"]: level["id"] for level in after}
+
+        self.assertEqual(len(before_ids), 2)
+        self.assertEqual(len(set(before_ids.values())), 2)
+        self.assertEqual(before_ids, after_ids)
+        self.assertIn(format(prices[1], ".17g"), before_ids[prices[1]])
+
 
 class RoundCandidateRegressionTest(unittest.TestCase):
     def test_overlapping_round_steps_keep_largest_step_without_duplicates(self):
@@ -673,6 +717,145 @@ class RoundCandidateRegressionTest(unittest.TestCase):
         self.assertEqual(
             round_ids[123_456_800.0],
             "round-support-123456800",
+        )
+
+    def test_round_ids_distinguish_one_hundred_at_1e17(self):
+        prices = (1e17, 1e17 + 100.0)
+        bars = [
+            Kline(
+                index * 60_000,
+                prices[0],
+                prices[1],
+                prices[0],
+                prices[0],
+                1.0,
+                (index + 1) * 60_000,
+            )
+            for index in range(2)
+        ]
+        levels = _round_candidates(
+            "BTCUSDT",
+            bars,
+            100.0,
+            StructureConfig(),
+            [
+                pivot_level(
+                    f"support-{format(price, '.17g')}",
+                    price,
+                    price,
+                )
+                for price in prices
+            ],
+        )
+        round_ids = {
+            item["round_level_price"]: item["id"]
+            for item in levels
+            if item["kind"] == "SUPPORT"
+            and item["round_level_price"] in prices
+        }
+
+        self.assertEqual(len(round_ids), 2)
+        self.assertEqual(len(set(round_ids.values())), 2)
+        self.assertEqual(
+            round_ids[prices[1]],
+            f"round-support-{format(prices[1], '.17g')}",
+        )
+
+    def test_zone_candidates_do_not_bypass_independent_emit_limit(self):
+        bars = make_bars(240, price=500_000.0)
+        for index in (0, 5):
+            bars[index] = replace_bar(
+                bars[index],
+                open=900_000.0,
+                high=900_100.0,
+                low=1.0,
+                close=900_000.0,
+            )
+        for index in (10, 15):
+            bars[index] = replace_bar(
+                bars[index],
+                open=100_000.0,
+                high=900_000.0,
+                low=99_900.0,
+                close=100_000.0,
+            )
+        config = StructureConfig(cluster_atr=5.0)
+        pivot_levels = [
+            pivot_level(
+                f"near-{kind.lower()}-zone-{index}",
+                300_000.0 + index * 20_000.0,
+                300_000.0 + index * 20_000.0,
+                kind=kind,
+            )
+            for kind in ("SUPPORT", "RESISTANCE")
+            for index in range(12)
+        ]
+        pivot_levels.append(
+            pivot_level("far-zone", 100_000.0, 100_000.0)
+        )
+
+        round_levels = _round_candidates(
+            "BTCUSDT",
+            bars,
+            1_000.0,
+            config,
+            pivot_levels,
+        )
+        qualified_by_kind = {
+            kind: [
+                item
+                for item in round_levels
+                if item["kind"] == kind
+                and item["_independently_qualified"]
+            ]
+            for kind in ("SUPPORT", "RESISTANCE")
+        }
+        for kind, qualified in qualified_by_kind.items():
+            with self.subTest(kind=kind):
+                self.assertGreater(len(qualified), 96)
+                self.assertEqual(
+                    sum(
+                        item.get("_emit_independently", False)
+                        for item in qualified
+                    ),
+                    96,
+                )
+        self.assertTrue(
+            any(
+                item["round_level_price"] == 100_000.0
+                and not item["_emit_independently"]
+                for item in qualified_by_kind["SUPPORT"]
+            )
+        )
+
+        merged = _merge_round_levels(
+            pivot_levels,
+            round_levels,
+            1_000.0,
+            config,
+        )
+        far_zone = next(item for item in merged if item["id"] == "far-zone")
+
+        for kind in ("SUPPORT", "RESISTANCE"):
+            with self.subTest(final_kind=kind):
+                self.assertLessEqual(
+                    sum(
+                        item["kind"] == kind and item["source"] == "ROUND"
+                        for item in merged
+                    ),
+                    96,
+                )
+        self.assertTrue(
+            any(item["round_level_price"] == 500_000.0 for item in merged)
+        )
+        self.assertEqual(far_zone["source"], "MERGED")
+        self.assertEqual(far_zone["round_level_price"], 100_000.0)
+        self.assertTrue(
+            all(
+                "_independently_qualified" not in item
+                and "_emit_independently" not in item
+                for item in merged
+            )
         )
 
 

@@ -211,7 +211,7 @@ def _cluster_pivots(
                 upper,
                 config.min_pivot_gap,
             )
-            price_token = "-".join(format(price, ".15g") for price in prices)
+            price_token = "-".join(format(price, ".17g") for price in prices)
             confirmation_token = "-".join(
                 str(int(item["confirmed_at"])) for item in independent
             )
@@ -357,7 +357,7 @@ def _round_candidates(
             )
             levels.append(
                 {
-                    "id": f"round-{kind.lower()}-{format(price, '.15g')}",
+                    "id": f"round-{kind.lower()}-{format(price, '.17g')}",
                     "kind": kind,
                     "source": "ROUND",
                     "lower": price,
@@ -377,6 +377,7 @@ def _round_candidates(
                     "round_level_price": price,
                     "round_level_step": step,
                     "_independently_qualified": count >= config.min_pivots,
+                    "_emit_independently": False,
                 }
             )
 
@@ -398,6 +399,7 @@ def _round_candidates(
             ),
         )[:MAX_QUALIFIED_ROUND_LEVELS_PER_KIND]
         for level in qualified:
+            level["_emit_independently"] = True
             selected[(kind, float(level["round_level_price"]))] = level
 
     zones_by_kind = {
@@ -587,10 +589,11 @@ def _merge_round_levels(
         dict(item)
         for index, item in enumerate(copied_round_levels)
         if index not in matched_rounds
-        and item.get("_independently_qualified", False)
+        and item.get("_emit_independently", False)
     )
     for item in result:
         item.pop("_independently_qualified", None)
+        item.pop("_emit_independently", None)
     return result
 
 
