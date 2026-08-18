@@ -7256,6 +7256,111 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(state.daily_profile_selection["selected_profiles"], [])
         self.assertIsNone(state.active_daily_profile_selection)
 
+    def test_daily_profile_as_of_rejects_present_invalid_time_fields_but_allows_missing_fields(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        fields = (
+            "evaluation_key",
+            "lookback_start",
+            "lookback_end",
+            "evaluated_at",
+            "evaluation_time",
+            "effective_from",
+            "effective_until",
+        )
+        valid = {
+            "evaluation_key": cutoff,
+            "lookback_start": cutoff - 7 * 86_400_000,
+            "lookback_end": cutoff,
+            "evaluated_at": current,
+            "evaluation_time": current,
+            "effective_from": current,
+            "effective_until": current + 86_400_000,
+        }
+        limits = {
+            "evaluation_key": cutoff,
+            "evaluated_at": current,
+            "effective_from": current,
+            "effective_until": current + 86_400_000,
+        }
+        invalid_values = (
+            None,
+            "",
+            "not-a-timestamp",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+        )
+
+        for field in fields:
+            for invalid in invalid_values:
+                with self.subTest(field=field, invalid=repr(invalid)):
+                    self.assertFalse(
+                        MonitorState._is_snapshot_as_of(
+                            {**valid, field: invalid},
+                            **limits,
+                        )
+                    )
+            with self.subTest(field=field, value="missing"):
+                missing = dict(valid)
+                missing.pop(field)
+                self.assertTrue(MonitorState._is_snapshot_as_of(missing, **limits))
+            with self.subTest(field=field, value="numeric string"):
+                self.assertTrue(
+                    MonitorState._is_snapshot_as_of(
+                        {**valid, field: str(valid[field])},
+                        **limits,
+                    )
+                )
+
+    def test_legacy_daily_selector_invalid_effective_times_refresh_to_inactive_error(self):
+        current = shanghai_timestamp("2026-07-30T08:00:00")
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        config = DailyProfileSelectorConfig().normalized()
+        invalid_values = (
+            None,
+            "",
+            "not-a-timestamp",
+            float("nan"),
+            float("inf"),
+            True,
+        )
+        for field in ("effective_from", "effective_until"):
+            for invalid in invalid_values:
+                with self.subTest(field=field, invalid=repr(invalid)):
+                    storage = LegacyFailingDailySelectionStorage()
+                    snapshot = {
+                        "version": "INVALID-EFFECTIVE-TIME",
+                        "status": "READY",
+                        "evaluation_key": cutoff,
+                        "lookback_end": cutoff,
+                        "evaluated_at": current,
+                        "effective_from": current,
+                        "effective_until": current + 86_400_000,
+                        "config": dict(config.__dict__),
+                        "selected_profiles": [
+                            {"key": "invalid-effective-without-row-time"}
+                        ],
+                        "selected_count": 1,
+                        field: invalid,
+                    }
+                    storage.daily_profile_selections.append(("BTCUSDT", snapshot))
+                    state = MonitorState(
+                        symbol="BTCUSDT",
+                        storage=storage,
+                        enable_daily_profile_selector=True,
+                        daily_profile_selector_config=config,
+                    )
+                    self.addCleanup(state.close)
+
+                    state._refresh_daily_profile_selection(current)
+
+                    self.assertEqual(state.daily_profile_selection["status"], "ERROR")
+                    self.assertEqual(state.daily_profile_selection["selected_profiles"], [])
+                    self.assertIsNone(state.active_daily_profile_selection)
+
     def test_legacy_daily_selector_rejects_any_future_or_unparseable_top_level_time(self):
         current = shanghai_timestamp("2026-07-30T08:00:00")
         cutoff = shanghai_timestamp("2026-07-30T07:50:00")

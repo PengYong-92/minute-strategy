@@ -3063,10 +3063,11 @@ class MonitorState:
             activation_minute=config.activation_minute,
         )
         latest = self.daily_profile_selection
+        latest_effective_from = self._snapshot_time_ms(latest, "effective_from")
         if (
             latest is None
             or not self._daily_profile_snapshot_is_safe(latest, target, current_time)
-            or int(latest.get("effective_from", -1)) != target["effective_from"]
+            or latest_effective_from != target["effective_from"]
             or not self._daily_profile_config_matches(latest, config)
         ):
             previous = self._load_daily_profile_selection_as_of(
@@ -3263,20 +3264,29 @@ class MonitorState:
         )
         found = False
         for field, limit in limits:
-            value = snapshot.get(field)
-            if value is None:
+            if field not in snapshot:
                 continue
             found = True
-            if isinstance(value, bool) or (
-                isinstance(value, float) and not value.is_integer()
-            ):
-                return False
-            try:
-                if int(value) > limit:
-                    return False
-            except (TypeError, ValueError):
+            value = MonitorState._snapshot_time_ms(snapshot, field)
+            if value is None or value > limit:
                 return False
         return found
+
+    @staticmethod
+    def _snapshot_time_ms(snapshot: dict | None, field: str) -> int | None:
+        if not isinstance(snapshot, dict) or field not in snapshot:
+            return None
+        value = snapshot[field]
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
     @classmethod
     def _daily_profile_snapshot_is_safe(
@@ -3293,14 +3303,18 @@ class MonitorState:
             effective_until=target["effective_until"],
         )
 
-    @staticmethod
-    def _selection_is_effective(snapshot: dict | None, current_time: int) -> bool:
+    @classmethod
+    def _selection_is_effective(cls, snapshot: dict | None, current_time: int) -> bool:
         if not snapshot:
             return False
+        effective_from = cls._snapshot_time_ms(snapshot, "effective_from")
+        effective_until = cls._snapshot_time_ms(snapshot, "effective_until")
         return (
             snapshot.get("status") in {"READY", "FALLBACK"}
-            and int(snapshot.get("effective_from", 0)) <= current_time
-            and int(snapshot.get("effective_until", 0)) > current_time
+            and effective_from is not None
+            and effective_until is not None
+            and effective_from <= current_time
+            and effective_until > current_time
         )
 
     @staticmethod
