@@ -1375,6 +1375,33 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(storage.entry_snapshots, [])
         self.assertEqual(webhook.calls, [])
 
+    def test_post_commit_profile_maintenance_failure_keeps_open_and_dispatches_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            webhook = RecordingWebhook()
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                webhook=webhook,
+                min_order_gap_ms=0,
+            )
+            signal = selected_profile_signal(119_999, reason="committed before cache")
+            latest = latest_kline(119_999)
+
+            with patch.object(
+                store,
+                "_refresh_profile_summary_cache",
+                side_effect=RuntimeError("cache maintenance failed"),
+            ):
+                first = state._maybe_open_order(signal, latest)
+            replay = state._maybe_open_order(signal, latest)
+
+            self.assertEqual((first, replay), ("OPENED", "OPENED"))
+            self.assertEqual(len(store.load_orders("BTCUSDT")), 1)
+            self.assertEqual(len(state.simulator.orders), 1)
+            self.assertEqual(len(webhook.calls), 1)
+
     def test_successful_open_bundle_shares_one_decision_identity_before_webhook(self):
         events = []
 
@@ -1666,6 +1693,89 @@ class MonitorStateTest(unittest.TestCase):
             recent = store.load_recent_signals("BTCUSDT")
             self.assertEqual(len(recent), 1)
             self.assertEqual(recent[0]["created_at_ms"], latest.close_time)
+
+    def test_daily_profile_block_replay_restores_all_visible_decision_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            signal = replace(
+                selected_profile_signal(119_999, reason="not selected today"),
+                daily_profile_selected=False,
+            )
+            latest = latest_kline(119_999)
+
+            first = state._maybe_open_order(
+                signal,
+                latest,
+                daily_profile_required=True,
+            )
+            first_page = state.snapshot()
+            replay = state._maybe_open_order(
+                replace(signal, reason="recomputed blocked reason"),
+                latest,
+                daily_profile_required=True,
+            )
+            replay_page = state.snapshot()
+
+            self.assertEqual((first, replay), (
+                "DAILY_PROFILE_NOT_SELECTED",
+                "DAILY_PROFILE_NOT_SELECTED",
+            ))
+            visible_keys = (
+                "risk_pause",
+                "rolling_edge",
+                "result_sequence_guard",
+                "wave_batch_guard",
+                "profile_degradation_guard",
+                "profile_health_guard",
+                "time_period_guard",
+                "selected_signal",
+            )
+            self.assertEqual(
+                {key: first_page[key] for key in visible_keys},
+                {key: replay_page[key] for key in visible_keys},
+            )
+
+    def test_same_kline_opposite_directions_create_independent_decisions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            webhook = RecordingWebhook()
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                webhook=webhook,
+                max_open_orders=2,
+                max_open_long_orders=1,
+                max_open_short_orders=1,
+                min_order_gap_ms=0,
+            )
+            latest = latest_kline(119_999)
+            long_signal = replace(
+                selected_profile_signal(119_999),
+                daily_profile_selected=False,
+                daily_profile_version="",
+                profile_key="",
+                threshold_segment="WD-02",
+            )
+            short_signal = replace(
+                long_signal,
+                direction="SHORT",
+                observe_direction="SHORT",
+                score=-90.0,
+                reason="same kline short",
+            )
+
+            decisions = (
+                state._maybe_open_order(long_signal, latest),
+                state._maybe_open_order(short_signal, latest),
+            )
+
+            self.assertEqual(decisions, ("OPENED", "OPENED"))
+            orders = store.load_orders("BTCUSDT")
+            self.assertEqual({order.direction for order in orders}, {"LONG", "SHORT"})
+            self.assertEqual(len({order.decision_id for order in orders}), 2)
+            self.assertEqual(len(webhook.calls), 2)
 
     def test_failed_real_bundle_does_not_fall_back_to_orphan_signal_audit(self):
         with tempfile.TemporaryDirectory() as temp_dir:

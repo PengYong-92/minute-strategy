@@ -135,8 +135,7 @@ def summarize_order_samples_with_guard(
     _attach_reconstructed_order_slots(snapshots)
     settled = _settled_samples(snapshots)
     open_orders = sum(1 for sample in snapshots if sample.get("result") not in {"WIN", "LOSS"})
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+    summary = {
         "snapshot_count": len(snapshots),
         "sample_count": len(settled),
         "open_orders": open_orders,
@@ -174,8 +173,10 @@ def summarize_order_samples_with_guard(
         "profile_guard_shadow": _profile_guard_shadow_summary(settled),
         "profile_guard_policy": _profile_guard_policy_summary(settled),
         "profile_guard_shadow_compare": _profile_guard_shadow_compare(settled),
-        "elapsed_seconds": round(time.perf_counter() - started, 4),
     }
+    summary["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+    summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return summary
 
 
 def risk_hint_keys_for_sample(sample: Mapping[str, Any]) -> list[str]:

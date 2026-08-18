@@ -24,7 +24,7 @@ from app.storage import SQLiteMonitorStore
 class OrdersApiTest(unittest.TestCase):
     def test_main_injects_versioned_strategy_build_id_from_cli_or_environment(self):
         cases = (
-            ({}, [], "minute-strategy-2026.08.18"),
+            ({}, [], server_module.DEFAULT_STRATEGY_BUILD_ID),
             ({"STRATEGY_BUILD_ID": "commit-ae7b484"}, [], "commit-ae7b484"),
             (
                 {"STRATEGY_BUILD_ID": "environment-build"},
@@ -67,6 +67,28 @@ class OrdersApiTest(unittest.TestCase):
                     monitor_state.call_args.kwargs["strategy_build_id"],
                     expected,
                 )
+
+        self.assertRegex(
+            server_module.DEFAULT_STRATEGY_BUILD_ID,
+            r"^minute-strategy-src-[0-9a-f]{16}$",
+        )
+
+    def test_strategy_source_build_id_is_stable_and_changes_with_source(self):
+        self.assertTrue(hasattr(server_module, "strategy_source_build_id"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "strategy.py"
+            second = root / "order_policy.py"
+            first.write_text("RULE = 1\n", encoding="utf-8")
+            second.write_text("GATE = 2\n", encoding="utf-8")
+
+            initial = server_module.strategy_source_build_id((first, second))
+            repeated = server_module.strategy_source_build_id((second, first))
+            first.write_text("RULE = 3\n", encoding="utf-8")
+            changed = server_module.strategy_source_build_id((first, second))
+
+            self.assertEqual(initial, repeated)
+            self.assertNotEqual(initial, changed)
 
     def test_help_documents_strategy_build_id_in_chinese(self):
         stdout = StringIO()

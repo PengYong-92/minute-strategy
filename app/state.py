@@ -1,3 +1,4 @@
+import hashlib
 import threading
 import time
 from bisect import bisect_left
@@ -76,7 +77,42 @@ from app.wave_batch_guard import (
 DAY_MS = 86_400_000
 REALTIME_PRICE_STALE_MS = 5_000
 TRANSITIONAL_DECISION_BUILD_ID = "TASK7_TRANSITIONAL_V1"
-DEFAULT_STRATEGY_BUILD_ID = "minute-strategy-2026.08.18"
+
+_STRATEGY_SOURCE_NAMES = (
+    "daily_profile_selector.py",
+    "decision_context.py",
+    "direction_pulse_shadow.py",
+    "models.py",
+    "order_policy.py",
+    "order_profile.py",
+    "profile_degradation_guard.py",
+    "profile_health_guard.py",
+    "result_sequence_guard.py",
+    "rolling_edge.py",
+    "simulator.py",
+    "stake_progression.py",
+    "state.py",
+    "strategy.py",
+    "time_period_guard.py",
+    "wave_batch_guard.py",
+    "wave_state.py",
+)
+
+
+def strategy_source_build_id(paths: Sequence[Path] | None = None) -> str:
+    source_paths = tuple(paths) if paths is not None else tuple(
+        Path(__file__).resolve().parent / name for name in _STRATEGY_SOURCE_NAMES
+    )
+    digest = hashlib.sha256()
+    for path in sorted(source_paths, key=lambda item: item.name):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return f"minute-strategy-src-{digest.hexdigest()[:16]}"
+
+
+DEFAULT_STRATEGY_BUILD_ID = strategy_source_build_id()
 
 
 class MonitorState:
@@ -1004,6 +1040,9 @@ class MonitorState:
                 value = audit_snapshot.get(source_key)
                 if isinstance(value, dict):
                     setattr(self, attribute_name, deepcopy(value))
+        self.risk_pause = "" if final_decision == "OPENED" else str(
+            context.get("final_reason") or ""
+        )
         self.selected_signal = enriched_signal
         self._bundled_decision_ids.add(enriched_signal.decision_id)
         return final_decision

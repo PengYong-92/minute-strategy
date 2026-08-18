@@ -15,7 +15,7 @@ from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.profile_health_guard import ProfileHealthGuardConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
-from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState
+from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState, strategy_source_build_id
 from app.time_period_guard import TimePeriodGuardConfig
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
 

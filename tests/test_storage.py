@@ -3,9 +3,11 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing, contextmanager
 from dataclasses import fields, replace
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from app.decision_context import (
     runtime_config_snapshot,
 )
 from app.models import ObservationSignal, Signal, SimulatedOrder
+from app import order_profile
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import DecisionAudit, SQLiteMonitorStore
@@ -302,6 +305,27 @@ def atomic_bundle_counts(db_path: Path) -> dict[str, int]:
 
 
 class SQLiteMonitorStoreTest(unittest.TestCase):
+    def test_profile_summary_generated_at_marks_completed_calculation(self):
+        original_summary = order_profile._summary
+        delayed = False
+
+        def delayed_summary(*args, **kwargs):
+            nonlocal delayed
+            if not delayed:
+                delayed = True
+                time.sleep(0.04)
+            return original_summary(*args, **kwargs)
+
+        started_at = datetime.now(timezone.utc)
+        with mock.patch.object(order_profile, "_summary", side_effect=delayed_summary):
+            summary = order_profile.summarize_order_samples_with_guard([])
+        completed_at = datetime.now(timezone.utc)
+        generated_at = datetime.fromisoformat(summary["generated_at"])
+
+        self.assertGreaterEqual(generated_at, started_at + timedelta(seconds=0.03))
+        self.assertLessEqual(generated_at, completed_at)
+        self.assertGreaterEqual(summary["elapsed_seconds"], 0.03)
+
     def assert_save_rejects_invalid_runtime_reference(
         self,
         snapshot: RuntimeConfigSnapshot,
@@ -3593,6 +3617,42 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                 store.load_stake_progression_credits(context.symbol)[0].status,
                 "PENDING",
             )
+
+    def test_post_commit_profile_maintenance_failure_does_not_fail_settlement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, _observed = (
+                atomic_bundle_fixture(include_observation=False)
+            )
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+            )
+            settled = replace(
+                order,
+                status="SETTLED",
+                result="WIN",
+                settled_at=order.expires_at,
+                exit_price=101.0,
+                pnl=8.0,
+            )
+
+            with mock.patch.object(
+                store,
+                "_refresh_profile_summary_cache",
+                side_effect=RuntimeError("cache maintenance failed"),
+            ):
+                store.save_settled_order_with_credit(settled, "BTCUSDT", None)
+
+            restored = store.load_orders("BTCUSDT")
+            snapshots = store.load_order_entry_snapshots("BTCUSDT")
+            self.assertEqual((restored[0].status, restored[0].result), ("SETTLED", "WIN"))
+            self.assertEqual(snapshots[0]["result"], "WIN")
 
     def test_settlement_snapshot_failure_rolls_back_order_and_credit(self):
         with tempfile.TemporaryDirectory() as temp_dir:

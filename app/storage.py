@@ -1042,11 +1042,29 @@ class SQLiteMonitorStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._profile_summary_lock = threading.RLock()
         self._profile_summary_revision: dict[str, int] = {}
+        self._profile_summary_dirty: set[str] = set()
         self._profile_summary_cache: dict[
             tuple[str, int, int, int],
             dict[str, Any],
         ] = {}
         self._init_schema()
+
+    def _maintain_profile_summary_after_commit(
+        self,
+        symbol: str,
+        *,
+        sample: Mapping[str, Any] | None = None,
+        settlement: SimulatedOrder | None = None,
+    ) -> None:
+        try:
+            self._refresh_profile_summary_cache(
+                symbol,
+                sample=sample,
+                settlement=settlement,
+            )
+        except Exception:  # noqa: BLE001 - 事务已提交，缓存维护只能标记为陈旧。
+            with self._profile_summary_lock:
+                self._profile_summary_dirty.add(symbol.upper())
 
     def storage_capacity(self) -> StorageCapacity:
         with self._connect() as connection:
@@ -1753,7 +1771,7 @@ class SQLiteMonitorStore:
                 )
         except sqlite3.Error as error:
             raise_for_sqlite_write_error(error, StorageWriteClass.CORE)
-        self._refresh_profile_summary_cache(symbol, settlement=order)
+        self._maintain_profile_summary_after_commit(symbol, settlement=order)
 
     @staticmethod
     def _update_settled_order(
@@ -2989,7 +3007,7 @@ class SQLiteMonitorStore:
             context.symbol,
             entry_snapshot,
         )
-        self._refresh_profile_summary_cache(
+        self._maintain_profile_summary_after_commit(
             context.symbol,
             sample=sample_from_entry_snapshot(cached_snapshot),
         )
@@ -3208,7 +3226,7 @@ class SQLiteMonitorStore:
             symbol,
             entry_snapshot,
         )
-        self._refresh_profile_summary_cache(
+        self._maintain_profile_summary_after_commit(
             symbol,
             sample=sample_from_entry_snapshot(cached_snapshot),
         )
@@ -3409,7 +3427,7 @@ class SQLiteMonitorStore:
     def update_order_entry_snapshot_settlement(self, order: SimulatedOrder, symbol: str) -> None:
         with self._connect() as connection:
             self._update_order_entry_snapshot_settlement(connection, order, symbol)
-        self._refresh_profile_summary_cache(symbol, settlement=order)
+        self._maintain_profile_summary_after_commit(symbol, settlement=order)
 
     def load_order_entry_snapshots(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:
