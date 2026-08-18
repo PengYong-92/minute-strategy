@@ -30,6 +30,11 @@ from app.direction_pulse_shadow import (
     empty_direction_pulse_shadow,
     evaluate_direction_pulse_shadow,
 )
+from app.entry_structure_shadow import (
+    EntryStructureGate,
+    StructureDetector,
+    StructureStateMachine,
+)
 from app.models import (
     FearGreedContext,
     Kline,
@@ -259,6 +264,17 @@ class MonitorState:
         self._bundled_decision_ids: set[str] = set()
         self._decision_storage_failed = False
         self._decision_runtime_config_cache = None
+        self._entry_structure_detector = StructureDetector()
+        self._entry_structure_state_machine = StructureStateMachine(
+            self._entry_structure_detector.config
+        )
+        self._entry_structure_gate = EntryStructureGate(
+            self._entry_structure_detector,
+            self._entry_structure_state_machine,
+        )
+        self._entry_structure_market_cache: dict[
+            tuple[str, int, int], dict[str, object]
+        ] = {}
         self._profile_source_cached = False
         self._cached_profile_source = None
         self._profile_summary_prepare_error = None
@@ -437,6 +453,10 @@ class MonitorState:
 
         merged_klines = self._merge_klines(existing, klines)
         latest = merged_klines[-1]
+        entry_structure_market = self._entry_structure_market_snapshot(
+            merged_klines,
+            operation_context,
+        )
         wave_state, wave_evaluated_at = advance_wave(
             merged_klines,
             previous=previous_wave,
@@ -542,7 +562,11 @@ class MonitorState:
                     daily_profile_required=daily_profile_required,
                 )
                 if not self._decision_storage_failed:
-                    self._record_observation_candidates(observation_signals, latest)
+                    self._record_observation_candidates(
+                        observation_signals,
+                        latest,
+                        entry_structure_market,
+                    )
                 observation_audits = tuple(self._observation_audit_collector)
             finally:
                 self._observation_audit_collector = None
@@ -716,6 +740,7 @@ class MonitorState:
             self._realtime_price_event_time_ms = 0
             self._realtime_price_received_at_ms = 0
             self._market_stream_status = "STARTING"
+            self._entry_structure_market_cache.clear()
             self._opened_signal_keys.clear()
             self._last_order_opened_at = self._latest_order_opened_at_by_direction(
                 restored_orders
@@ -739,6 +764,264 @@ class MonitorState:
         return expected_context is None or expected_context == (
             self.symbol,
             self._symbol_generation,
+        )
+
+    @staticmethod
+    def _entry_structure_error_market(
+        latest: Kline,
+        stage: str,
+        error: Exception | None = None,
+    ) -> dict[str, object]:
+        error_type = type(error).__name__ if error is not None else "InvalidResult"
+        return {
+            "version": "ENTRY_STRUCTURE_SHADOW_V1",
+            "mode": "SHADOW_ONLY",
+            "status": "ERROR",
+            "evaluated_at": int(latest.close_time),
+            "states": [],
+            "reason_code": f"{stage.upper()}_ERROR_{error_type.upper()}",
+            "error_detail": error_type,
+        }
+
+    def _entry_structure_market_snapshot(
+        self,
+        closed_klines: Sequence[Kline],
+        operation_context: tuple[str, int],
+    ) -> dict[str, object]:
+        latest = closed_klines[-1]
+        cache_key = (
+            str(operation_context[0]).upper(),
+            int(operation_context[1]),
+            int(latest.close_time),
+        )
+        with self._lock:
+            cache = self._entry_structure_market_cache
+            if not isinstance(cache, dict):
+                cache = {}
+                self._entry_structure_market_cache = cache
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                detected = self._entry_structure_detector.detect(
+                    cache_key[0],
+                    closed_klines,
+                )
+            except Exception as exc:  # noqa: BLE001 - 影子检测失败不得影响主流程。
+                market = self._entry_structure_error_market(
+                    latest,
+                    "DETECTOR",
+                    exc,
+                )
+            else:
+                if not isinstance(detected, dict):
+                    market = self._entry_structure_error_market(
+                        latest,
+                        "DETECTOR_RESULT",
+                    )
+                else:
+                    try:
+                        states = self._entry_structure_state_machine.evaluate(
+                            detected,
+                            closed_klines,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 状态影子失败不得影响主流程。
+                        market = self._entry_structure_error_market(
+                            latest,
+                            "STATE_MACHINE",
+                            exc,
+                        )
+                    else:
+                        if not isinstance(states, (list, tuple)):
+                            market = self._entry_structure_error_market(
+                                latest,
+                                "STATE_MACHINE_RESULT",
+                            )
+                        else:
+                            try:
+                                market = {
+                                    **deepcopy(detected),
+                                    "states": deepcopy(list(states)),
+                                }
+                            except Exception as exc:  # noqa: BLE001 - 原始影子快照必须故障隔离。
+                                market = self._entry_structure_error_market(
+                                    latest,
+                                    "SNAPSHOT_FREEZE",
+                                    exc,
+                                )
+            cache[cache_key] = market
+            while len(cache) > 256:
+                cache.pop(next(iter(cache)))
+            return market
+
+    def _current_entry_structure_market(self, latest: Kline) -> dict[str, object]:
+        context = (self.symbol, self._symbol_generation)
+        key = (self.symbol, self._symbol_generation, int(latest.close_time))
+        cached = self._entry_structure_market_cache.get(key)
+        if cached is not None:
+            return cached
+        closed_klines = list(self.klines)
+        if not closed_klines or closed_klines[-1].close_time != latest.close_time:
+            closed_klines = [item for item in closed_klines if item.close_time < latest.close_time]
+            closed_klines.append(latest)
+        return self._entry_structure_market_snapshot(closed_klines, context)
+
+    @staticmethod
+    def _normalize_entry_structure_payload(
+        payload: dict[str, object],
+        latest: Kline,
+        candidate_origin: str,
+        candidate_direction: str,
+    ) -> dict[str, object]:
+        source = deepcopy(payload)
+        evaluated_at = int(
+            source.get(
+                "entry_structure_evaluated_at",
+                source.get("evaluated_at", latest.close_time),
+            )
+        )
+        state = str(
+            source.get(
+                "entry_structure_state",
+                source.get("state", source.get("status", "NOT_AVAILABLE")),
+            )
+        )
+        bias = str(
+            source.get(
+                "entry_structure_bias",
+                source.get("bias", "NOT_AVAILABLE"),
+            )
+        )
+        reason = str(
+            source.get(
+                "entry_structure_reason_code",
+                source.get("reason_code", source.get("reason", "NOT_EVALUATED")),
+            )
+        )
+        version = str(
+            source.get(
+                "entry_structure_version",
+                source.get("version", "ENTRY_STRUCTURE_SHADOW_V1"),
+            )
+        )
+        normalized = {
+            "entry_structure_version": version,
+            "entry_structure_mode": "SHADOW_ONLY",
+            "entry_structure_evaluated_at": evaluated_at,
+            "entry_structure_state": state,
+            "entry_structure_bias": bias,
+            "entry_structure_reason_code": reason,
+            "version": version,
+            "mode": "SHADOW_ONLY",
+            "status": state,
+            "evaluated_at": evaluated_at,
+            "state": state,
+            "bias": bias,
+            "reason_code": reason,
+            "reason": reason,
+            "audit_only": True,
+            "candidate_origin": candidate_origin,
+            "candidate_direction": candidate_direction,
+            "active_level_source": "NOT_AVAILABLE",
+            "active_level_lower": None,
+            "active_level_upper": None,
+            "active_level_touch_count": 0,
+            "active_level_confirmed_at": 0,
+            "nearest_support_lower": None,
+            "nearest_support_upper": None,
+            "nearest_resistance_lower": None,
+            "nearest_resistance_upper": None,
+            "support_distance_price": None,
+            "support_distance_bps": None,
+            "support_distance_atr": None,
+            "resistance_distance_price": None,
+            "resistance_distance_bps": None,
+            "resistance_distance_atr": None,
+            "breakout_direction": "NOT_AVAILABLE",
+            "breakout_closed_bars": 0,
+            "breakout_buffer_atr": None,
+            "retest_status": "NOT_AVAILABLE",
+            "round_level_price": None,
+            "round_level_step": None,
+            **source,
+        }
+        normalized.update(
+            {
+                "entry_structure_version": version,
+                "entry_structure_mode": "SHADOW_ONLY",
+                "entry_structure_evaluated_at": evaluated_at,
+                "entry_structure_state": state,
+                "entry_structure_bias": bias,
+                "entry_structure_reason_code": reason,
+                "version": version,
+                "mode": "SHADOW_ONLY",
+                "status": state,
+                "evaluated_at": evaluated_at,
+                "state": state,
+                "bias": bias,
+                "reason_code": reason,
+                "reason": reason,
+                "audit_only": True,
+                "candidate_origin": candidate_origin,
+                "candidate_direction": candidate_direction,
+            }
+        )
+        return normalized
+
+    def _attach_entry_structure_snapshot(
+        self,
+        signal: Signal,
+        latest: Kline,
+        candidate_origin: str,
+        market_snapshot: dict[str, object] | None = None,
+    ) -> Signal:
+        direction = str(signal.direction or "").upper()
+        existing = signal.entry_structure_shadow
+        if isinstance(existing, dict) and existing:
+            existing_origin = str(existing.get("candidate_origin", ""))
+            existing_direction = str(existing.get("candidate_direction", ""))
+            existing_evaluated_at = existing.get(
+                "entry_structure_evaluated_at",
+                existing.get("evaluated_at"),
+            )
+            if (
+                existing_origin in {"", candidate_origin}
+                and existing_direction in {"", direction}
+                and type(existing_evaluated_at) is int
+                and existing_evaluated_at == int(latest.close_time)
+            ):
+                payload = self._normalize_entry_structure_payload(
+                    existing,
+                    latest,
+                    candidate_origin,
+                    direction,
+                )
+                return replace(
+                    signal,
+                    candidate_origin=candidate_origin,
+                    entry_structure_shadow=deepcopy(payload),
+                )
+        market = market_snapshot or self._current_entry_structure_market(latest)
+        payload = self._entry_structure_gate.attach(
+            signal,
+            market,
+            candidate_origin,
+        )
+        if not isinstance(payload, dict):
+            payload = self._entry_structure_error_market(
+                latest,
+                "ATTACH_RESULT",
+            )
+        payload = self._normalize_entry_structure_payload(
+            payload,
+            latest,
+            candidate_origin,
+            direction,
+        )
+        return replace(
+            signal,
+            candidate_origin=candidate_origin,
+            entry_structure_shadow=deepcopy(payload),
         )
 
     @staticmethod
@@ -1331,83 +1614,7 @@ class MonitorState:
         n12_n20.setdefault("n12", {"status": "NOT_AVAILABLE", "sample_size": 0})
         n12_n20.setdefault("n20", {"status": "NOT_AVAILABLE", "sample_size": 0})
 
-        source_structure = deepcopy(signal.entry_structure_shadow)
-        structure_state = source_structure.get(
-            "entry_structure_state",
-            source_structure.get("state", "NOT_AVAILABLE"),
-        )
-        structure_bias = source_structure.get(
-            "entry_structure_bias",
-            source_structure.get("bias", "NOT_AVAILABLE"),
-        )
-        structure_reason = source_structure.get(
-            "entry_structure_reason_code",
-            source_structure.get("reason_code", "NOT_EVALUATED"),
-        )
-        structure_evaluated_at = int(
-            source_structure.get(
-                "entry_structure_evaluated_at",
-                source_structure.get("evaluated_at", latest.close_time),
-            )
-        )
-        structure = {
-            "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
-            "entry_structure_mode": "SHADOW_ONLY",
-            "entry_structure_evaluated_at": structure_evaluated_at,
-            "entry_structure_state": structure_state,
-            "entry_structure_bias": structure_bias,
-            "entry_structure_reason_code": structure_reason,
-            "candidate_origin": str(run.identity["candidate_origin"]),
-            "active_level_source": "NOT_AVAILABLE",
-            "active_level_lower": None,
-            "active_level_upper": None,
-            "active_level_touch_count": 0,
-            "active_level_confirmed_at": 0,
-            "nearest_support_lower": None,
-            "nearest_support_upper": None,
-            "nearest_resistance_lower": None,
-            "nearest_resistance_upper": None,
-            "support_distance_price": None,
-            "support_distance_bps": None,
-            "support_distance_atr": None,
-            "resistance_distance_price": None,
-            "resistance_distance_bps": None,
-            "resistance_distance_atr": None,
-            "breakout_direction": "NOT_AVAILABLE",
-            "breakout_closed_bars": 0,
-            "breakout_buffer_atr": None,
-            "retest_status": "NOT_AVAILABLE",
-            "round_level_price": None,
-            "round_level_step": None,
-            "audit_only": True,
-            **source_structure,
-        }
-        structure["entry_structure_version"] = str(
-            source_structure.get(
-                "entry_structure_version",
-                source_structure.get("version", "ENTRY_STRUCTURE_SHADOW_V1"),
-            )
-        )
-        structure["entry_structure_mode"] = str(
-            source_structure.get(
-                "entry_structure_mode",
-                source_structure.get("mode", "SHADOW_ONLY"),
-            )
-        )
-        structure["entry_structure_evaluated_at"] = structure_evaluated_at
-        structure["entry_structure_state"] = structure_state
-        structure["entry_structure_bias"] = structure_bias
-        structure["entry_structure_reason_code"] = structure_reason
-        structure["evaluated_at"] = structure_evaluated_at
-        structure["state"] = structure_state
-        structure["bias"] = structure_bias
-        structure["reason_code"] = structure_reason
-        structure["candidate_origin"] = str(run.identity["candidate_origin"])
-        structure["audit_only"] = True
-        structure["version"] = structure["entry_structure_version"]
-        structure["mode"] = structure["entry_structure_mode"]
-        structure["status"] = structure["entry_structure_state"]
-        structure["reason"] = structure["entry_structure_reason_code"]
+        structure = deepcopy(signal.entry_structure_shadow)
 
         trace_by_stage = {
             str(record["stage"]): record
@@ -1929,6 +2136,8 @@ class MonitorState:
             "status": "NOT_AVAILABLE",
             "reason": "NOT_EVALUATED",
         }
+        if isinstance(signal.entry_structure_shadow, dict) and signal.entry_structure_shadow:
+            entry_structure = deepcopy(signal.entry_structure_shadow)
         return {
             "identity": deepcopy(run.identity),
             "market": {
@@ -2154,9 +2363,42 @@ class MonitorState:
             current_time=latest.close_time,
             daily_profile_required=daily_profile_required,
         )
+        precomputed_gate = None
+        if (
+            not self.enable_daily_profile_selector
+            and self.enable_observation_profile_promotion
+        ):
+            promotion_candidate = self._observation_profile_promoted_signal(
+                signal,
+                latest,
+                "SESSION_BLOCKED",
+            )
+            if promotion_candidate is not None:
+                precomputed_gate = self.order_policy.evaluate(
+                    signal,
+                    latest,
+                    self.simulator.orders,
+                    self._last_order_opened_at,
+                    self._opened_signal_keys,
+                )
+            if (
+                promotion_candidate is not None
+                and precomputed_gate is not None
+                and precomputed_gate.code == "SESSION_BLOCKED"
+            ):
+                signal = self._attach_quality_score(
+                    promotion_candidate,
+                    current_time=latest.close_time,
+                )
+                precomputed_gate = None
         candidate_origin = self._formal_candidate_origin(signal)
         if signal.candidate_origin != candidate_origin:
             signal = replace(signal, candidate_origin=candidate_origin)
+        signal = self._attach_entry_structure_snapshot(
+            signal,
+            latest,
+            candidate_origin,
+        )
         self.selected_signal = signal
         run = self._new_decision_run(
             signal,
@@ -2390,7 +2632,11 @@ class MonitorState:
             health_decision.to_dict(),
         )
 
-        signal, gate = self._admit_order_candidate(signal, latest)
+        signal, gate = self._admit_order_candidate(
+            signal,
+            latest,
+            precomputed_gate=precomputed_gate,
+        )
         run.extend(gate.decision_trace)
         if not gate.open_allowed:
             if not self._persist_blocked_decision(
@@ -2742,6 +2988,7 @@ class MonitorState:
                 primary_decision=True,
                 final_reason=reason,
                 run=run,
+                entry_structure_attached=True,
             )
             if self._decision_storage_failed:
                 return False
@@ -2785,31 +3032,21 @@ class MonitorState:
         self._bundled_decision_ids.add(context.decision_id)
         return True
 
-    def _admit_order_candidate(self, signal: Signal, latest: Kline) -> tuple[Signal, OrderGate]:
-        gate = self.order_policy.evaluate(
+    def _admit_order_candidate(
+        self,
+        signal: Signal,
+        latest: Kline,
+        *,
+        precomputed_gate: OrderGate | None = None,
+    ) -> tuple[Signal, OrderGate]:
+        gate = precomputed_gate or self.order_policy.evaluate(
             signal,
             latest,
             self.simulator.orders,
             self._last_order_opened_at,
             self._opened_signal_keys,
         )
-        promoted_signal = None
-        if not self.enable_daily_profile_selector:
-            promoted_signal = self._observation_profile_promoted_signal(signal, latest, gate.code)
-        if promoted_signal is not None and promoted_signal is not signal:
-            signal = promoted_signal
-            self.selected_signal = signal
-            self.rolling_edge = self._rolling_edge_status(signal, latest)
-            gate = self.order_policy.evaluate(
-                signal,
-                latest,
-                self.simulator.orders,
-                self._last_order_opened_at,
-                self._opened_signal_keys,
-            )
         signal = self._attach_quality_score(signal, current_time=latest.close_time)
-        if promoted_signal is not None:
-            self.selected_signal = signal
         return signal, gate
 
     def _execute_open_order(
@@ -2904,6 +3141,7 @@ class MonitorState:
                 runtime_config_hash=context.runtime_config_hash,
                 strategy_build_id=context.strategy_build_id,
                 candidate_origin=context.candidate_origin,
+                entry_structure_shadow=deepcopy(signal.entry_structure_shadow),
                 quality_score_inputs=deepcopy(signal.quality_score_inputs),
                 decision_inputs=context_payload["inputs"],
                 decision_trace=context_payload["decision_trace"],
@@ -3712,6 +3950,7 @@ class MonitorState:
             quality_score_inputs=dict(signal.quality_score_inputs),
             direction_pulse_shadow=dict(signal.direction_pulse_shadow),
             adaptive_profile_state=deepcopy(signal.adaptive_profile_state),
+            entry_structure_shadow=deepcopy(signal.entry_structure_shadow),
             profile_health_status=signal.profile_health_status,
             profile_health_sample_size=signal.profile_health_sample_size,
             profile_health_win_rate=signal.profile_health_win_rate,
@@ -3730,7 +3969,22 @@ class MonitorState:
         primary_decision: bool = False,
         final_reason: str | None = None,
         run: _DecisionRun | None = None,
+        entry_structure_attached: bool = False,
     ) -> bool:
+        direction = signal.observe_direction or signal.direction
+        if direction not in {"LONG", "SHORT"}:
+            return False
+        signal = replace(
+            signal,
+            direction=direction,
+            candidate_origin=candidate_origin,
+        )
+        if not entry_structure_attached:
+            signal = self._attach_entry_structure_snapshot(
+                signal,
+                latest,
+                candidate_origin,
+            )
         observation = self._new_observation(signal, latest, decision)
         if observation is None:
             return False
@@ -3764,6 +4018,7 @@ class MonitorState:
             decision_inputs=context_payload["inputs"],
             decision_trace=context_payload["decision_trace"],
             first_decisive_block=context.first_decisive_block,
+            entry_structure_shadow=deepcopy(enriched_signal.entry_structure_shadow),
         )
         self.observations.append(observation)
         if self.storage:
@@ -3803,8 +4058,27 @@ class MonitorState:
             )
         return True
 
-    def _record_observation_candidates(self, signals: Sequence[Signal], latest: Kline) -> None:
+    def _record_observation_candidates(
+        self,
+        signals: Sequence[Signal],
+        latest: Kline,
+        market_snapshot: dict[str, object] | None = None,
+    ) -> None:
         for candidate_ordinal, signal in enumerate(signals, start=1):
+            direction = signal.observe_direction or signal.direction
+            if direction not in {"LONG", "SHORT"}:
+                continue
+            signal = replace(
+                signal,
+                direction=direction,
+                candidate_origin="RESEARCH_OBSERVATION",
+            )
+            signal = self._attach_entry_structure_snapshot(
+                signal,
+                latest,
+                "RESEARCH_OBSERVATION",
+                market_snapshot,
+            )
             if self._has_open_research_observation(signal, latest):
                 continue
             self._record_observation(
@@ -3813,6 +4087,7 @@ class MonitorState:
                 "RESEARCH_OBSERVE",
                 candidate_origin="RESEARCH_OBSERVATION",
                 candidate_ordinal=candidate_ordinal,
+                entry_structure_attached=True,
             )
 
     def _has_open_research_observation(self, signal: Signal, latest: Kline) -> bool:

@@ -20,6 +20,7 @@ from app.daily_profile_selector import (
     profile_key as daily_profile_key,
 )
 from app.decision_context import DecisionContext
+from app.entry_structure_shadow import EntryStructureGate, StructureConfig
 from app.models import (
     FearGreedContext,
     Kline,
@@ -1274,10 +1275,12 @@ class MonitorStateTest(unittest.TestCase):
         conflict = replace(
             base,
             entry_structure_shadow={
-                "entry_structure_evaluated_at": 118_000,
+                "entry_structure_evaluated_at": latest.close_time,
                 "entry_structure_state": "BREAKDOWN",
                 "entry_structure_bias": "SHORT",
                 "entry_structure_reason_code": "TASK12_BREAKDOWN_CONFIRMED",
+                "candidate_origin": "NATIVE_ACTIONABLE",
+                "candidate_direction": "LONG",
                 "breakout_direction": "SHORT",
                 "retest_status": "FAILED",
             },
@@ -2265,9 +2268,12 @@ class MonitorStateTest(unittest.TestCase):
                     "status": "RESIDENT",
                 },
                 entry_structure_shadow={
+                    "entry_structure_evaluated_at": 119_999,
                     "entry_structure_state": "SUPPORT_RECLAIM",
                     "entry_structure_bias": "LONG",
                     "active_level_source": "RECENT_SWING",
+                    "candidate_origin": "NATIVE_ACTIONABLE",
+                    "candidate_direction": "LONG",
                 },
             )
             self.assertEqual(
@@ -2292,9 +2298,12 @@ class MonitorStateTest(unittest.TestCase):
                     "status": "CANDIDATE",
                 },
                 entry_structure_shadow={
+                    "entry_structure_evaluated_at": 179_999,
                     "entry_structure_state": "RESISTANCE_REJECT",
                     "entry_structure_bias": "SHORT",
                     "active_level_source": "ROUND_LEVEL",
+                    "candidate_origin": "RESEARCH_OBSERVATION",
+                    "candidate_direction": "SHORT",
                 },
             )
             self.assertTrue(
@@ -10279,6 +10288,208 @@ class MonitorStateTest(unittest.TestCase):
             self.assertIsNone(state.last_error)
             state.close()
             store.close()
+
+
+class EntryStructureDecisionIntegrationTest(unittest.TestCase):
+    class CountingDetector:
+        def __init__(self, *, error: Exception | None = None):
+            self.config = StructureConfig()
+            self.error = error
+            self.calls = []
+
+        def detect(self, symbol, closed_klines):
+            self.calls.append((symbol, closed_klines[-1].close_time))
+            if self.error is not None:
+                raise self.error
+            return {
+                "version": "ENTRY_STRUCTURE_SHADOW_V1",
+                "mode": "SHADOW_ONLY",
+                "status": "INSUFFICIENT_DATA",
+                "symbol": symbol,
+                "evaluated_at": closed_klines[-1].close_time,
+                "atr": None,
+                "levels": [],
+                "nearest_support": None,
+                "nearest_resistance": None,
+            }
+
+    class CountingStateMachine:
+        def __init__(self, config, *, error: Exception | None = None):
+            self.config = config
+            self.error = error
+            self.calls = []
+
+        def evaluate(self, detected, closed_klines):
+            self.calls.append(closed_klines[-1].close_time)
+            if self.error is not None:
+                raise self.error
+            return []
+
+    @staticmethod
+    def _install_structure_pipeline(state, *, detector_error=None, state_error=None):
+        detector = EntryStructureDecisionIntegrationTest.CountingDetector(
+            error=detector_error
+        )
+        machine = EntryStructureDecisionIntegrationTest.CountingStateMachine(
+            detector.config,
+            error=state_error,
+        )
+        state._entry_structure_detector = detector
+        state._entry_structure_state_machine = machine
+        state._entry_structure_gate = EntryStructureGate(detector, machine)
+        state._entry_structure_market_cache_key = None
+        state._entry_structure_market_cache = None
+        return detector, machine
+
+    @staticmethod
+    def _run_update(state, bars):
+        def formal(klines, fear_greed=None):
+            return replace(
+                selected_profile_signal(klines[-1].close_time),
+                open_time=klines[-1].open_time,
+                daily_profile_selected=False,
+                daily_profile_version="",
+            )
+
+        def analyzed(klines, timeframe_minutes, fear_greed=None):
+            return formal(klines)
+
+        def research(klines, timeframe_minutes, fear_greed=None):
+            return [
+                replace(
+                    formal(klines),
+                    direction="WAIT",
+                    observe_direction="SHORT",
+                    observe_only=True,
+                    strategy_family="short_extension",
+                    strategy_tag="task14_research",
+                    profile_key="",
+                    score=-60.0,
+                    threshold=70.0,
+                    session_allowed=False,
+                )
+            ]
+
+        with (
+            patch("app.state.analyze_volume_price", side_effect=analyzed),
+            patch("app.state.analyze_observation_signals", side_effect=research),
+            patch("app.state.choose_trade_signal", side_effect=formal),
+        ):
+            return state.update_from_klines(bars)
+
+    def test_one_raw_snapshot_per_closed_kline_is_shared_cached_and_reset(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            min_order_gap_ms=0,
+            enable_rolling_edge_guard=False,
+            enable_observation_profile_promotion=False,
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        )
+        self.addCleanup(state.close)
+        detector, machine = self._install_structure_pipeline(state)
+        bars = [kline(index, 100.0 + index / 100.0, 100.0) for index in range(30)]
+
+        self.assertTrue(self._run_update(state, bars))
+        self.assertEqual(len(detector.calls), 1)
+        self.assertEqual(len(machine.calls), 1)
+        self.assertEqual(
+            state.selected_signal.entry_structure_shadow["candidate_origin"],
+            "NATIVE_ACTIONABLE",
+        )
+        research = next(
+            item
+            for item in state.observations
+            if item.candidate_origin == "RESEARCH_OBSERVATION"
+        )
+        self.assertEqual(research.direction, "SHORT")
+        self.assertEqual(
+            research.entry_structure_shadow["candidate_direction"], "SHORT"
+        )
+
+        self.assertTrue(self._run_update(state, bars))
+        self.assertEqual(len(detector.calls), 1)
+        next_bars = [*bars, kline(30, 100.3, 100.0)]
+        self.assertTrue(self._run_update(state, next_bars))
+        self.assertEqual(len(detector.calls), 2)
+
+        state.reset_symbol("BTCUSDT")
+        self.assertTrue(self._run_update(state, bars))
+        self.assertEqual(len(detector.calls), 3)
+        self.assertEqual(len(machine.calls), 3)
+
+    def test_open_bundle_copies_one_structure_value_without_shared_references(self):
+        storage = RecordingStorage()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            min_order_gap_ms=0,
+            enable_rolling_edge_guard=False,
+            enable_observation_profile_promotion=False,
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        )
+        self.addCleanup(state.close)
+        self._install_structure_pipeline(state)
+        bars = [kline(index, 100.0 + index / 100.0, 100.0) for index in range(30)]
+
+        self.assertTrue(self._run_update(state, bars))
+
+        selected = state.selected_signal
+        order = next(item for item in state.simulator.orders if item.decision_id == selected.decision_id)
+        observation = next(
+            item for item in state.observations if item.decision_id == selected.decision_id
+        )
+        context_structure = selected.decision_inputs["entry_structure"]
+        signal_structure = selected.decision_inputs["signal"]["entry_structure_shadow"]
+        structures = (
+            selected.entry_structure_shadow,
+            context_structure,
+            signal_structure,
+            observation.entry_structure_shadow,
+            order.entry_structure_shadow,
+        )
+        for structure in structures[1:]:
+            self.assertEqual(structure, structures[0])
+            self.assertIsNot(structure, structures[0])
+        self.assertIsNot(context_structure, signal_structure)
+
+    def test_detector_and_state_machine_failures_are_shadow_only(self):
+        outcomes = []
+        for failure in (None, "detector", "state"):
+            webhook = RecordingWebhook()
+            state = MonitorState(
+                symbol="BTCUSDT",
+                webhook=webhook,
+                min_order_gap_ms=0,
+                enable_rolling_edge_guard=False,
+                enable_observation_profile_promotion=False,
+                result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+            )
+            self.addCleanup(state.close)
+            self._install_structure_pipeline(
+                state,
+                detector_error=(RuntimeError("detector failed") if failure == "detector" else None),
+                state_error=(RuntimeError("state failed") if failure == "state" else None),
+            )
+            bars = [kline(index, 100.0 + index / 100.0, 100.0) for index in range(30)]
+
+            self.assertTrue(self._run_update(state, bars))
+            order = state.simulator.orders[0]
+            outcomes.append(
+                (
+                    order.id,
+                    order.direction,
+                    order.opened_at,
+                    order.expires_at,
+                    order.stake,
+                    order.stake_progression_step,
+                    list(webhook.calls),
+                )
+            )
+            self.assertEqual(order.entry_structure_shadow["entry_structure_mode"], "SHADOW_ONLY")
+            if failure is not None:
+                self.assertEqual(order.entry_structure_shadow["entry_structure_state"], "ERROR")
+
+        self.assertEqual(outcomes[1:], [outcomes[0], outcomes[0]])
 
 
 if __name__ == "__main__":

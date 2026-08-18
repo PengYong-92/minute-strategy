@@ -1,6 +1,7 @@
 import json
 import threading
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from app.models import Signal
@@ -28,6 +29,23 @@ def signal(direction="LONG", timeframe_minutes=30, reason="策略开单"):
 
 
 class WebhookSignalProxyTest(unittest.TestCase):
+    def test_entry_structure_shadow_never_changes_webhook_payload(self):
+        proxy = WebhookSignalProxy()
+        baseline = signal("LONG", 10)
+        structured = replace(
+            baseline,
+            entry_structure_shadow={
+                "entry_structure_state": "RESISTANCE_REJECTED",
+                "entry_structure_bias": "CONFLICT",
+                "detail": {"levels": [100.0]},
+            },
+        )
+
+        self.assertEqual(
+            proxy.build_payload("BTCUSDT", structured, amount=10.0),
+            proxy.build_payload("BTCUSDT", baseline, amount=10.0),
+        )
+
     def test_builds_payload_for_external_signal_ingest(self):
         proxy = WebhookSignalProxy()
 
