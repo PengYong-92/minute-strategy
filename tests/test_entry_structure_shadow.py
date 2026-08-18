@@ -1,6 +1,6 @@
 import unittest
 
-from app.models import Kline
+from app.models import Kline, Signal
 
 
 def bars_from_ranges(ranges):
@@ -188,6 +188,273 @@ class EntryStructureDetectorTest(unittest.TestCase):
         self.assertFalse(
             any(level["lower"] < 150.0 for level in snapshot["levels"])
         )
+
+
+def state_bars(closes, *, lows=None, highs=None):
+    lows = lows or [close - 0.2 for close in closes]
+    highs = highs or [close + 0.2 for close in closes]
+    return bars_from_ranges(
+        [(low, high, close) for low, high, close in zip(lows, highs, closes)]
+    )
+
+
+def detected_level(
+    kind="SUPPORT",
+    *,
+    distance_atr=0.0,
+    touches=3,
+    confirmed_at=10,
+    evaluated_at=60_000,
+):
+    level = {
+        "id": f"{kind.lower()}-level",
+        "kind": kind,
+        "source": "PIVOT",
+        "lower": 100.0,
+        "upper": 101.0,
+        "pivot_count": 2,
+        "touch_count": touches,
+        "last_confirmed_at": confirmed_at,
+        "distance_price": distance_atr * 10.0,
+        "distance_bps": distance_atr * 100.0,
+        "distance_atr": distance_atr,
+        "round_level_price": None,
+        "round_level_step": None,
+    }
+    return {
+        "version": "ENTRY_STRUCTURE_SHADOW_V1",
+        "mode": "SHADOW_ONLY",
+        "status": "READY",
+        "evaluated_at": evaluated_at,
+        "bars": 40,
+        "atr": 10.0,
+        "levels": [level],
+        "support": [level] if kind == "SUPPORT" else [],
+        "resistance": [level] if kind == "RESISTANCE" else [],
+        "nearest_support": level if kind == "SUPPORT" else None,
+        "nearest_resistance": level if kind == "RESISTANCE" else None,
+    }
+
+
+def candidate(direction="LONG"):
+    return Signal(
+        direction=direction,
+        timeframe_minutes=10,
+        level="A",
+        reason="test",
+        price=100.0,
+        open_time=0,
+    )
+
+
+class EntryStructureStateTest(unittest.TestCase):
+    def test_structure_state_transition_matrix(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        machine = StructureStateMachine()
+        cases = [
+            (
+                detected_level("SUPPORT", distance_atr=0.35),
+                state_bars([104.5]),
+                "APPROACHING_SUPPORT",
+            ),
+            (
+                detected_level("SUPPORT"),
+                state_bars([101.6], lows=[100.5], highs=[102.0]),
+                "SUPPORT_REJECTED",
+            ),
+            (
+                detected_level("SUPPORT"),
+                state_bars([98.8]),
+                "BREAKOUT_PENDING",
+            ),
+            (
+                detected_level("SUPPORT", evaluated_at=120_000),
+                state_bars([98.8, 98.7]),
+                "BREAKOUT_CONFIRMED",
+            ),
+            (
+                detected_level("SUPPORT", evaluated_at=180_000),
+                state_bars(
+                    [98.8, 98.7, 99.4],
+                    lows=[98.5, 98.4, 99.0],
+                    highs=[99.0, 99.0, 100.5],
+                ),
+                "RETEST_HELD",
+            ),
+            (
+                detected_level("SUPPORT", evaluated_at=120_000),
+                state_bars([98.8, 100.5], lows=[98.5, 99.8], highs=[99.0, 101.0]),
+                "FALSE_BREAKOUT",
+            ),
+            (
+                detected_level("SUPPORT", evaluated_at=180_000),
+                state_bars([96.4, 96.3, 96.2]),
+                "LEVEL_INVALIDATED",
+            ),
+        ]
+        for detected, bars, expected in cases:
+            with self.subTest(expected=expected):
+                result = machine.evaluate(detected, bars)
+                self.assertEqual(result[0]["state"], expected)
+
+    def test_resistance_rejection_and_retest_pending_are_mirrored(self):
+        from app.entry_structure_shadow import StructureStateMachine
+
+        machine = StructureStateMachine()
+        rejected = machine.evaluate(
+            detected_level("RESISTANCE"),
+            state_bars([99.4], lows=[99.0], highs=[100.5]),
+        )[0]
+        retest = machine.evaluate(
+            detected_level("RESISTANCE", evaluated_at=180_000),
+            state_bars(
+                [102.2, 102.3, 101.3],
+                lows=[102.0, 102.0, 100.8],
+                highs=[102.5, 102.6, 101.8],
+            ),
+        )[0]
+
+        self.assertEqual(rejected["state"], "RESISTANCE_REJECTED")
+        self.assertEqual(retest["state"], "RETEST_PENDING")
+
+    def test_direction_mapping_matches_documented_table(self):
+        from app.entry_structure_shadow import map_direction_bias
+
+        cases = [
+            ("LONG", "APPROACHING_RESISTANCE", "RESISTANCE", "NONE", "CONFLICT"),
+            ("SHORT", "APPROACHING_RESISTANCE", "RESISTANCE", "NONE", "NEUTRAL"),
+            ("LONG", "SUPPORT_REJECTED", "SUPPORT", "NONE", "CONFIRMED"),
+            ("SHORT", "SUPPORT_REJECTED", "SUPPORT", "NONE", "CONFLICT"),
+            ("LONG", "BREAKOUT_PENDING", "RESISTANCE", "UP", "PENDING"),
+            ("SHORT", "BREAKOUT_PENDING", "RESISTANCE", "UP", "CONFLICT"),
+            ("LONG", "BREAKOUT_CONFIRMED", "RESISTANCE", "UP", "CONFIRMED"),
+            ("SHORT", "BREAKOUT_CONFIRMED", "RESISTANCE", "UP", "CONFLICT"),
+            ("LONG", "FALSE_BREAKOUT", "RESISTANCE", "UP", "CONFLICT"),
+            ("SHORT", "FALSE_BREAKOUT", "RESISTANCE", "UP", "CONFIRMED"),
+            ("LONG", "LEVEL_INVALIDATED", "SUPPORT", "DOWN", "NEUTRAL"),
+        ]
+        for direction, state, kind, breakout_direction, expected in cases:
+            with self.subTest(direction=direction, state=state):
+                evidence = {
+                    **detected_level(kind)["levels"][0],
+                    "state": state,
+                    "breakout_direction": breakout_direction,
+                }
+                self.assertEqual(
+                    map_direction_bias(direction, evidence)["bias"],
+                    expected,
+                )
+
+        inconsistent = {
+            **detected_level("RESISTANCE")["levels"][0],
+            "state": "SUPPORT_REJECTED",
+            "breakout_direction": "NONE",
+        }
+        mapped = map_direction_bias("LONG", inconsistent)
+        self.assertEqual(mapped["bias"], "NEUTRAL")
+        self.assertEqual(mapped["reason_code"], "STRUCTURE_EVIDENCE_INCONSISTENT")
+
+    def test_conservative_priority_and_tie_breaks(self):
+        from app.entry_structure_shadow import EntryStructureGate
+
+        gate = EntryStructureGate()
+        evidence = [
+            {"id": "neutral", "bias": "NEUTRAL", "distance_atr": 0.01, "touch_count": 9, "last_confirmed_at": 99},
+            {"id": "confirmed", "bias": "CONFIRMED", "distance_atr": 0.01, "touch_count": 9, "last_confirmed_at": 99},
+            {"id": "pending", "bias": "PENDING", "distance_atr": 0.01, "touch_count": 9, "last_confirmed_at": 99},
+            {"id": "conflict", "bias": "CONFLICT", "distance_atr": 0.50, "touch_count": 1, "last_confirmed_at": 1},
+        ]
+        equal_bias = [
+            {"id": "far", "bias": "CONFLICT", "distance_atr": 0.2, "touch_count": 9, "last_confirmed_at": 99},
+            {"id": "near-fewer", "bias": "CONFLICT", "distance_atr": 0.1, "touch_count": 2, "last_confirmed_at": 99},
+            {"id": "near-more-older", "bias": "CONFLICT", "distance_atr": 0.1, "touch_count": 3, "last_confirmed_at": 50},
+            {"id": "nearest-more-touches-newer", "bias": "CONFLICT", "distance_atr": 0.1, "touch_count": 3, "last_confirmed_at": 100},
+        ]
+
+        self.assertEqual(
+            [item["bias"] for item in gate.rank(evidence)],
+            ["CONFLICT", "PENDING", "CONFIRMED", "NEUTRAL"],
+        )
+        self.assertEqual(
+            gate.rank(equal_bias)[0]["id"],
+            "nearest-more-touches-newer",
+        )
+
+    def test_gate_payload_is_shadow_only_and_keeps_both_nearest_levels(self):
+        from app.entry_structure_shadow import EntryStructureGate
+
+        support = {
+            **detected_level("SUPPORT", distance_atr=0.2)["levels"][0],
+            "state": "SUPPORT_REJECTED",
+            "breakout_direction": "NONE",
+            "breakout_closed_bars": 0,
+            "retest_status": "NOT_APPLICABLE",
+        }
+        resistance = {
+            **detected_level("RESISTANCE", distance_atr=0.1)["levels"][0],
+            "state": "APPROACHING_RESISTANCE",
+            "breakout_direction": "NONE",
+            "breakout_closed_bars": 0,
+            "retest_status": "NOT_APPLICABLE",
+        }
+        market = {
+            **detected_level("SUPPORT"),
+            "states": [support, resistance],
+            "nearest_support": support,
+            "nearest_resistance": resistance,
+        }
+
+        payload = EntryStructureGate().attach(
+            candidate("LONG"),
+            market,
+            "NATIVE_ACTIONABLE",
+        )
+
+        self.assertEqual(payload["entry_structure_mode"], "SHADOW_ONLY")
+        self.assertEqual(payload["entry_structure_bias"], "CONFLICT")
+        self.assertEqual(payload["active_level_upper"], 101.0)
+        self.assertEqual(payload["active_level_confirmed_at"], 10)
+        self.assertEqual(payload["nearest_support_lower"], 100.0)
+        self.assertEqual(payload["nearest_resistance_upper"], 101.0)
+        self.assertEqual(payload["support_distance_atr"], 0.2)
+        self.assertEqual(payload["resistance_distance_atr"], 0.1)
+        self.assertIsNone(payload["round_level_price"])
+        self.assertIsNone(payload["round_level_step"])
+        self.assertEqual(payload["candidate_origin"], "NATIVE_ACTIONABLE")
+
+    def test_insufficient_data_and_detector_exception_are_safe_neutral(self):
+        from app.entry_structure_shadow import EntryStructureGate, StructureDetector
+
+        insufficient = EntryStructureGate().evaluate(
+            candidate(),
+            "BTCUSDT",
+            state_bars([100.0] * 5),
+        )
+
+        class BrokenDetector(StructureDetector):
+            def detect(self, symbol, closed_klines):
+                raise RuntimeError("broken detector")
+
+        failed = EntryStructureGate(detector=BrokenDetector()).evaluate(
+            candidate(),
+            "BTCUSDT",
+            state_bars([100.0] * 30),
+        )
+
+        self.assertEqual(
+            (insufficient["entry_structure_mode"], insufficient["entry_structure_state"], insufficient["entry_structure_bias"]),
+            ("SHADOW_ONLY", "INSUFFICIENT_DATA", "NEUTRAL"),
+        )
+        self.assertEqual(
+            (failed["entry_structure_mode"], failed["entry_structure_state"], failed["entry_structure_bias"]),
+            ("SHADOW_ONLY", "ERROR", "NEUTRAL"),
+        )
+        self.assertEqual(
+            failed["entry_structure_reason_code"],
+            "DETECTOR_ERROR_RUNTIMEERROR",
+        )
+        self.assertIn("broken detector", failed["error_detail"])
 
 
 if __name__ == "__main__":

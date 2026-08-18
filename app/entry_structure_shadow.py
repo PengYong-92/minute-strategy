@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 import sys
 from typing import Sequence
 
-from app.models import Kline
+from app.models import Kline, Signal
 
 
 ENTRY_STRUCTURE_VERSION = "ENTRY_STRUCTURE_SHADOW_V1"
@@ -24,6 +25,12 @@ class StructureConfig:
     min_pivot_gap: int = 5
     minimum_bars: int = 20
     rejection_atr: float = 0.05
+    approach_atr: float = 0.35
+    breakout_atr: float = 0.10
+    breakout_confirm_bars: int = 2
+    retest_window_bars: int = 5
+    invalidation_atr: float = 0.35
+    invalidation_bars: int = 3
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -34,6 +41,9 @@ class StructureConfig:
             "min_pivots",
             "min_pivot_gap",
             "minimum_bars",
+            "breakout_confirm_bars",
+            "retest_window_bars",
+            "invalidation_bars",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -42,7 +52,13 @@ class StructureConfig:
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
 
-        for name in ("cluster_atr", "rejection_atr"):
+        for name in (
+            "cluster_atr",
+            "rejection_atr",
+            "approach_atr",
+            "breakout_atr",
+            "invalidation_atr",
+        ):
             value = getattr(self, name)
             if type(value) not in (int, float):
                 raise TypeError(f"{name} must be a number")
@@ -772,3 +788,667 @@ class StructureDetector:
             "nearest_support": support[0] if support else None,
             "nearest_resistance": resistance[0] if resistance else None,
         }
+
+
+def _finite_number(value: object, *, minimum: float = 0.0) -> bool:
+    return (
+        type(value) in (int, float)
+        and math.isfinite(float(value))
+        and float(value) >= minimum
+    )
+
+
+def _error_evidence(reason_code: str) -> dict[str, object]:
+    return {
+        "id": "structure-error",
+        "kind": "",
+        "source": "",
+        "lower": 0.0,
+        "upper": 0.0,
+        "pivot_count": 0,
+        "touch_count": 0,
+        "last_confirmed_at": 0,
+        "distance_price": 0.0,
+        "distance_bps": 0.0,
+        "distance_atr": 0.0,
+        "round_level_price": None,
+        "round_level_step": None,
+        "state": "ERROR",
+        "breakout_direction": "NONE",
+        "breakout_closed_bars": 0,
+        "breakout_buffer_atr": 0.10,
+        "retest_status": "NOT_APPLICABLE",
+        "reason_code": reason_code,
+    }
+
+
+def _valid_level(level: object, evaluated_at: int) -> bool:
+    if not isinstance(level, Mapping):
+        return False
+    kind = level.get("kind")
+    lower = level.get("lower")
+    upper = level.get("upper")
+    touches = level.get("touch_count")
+    confirmed_at = level.get("last_confirmed_at")
+    if kind not in ("SUPPORT", "RESISTANCE"):
+        return False
+    if not _finite_number(lower) or not _finite_number(upper):
+        return False
+    if float(lower) <= 0 or float(upper) < float(lower):
+        return False
+    if type(touches) is not int or touches < 0:
+        return False
+    if (
+        type(confirmed_at) is not int
+        or confirmed_at < 0
+        or confirmed_at > evaluated_at
+    ):
+        return False
+    for name in ("distance_price", "distance_bps", "distance_atr"):
+        if not _finite_number(level.get(name)):
+            return False
+    if not str(level.get("id", "")):
+        return False
+    return True
+
+
+def _causal_bars(
+    closed_klines: Sequence[Kline],
+    evaluated_at: int,
+) -> tuple[Kline, ...] | None:
+    causal = []
+    for item in closed_klines:
+        if not isinstance(item, Kline) or type(item.close_time) is not int:
+            return None
+        if item.close_time <= evaluated_at:
+            causal.append(item)
+    scoped = tuple(causal[-MAX_STRUCTURE_BARS:])
+    if (
+        not scoped
+        or scoped[-1].close_time != evaluated_at
+        or not _valid_scoped_klines(scoped)
+    ):
+        return None
+    return scoped
+
+
+def _at_or_below(value: float, boundary: float) -> bool:
+    return value < boundary or math.isclose(
+        value,
+        boundary,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    )
+
+
+def _at_or_above(value: float, boundary: float) -> bool:
+    return value > boundary or math.isclose(
+        value,
+        boundary,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    )
+
+
+def _classify_level_state(
+    level: Mapping[str, object],
+    bars: Sequence[Kline],
+    atr: float,
+    config: StructureConfig,
+) -> dict[str, object]:
+    result = dict(level)
+    kind = str(level["kind"])
+    lower = float(level["lower"])
+    upper = float(level["upper"])
+    confirmed_at = int(level["last_confirmed_at"])
+    relevant = tuple(item for item in bars if item.close_time >= confirmed_at)
+    if not relevant:
+        return _error_evidence("STRUCTURE_LEVEL_HAS_NO_CAUSAL_BARS")
+
+    breakout_direction = "DOWN" if kind == "SUPPORT" else "UP"
+    breakout_buffer = config.breakout_atr * atr
+    rejection_buffer = config.rejection_atr * atr
+    invalidation_buffer = config.invalidation_atr * atr
+    lifecycle = "IDLE"
+    state = "NO_NEARBY_LEVEL"
+    retest_status = "NOT_APPLICABLE"
+    breakout_count = 0
+    confirmed_index: int | None = None
+    deep_count = 0
+
+    def is_breakout(item: Kline) -> bool:
+        if kind == "SUPPORT":
+            return _at_or_below(item.close, lower - breakout_buffer)
+        return _at_or_above(item.close, upper + breakout_buffer)
+
+    def is_deep_invalidation(item: Kline) -> bool:
+        if kind == "SUPPORT":
+            return _at_or_below(item.close, lower - invalidation_buffer)
+        return _at_or_above(item.close, upper + invalidation_buffer)
+
+    def is_reclaimed(item: Kline) -> bool:
+        if kind == "SUPPORT":
+            return _at_or_above(item.close, lower)
+        return _at_or_below(item.close, upper)
+
+    def is_retest_held(item: Kline) -> bool:
+        if kind == "SUPPORT":
+            return _at_or_below(item.close, lower - rejection_buffer)
+        return _at_or_above(item.close, upper + rejection_buffer)
+
+    for index, item in enumerate(relevant):
+        deep_count = deep_count + 1 if is_deep_invalidation(item) else 0
+        if deep_count >= config.invalidation_bars:
+            state = "LEVEL_INVALIDATED"
+            lifecycle = "INVALIDATED"
+            retest_status = "FAILED"
+            break
+
+        breakout = is_breakout(item)
+        intersects = item.low <= upper and item.high >= lower
+
+        if lifecycle in ("IDLE", "FALSE"):
+            if breakout:
+                lifecycle = "PENDING"
+                breakout_count = 1
+                confirmed_index = None
+                state = "BREAKOUT_PENDING"
+                retest_status = "NOT_APPLICABLE"
+                continue
+            if lifecycle == "FALSE":
+                state = "FALSE_BREAKOUT"
+                retest_status = "FAILED"
+                continue
+            rejected = (
+                intersects
+                and (
+                    _at_or_above(item.close, upper + rejection_buffer)
+                    if kind == "SUPPORT"
+                    else _at_or_below(item.close, lower - rejection_buffer)
+                )
+            )
+            if rejected:
+                state = (
+                    "SUPPORT_REJECTED"
+                    if kind == "SUPPORT"
+                    else "RESISTANCE_REJECTED"
+                )
+            elif _within_distance_limit(
+                _price_to_zone_distance(item.close, result),
+                config.approach_atr * atr,
+            ):
+                state = (
+                    "APPROACHING_SUPPORT"
+                    if kind == "SUPPORT"
+                    else "APPROACHING_RESISTANCE"
+                )
+            else:
+                state = "NO_NEARBY_LEVEL"
+            retest_status = "NOT_APPLICABLE"
+            continue
+
+        if lifecycle == "PENDING":
+            if breakout:
+                breakout_count += 1
+                if breakout_count >= config.breakout_confirm_bars:
+                    lifecycle = "CONFIRMED"
+                    confirmed_index = index
+                    state = "BREAKOUT_CONFIRMED"
+                    retest_status = "AWAITING"
+                else:
+                    state = "BREAKOUT_PENDING"
+                continue
+            if is_reclaimed(item):
+                lifecycle = "FALSE"
+                state = "FALSE_BREAKOUT"
+                retest_status = "FAILED"
+            else:
+                breakout_count = 0
+                state = "BREAKOUT_PENDING"
+            continue
+
+        if lifecycle in ("CONFIRMED", "RETEST_PENDING", "HELD"):
+            bars_after_confirmation = (
+                index - confirmed_index if confirmed_index is not None else 0
+            )
+            inside_retest_window = (
+                1 <= bars_after_confirmation <= config.retest_window_bars
+            )
+            if lifecycle == "HELD":
+                state = "RETEST_HELD"
+                retest_status = "HELD"
+                continue
+            if not inside_retest_window:
+                lifecycle = "CONFIRMED"
+                state = "BREAKOUT_CONFIRMED"
+                retest_status = (
+                    "AWAITING"
+                    if bars_after_confirmation <= config.retest_window_bars
+                    else "NOT_APPLICABLE"
+                )
+                continue
+            if is_reclaimed(item):
+                lifecycle = "FALSE"
+                state = "FALSE_BREAKOUT"
+                retest_status = "FAILED"
+                continue
+            if not intersects:
+                state = (
+                    "RETEST_PENDING"
+                    if lifecycle == "RETEST_PENDING"
+                    else "BREAKOUT_CONFIRMED"
+                )
+                retest_status = (
+                    "PENDING" if lifecycle == "RETEST_PENDING" else "AWAITING"
+                )
+                continue
+            if is_retest_held(item):
+                lifecycle = "HELD"
+                state = "RETEST_HELD"
+                retest_status = "HELD"
+            else:
+                lifecycle = "RETEST_PENDING"
+                state = "RETEST_PENDING"
+                retest_status = "PENDING"
+
+    latest = relevant[-1]
+    distances = _distance(float(latest.close), result, atr)
+    result.update(distances)
+    result.update(
+        {
+            "state": state,
+            "breakout_direction": (
+                breakout_direction
+                if state
+                in {
+                    "BREAKOUT_PENDING",
+                    "BREAKOUT_CONFIRMED",
+                    "RETEST_PENDING",
+                    "RETEST_HELD",
+                    "FALSE_BREAKOUT",
+                    "LEVEL_INVALIDATED",
+                }
+                else "NONE"
+            ),
+            "breakout_closed_bars": breakout_count,
+            "breakout_buffer_atr": config.breakout_atr,
+            "retest_status": retest_status,
+            "reason_code": f"STRUCTURE_STATE_{state}",
+        }
+    )
+    return result
+
+
+class StructureStateMachine:
+    STATES = {
+        "INSUFFICIENT_DATA",
+        "NO_NEARBY_LEVEL",
+        "APPROACHING_SUPPORT",
+        "APPROACHING_RESISTANCE",
+        "SUPPORT_REJECTED",
+        "RESISTANCE_REJECTED",
+        "BREAKOUT_PENDING",
+        "BREAKOUT_CONFIRMED",
+        "RETEST_PENDING",
+        "RETEST_HELD",
+        "FALSE_BREAKOUT",
+        "LEVEL_INVALIDATED",
+        "ERROR",
+    }
+
+    def __init__(self, config: StructureConfig | None = None):
+        self.config = config or StructureConfig()
+
+    def evaluate(
+        self,
+        detected: dict[str, object],
+        closed_klines: Sequence[Kline],
+    ) -> list[dict[str, object]]:
+        if not isinstance(detected, Mapping):
+            return [_error_evidence("STRUCTURE_SNAPSHOT_INVALID")]
+        if detected.get("status") != "READY":
+            return []
+        evaluated_at = detected.get("evaluated_at")
+        atr = detected.get("atr")
+        if type(evaluated_at) is not int or evaluated_at <= 0:
+            return [_error_evidence("STRUCTURE_EVALUATED_AT_INVALID")]
+        if not _finite_number(atr) or float(atr) <= 0:
+            return [_error_evidence("STRUCTURE_ATR_INVALID")]
+        causal = _causal_bars(closed_klines, evaluated_at)
+        if causal is None:
+            return [_error_evidence("STRUCTURE_CAUSAL_WINDOW_INVALID")]
+
+        nearest = []
+        for kind, key, fallback_key in (
+            ("SUPPORT", "nearest_support", "support"),
+            ("RESISTANCE", "nearest_resistance", "resistance"),
+        ):
+            level = detected.get(key)
+            if level is None:
+                fallback = detected.get(fallback_key, [])
+                if isinstance(fallback, Sequence) and fallback:
+                    level = fallback[0]
+            if level is None:
+                continue
+            if not _valid_level(level, evaluated_at):
+                return [_error_evidence("STRUCTURE_LEVEL_INVALID")]
+            if str(level.get("kind")) != kind:
+                return [_error_evidence("STRUCTURE_LEVEL_KIND_INVALID")]
+            nearest.append(level)
+
+        if not nearest:
+            return []
+        return [
+            _classify_level_state(level, causal, float(atr), self.config)
+            for level in nearest
+        ]
+
+
+_BREAKOUT_STATES = {
+    "BREAKOUT_PENDING",
+    "BREAKOUT_CONFIRMED",
+    "RETEST_PENDING",
+    "RETEST_HELD",
+    "FALSE_BREAKOUT",
+}
+
+
+def _invalid_mapped_evidence(
+    evidence: object,
+    reason_code: str = "STRUCTURE_EVIDENCE_INVALID",
+) -> dict[str, object]:
+    result = dict(evidence) if isinstance(evidence, Mapping) else {}
+    result.update(_error_evidence(reason_code))
+    result["bias"] = "NEUTRAL"
+    return result
+
+
+def map_direction_bias(
+    direction: str,
+    evidence: Mapping[str, object],
+) -> dict[str, object]:
+    if direction not in ("LONG", "SHORT") or not isinstance(evidence, Mapping):
+        return _invalid_mapped_evidence(evidence)
+    state = str(evidence.get("state", ""))
+    if state not in StructureStateMachine.STATES:
+        return _invalid_mapped_evidence(evidence)
+    if state in ("INSUFFICIENT_DATA", "NO_NEARBY_LEVEL", "ERROR"):
+        result = dict(evidence)
+        result["bias"] = "NEUTRAL"
+        result.setdefault("reason_code", f"STRUCTURE_STATE_{state}")
+        return result
+    if not _valid_level(evidence, sys.maxsize):
+        return _invalid_mapped_evidence(evidence)
+
+    kind = str(evidence.get("kind"))
+    breakout_direction = str(evidence.get("breakout_direction", "NONE"))
+    consistent = True
+    if state in ("APPROACHING_SUPPORT", "SUPPORT_REJECTED"):
+        consistent = kind == "SUPPORT" and breakout_direction == "NONE"
+    elif state in ("APPROACHING_RESISTANCE", "RESISTANCE_REJECTED"):
+        consistent = kind == "RESISTANCE" and breakout_direction == "NONE"
+    elif state in _BREAKOUT_STATES:
+        expected = "DOWN" if kind == "SUPPORT" else "UP"
+        consistent = breakout_direction == expected
+    elif state == "LEVEL_INVALIDATED":
+        consistent = breakout_direction in (
+            "NONE",
+            "DOWN" if kind == "SUPPORT" else "UP",
+        )
+    if not consistent:
+        return _invalid_mapped_evidence(
+            evidence,
+            "STRUCTURE_EVIDENCE_INCONSISTENT",
+        )
+
+    if state == "APPROACHING_SUPPORT":
+        bias = "NEUTRAL" if direction == "LONG" else "CONFLICT"
+    elif state == "APPROACHING_RESISTANCE":
+        bias = "CONFLICT" if direction == "LONG" else "NEUTRAL"
+    elif state == "SUPPORT_REJECTED":
+        bias = "CONFIRMED" if direction == "LONG" else "CONFLICT"
+    elif state == "RESISTANCE_REJECTED":
+        bias = "CONFLICT" if direction == "LONG" else "CONFIRMED"
+    elif state == "LEVEL_INVALIDATED":
+        bias = "NEUTRAL"
+    else:
+        up = breakout_direction == "UP"
+        follows = (direction == "LONG" and up) or (direction == "SHORT" and not up)
+        if state in ("BREAKOUT_PENDING", "RETEST_PENDING"):
+            bias = "PENDING" if follows else "CONFLICT"
+        elif state in ("BREAKOUT_CONFIRMED", "RETEST_HELD"):
+            bias = "CONFIRMED" if follows else "CONFLICT"
+        else:
+            bias = "CONFLICT" if follows else "CONFIRMED"
+
+    result = dict(evidence)
+    result["bias"] = bias
+    result["reason_code"] = f"STRUCTURE_{state}_{direction}_{bias}"
+    return result
+
+
+def _payload_number(value: object) -> float | int | None:
+    if type(value) is int:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    return None
+
+
+def _level_payload(prefix: str, level: object) -> dict[str, object]:
+    source = level if isinstance(level, Mapping) else {}
+    return {
+        f"{prefix}_id": str(source.get("id", "")),
+        f"{prefix}_kind": str(source.get("kind", "")),
+        f"{prefix}_source": str(source.get("source", "")),
+        f"{prefix}_lower": _payload_number(source.get("lower")),
+        f"{prefix}_upper": _payload_number(source.get("upper")),
+        f"{prefix}_distance_price": _payload_number(
+            source.get("distance_price")
+        ),
+        f"{prefix}_distance_bps": _payload_number(source.get("distance_bps")),
+        f"{prefix}_distance_atr": _payload_number(source.get("distance_atr")),
+        f"{prefix}_touch_count": _payload_number(source.get("touch_count")),
+        f"{prefix}_last_confirmed_at": _payload_number(
+            source.get("last_confirmed_at")
+        ),
+    }
+
+
+class EntryStructureGate:
+    _BIAS_PRIORITY = {
+        "CONFLICT": 0,
+        "PENDING": 1,
+        "CONFIRMED": 2,
+        "NEUTRAL": 3,
+    }
+
+    def __init__(
+        self,
+        detector: StructureDetector | None = None,
+        state_machine: StructureStateMachine | None = None,
+    ):
+        self.detector = detector or StructureDetector()
+        self.state_machine = state_machine or StructureStateMachine(
+            self.detector.config
+        )
+
+    def rank(
+        self,
+        evidence: Sequence[Mapping[str, object]],
+    ) -> list[dict[str, object]]:
+        def key(item: Mapping[str, object]) -> tuple[object, ...]:
+            distance = item.get("distance_atr")
+            safe_distance = (
+                float(distance)
+                if _finite_number(distance)
+                else sys.float_info.max
+            )
+            touches = item.get("touch_count")
+            safe_touches = touches if type(touches) is int and touches >= 0 else 0
+            confirmed = item.get("last_confirmed_at")
+            safe_confirmed = (
+                confirmed if type(confirmed) is int and confirmed >= 0 else 0
+            )
+            return (
+                self._BIAS_PRIORITY.get(str(item.get("bias", "")), 4),
+                safe_distance,
+                -safe_touches,
+                -safe_confirmed,
+                str(item.get("id", "")),
+            )
+
+        return sorted((dict(item) for item in evidence), key=key)
+
+    def attach(
+        self,
+        signal: Signal,
+        market_snapshot: dict[str, object],
+        candidate_origin: str,
+    ) -> dict[str, object]:
+        status = str(market_snapshot.get("status", "ERROR"))
+        states = market_snapshot.get("states", [])
+        mapped = []
+        if status == "READY" and isinstance(states, Sequence):
+            mapped = [
+                map_direction_bias(signal.direction, item)
+                for item in states
+                if isinstance(item, Mapping)
+            ]
+        if status == "INSUFFICIENT_DATA":
+            active = _error_evidence("STRUCTURE_INSUFFICIENT_DATA")
+            active["state"] = "INSUFFICIENT_DATA"
+            active["bias"] = "NEUTRAL"
+        elif status != "READY":
+            active = _invalid_mapped_evidence(
+                {}, "STRUCTURE_SNAPSHOT_NOT_READY"
+            )
+        elif mapped:
+            active = self.rank(mapped)[0]
+        else:
+            active = _error_evidence("STRUCTURE_NO_NEARBY_LEVEL")
+            active["state"] = "NO_NEARBY_LEVEL"
+            active["bias"] = "NEUTRAL"
+
+        state = str(active.get("state", "ERROR"))
+        bias = str(active.get("bias", "NEUTRAL"))
+        reason_code = str(
+            active.get("reason_code", f"STRUCTURE_STATE_{state}")
+        )
+        evaluated_at = market_snapshot.get("evaluated_at", 0)
+        safe_evaluated_at = evaluated_at if type(evaluated_at) is int else 0
+        payload = {
+            "entry_structure_version": ENTRY_STRUCTURE_VERSION,
+            "entry_structure_mode": "SHADOW_ONLY",
+            "entry_structure_evaluated_at": safe_evaluated_at,
+            "entry_structure_state": state,
+            "entry_structure_bias": bias,
+            "entry_structure_reason_code": reason_code,
+            "version": ENTRY_STRUCTURE_VERSION,
+            "mode": "SHADOW_ONLY",
+            "status": state,
+            "evaluated_at": safe_evaluated_at,
+            "state": state,
+            "bias": bias,
+            "reason_code": reason_code,
+            "audit_only": True,
+            "candidate_origin": str(candidate_origin),
+            "candidate_direction": str(signal.direction),
+            "active_level_source": str(active.get("source", "")),
+            "breakout_direction": str(
+                active.get("breakout_direction", "NONE")
+            ),
+            "breakout_closed_bars": _payload_number(
+                active.get("breakout_closed_bars", 0)
+            ),
+            "breakout_buffer_atr": _payload_number(
+                active.get("breakout_buffer_atr", self.state_machine.config.breakout_atr)
+            ),
+            "retest_status": str(
+                active.get("retest_status", "NOT_APPLICABLE")
+            ),
+        }
+        payload.update(_level_payload("active_level", active))
+        payload["active_level_confirmed_at"] = _payload_number(
+            active.get("last_confirmed_at")
+        )
+        payload.update(
+            _level_payload("nearest_support", market_snapshot.get("nearest_support"))
+        )
+        payload.update(
+            _level_payload(
+                "nearest_resistance", market_snapshot.get("nearest_resistance")
+            )
+        )
+        payload.update(
+            {
+                "support_distance_price": payload["nearest_support_distance_price"],
+                "support_distance_bps": payload["nearest_support_distance_bps"],
+                "support_distance_atr": payload["nearest_support_distance_atr"],
+                "resistance_distance_price": payload[
+                    "nearest_resistance_distance_price"
+                ],
+                "resistance_distance_bps": payload[
+                    "nearest_resistance_distance_bps"
+                ],
+                "resistance_distance_atr": payload[
+                    "nearest_resistance_distance_atr"
+                ],
+                "round_level_price": _payload_number(
+                    active.get("round_level_price")
+                ),
+                "round_level_step": _payload_number(
+                    active.get("round_level_step")
+                ),
+            }
+        )
+        return payload
+
+    def evaluate(
+        self,
+        signal: Signal,
+        symbol: str,
+        closed_klines: Sequence[Kline],
+        candidate_origin: str = "NATIVE_ACTIONABLE",
+    ) -> dict[str, object]:
+        try:
+            detected = self.detector.detect(symbol, closed_klines)
+        except Exception as exc:
+            code = f"DETECTOR_ERROR_{type(exc).__name__.upper()}"
+            payload = self.attach(
+                signal,
+                {
+                    "status": "ERROR",
+                    "evaluated_at": 0,
+                    "states": [_error_evidence(code)],
+                    "nearest_support": None,
+                    "nearest_resistance": None,
+                },
+                candidate_origin,
+            )
+            payload["entry_structure_reason_code"] = code
+            payload["reason_code"] = code
+            payload["error_detail"] = str(exc)[:240]
+            return payload
+
+        try:
+            states = self.state_machine.evaluate(detected, closed_klines)
+            market = {**detected, "states": states}
+            return self.attach(signal, market, candidate_origin)
+        except Exception as exc:
+            code = f"STATE_MACHINE_ERROR_{type(exc).__name__.upper()}"
+            payload = self.attach(
+                signal,
+                {
+                    "status": "ERROR",
+                    "evaluated_at": detected.get("evaluated_at", 0),
+                    "states": [_error_evidence(code)],
+                    "nearest_support": detected.get("nearest_support"),
+                    "nearest_resistance": detected.get("nearest_resistance"),
+                },
+                candidate_origin,
+            )
+            payload["entry_structure_reason_code"] = code
+            payload["reason_code"] = code
+            payload["error_detail"] = str(exc)[:240]
+            return payload
