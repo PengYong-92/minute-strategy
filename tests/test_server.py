@@ -705,12 +705,14 @@ class OrdersApiTest(unittest.TestCase):
                 )
                 store.update_order_entry_snapshot_settlement(order, "BTCUSDT")
             state = MonitorState(symbol="BTCUSDT", storage=store)
+            store.wait_for_profile_summary_rebuilds(timeout=10)
             server = _serve(state)
             try:
                 payload = _get_json(f"http://127.0.0.1:{server.server_port}/api/order-profile")
             finally:
                 server.shutdown()
                 server.server_close()
+                state.close()
 
         self.assertEqual(payload["total"]["orders"], 2)
         self.assertEqual(payload["total"]["losses"], 2)

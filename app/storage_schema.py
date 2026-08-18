@@ -2,8 +2,8 @@ import sqlite3
 from dataclasses import dataclass
 
 
-SCHEMA_VERSION = 2
-_MIGRATION_SAVEPOINT = "storage_schema_v2"
+SCHEMA_VERSION = 3
+_MIGRATION_SAVEPOINT = "storage_schema_v3"
 
 
 class SchemaConflictError(RuntimeError):
@@ -119,7 +119,246 @@ _TABLE_SPECS = (
             _ColumnSpec("outcome_payload", "text not null", "TEXT", not_null=1),
         ),
     ),
+    _TableSpec(
+        name="profile_summary_revisions",
+        create_sql="""
+            create table if not exists profile_summary_revisions (
+                symbol text primary key,
+                revision integer not null check(revision >= 0),
+                updated_at_ms integer not null default (strftime('%s','now') * 1000)
+            )
+        """,
+        columns=(
+            _ColumnSpec("symbol", "text primary key", "TEXT", primary_key=1),
+            _ColumnSpec("revision", "integer not null check(revision >= 0)", "INTEGER", not_null=1),
+            _ColumnSpec(
+                "updated_at_ms",
+                "integer not null default (strftime('%s','now') * 1000)",
+                "INTEGER",
+                not_null=1,
+                default="strftime('%s','now') * 1000",
+            ),
+        ),
+    ),
+    _TableSpec(
+        name="profile_summary_materializations",
+        create_sql="""
+            create table if not exists profile_summary_materializations (
+                symbol text not null,
+                summary_schema_version integer not null check(summary_schema_version > 0),
+                algorithm_fingerprint text not null,
+                snapshot_limit integer not null check(snapshot_limit > 0),
+                profile_guard_min_history integer not null check(profile_guard_min_history > 0),
+                profile_guard_min_group_size integer not null check(profile_guard_min_group_size > 0),
+                source_revision integer not null check(source_revision >= 0),
+                payload text not null,
+                updated_at_ms integer not null default (strftime('%s','now') * 1000),
+                primary key(
+                    symbol, summary_schema_version, algorithm_fingerprint,
+                    snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size
+                )
+            )
+        """,
+        columns=(
+            _ColumnSpec("symbol", "text not null", "TEXT", not_null=1, primary_key=1),
+            _ColumnSpec(
+                "summary_schema_version",
+                "integer not null check(summary_schema_version > 0)",
+                "INTEGER",
+                not_null=1,
+                primary_key=2,
+            ),
+            _ColumnSpec(
+                "algorithm_fingerprint",
+                "text not null",
+                "TEXT",
+                not_null=1,
+                primary_key=3,
+            ),
+            _ColumnSpec(
+                "snapshot_limit",
+                "integer not null check(snapshot_limit > 0)",
+                "INTEGER",
+                not_null=1,
+                primary_key=4,
+            ),
+            _ColumnSpec(
+                "profile_guard_min_history",
+                "integer not null check(profile_guard_min_history > 0)",
+                "INTEGER",
+                not_null=1,
+                primary_key=5,
+            ),
+            _ColumnSpec(
+                "profile_guard_min_group_size",
+                "integer not null check(profile_guard_min_group_size > 0)",
+                "INTEGER",
+                not_null=1,
+                primary_key=6,
+            ),
+            _ColumnSpec(
+                "source_revision",
+                "integer not null check(source_revision >= 0)",
+                "INTEGER",
+                not_null=1,
+            ),
+            _ColumnSpec("payload", "text not null", "TEXT", not_null=1),
+            _ColumnSpec(
+                "updated_at_ms",
+                "integer not null default (strftime('%s','now') * 1000)",
+                "INTEGER",
+                not_null=1,
+                default="strftime('%s','now') * 1000",
+            ),
+        ),
+    ),
+    _TableSpec(
+        name="profile_guard_materializations",
+        create_sql="""
+            create table if not exists profile_guard_materializations (
+                symbol text not null,
+                summary_schema_version integer not null check(summary_schema_version > 0),
+                algorithm_fingerprint text not null,
+                snapshot_limit integer not null check(snapshot_limit > 0),
+                profile_guard_min_history integer not null check(profile_guard_min_history > 0),
+                profile_guard_min_group_size integer not null check(profile_guard_min_group_size > 0),
+                source_revision integer not null check(source_revision >= 0),
+                payload text not null,
+                updated_at_ms integer not null default (strftime('%s','now') * 1000),
+                primary key(
+                    symbol, summary_schema_version, algorithm_fingerprint,
+                    snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size
+                )
+            )
+        """,
+        columns=(
+            _ColumnSpec("symbol", "text not null", "TEXT", not_null=1, primary_key=1),
+            _ColumnSpec("summary_schema_version", "integer not null check(summary_schema_version > 0)", "INTEGER", not_null=1, primary_key=2),
+            _ColumnSpec("algorithm_fingerprint", "text not null", "TEXT", not_null=1, primary_key=3),
+            _ColumnSpec("snapshot_limit", "integer not null check(snapshot_limit > 0)", "INTEGER", not_null=1, primary_key=4),
+            _ColumnSpec("profile_guard_min_history", "integer not null check(profile_guard_min_history > 0)", "INTEGER", not_null=1, primary_key=5),
+            _ColumnSpec("profile_guard_min_group_size", "integer not null check(profile_guard_min_group_size > 0)", "INTEGER", not_null=1, primary_key=6),
+            _ColumnSpec("source_revision", "integer not null check(source_revision >= 0)", "INTEGER", not_null=1),
+            _ColumnSpec("payload", "text not null", "TEXT", not_null=1),
+            _ColumnSpec("updated_at_ms", "integer not null default (strftime('%s','now') * 1000)", "INTEGER", not_null=1, default="strftime('%s','now') * 1000"),
+        ),
+    ),
+    _TableSpec(
+        name="profile_guard_settlement_branches",
+        create_sql="""
+            create table if not exists profile_guard_settlement_branches (
+                symbol text not null,
+                summary_schema_version integer not null check(summary_schema_version > 0),
+                algorithm_fingerprint text not null,
+                snapshot_limit integer not null check(snapshot_limit > 0),
+                profile_guard_min_history integer not null check(profile_guard_min_history > 0),
+                profile_guard_min_group_size integer not null check(profile_guard_min_group_size > 0),
+                base_revision integer not null check(base_revision >= 0),
+                order_id integer not null,
+                result text not null check(result in ('WIN', 'LOSS')),
+                payload text not null,
+                updated_at_ms integer not null default (strftime('%s','now') * 1000),
+                primary key(
+                    symbol, summary_schema_version, algorithm_fingerprint,
+                    snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size, base_revision, order_id, result
+                )
+            )
+        """,
+        columns=(
+            _ColumnSpec("symbol", "text not null", "TEXT", not_null=1, primary_key=1),
+            _ColumnSpec("summary_schema_version", "integer not null check(summary_schema_version > 0)", "INTEGER", not_null=1, primary_key=2),
+            _ColumnSpec("algorithm_fingerprint", "text not null", "TEXT", not_null=1, primary_key=3),
+            _ColumnSpec("snapshot_limit", "integer not null check(snapshot_limit > 0)", "INTEGER", not_null=1, primary_key=4),
+            _ColumnSpec("profile_guard_min_history", "integer not null check(profile_guard_min_history > 0)", "INTEGER", not_null=1, primary_key=5),
+            _ColumnSpec("profile_guard_min_group_size", "integer not null check(profile_guard_min_group_size > 0)", "INTEGER", not_null=1, primary_key=6),
+            _ColumnSpec("base_revision", "integer not null check(base_revision >= 0)", "INTEGER", not_null=1, primary_key=7),
+            _ColumnSpec("order_id", "integer not null", "INTEGER", not_null=1, primary_key=8),
+            _ColumnSpec("result", "text not null check(result in ('WIN', 'LOSS'))", "TEXT", not_null=1, primary_key=9),
+            _ColumnSpec("payload", "text not null", "TEXT", not_null=1),
+            _ColumnSpec("updated_at_ms", "integer not null default (strftime('%s','now') * 1000)", "INTEGER", not_null=1, default="strftime('%s','now') * 1000"),
+        ),
+    ),
+    _TableSpec(
+        name="profile_guard_settlement_successors",
+        create_sql="""
+            create table if not exists profile_guard_settlement_successors (
+                symbol text not null,
+                summary_schema_version integer not null check(summary_schema_version > 0),
+                algorithm_fingerprint text not null,
+                snapshot_limit integer not null check(snapshot_limit > 0),
+                profile_guard_min_history integer not null check(profile_guard_min_history > 0),
+                profile_guard_min_group_size integer not null check(profile_guard_min_group_size > 0),
+                base_revision integer not null check(base_revision >= 0),
+                settled_order_id integer not null,
+                settled_result text not null check(settled_result in ('WIN', 'LOSS')),
+                pending_order_id integer not null,
+                pending_result text not null check(pending_result in ('WIN', 'LOSS')),
+                payload text not null,
+                updated_at_ms integer not null default (strftime('%s','now') * 1000),
+                primary key(
+                    symbol, summary_schema_version, algorithm_fingerprint,
+                    snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size, base_revision,
+                    settled_order_id, settled_result,
+                    pending_order_id, pending_result
+                )
+            )
+        """,
+        columns=(
+            _ColumnSpec("symbol", "text not null", "TEXT", not_null=1, primary_key=1),
+            _ColumnSpec("summary_schema_version", "integer not null check(summary_schema_version > 0)", "INTEGER", not_null=1, primary_key=2),
+            _ColumnSpec("algorithm_fingerprint", "text not null", "TEXT", not_null=1, primary_key=3),
+            _ColumnSpec("snapshot_limit", "integer not null check(snapshot_limit > 0)", "INTEGER", not_null=1, primary_key=4),
+            _ColumnSpec("profile_guard_min_history", "integer not null check(profile_guard_min_history > 0)", "INTEGER", not_null=1, primary_key=5),
+            _ColumnSpec("profile_guard_min_group_size", "integer not null check(profile_guard_min_group_size > 0)", "INTEGER", not_null=1, primary_key=6),
+            _ColumnSpec("base_revision", "integer not null check(base_revision >= 0)", "INTEGER", not_null=1, primary_key=7),
+            _ColumnSpec("settled_order_id", "integer not null", "INTEGER", not_null=1, primary_key=8),
+            _ColumnSpec("settled_result", "text not null check(settled_result in ('WIN', 'LOSS'))", "TEXT", not_null=1, primary_key=9),
+            _ColumnSpec("pending_order_id", "integer not null", "INTEGER", not_null=1, primary_key=10),
+            _ColumnSpec("pending_result", "text not null check(pending_result in ('WIN', 'LOSS'))", "TEXT", not_null=1, primary_key=11),
+            _ColumnSpec("payload", "text not null", "TEXT", not_null=1),
+            _ColumnSpec("updated_at_ms", "integer not null default (strftime('%s','now') * 1000)", "INTEGER", not_null=1, default="strftime('%s','now') * 1000"),
+        ),
+    ),
+    _TableSpec(
+        name="profile_summary_leases",
+        create_sql="""
+            create table if not exists profile_summary_leases (
+                symbol text not null,
+                summary_schema_version integer not null check(summary_schema_version > 0),
+                algorithm_fingerprint text not null,
+                snapshot_limit integer not null check(snapshot_limit > 0),
+                profile_guard_min_history integer not null check(profile_guard_min_history > 0),
+                profile_guard_min_group_size integer not null check(profile_guard_min_group_size > 0),
+                source_revision integer not null check(source_revision >= 0),
+                owner_id text not null,
+                expires_at_ms integer not null,
+                primary key(
+                    symbol, summary_schema_version, algorithm_fingerprint,
+                    snapshot_limit, profile_guard_min_history,
+                    profile_guard_min_group_size, source_revision
+                )
+            )
+        """,
+        columns=(
+            _ColumnSpec("symbol", "text not null", "TEXT", not_null=1, primary_key=1),
+            _ColumnSpec("summary_schema_version", "integer not null check(summary_schema_version > 0)", "INTEGER", not_null=1, primary_key=2),
+            _ColumnSpec("algorithm_fingerprint", "text not null", "TEXT", not_null=1, primary_key=3),
+            _ColumnSpec("snapshot_limit", "integer not null check(snapshot_limit > 0)", "INTEGER", not_null=1, primary_key=4),
+            _ColumnSpec("profile_guard_min_history", "integer not null check(profile_guard_min_history > 0)", "INTEGER", not_null=1, primary_key=5),
+            _ColumnSpec("profile_guard_min_group_size", "integer not null check(profile_guard_min_group_size > 0)", "INTEGER", not_null=1, primary_key=6),
+            _ColumnSpec("source_revision", "integer not null check(source_revision >= 0)", "INTEGER", not_null=1, primary_key=7),
+            _ColumnSpec("owner_id", "text not null", "TEXT", not_null=1),
+            _ColumnSpec("expires_at_ms", "integer not null", "INTEGER", not_null=1),
+        ),
+    ),
 )
+
+_V2_TABLE_SPECS = _TABLE_SPECS[:2]
+_PROFILE_TABLE_SPECS = _TABLE_SPECS[2:]
 
 
 _ADDED_COLUMN_SPECS = {
@@ -165,6 +404,22 @@ _ADDED_COLUMN_SPECS = {
 
 
 _INDEX_SPECS = (
+    _IndexSpec(
+        name="ux_orders_symbol_decision_id",
+        table="orders",
+        create_sql="""
+            create unique index if not exists ux_orders_symbol_decision_id
+            on orders(symbol, decision_id)
+            where decision_id is not null
+        """,
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("decision_id"),
+        ),
+        unique=1,
+        partial=1,
+        predicate=("decision_id", "notnull"),
+    ),
     _IndexSpec(
         name="idx_decision_contexts_symbol_closed_kline",
         table="decision_contexts",
@@ -251,6 +506,51 @@ _INDEX_SPECS = (
         partial=1,
         predicate=("aggregation_key", "notnull"),
     ),
+    _IndexSpec(
+        name="ux_signal_audit_symbol_decision_id",
+        table="signal_audit",
+        create_sql="""
+            create unique index if not exists
+                ux_signal_audit_symbol_decision_id
+            on signal_audit(symbol, decision_id)
+            where decision_id is not null
+        """,
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("decision_id"),
+        ),
+        unique=1,
+        partial=1,
+        predicate=("decision_id", "notnull"),
+    ),
+    _IndexSpec(
+        name="ux_observation_signals_symbol_decision_id",
+        table="observation_signals",
+        create_sql="""
+            create unique index if not exists
+                ux_observation_signals_symbol_decision_id
+            on observation_signals(symbol, decision_id)
+            where decision_id is not null
+        """,
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("decision_id"),
+        ),
+        unique=1,
+        partial=1,
+        predicate=("decision_id", "notnull"),
+    ),
+)
+
+_V3_DECISION_INDEX_NAMES = frozenset(
+    {
+        "ux_orders_symbol_decision_id",
+        "ux_signal_audit_symbol_decision_id",
+        "ux_observation_signals_symbol_decision_id",
+    }
+)
+_V2_INDEX_SPECS = tuple(
+    spec for spec in _INDEX_SPECS if spec.name not in _V3_DECISION_INDEX_NAMES
 )
 
 
@@ -651,8 +951,8 @@ def _canonical_partial_predicate(sql: str | None) -> tuple[str, str] | None:
         column = _strip_outer_token_parentheses(
             expression[: -len(operator)]
         )
-        if column == (("identifier", "aggregation_key"),):
-            return ("aggregation_key", "notnull")
+        if len(column) == 1 and column[0][0] == "identifier":
+            return (column[0][1], "notnull")
     return None
 
 
@@ -797,8 +1097,12 @@ def _validate_owned_table_index_inventory(
         )
 
 
-def _validate_v2_schema(connection: sqlite3.Connection) -> None:
-    for table_spec in _TABLE_SPECS:
+def _validate_schema(
+    connection: sqlite3.Connection,
+    table_specs: tuple[_TableSpec, ...],
+    index_specs: tuple[_IndexSpec, ...] = _INDEX_SPECS,
+) -> None:
+    for table_spec in table_specs:
         _validate_table(connection, table_spec)
     for table, column_specs in _ADDED_COLUMN_SPECS.items():
         _require_table(connection, table)
@@ -811,10 +1115,72 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
                     "required column is missing"
                 )
             _validate_column(table, column_spec, row)
-    for index_spec in _INDEX_SPECS:
+    for index_spec in index_specs:
         _validate_index(connection, index_spec)
-    for table_spec in _TABLE_SPECS:
+    for table_spec in table_specs:
         _validate_owned_table_index_inventory(connection, table_spec)
+
+
+def _is_legacy_profile_materialization_table(
+    connection: sqlite3.Connection,
+) -> bool:
+    if _schema_object(connection, "profile_summary_materializations") is None:
+        return False
+    rows = _ordered_column_rows(connection, "profile_summary_materializations")
+    signature = tuple((str(row[1]), int(row[5])) for row in rows)
+    return signature == (
+        ("symbol", 1),
+        ("snapshot_limit", 2),
+        ("profile_guard_min_history", 3),
+        ("profile_guard_min_group_size", 4),
+        ("source_revision", 0),
+        ("payload", 0),
+        ("updated_at_ms", 0),
+    )
+
+
+def _ensure_profile_tables_v3(connection: sqlite3.Connection) -> None:
+    revision_spec, materialization_spec, *additional_specs = _PROFILE_TABLE_SPECS
+    revision_object = _schema_object(connection, revision_spec.name)
+    if revision_object is None:
+        connection.execute(revision_spec.create_sql)
+    _validate_table(connection, revision_spec)
+
+    materialization_object = _schema_object(connection, materialization_spec.name)
+    if materialization_object is not None and _is_legacy_profile_materialization_table(
+        connection
+    ):
+        connection.execute("drop table profile_summary_materializations")
+        materialization_object = None
+    if materialization_object is None:
+        connection.execute(materialization_spec.create_sql)
+    _validate_table(connection, materialization_spec)
+
+    for table_spec in additional_specs:
+        schema_object = _schema_object(connection, table_spec.name)
+        if schema_object is None:
+            connection.execute(table_spec.create_sql)
+        _validate_table(connection, table_spec)
+
+
+def _reject_duplicate_decision_lifecycle_rows(
+    connection: sqlite3.Connection,
+) -> None:
+    for table in ("orders", "signal_audit", "observation_signals"):
+        duplicate = connection.execute(
+            f"""
+            select symbol, decision_id, count(*)
+            from {_quote_identifier(table)}
+            where decision_id is not null and decision_id != ''
+            group by symbol, decision_id
+            having count(*) > 1
+            limit 1
+            """
+        ).fetchone()
+        if duplicate is not None:
+            raise SchemaConflictError(
+                f"SQLite schema conflict for {table}: duplicate decision_id rows"
+            )
 
 
 def _rollback_migration(
@@ -845,13 +1211,19 @@ def migrate(connection: sqlite3.Connection) -> None:
             f"maximum supported version is {SCHEMA_VERSION}"
         )
     if version == SCHEMA_VERSION:
-        _validate_v2_schema(connection)
+        _validate_schema(connection, _TABLE_SPECS)
         return
+    if version == 2:
+        _validate_schema(
+            connection,
+            _V2_TABLE_SPECS,
+            _V2_INDEX_SPECS,
+        )
 
     caller_in_transaction = connection.in_transaction
     connection.execute(f"savepoint {_MIGRATION_SAVEPOINT}")
     try:
-        for table_spec in _TABLE_SPECS:
+        for table_spec in _V2_TABLE_SPECS:
             existing = _schema_object(connection, table_spec.name)
             if existing is not None and existing[0].casefold() != "table":
                 _require_table(connection, table_spec.name)
@@ -861,6 +1233,10 @@ def migrate(connection: sqlite3.Connection) -> None:
         for table, column_specs in _ADDED_COLUMN_SPECS.items():
             _ensure_added_columns(connection, table, column_specs)
 
+        _ensure_profile_tables_v3(connection)
+
+        _reject_duplicate_decision_lifecycle_rows(connection)
+
         for index_spec in _INDEX_SPECS:
             if _schema_object(connection, index_spec.name) is not None:
                 _validate_index(connection, index_spec)
@@ -868,7 +1244,7 @@ def migrate(connection: sqlite3.Connection) -> None:
                 connection.execute(index_spec.create_sql)
             _validate_index(connection, index_spec)
 
-        _validate_v2_schema(connection)
+        _validate_schema(connection, _TABLE_SPECS)
         connection.execute(f"pragma user_version = {SCHEMA_VERSION}")
         connection.execute(f"release savepoint {_MIGRATION_SAVEPOINT}")
     except Exception as migration_error:

@@ -9,6 +9,7 @@ let observationsTotalPages = 1;
 let lastObservationFilterOptions = null;
 let lastState = null;
 let lastOrderProfile = null;
+let lastObservationSummary = null;
 let stateRequestInFlight = false;
 let priceRequestInFlight = false;
 let symbolRevision = 0;
@@ -647,6 +648,7 @@ function renderObservations(observations) {
 }
 
 function renderObservationSummary(summary) {
+  lastObservationSummary = summary;
   const groups = summary && Array.isArray(summary.groups) ? summary.groups : [];
   $("observation-summary").innerHTML = groups.length ? groups.map((item) => `
     <tr>
@@ -667,11 +669,16 @@ function renderObservationSummary(summary) {
     </tr>
   `).join("") : `<tr><td colspan="14" class="empty-row">暂无观察画像统计</td></tr>`;
 
+  $("observation-profile").textContent = fmtObservationProfile(summary);
+  renderObservationSummaryInfo(summary);
+}
+
+function renderObservationSummaryInfo(summary) {
   const total = summary && summary.total ? summary.total : {};
   const actionCounts = summary && summary.action_counts ? summary.action_counts : {};
-  $("observation-profile").textContent = fmtObservationProfile(summary);
   $("observation-summary-info").textContent = (
-    `信号 ${total.signals || 0} · 结算 ${total.settled || 0} · `
+    `订单画像缓存 ${profileCacheStatusLabel(lastOrderProfile)} · `
+    + `信号 ${total.signals || 0} · 结算 ${total.settled || 0} · `
     + `胜率 ${fmtPct(total.win_rate)} · EV ${fmtMoney(total.ev)} · `
     + `重点 ${actionCounts.PROMOTE_WATCH || 0} / 风险 ${actionCounts.BLOCK_WATCH || 0}`
   );
@@ -700,8 +707,31 @@ function renderDailyProfileSelection(selection) {
   `).join("") : `<div class="daily-profile-empty">${escapeHtml(current.reason || "当前没有达到启用条件的画像")}</div>`;
 }
 
+function profileCacheStatusLabel(summary) {
+  const labels = {
+    PREPARING: "准备中",
+    STALE: "已陈旧",
+    READY: "已就绪",
+  };
+  const status = summary && summary.cache_status ? summary.cache_status : "PREPARING";
+  const source = summary && summary.source_revision !== null
+    && summary.source_revision !== undefined
+    ? summary.source_revision
+    : DASH;
+  const current = summary && summary.current_revision !== null
+    && summary.current_revision !== undefined
+    ? summary.current_revision
+    : DASH;
+  return `${labels[status] || status} · 摘要版本 ${source} / 当前版本 ${current}`;
+}
+
 function renderOrderProfile(summary) {
+  lastOrderProfile = summary;
   const hints = summary && Array.isArray(summary.risk_hints) ? summary.risk_hints : [];
+  const cacheStatus = summary && summary.cache_status ? summary.cache_status : "PREPARING";
+  const emptyMessage = cacheStatus === "PREPARING"
+    ? "订单弱点画像正在准备"
+    : (cacheStatus === "STALE" ? "当前显示旧版本画像，后台正在更新" : "暂无订单弱点画像");
   $("order-profile-summary").innerHTML = hints.length ? hints.map((item) => `
     <tr class="${num(item.ev) < 0 ? "row-loss" : "row-win"}">
       <td>${escapeHtml(riskHintLabel(item.key))}<br><span>${escapeHtml(item.key || DASH)}</span></td>
@@ -710,12 +740,12 @@ function renderOrderProfile(summary) {
       <td>${fmtMoney(item.ev)}</td>
       <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${fmtMoney(item.pnl)}</td>
     </tr>
-  `).join("") : `<tr><td colspan="5" class="empty-row">暂无订单弱点画像</td></tr>`;
+  `).join("") : `<tr><td colspan="5" class="empty-row">${escapeHtml(emptyMessage)}</td></tr>`;
 
   const total = summary && summary.total ? summary.total : {};
   $("order-profile").textContent = fmtOrderProfile(summary);
   $("order-profile-info").textContent = (
-    `订单 ${total.orders || 0} · 胜率 ${fmtPct(total.win_rate)} · `
+    `${profileCacheStatusLabel(summary)} · 订单 ${total.orders || 0} · 胜率 ${fmtPct(total.win_rate)} · `
     + `EV ${fmtMoney(total.ev)} · 弱点 ${hints.length}`
   );
   renderProfileGuard(summary && summary.profile_guard ? summary.profile_guard : null);
@@ -725,6 +755,7 @@ function renderOrderProfile(summary) {
     summary && summary.profile_guard_shadow_compare ? summary.profile_guard_shadow_compare : null
   );
   renderCurrentRiskProfile(lastState, summary);
+  if (lastObservationSummary) renderObservationSummaryInfo(lastObservationSummary);
 }
 
 function renderProfileGuard(guard) {

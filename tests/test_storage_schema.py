@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from app.models import SimulatedOrder
@@ -298,8 +299,8 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(_schema_snapshot(connection), before_schema)
         self.assertEqual(connection.total_changes, before_changes)
 
-    def test_zero_and_v1_databases_upgrade_to_v2(self):
-        self.assertEqual(SCHEMA_VERSION, 2)
+    def test_zero_and_v1_databases_upgrade_to_current_schema(self):
+        self.assertEqual(SCHEMA_VERSION, 3)
         for legacy_version in (0, 1):
             with self.subTest(legacy_version=legacy_version):
                 connection = sqlite3.connect(":memory:")
@@ -311,7 +312,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
 
                 self.assertEqual(
                     connection.execute("pragma user_version").fetchone()[0],
-                    2,
+                    SCHEMA_VERSION,
                 )
                 tables = {
                     row[0]
@@ -529,7 +530,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         connection.set_trace_callback(None)
         self.assertEqual(_schema_snapshot(connection), before)
         self.assertEqual(connection.total_changes, changes_before)
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
         self.assertFalse(
             any(
                 statement.lstrip().upper().startswith(
@@ -777,7 +781,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         before = _schema_snapshot(connection)
         self._migrate(connection)
 
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
         self.assertEqual(_schema_snapshot(connection), before)
 
     def test_incompatible_existing_v2_column_rolls_back_without_certification(self):
@@ -817,7 +824,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
 
         self._migrate(connection)
 
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
         columns = _column_details(connection, "orders")
         self.assertIn("legacy_extension", columns)
         self.assertIn("decision_id", columns)
@@ -979,7 +989,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                     self.assertEqual(connection.total_changes, changes_before)
                     self.assertEqual(
                         connection.execute("pragma user_version").fetchone()[0],
-                        2,
+                        SCHEMA_VERSION,
                     )
                 finally:
                     connection.close()
@@ -1012,14 +1022,14 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             "alter table runtime_config_snapshots add column future_note text"
         )
         connection.execute("create table future_v3_state(value text)")
-        connection.execute("pragma user_version = 3")
+        connection.execute(f"pragma user_version = {SCHEMA_VERSION + 1}")
         before_schema = _schema_snapshot(connection)
         changes_before = connection.total_changes
         transaction_before = connection.in_transaction
 
         with self.assertRaisesRegex(
             RuntimeError,
-            r"(?i)unsupported.*schema version.*3",
+            rf"(?i)unsupported.*schema version.*{SCHEMA_VERSION + 1}",
         ) as raised:
             self._migrate(connection)
 
@@ -1028,11 +1038,14 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             "UnsupportedSchemaVersionError",
         )
         self.assertEqual(connection.in_transaction, transaction_before)
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 3)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION + 1,
+        )
         self.assertEqual(_schema_snapshot(connection), before_schema)
         self.assertEqual(connection.total_changes, changes_before)
 
-    def test_fresh_store_is_v2_and_existing_order_behavior_still_works(self):
+    def test_fresh_store_is_current_and_existing_order_behavior_still_works(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
             store = SQLiteMonitorStore(db_path)
@@ -1049,7 +1062,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
 
             store.save_order(order, "BTCUSDT")
             restored = store.load_orders("BTCUSDT")
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 version = connection.execute("pragma user_version").fetchone()[0]
                 tables = {
                     row[0]
@@ -1063,8 +1076,9 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                     from orders where symbol = 'BTCUSDT' and order_id = 9
                     """
                 ).fetchone()
+            store.close()
 
-        self.assertEqual(version, 2)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertTrue(
             {
                 "orders",
@@ -1120,7 +1134,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
     def test_release_failure_rolls_back_and_allows_retry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "locked.sqlite3"
-            with sqlite3.connect(db_path) as setup:
+            with closing(sqlite3.connect(db_path)) as setup:
                 self.assertEqual(
                     setup.execute("pragma journal_mode = delete").fetchone()[0],
                     "delete",
@@ -1128,7 +1142,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                 _create_legacy_schema(setup)
                 _insert_legacy_sentinels(setup)
                 setup.execute("pragma user_version = 1")
-            with sqlite3.connect(db_path) as baseline:
+            with closing(sqlite3.connect(db_path)) as baseline:
                 before_schema = _schema_snapshot(baseline)
                 before_payloads = _legacy_payload_snapshot(baseline)
 
@@ -1169,7 +1183,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                 self.assertNotIn("runtime_config_snapshots", writer_tables)
                 self.assertNotIn("decision_contexts", writer_tables)
 
-                with sqlite3.connect(db_path, timeout=0.0) as fresh:
+                with closing(sqlite3.connect(db_path, timeout=0.0)) as fresh:
                     self.assertEqual(
                         fresh.execute("pragma user_version").fetchone()[0],
                         1,
@@ -1185,14 +1199,14 @@ class StorageSchemaMigrationTest(unittest.TestCase):
                 self.assertFalse(writer.in_transaction)
                 self.assertEqual(
                     writer.execute("pragma user_version").fetchone()[0],
-                    2,
+                    SCHEMA_VERSION,
                 )
                 self.assertIn("decision_id", _column_details(writer, "orders"))
                 self.assertEqual(_legacy_payload_snapshot(writer), before_payloads)
-                with sqlite3.connect(db_path) as fresh:
+                with closing(sqlite3.connect(db_path)) as fresh:
                     self.assertEqual(
                         fresh.execute("pragma user_version").fetchone()[0],
-                        2,
+                        SCHEMA_VERSION,
                     )
                     self.assertIn(
                         "runtime_config_snapshots",
@@ -1278,7 +1292,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         self._migrate(connection)
 
         self.assertTrue(connection.in_transaction)
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
         self.assertIn("decision_id", _column_details(connection, "orders"))
         connection.execute("rollback to savepoint caller_work")
         connection.execute("release savepoint caller_work")
@@ -1308,7 +1325,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         ]
         self.assertEqual(order_columns.count("decision_id"), 1)
         self.assertIn("runtime_config_hash", order_columns)
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 2)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
 
     @staticmethod
     def _insert_audit(

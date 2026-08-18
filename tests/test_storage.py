@@ -3076,7 +3076,8 @@ class AtomicDecisionBundleTest(unittest.TestCase):
     def test_orders_schema_has_unique_non_null_decision_identity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
-            SQLiteMonitorStore(db_path)
+            store = SQLiteMonitorStore(db_path)
+            store.close()
 
             with closing(sqlite3.connect(db_path)) as connection:
                 indexes = connection.execute("pragma index_list(orders)").fetchall()
@@ -3096,12 +3097,15 @@ class AtomicDecisionBundleTest(unittest.TestCase):
     def test_legacy_database_without_decision_index_is_upgraded_in_place(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
-            SQLiteMonitorStore(db_path)
+            store = SQLiteMonitorStore(db_path)
+            store.close()
             with closing(sqlite3.connect(db_path)) as connection:
                 connection.execute("drop index ux_orders_symbol_decision_id")
+                connection.execute("pragma user_version = 2")
                 connection.commit()
 
-            SQLiteMonitorStore(db_path)
+            upgraded = SQLiteMonitorStore(db_path)
+            upgraded.close()
 
             with closing(sqlite3.connect(db_path)) as connection:
                 index = connection.execute(
@@ -3114,7 +3118,8 @@ class AtomicDecisionBundleTest(unittest.TestCase):
     def test_legacy_duplicate_decision_bindings_require_explicit_repair(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
-            SQLiteMonitorStore(db_path)
+            store = SQLiteMonitorStore(db_path)
+            store.close()
             with closing(sqlite3.connect(db_path)) as connection:
                 connection.execute("drop index ux_orders_symbol_decision_id")
                 for order_id in (1, 2):
@@ -3135,9 +3140,10 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                             "config-hash",
                         ),
                     )
+                connection.execute("pragma user_version = 2")
                 connection.commit()
 
-            with self.assertRaisesRegex(ValueError, "duplicate decision identities"):
+            with self.assertRaisesRegex(RuntimeError, "duplicate decision_id"):
                 SQLiteMonitorStore(db_path)
 
             with closing(sqlite3.connect(db_path)) as connection:

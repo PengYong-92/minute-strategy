@@ -12,6 +12,7 @@ CORE_RESERVE_BYTES = 256 * 1024**2
 
 class StorageWriteClass(str, Enum):
     ORDINARY_AUDIT = "ORDINARY_AUDIT"
+    REBUILDABLE_AUXILIARY = "REBUILDABLE_AUXILIARY"
     CORE = "CORE"
 
 
@@ -43,6 +44,10 @@ class OrdinaryAuditCapacityError(StorageCapacityError):
 
 
 class CoreStorageCapacityError(StorageCapacityError):
+    pass
+
+
+class RebuildableAuxiliaryCapacityError(StorageCapacityError):
     pass
 
 
@@ -140,11 +145,19 @@ def ensure_write_allowed(
     write_class: StorageWriteClass,
 ) -> None:
     normalized_class = StorageWriteClass(write_class)
-    if normalized_class is StorageWriteClass.ORDINARY_AUDIT:
+    if normalized_class in {
+        StorageWriteClass.ORDINARY_AUDIT,
+        StorageWriteClass.REBUILDABLE_AUXILIARY,
+    }:
         if capacity.ordinary_audit_allowed:
             return
-        raise OrdinaryAuditCapacityError(
-            f"ordinary audit write is disabled at {capacity.status}",
+        exception_type = (
+            OrdinaryAuditCapacityError
+            if normalized_class is StorageWriteClass.ORDINARY_AUDIT
+            else RebuildableAuxiliaryCapacityError
+        )
+        raise exception_type(
+            f"{normalized_class.value} write is disabled at {capacity.status}",
             write_class=normalized_class,
             capacity=capacity,
         )
@@ -184,11 +197,12 @@ def raise_for_sqlite_write_error(
     normalized_class = StorageWriteClass(write_class)
     if not _is_sqlite_full(error):
         raise error
-    exception_type = (
-        OrdinaryAuditCapacityError
-        if normalized_class is StorageWriteClass.ORDINARY_AUDIT
-        else CoreStorageCapacityError
-    )
+    if normalized_class is StorageWriteClass.ORDINARY_AUDIT:
+        exception_type = OrdinaryAuditCapacityError
+    elif normalized_class is StorageWriteClass.REBUILDABLE_AUXILIARY:
+        exception_type = RebuildableAuxiliaryCapacityError
+    else:
+        exception_type = CoreStorageCapacityError
     raise exception_type(
         "SQLite cannot allocate another database page",
         write_class=normalized_class,

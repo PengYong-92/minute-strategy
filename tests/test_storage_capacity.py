@@ -14,6 +14,7 @@ from app.storage_capacity import (
     WARNING_BYTES,
     CoreStorageCapacityError,
     OrdinaryAuditCapacityError,
+    RebuildableAuxiliaryCapacityError,
     StorageCapacity,
     StorageCapacityConfigurationError,
     StorageWriteClass,
@@ -99,6 +100,15 @@ class CapacityBoundaryTest(unittest.TestCase):
             StorageWriteClass.ORDINARY_AUDIT,
         )
         ensure_write_allowed(compact, StorageWriteClass.CORE)
+        with self.assertRaises(RebuildableAuxiliaryCapacityError) as auxiliary:
+            ensure_write_allowed(
+                compact,
+                StorageWriteClass.REBUILDABLE_AUXILIARY,
+            )
+        self.assertEqual(
+            auxiliary.exception.write_class,
+            StorageWriteClass.REBUILDABLE_AUXILIARY,
+        )
 
         hard_limit = capacity_for_bytes(MAX_DATABASE_BYTES)
         with self.assertRaises(CoreStorageCapacityError) as core_error:
@@ -267,6 +277,22 @@ class SQLiteCapacityIntegrationTest(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+    def test_sqlite_full_is_classified_as_rebuildable_auxiliary_failure(self):
+        error = sqlite3.OperationalError("database or disk is full")
+        error.sqlite_errorcode = sqlite3.SQLITE_FULL
+
+        with self.assertRaises(RebuildableAuxiliaryCapacityError) as raised:
+            raise_for_sqlite_write_error(
+                error,
+                StorageWriteClass.REBUILDABLE_AUXILIARY,
+            )
+
+        self.assertIs(raised.exception.__cause__, error)
+        self.assertEqual(
+            raised.exception.write_class,
+            StorageWriteClass.REBUILDABLE_AUXILIARY,
+        )
 
     def test_configure_max_page_count_verifies_effective_value(self):
         class WrongEffectiveConnection:
