@@ -1,4 +1,5 @@
 from copy import deepcopy
+from collections.abc import Mapping, Sequence
 import json
 import math
 import time
@@ -426,6 +427,214 @@ class StructureStateRegressionTest(unittest.TestCase):
         self.assertEqual(
             (attached["entry_structure_state"], attached["entry_structure_bias"]),
             ("ERROR", "NEUTRAL"),
+        )
+
+    def test_attach_contains_hostile_inputs_without_reading_them_again(self):
+        from app.entry_structure_shadow import EntryStructureGate
+
+        secret = "token=attach-secret /private/attach/path"
+
+        class HostileMapping(Mapping):
+            def __getitem__(self, key):
+                raise RuntimeError(secret)
+
+            def __iter__(self):
+                raise RuntimeError(secret)
+
+            def __len__(self):
+                raise RuntimeError(secret)
+
+            def get(self, key, default=None):
+                raise RuntimeError(secret)
+
+            def items(self):
+                raise RuntimeError(secret)
+
+        class HostileSignal:
+            @property
+            def direction(self):
+                raise RuntimeError(secret)
+
+        class HostileOrigin:
+            def __str__(self):
+                raise RuntimeError(secret)
+
+        gate = EntryStructureGate()
+        market_failure = gate.attach(
+            candidate("SHORT"),
+            HostileMapping(),
+            "PROFILE_PROMOTED_WAIT",
+        )
+        signal_failure = gate.attach(
+            HostileSignal(), detected_level("SUPPORT"), "NATIVE_ACTIONABLE"
+        )
+        origin_failure = gate.attach(
+            candidate(), detected_level("SUPPORT"), HostileOrigin()
+        )
+        self.assertEqual(
+            (
+                market_failure["entry_structure_mode"],
+                market_failure["entry_structure_state"],
+                market_failure["entry_structure_bias"],
+            ),
+            ("SHADOW_ONLY", "ERROR", "NEUTRAL"),
+        )
+        self.assertEqual(
+            market_failure["entry_structure_reason_code"],
+            "ATTACH_ERROR_RUNTIMEERROR",
+        )
+        self.assertEqual(market_failure["error_detail"], "RuntimeError")
+
+        for payload in (market_failure, signal_failure, origin_failure):
+            serialized = json.dumps(payload, allow_nan=False, sort_keys=True)
+            self.assertNotIn("attach-secret", serialized)
+            self.assertNotIn("/private/attach/path", serialized)
+
+        self.assertEqual(market_failure["candidate_origin"], "PROFILE_PROMOTED_WAIT")
+        self.assertEqual(market_failure["candidate_direction"], "SHORT")
+        self.assertEqual(signal_failure["candidate_direction"], "")
+        self.assertEqual(origin_failure["candidate_origin"], "")
+
+    def test_evaluate_contains_hostile_mapping_and_sequence_inputs(self):
+        from app.entry_structure_shadow import EntryStructureGate, StructureDetector
+
+        secret = "token=evaluate-secret /private/evaluate/path"
+
+        class GetHostileMapping(Mapping):
+            def __getitem__(self, key):
+                raise RuntimeError(secret)
+
+            def __iter__(self):
+                raise RuntimeError(secret)
+
+            def __len__(self):
+                return 1
+
+            def get(self, key, default=None):
+                raise RuntimeError(secret)
+
+        class IterHostileMapping(Mapping):
+            def __init__(self):
+                self.data = {"status": "INSUFFICIENT_DATA"}
+
+            def __getitem__(self, key):
+                return self.data[key]
+
+            def __iter__(self):
+                raise RuntimeError(secret)
+
+            def __len__(self):
+                return len(self.data)
+
+            def get(self, key, default=None):
+                return self.data.get(key, default)
+
+            def items(self):
+                raise RuntimeError(secret)
+
+            def keys(self):
+                raise RuntimeError(secret)
+
+        class ResultDetector(StructureDetector):
+            def __init__(self, result):
+                super().__init__()
+                self.result = result
+
+            def detect(self, symbol, closed_klines):
+                return self.result
+
+        class HostileSequence(Sequence):
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, index):
+                raise RuntimeError(secret)
+
+            def __iter__(self):
+                raise RuntimeError(secret)
+
+        get_failure = EntryStructureGate(
+            detector=ResultDetector(GetHostileMapping())
+        ).evaluate(
+            candidate("SHORT"),
+            "BTCUSDT",
+            [],
+            candidate_origin="RESEARCH_OBSERVATION",
+        )
+        payloads = [
+            get_failure,
+            EntryStructureGate(detector=ResultDetector(IterHostileMapping())).evaluate(
+                candidate(), "BTCUSDT", []
+            ),
+            EntryStructureGate().evaluate(
+                candidate(), "BTCUSDT", HostileSequence()
+            ),
+        ]
+
+        for payload in payloads:
+            with self.subTest(reason=payload["entry_structure_reason_code"]):
+                self.assertEqual(
+                    (payload["entry_structure_mode"], payload["entry_structure_state"], payload["entry_structure_bias"]),
+                    ("SHADOW_ONLY", "ERROR", "NEUTRAL"),
+                )
+                self.assertEqual(payload["error_detail"], "RuntimeError")
+                serialized = json.dumps(payload, allow_nan=False, sort_keys=True)
+                self.assertNotIn("evaluate-secret", serialized)
+                self.assertNotIn("/private/evaluate/path", serialized)
+
+        self.assertEqual(get_failure["candidate_origin"], "RESEARCH_OBSERVATION")
+        self.assertEqual(get_failure["candidate_direction"], "SHORT")
+
+    def test_states_container_is_strictly_validated(self):
+        from app.entry_structure_shadow import EntryStructureGate
+
+        secret = "token=states-secret /private/states/path"
+
+        class HostileSequence(Sequence):
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, index):
+                raise RuntimeError(secret)
+
+            def __iter__(self):
+                raise RuntimeError(secret)
+
+        valid = evidence("SUPPORT", "SUPPORT_REJECTED")
+        invalid_states = (
+            "not-a-state-list",
+            b"not-a-state-list",
+            {"state": valid},
+            [1, 2],
+            [valid, 1],
+            HostileSequence(),
+        )
+        gate = EntryStructureGate()
+        for states in invalid_states:
+            with self.subTest(states_type=type(states).__name__):
+                market = {**detected_level("SUPPORT"), "states": states}
+                payload = gate.attach(candidate(), market, "NATIVE_ACTIONABLE")
+                self.assertEqual(
+                    (payload["entry_structure_state"], payload["entry_structure_bias"]),
+                    ("ERROR", "NEUTRAL"),
+                )
+                self.assertEqual(
+                    payload["entry_structure_reason_code"],
+                    "STRUCTURE_STATES_INVALID",
+                )
+                serialized = json.dumps(payload, allow_nan=False, sort_keys=True)
+                self.assertNotIn("states-secret", serialized)
+                self.assertNotIn("/private/states/path", serialized)
+
+        empty = {
+            **detected_level("SUPPORT"),
+            "states": [],
+            "nearest_support": None,
+        }
+        empty_payload = gate.attach(candidate(), empty, "NATIVE_ACTIONABLE")
+        self.assertEqual(
+            (empty_payload["entry_structure_state"], empty_payload["entry_structure_bias"]),
+            ("NO_NEARBY_LEVEL", "NEUTRAL"),
         )
 
     def test_error_details_never_leak_exception_message(self):

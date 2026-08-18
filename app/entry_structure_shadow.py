@@ -1327,6 +1327,75 @@ def _level_payload(prefix: str, level: object) -> dict[str, object]:
     }
 
 
+def _minimal_error_payload(
+    *,
+    breakout_buffer_atr: object,
+    reason_code: str,
+    error_detail: str = "",
+    candidate_origin: object = "",
+    candidate_direction: object = "",
+) -> dict[str, object]:
+    safe_buffer = (
+        float(breakout_buffer_atr)
+        if _finite_number(breakout_buffer_atr)
+        else 0.10
+    )
+    payload = {
+        "entry_structure_version": ENTRY_STRUCTURE_VERSION,
+        "entry_structure_mode": "SHADOW_ONLY",
+        "entry_structure_evaluated_at": 0,
+        "entry_structure_state": "ERROR",
+        "entry_structure_bias": "NEUTRAL",
+        "entry_structure_reason_code": reason_code,
+        "version": ENTRY_STRUCTURE_VERSION,
+        "mode": "SHADOW_ONLY",
+        "status": "ERROR",
+        "evaluated_at": 0,
+        "state": "ERROR",
+        "bias": "NEUTRAL",
+        "reason_code": reason_code,
+        "audit_only": True,
+        "candidate_origin": (
+            candidate_origin if type(candidate_origin) is str else ""
+        ),
+        "candidate_direction": (
+            candidate_direction if type(candidate_direction) is str else ""
+        ),
+        "active_level_source": "",
+        "breakout_direction": "NONE",
+        "breakout_closed_bars": 0,
+        "breakout_buffer_atr": safe_buffer,
+        "retest_status": "NOT_APPLICABLE",
+    }
+    payload.update(_level_payload("active_level", {}))
+    payload["active_level_confirmed_at"] = 0
+    payload.update(_level_payload("nearest_support", {}))
+    payload.update(_level_payload("nearest_resistance", {}))
+    payload.update(
+        {
+            "support_distance_price": None,
+            "support_distance_bps": None,
+            "support_distance_atr": None,
+            "resistance_distance_price": None,
+            "resistance_distance_bps": None,
+            "resistance_distance_atr": None,
+            "round_level_price": None,
+            "round_level_step": None,
+        }
+    )
+    if error_detail:
+        payload["error_detail"] = error_detail
+    return payload
+
+
+def _safe_candidate_direction(signal: object) -> str:
+    try:
+        direction = signal.direction  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+    return direction if type(direction) is str else ""
+
+
 class EntryStructureGate:
     _BIAS_PRIORITY = {
         "CONFLICT": 0,
@@ -1372,54 +1441,87 @@ class EntryStructureGate:
 
         return sorted((dict(item) for item in evidence), key=key)
 
+    def _configured_breakout_atr(self) -> float:
+        try:
+            configured = self.state_machine.config.breakout_atr
+        except Exception:
+            return 0.10
+        return float(configured) if _finite_number(configured) else 0.10
+
     def attach(
         self,
         signal: Signal,
         market_snapshot: object,
         candidate_origin: str,
     ) -> dict[str, object]:
-        snapshot = market_snapshot if isinstance(market_snapshot, Mapping) else {}
-        snapshot_valid = isinstance(market_snapshot, Mapping)
+        try:
+            return self._attach_impl(signal, market_snapshot, candidate_origin)
+        except Exception as exc:
+            error_type = type(exc).__name__
+            return _minimal_error_payload(
+                breakout_buffer_atr=self._configured_breakout_atr(),
+                reason_code=f"ATTACH_ERROR_{error_type.upper()}",
+                error_detail=error_type,
+                candidate_origin=candidate_origin,
+                candidate_direction=_safe_candidate_direction(signal),
+            )
+
+    def _attach_impl(
+        self,
+        signal: Signal,
+        market_snapshot: object,
+        candidate_origin: str,
+    ) -> dict[str, object]:
+        configured_buffer = self._configured_breakout_atr()
+        safe_origin = candidate_origin if type(candidate_origin) is str else ""
+        safe_direction = _safe_candidate_direction(signal)
+        if not isinstance(market_snapshot, Mapping):
+            return _minimal_error_payload(
+                breakout_buffer_atr=configured_buffer,
+                reason_code="STRUCTURE_SNAPSHOT_INVALID",
+                candidate_origin=safe_origin,
+                candidate_direction=safe_direction,
+            )
+        snapshot = market_snapshot
         status = str(snapshot.get("status", "ERROR"))
         states = snapshot.get("states", [])
         mapped = []
-        if status == "READY" and isinstance(states, Sequence):
-            mapped = [
-                map_direction_bias(signal.direction, item)
-                for item in states
-                if isinstance(item, Mapping)
-            ]
+        if status == "READY":
+            if type(states) not in (list, tuple) or not all(
+                isinstance(item, Mapping) for item in states
+            ):
+                return _minimal_error_payload(
+                    breakout_buffer_atr=configured_buffer,
+                    reason_code="STRUCTURE_STATES_INVALID",
+                    candidate_origin=safe_origin,
+                    candidate_direction=safe_direction,
+                )
+            mapped = [map_direction_bias(safe_direction, item) for item in states]
         if status == "INSUFFICIENT_DATA":
             active = _error_evidence(
                 "STRUCTURE_INSUFFICIENT_DATA",
-                self.state_machine.config.breakout_atr,
+                configured_buffer,
             )
             active["state"] = "INSUFFICIENT_DATA"
             active["bias"] = "NEUTRAL"
-        elif not snapshot_valid:
-            active = _invalid_mapped_evidence(
-                {},
-                "STRUCTURE_SNAPSHOT_INVALID",
-                self.state_machine.config.breakout_atr,
-            )
         elif status != "READY":
             active = _invalid_mapped_evidence(
                 {},
                 "STRUCTURE_SNAPSHOT_NOT_READY",
-                self.state_machine.config.breakout_atr,
+                configured_buffer,
             )
         elif mapped:
             active = self.rank(mapped)[0]
         else:
             active = _error_evidence(
                 "STRUCTURE_NO_NEARBY_LEVEL",
-                self.state_machine.config.breakout_atr,
+                configured_buffer,
             )
             active["state"] = "NO_NEARBY_LEVEL"
             active["bias"] = "NEUTRAL"
 
         if active.get("state") == "ERROR":
-            active["breakout_buffer_atr"] = self.state_machine.config.breakout_atr
+            active["breakout_buffer_atr"] = configured_buffer
 
         state = str(active.get("state", "ERROR"))
         bias = str(active.get("bias", "NEUTRAL"))
@@ -1443,8 +1545,8 @@ class EntryStructureGate:
             "bias": bias,
             "reason_code": reason_code,
             "audit_only": True,
-            "candidate_origin": str(candidate_origin),
-            "candidate_direction": str(signal.direction),
+            "candidate_origin": safe_origin,
+            "candidate_direction": safe_direction,
             "active_level_source": str(active.get("source", "")),
             "breakout_direction": str(
                 active.get("breakout_direction", "NONE")
@@ -1453,7 +1555,7 @@ class EntryStructureGate:
                 active.get("breakout_closed_bars", 0)
             ),
             "breakout_buffer_atr": _payload_number(
-                active.get("breakout_buffer_atr", self.state_machine.config.breakout_atr)
+                active.get("breakout_buffer_atr", configured_buffer)
             ),
             "retest_status": str(
                 active.get("retest_status", "NOT_APPLICABLE")
@@ -1503,75 +1605,62 @@ class EntryStructureGate:
         candidate_origin: str = "NATIVE_ACTIONABLE",
     ) -> dict[str, object]:
         try:
+            return self._evaluate_impl(
+                signal,
+                symbol,
+                closed_klines,
+                candidate_origin,
+            )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            return _minimal_error_payload(
+                breakout_buffer_atr=self._configured_breakout_atr(),
+                reason_code=f"EVALUATION_ERROR_{error_type.upper()}",
+                error_detail=error_type,
+                candidate_origin=candidate_origin,
+                candidate_direction=_safe_candidate_direction(signal),
+            )
+
+    def _evaluate_impl(
+        self,
+        signal: Signal,
+        symbol: str,
+        closed_klines: Sequence[Kline],
+        candidate_origin: str,
+    ) -> dict[str, object]:
+        configured_buffer = self._configured_breakout_atr()
+        safe_origin = candidate_origin if type(candidate_origin) is str else ""
+        safe_direction = _safe_candidate_direction(signal)
+        try:
             detected = self.detector.detect(symbol, closed_klines)
         except Exception as exc:
-            code = f"DETECTOR_ERROR_{type(exc).__name__.upper()}"
-            payload = self.attach(
-                signal,
-                {
-                    "status": "ERROR",
-                    "evaluated_at": 0,
-                    "states": [
-                        _error_evidence(
-                            code,
-                            self.state_machine.config.breakout_atr,
-                        )
-                    ],
-                    "nearest_support": None,
-                    "nearest_resistance": None,
-                },
-                candidate_origin,
+            error_type = type(exc).__name__
+            return _minimal_error_payload(
+                breakout_buffer_atr=configured_buffer,
+                reason_code=f"DETECTOR_ERROR_{error_type.upper()}",
+                error_detail=error_type,
+                candidate_origin=safe_origin,
+                candidate_direction=safe_direction,
             )
-            payload["entry_structure_reason_code"] = code
-            payload["reason_code"] = code
-            payload["error_detail"] = type(exc).__name__
-            return payload
 
         if not isinstance(detected, Mapping):
-            code = "DETECTOR_RESULT_INVALID"
-            payload = self.attach(
-                signal,
-                {
-                    "status": "ERROR",
-                    "evaluated_at": 0,
-                    "states": [
-                        _error_evidence(
-                            code,
-                            self.state_machine.config.breakout_atr,
-                        )
-                    ],
-                    "nearest_support": None,
-                    "nearest_resistance": None,
-                },
-                candidate_origin,
+            return _minimal_error_payload(
+                breakout_buffer_atr=configured_buffer,
+                reason_code="DETECTOR_RESULT_INVALID",
+                candidate_origin=safe_origin,
+                candidate_direction=safe_direction,
             )
-            payload["entry_structure_reason_code"] = code
-            payload["reason_code"] = code
-            return payload
 
         try:
             states = self.state_machine.evaluate(detected, closed_klines)
             market = {**detected, "states": states}
-            return self.attach(signal, market, candidate_origin)
         except Exception as exc:
-            code = f"STATE_MACHINE_ERROR_{type(exc).__name__.upper()}"
-            payload = self.attach(
-                signal,
-                {
-                    "status": "ERROR",
-                    "evaluated_at": detected.get("evaluated_at", 0),
-                    "states": [
-                        _error_evidence(
-                            code,
-                            self.state_machine.config.breakout_atr,
-                        )
-                    ],
-                    "nearest_support": detected.get("nearest_support"),
-                    "nearest_resistance": detected.get("nearest_resistance"),
-                },
-                candidate_origin,
+            error_type = type(exc).__name__
+            return _minimal_error_payload(
+                breakout_buffer_atr=configured_buffer,
+                reason_code=f"STATE_MACHINE_ERROR_{error_type.upper()}",
+                error_detail=error_type,
+                candidate_origin=safe_origin,
+                candidate_direction=safe_direction,
             )
-            payload["entry_structure_reason_code"] = code
-            payload["reason_code"] = code
-            payload["error_detail"] = type(exc).__name__
-            return payload
+        return self.attach(signal, market, candidate_origin)
