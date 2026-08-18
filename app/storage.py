@@ -163,7 +163,7 @@ _OBSERVATION_CANONICAL_FILTER_SQL = {
     "family": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.strategy_family'), json_extract(decision_contexts.input_payload, '$.signal.strategy_family'), observation_signals.strategy_family)",
     "tag": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.strategy_tag'), json_extract(decision_contexts.input_payload, '$.signal.strategy_tag'), observation_signals.strategy_tag)",
     "segment": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.threshold_segment'), json_extract(decision_contexts.input_payload, '$.signal.threshold_segment'), observation_signals.threshold_segment)",
-    "profile": "coalesce(decision_contexts.profile_key, json_extract(decision_contexts.input_payload, '$.identity.profile_key'), json_extract(decision_contexts.input_payload, '$.signal.profile_key'), '')",
+    "profile": "coalesce(nullif(decision_contexts.profile_key, ''), nullif(json_extract(decision_contexts.input_payload, '$.identity.profile_key'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.profile_key'), ''), nullif(json_extract(observation_signals.payload, '$.profile_key'), ''), cast(observation_signals.timeframe_minutes as text) || '|' || observation_signals.strategy_family || '|' || observation_signals.strategy_tag || '|' || upper(observation_signals.direction) || '|' || upper(observation_signals.threshold_segment))",
     "origin": "coalesce(decision_contexts.candidate_origin, observation_signals.candidate_origin, '')",
     "qualification_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.qualification_state'), observation_signals.qualification_state, '')",
     "adaptive_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.state'), json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.status'), observation_signals.adaptive_state, '')",
@@ -760,15 +760,16 @@ def _signal_audit_payload(
     compact_adaptive = {}
     if isinstance(adaptive, Mapping):
         adaptive_keys = (
+            "profile_key",
             "qualification_state",
+            "qualification_version",
+            "qualification_evaluated_at",
+            "joint_failure_runs",
             "status",
-            "reason_code",
-            "n12_samples",
-            "n12_wins",
-            "n12_win_rate",
-            "n20_samples",
-            "n20_ev",
-            "updated_at",
+            "reason",
+            "evaluated_at",
+            "n12",
+            "n20",
         )
         compact_adaptive = {
             key: adaptive[key] for key in adaptive_keys if key in adaptive
@@ -3059,6 +3060,73 @@ class SQLiteMonitorStore:
             )
             clean_payload = {key: value for key, value in payload.items() if key in accepted}
             observations.append(ObservationSignal(**clean_payload))
+        return observations
+
+    def load_adaptive_profile_observations(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 15,
+        evaluated_at: int,
+        profile_keys: set[str] | tuple[str, ...] | list[str] | None = None,
+    ) -> list[ObservationSignal]:
+        days = int(lookback_days)
+        if days < 15:
+            raise ValueError("adaptive profile lookback must be at least 15 days")
+        if isinstance(evaluated_at, bool) or not isinstance(evaluated_at, int):
+            raise TypeError("evaluated_at must be an integer timestamp")
+        if evaluated_at < 0:
+            raise ValueError("evaluated_at must not be negative")
+        normalized_keys = tuple(
+            sorted(
+                {
+                    str(item).strip()
+                    for item in (profile_keys or ())
+                    if str(item).strip()
+                }
+            )
+        )
+        cutoff = evaluated_at - days * 86_400_000
+        profile_sql = _OBSERVATION_CANONICAL_FILTER_SQL["profile"]
+        profile_filter = ""
+        parameters: list[Any] = [symbol.upper(), cutoff, evaluated_at]
+        if normalized_keys:
+            placeholders = ", ".join("?" for _item in normalized_keys)
+            profile_filter = f"and {profile_sql} in ({placeholders})"
+            parameters.extend(normalized_keys)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
+                       {_LINKED_CONTEXT_COLUMNS}
+                from observation_signals
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                where observation_signals.symbol = ?
+                  and observation_signals.status = 'SETTLED'
+                  and observation_signals.settled_at >= ?
+                  and observation_signals.settled_at < ?
+                  {profile_filter}
+                order by observation_signals.settled_at,
+                         observation_signals.opened_at,
+                         observation_signals.observation_key
+                """,
+                parameters,
+            ).fetchall()
+        accepted = {field.name for field in fields(ObservationSignal)}
+        observations = []
+        for row in rows:
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
+            observations.append(
+                ObservationSignal(
+                    **{key: value for key, value in payload.items() if key in accepted}
+                )
+            )
         return observations
 
     def save_daily_profile_selection(self, symbol: str, snapshot: dict[str, Any]) -> None:

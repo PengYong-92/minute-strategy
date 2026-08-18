@@ -13,6 +13,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app import storage as storage_module
+from app.adaptive_profile_state import ADAPTIVE_PROFILE_STATE_VERSION
 from app.daily_profile_selector import (
     DailyProfileSelectorConfig,
     build_daily_selection,
@@ -239,6 +240,93 @@ def selected_profile_signal(
         daily_profile_version=daily_profile_version,
         wave_batch_id=wave_batch_id,
     )
+
+
+def adaptive_profile_snapshot(
+    status: str,
+    evaluated_at: int,
+    *,
+    profile_key: str = PROFILE_KEY,
+) -> dict:
+    sample_size = 0 if status == "WARMUP" else 12
+    wins = 0 if status == "WARMUP" else (7 if status == "ACTIVE" else 6)
+    if status == "PAUSED":
+        sample_size = 20
+        wins = 5
+    n12_size = min(sample_size, 12)
+    return {
+        "version": ADAPTIVE_PROFILE_STATE_VERSION,
+        "status": status,
+        "reason": f"fixture {status}",
+        "evaluated_at": evaluated_at,
+        "profile_key": profile_key,
+        "n12": {
+            "sample_size": n12_size,
+            "wins": min(wins, n12_size),
+            "losses": max(0, n12_size - wins),
+            "win_rate": 0.0 if not n12_size else min(wins, n12_size) / n12_size,
+            "pnl": 0.0,
+            "ev": 0.0,
+        },
+        "n20": {
+            "sample_size": sample_size,
+            "wins": wins,
+            "losses": max(0, sample_size - wins),
+            "win_rate": 0.0 if not sample_size else wins / sample_size,
+            "pnl": -10.0 if status == "PAUSED" else 0.0,
+            "ev": -0.5 if status == "PAUSED" else 0.0,
+        },
+        "previous": None,
+        "transition": f"NONE->{status}",
+        "previous_ignored_reason": "",
+    }
+
+
+def adaptive_admission_state(
+    status: str,
+    current_time: int,
+    *,
+    storage=None,
+) -> MonitorState:
+    state = MonitorState(
+        symbol="BTCUSDT",
+        storage=storage,
+        max_open_orders=3,
+        max_open_long_orders=2,
+        max_open_short_orders=2,
+        min_order_gap_ms=0,
+        enable_daily_profile_selector=True,
+        enable_rolling_edge_guard=False,
+        result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        profile_degradation_guard_config=ProfileDegradationGuardConfig(
+            cooldown_minutes=0
+        ),
+        profile_health_guard_config=ProfileHealthGuardConfig(enabled=False),
+        wave_batch_guard_config=WaveBatchGuardConfig(enabled=False),
+        now_ms=lambda: current_time,
+    )
+    qualification = {
+        "key": PROFILE_KEY,
+        "direction": "LONG",
+        "threshold_segment": "WD-08",
+        "qualification_state": "QUALIFIED",
+        "joint_failure_runs": 0,
+        "fast_7d": {"sample_size": 24, "win_rate": 0.625, "pnl": 20.0, "ev": 0.8333},
+        "stable_14d": {"sample_size": 40, "win_rate": 0.6, "pnl": 32.0, "ev": 0.8},
+    }
+    state.active_daily_profile_selection = {
+        "version": PROFILE_VERSION,
+        "status": "READY",
+        "evaluated_at": current_time - 10 * MINUTE_MS,
+        "effective_from": current_time - 86_400_000,
+        "effective_until": current_time + 86_400_000,
+        "selected_profiles": [qualification],
+        "candidates": [qualification],
+    }
+    state.adaptive_profile_states = {
+        PROFILE_KEY: adaptive_profile_snapshot(status, current_time - 1)
+    }
+    return state
 
 
 def latest_kline(current_time: int, close: float = 100.0) -> Kline:
@@ -9450,6 +9538,510 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(storage.atomic_calls[0][0], "open")
         self.assertEqual(storage.atomic_calls[0][1], "BTCUSDT")
         self.assertEqual(storage.entry_snapshots[0][0], "BTCUSDT")
+
+    def test_adaptive_admission_matrix_and_frozen_audit_snapshot(self):
+        current_time = 1_800_000_000_000
+        cases = (
+            ("WARMUP", "FIRST", True, 10.0, True, "OPENED"),
+            ("ACTIVE", "SECOND", True, 18.0, True, "OPENED"),
+            (
+                "WATCH",
+                "FIRST",
+                True,
+                10.0,
+                False,
+                "OPENED",
+            ),
+            (
+                "WATCH",
+                "SECOND",
+                False,
+                0.0,
+                False,
+                "ADAPTIVE_PROFILE_SECOND_BLOCKED",
+            ),
+            (
+                "PAUSED",
+                "FIRST",
+                False,
+                0.0,
+                False,
+                "ADAPTIVE_PROFILE_PAUSED",
+            ),
+        )
+        for status, slot, opens, stake, progression, expected in cases:
+            with self.subTest(status=status, slot=slot):
+                state = adaptive_admission_state(status, current_time)
+                pending = StakeProgressionCredit(
+                    source_order_id=77,
+                    created_at=current_time - 1,
+                    direction="LONG",
+                )
+                if status in {"ACTIVE", "WATCH"}:
+                    state.simulator.stake_progression.credits.append(pending)
+                if slot == "SECOND":
+                    state.simulator.orders.append(
+                        SimulatedOrder(
+                            id=88,
+                            direction="LONG",
+                            timeframe_minutes=10,
+                            level="A",
+                            reason="existing same-direction order",
+                            entry_price=100.0,
+                            opened_at=current_time - 60_000,
+                            expires_at=current_time + 540_000,
+                        )
+                    )
+                    state.simulator._next_id = 89
+
+                candidate = selected_profile_signal(current_time)
+                if not opens:
+                    candidate = replace(
+                        candidate,
+                        observe_direction="",
+                        observe_only=False,
+                    )
+                decision = state._maybe_open_order(
+                    candidate,
+                    latest_kline(current_time),
+                    daily_profile_required=True,
+                )
+
+                self.assertEqual(decision, expected)
+                opened = [item for item in state.simulator.orders if item.id != 88]
+                self.assertEqual(bool(opened), opens)
+                if opens:
+                    order = opened[-1]
+                    self.assertEqual(order.stake, stake)
+                    self.assertEqual(order.adaptive_profile_state["status"], status)
+                    self.assertEqual(
+                        order.adaptive_profile_state["qualification_state"],
+                        "QUALIFIED",
+                    )
+                    self.assertEqual(
+                        order.decision_inputs["context"]["n12_n20"]["profile_key"],
+                        PROFILE_KEY,
+                    )
+                    self.assertEqual(
+                        order.decision_inputs["signal"]["adaptive_profile_state"][
+                            "status"
+                        ],
+                        status,
+                    )
+                    self.assertEqual(
+                        order.decision_inputs["admission"]["stake"][
+                            "selected_order_terms"
+                        ]["allow_progression"],
+                        progression,
+                    )
+                else:
+                    self.assertEqual(len(state.observations), 1)
+                    observed = state.observations[0]
+                    self.assertEqual(observed.adaptive_profile_state["status"], status)
+                    self.assertEqual(observed.first_decisive_block, "ADAPTIVE_PROFILE")
+                    self.assertEqual(observed.decision_id, state.selected_signal.decision_id)
+                    self.assertEqual(
+                        observed.decision_inputs["signal"]["adaptive_profile_state"][
+                            "status"
+                        ],
+                        status,
+                    )
+                state.close()
+
+    def test_watch_first_preserves_pending_credit_and_win_does_not_create_credit(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state("WATCH", current_time)
+        pending = StakeProgressionCredit(
+            source_order_id=77,
+            created_at=current_time - 1,
+            direction="LONG",
+        )
+        state.simulator.stake_progression.credits.append(pending)
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+        event = state.simulator.settle_expired_order_events(
+            current_time + 10 * MINUTE_MS,
+            101.0,
+        )[0]
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(event.order.stake, 10.0)
+        self.assertEqual(event.order.adaptive_profile_state["status"], "WATCH")
+        self.assertIsNone(event.progression_credit)
+        self.assertEqual(state.simulator.stake_progression.credits, [pending])
+        self.assertEqual(pending.status, "PENDING")
+        state.close()
+
+    def test_adaptive_committed_decision_reuses_same_closed_kline(self):
+        current_time = 1_800_000_000_000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = adaptive_admission_state(
+                "ACTIVE",
+                current_time,
+                storage=store,
+            )
+            signal = selected_profile_signal(current_time)
+            latest = latest_kline(current_time)
+
+            first = state._maybe_open_order(
+                signal,
+                latest,
+                daily_profile_required=True,
+            )
+            first_order = state.simulator.orders[0]
+            first_decision_id = first_order.decision_id
+            identity = first_order.decision_inputs["identity"]["candidate_identity"]
+            self.assertEqual(
+                set(identity),
+                {
+                    "candidate_origin",
+                    "candidate_ordinal",
+                    "direction",
+                    "profile_key",
+                    "strategy_family",
+                    "strategy_tag",
+                    "order_slot",
+                    "order_slot_scope",
+                    "timeframe_minutes",
+                    "threshold_segment",
+                },
+            )
+            self.assertEqual(
+                first_order.decision_inputs["signal"]["adaptive_profile_state"][
+                    "status"
+                ],
+                "ACTIVE",
+            )
+            state.adaptive_profile_states[PROFILE_KEY] = adaptive_profile_snapshot(
+                "WATCH",
+                current_time + 1,
+            )
+            replay = state._maybe_open_order(
+                replace(signal, reason="recomputed duplicate"),
+                latest,
+                daily_profile_required=True,
+            )
+
+            self.assertEqual((first, replay), ("OPENED", "OPENED"))
+            self.assertEqual(len(state.simulator.orders), 1)
+            self.assertEqual(len(store.load_orders("BTCUSDT")), 1)
+            self.assertEqual(state.simulator.orders[0].decision_id, first_decision_id)
+            self.assertEqual(
+                state.selected_signal.adaptive_profile_state["status"],
+                "ACTIVE",
+            )
+            self.assertEqual(
+                state.simulator.orders[0].order_slot,
+                "FIRST",
+            )
+            state.close()
+            store.close()
+
+    def test_stale_selected_boolean_without_exact_membership_is_not_qualified(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state("ACTIVE", current_time)
+        state.active_daily_profile_selection["selected_profiles"] = []
+        stale = selected_profile_signal(current_time)
+
+        decision = state._maybe_open_order(
+            stale,
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+
+        self.assertEqual(decision, "DAILY_PROFILE_NOT_SELECTED")
+        self.assertEqual(state.simulator.orders, [])
+        self.assertEqual(
+            state.selected_signal.adaptive_profile_state["qualification_state"],
+            "NOT_QUALIFIED",
+        )
+        self.assertEqual(state.selected_signal.first_decisive_block, "DAILY_PROFILE")
+        state.close()
+
+    def test_adaptive_slot_is_same_direction_only_before_context_freeze(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state("WATCH", current_time)
+        state.simulator.orders.append(
+            SimulatedOrder(
+                id=91,
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="opposite direction",
+                entry_price=100.0,
+                opened_at=current_time - MINUTE_MS,
+                expires_at=current_time + 9 * MINUTE_MS,
+            )
+        )
+        state.simulator._next_id = 92
+
+        decision = state._maybe_open_order(
+            selected_profile_signal(current_time),
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+
+        self.assertEqual(decision, "OPENED")
+        opened = state.simulator.orders[-1]
+        self.assertEqual(opened.order_slot, "FIRST")
+        self.assertEqual(opened.decision_inputs["identity"]["order_slot"], "FIRST")
+        self.assertEqual(opened.adaptive_profile_state["status"], "WATCH")
+        state.close()
+
+    def test_adaptive_state_never_promotes_unqualified_or_wait_candidate(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state("ACTIVE", current_time)
+        unqualified = replace(
+            selected_profile_signal(current_time),
+            daily_profile_selected=False,
+        )
+
+        blocked = state._maybe_open_order(
+            unqualified,
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+        waiting = state._maybe_open_order(
+            Signal(
+                "WAIT",
+                10,
+                "B",
+                "no candidate",
+                100.0,
+                current_time,
+                threshold_segment="WD-08",
+                strategy_family="drop_reclaim",
+                strategy_tag="live_profile",
+                profile_key=PROFILE_KEY,
+                threshold=1.0,
+            ),
+            latest_kline(current_time + MINUTE_MS),
+        )
+
+        self.assertEqual(blocked, "DAILY_PROFILE_NOT_SELECTED")
+        self.assertEqual(waiting, "BELOW_THRESHOLD")
+        self.assertEqual(state.simulator.orders, [])
+        state.close()
+
+    def test_adaptive_blocked_observations_use_exact_five_part_identity(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state("PAUSED", current_time)
+        first = selected_profile_signal(current_time)
+        second_key = "10|drop_reclaim|other_profile|LONG|WD-08"
+        second = replace(
+            first,
+            strategy_tag="other_profile",
+            profile_key=second_key,
+            open_time=current_time + 1,
+        )
+        state.adaptive_profile_states[second_key] = adaptive_profile_snapshot(
+            "PAUSED",
+            current_time - 1,
+            profile_key=second_key,
+        )
+        state.active_daily_profile_selection["selected_profiles"].append(
+            {
+                "key": second_key,
+                "qualification_state": "QUALIFIED",
+                "fast_7d": {},
+                "stable_14d": {},
+            }
+        )
+
+        first_decision = state._maybe_open_order(
+            first,
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+        second_decision = state._maybe_open_order(
+            second,
+            latest_kline(current_time),
+            daily_profile_required=True,
+        )
+
+        self.assertEqual(first_decision, "ADAPTIVE_PROFILE_PAUSED")
+        self.assertEqual(second_decision, "ADAPTIVE_PROFILE_PAUSED")
+        self.assertEqual(len(state.observations), 2)
+        self.assertEqual(
+            {item.profile_key for item in state.observations},
+            {PROFILE_KEY, second_key},
+        )
+        self.assertEqual(len({item.observation_key for item in state.observations}), 2)
+        state.close()
+
+    def test_settlement_commit_precedes_exact_key_refresh_with_strict_cutoff(self):
+        class OrderedStorage(RecordingStorage):
+            def __init__(self):
+                super().__init__()
+                self.events = []
+
+            def save_observations(self, observations, symbol):
+                self.events.append("settlement_committed")
+                self.observations.extend(
+                    (symbol, replace(item).to_dict()) for item in observations
+                )
+
+        current_time = 1_800_000_000_000
+        storage = OrderedStorage()
+        state = adaptive_admission_state("WARMUP", current_time, storage=storage)
+        opened_at = current_time - 10 * MINUTE_MS
+        pending = replace(
+            settled_observation(
+                501,
+                "WIN",
+                opened_at,
+                family="drop_reclaim",
+                tag="live_profile",
+                segment="WD-08",
+            ),
+            observation_key="adaptive-pending",
+            status="OPEN",
+            result=None,
+            exit_price=None,
+            settled_at=None,
+            pnl=0.0,
+            profile_key=PROFILE_KEY,
+        )
+        state.observations = [pending]
+        cutoffs = []
+        original_refresh = state._refresh_adaptive_profile_keys
+
+        def recording_refresh(keys, evaluated_at):
+            storage.events.append(f"refresh:{next(iter(keys))}")
+            cutoffs.append(evaluated_at)
+            return original_refresh(keys, evaluated_at)
+
+        state._refresh_adaptive_profile_keys = recording_refresh
+
+        settled = state._settle_observations(current_time, 101.0)
+
+        self.assertEqual(settled, [pending])
+        self.assertEqual(
+            storage.events[:2],
+            ["settlement_committed", f"refresh:{PROFILE_KEY}"],
+        )
+        self.assertEqual(cutoffs, [current_time + 1])
+        state.close()
+
+    def test_refresh_failure_preserves_committed_settlement_and_prior_state(self):
+        class OrderedStorage(RecordingStorage):
+            def save_observations(self, observations, symbol):
+                self.observations.extend(
+                    (symbol, replace(item).to_dict()) for item in observations
+                )
+
+        current_time = 1_800_000_000_000
+        storage = OrderedStorage()
+        state = adaptive_admission_state("WARMUP", current_time, storage=storage)
+        prior = deepcopy(state.adaptive_profile_states[PROFILE_KEY])
+        pending = replace(
+            settled_observation(
+                502,
+                "WIN",
+                current_time - 10 * MINUTE_MS,
+                family="drop_reclaim",
+                tag="live_profile",
+                segment="WD-08",
+            ),
+            observation_key="adaptive-refresh-failure",
+            status="OPEN",
+            result=None,
+            exit_price=None,
+            settled_at=None,
+            pnl=0.0,
+            profile_key=PROFILE_KEY,
+        )
+        state.observations = [pending]
+
+        with patch(
+            "app.state.rebuild_adaptive_profile_states",
+            side_effect=RuntimeError("adaptive rebuild failed"),
+        ):
+            settled = state._settle_observations(current_time, 101.0)
+
+        self.assertEqual(settled, [pending])
+        self.assertEqual(pending.status, "SETTLED")
+        self.assertEqual(storage.observations[-1][1]["status"], "SETTLED")
+        self.assertEqual(state.adaptive_profile_states[PROFILE_KEY], prior)
+        self.assertIn("adaptive rebuild failed", state.last_error)
+
+        state._refresh_adaptive_profile_keys({PROFILE_KEY}, current_time + 2)
+        self.assertIsNone(state.last_error)
+        self.assertEqual(
+            state.adaptive_profile_states[PROFILE_KEY]["n12"]["sample_size"],
+            1,
+        )
+        state.close()
+
+    def test_adaptive_restart_rebuilds_at_least_fifteen_days_and_reset_isolated(self):
+        current_time = 20 * 86_400_000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            start = current_time - 14 * 86_400_000
+            rows = [
+                settled_observation(
+                    index,
+                    "WIN" if index < 5 else "LOSS",
+                    start + index * 11 * MINUTE_MS,
+                    family="drop_reclaim",
+                    tag="live_profile",
+                    segment="WD-08",
+                )
+                for index in range(20)
+            ]
+            for row in rows:
+                store.save_observation(row, "BTCUSDT")
+            eth_row = settled_observation(
+                900,
+                "WIN",
+                current_time - 11 * MINUTE_MS,
+                family="other",
+                tag="eth_profile",
+                segment="WD-09",
+            )
+            store.save_observation(eth_row, "ETHUSDT")
+
+            first = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                now_ms=lambda: current_time,
+            )
+            before = deepcopy(first.adaptive_profile_states)
+            first.close()
+            restarted = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                now_ms=lambda: current_time,
+            )
+
+            self.assertEqual(restarted.adaptive_profile_states, before)
+            self.assertEqual(restarted.adaptive_profile_states[PROFILE_KEY]["status"], "PAUSED")
+            restarted.reset_symbol("ETHUSDT")
+            self.assertNotIn(PROFILE_KEY, restarted.adaptive_profile_states)
+            self.assertEqual(
+                set(restarted.adaptive_profile_states),
+                {"10|other|eth_profile|LONG|WD-09"},
+            )
+            restarted.close()
+            store.close()
+
+    def test_constructor_keeps_adaptive_rebuild_error_visible(self):
+        with patch(
+            "app.state.rebuild_adaptive_profile_states",
+            side_effect=RuntimeError("startup adaptive rebuild failed"),
+        ):
+            state = MonitorState(
+                symbol="BTCUSDT",
+                now_ms=lambda: 1_800_000_000_000,
+            )
+
+        self.assertIn("startup adaptive rebuild failed", state.last_error)
+        state.close()
 
 
 if __name__ == "__main__":

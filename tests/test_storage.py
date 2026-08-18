@@ -4066,6 +4066,63 @@ class AtomicDecisionBundleTest(unittest.TestCase):
 
                 self.assertEqual(store.load_orders(context.symbol)[0], order)
 
+    def test_adaptive_loader_is_exact_causal_and_not_limited_to_five_hundred(self):
+        evaluated_at = 1_800_000_000_000
+        profile_key = "10|short_extension|normal_down_short_extension_observe|SHORT|WD-02"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            rows = [
+                observation(
+                    f"adaptive-{index}",
+                    opened_at=evaluated_at - 8 * 86_400_000 + index * 660_000,
+                )
+                for index in range(520)
+            ]
+            other = observation(
+                "adaptive-other-profile",
+                tag="other",
+                opened_at=evaluated_at - 60_000,
+            )
+            future = replace(
+                observation(
+                    "adaptive-cutoff-equal",
+                    opened_at=evaluated_at - 600_000,
+                ),
+                expires_at=evaluated_at,
+                settled_at=evaluated_at,
+            )
+            old = observation(
+                "adaptive-too-old",
+                opened_at=evaluated_at - 16 * 86_400_000,
+            )
+            store.save_observations([*rows, other, future, old], "BTCUSDT")
+
+            restored = store.load_adaptive_profile_observations(
+                "BTCUSDT",
+                lookback_days=15,
+                evaluated_at=evaluated_at,
+                profile_keys={profile_key},
+            )
+            store.close()
+
+        self.assertEqual(len(restored), 520)
+        self.assertTrue(all(item.settled_at < evaluated_at for item in restored))
+        self.assertEqual(
+            {item.strategy_tag for item in restored},
+            {"normal_down_short_extension_observe"},
+        )
+
+    def test_adaptive_loader_requires_fifteen_day_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            with self.assertRaisesRegex(ValueError, "at least 15 days"):
+                store.load_adaptive_profile_observations(
+                    "BTCUSDT",
+                    lookback_days=14,
+                    evaluated_at=1_800_000_000_000,
+                )
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

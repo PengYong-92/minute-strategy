@@ -13,8 +13,13 @@ from app.decision_context import (
     DecisionContextBuilder,
     runtime_config_snapshot,
 )
+from app.adaptive_profile_state import (
+    evaluate_adaptive_profile_state,
+    rebuild_adaptive_profile_states,
+)
 
 from app.daily_profile_selector import (
+    QUALIFICATION_VERSION,
     DailyProfileSelectorConfig,
     build_daily_selection,
     profile_key as daily_profile_key,
@@ -210,6 +215,7 @@ class MonitorState:
         self.stake_progression_max_active = max(1, int(stake_progression_max_active))
         self._ignored_stake_progression_max_orders = stake_progression_max_orders
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self.last_error: str | None = None
         self.stake_progression_base_only_segments = tuple(
             item.strip().upper()
             for item in (stake_progression_base_only_segments or [])
@@ -272,6 +278,10 @@ class MonitorState:
                 self._profile_summary_prepare_error = exc
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
+        adaptive_observations = self._load_adaptive_profile_observations(
+            restored_observations,
+            evaluated_at=int(self._now_ms()),
+        )
         self.simulator = self._build_simulator(self.symbol, restored_orders)
         self._pending_settlement_events: list[tuple[str, SettlementEvent]] = []
         self.fear_greed_provider = fear_greed_provider
@@ -299,6 +309,9 @@ class MonitorState:
         )
         self.signals: list[Signal] = []
         self.observations: list[ObservationSignal] = list(reversed(restored_observations))
+        self._adaptive_profile_observations = list(adaptive_observations)
+        self.adaptive_profile_states: dict[str, dict] = {}
+        self._rebuild_all_adaptive_profile_states(int(self._now_ms()))
         self._direction_pulse_history = self._load_direction_pulse_history(restored_observations)
         self.direction_pulse_shadow = empty_direction_pulse_shadow(current_time=self._now_ms())
         self._refresh_direction_pulse_shadow(self._now_ms(), report_error=False)
@@ -316,7 +329,6 @@ class MonitorState:
             self._now_ms(),
             self.time_period_guard_config,
         ).to_dict()
-        self.last_error: str | None = None
         self.updated_at_ms = 0
         self._realtime_price: float | None = None
         self._realtime_price_event_time_ms = 0
@@ -647,8 +659,13 @@ class MonitorState:
         with self._lock:
             self._symbol_generation += 1
             self.symbol = symbol.upper()
+            self.last_error = None
             restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
             restored_observations = self._load_restored_observations()
+            adaptive_observations = self._load_adaptive_profile_observations(
+                restored_observations,
+                evaluated_at=int(self._now_ms()),
+            )
             self.simulator = self._build_simulator(self.symbol, restored_orders)
             self.fear_greed = None
             self.warmup = None
@@ -674,6 +691,9 @@ class MonitorState:
             )
             self.signals = []
             self.observations = list(reversed(restored_observations))
+            self._adaptive_profile_observations = list(adaptive_observations)
+            self.adaptive_profile_states = {}
+            self._rebuild_all_adaptive_profile_states(int(self._now_ms()))
             self._direction_pulse_history = self._load_direction_pulse_history(restored_observations)
             self.direction_pulse_shadow = empty_direction_pulse_shadow(current_time=self._now_ms())
             self._refresh_direction_pulse_shadow(self._now_ms(), report_error=False)
@@ -687,7 +707,6 @@ class MonitorState:
             self.profile_degradation_guard = self._empty_profile_degradation_guard()
             self.profile_health_guard = self._empty_profile_health_guard()
             self.profile_guard_audit = self._empty_profile_guard_audit()
-            self.last_error = None
             self.updated_at_ms = int(time.time() * 1000)
             self.time_period_guard = evaluate_time_period_guard(
                 self.updated_at_ms,
@@ -1397,6 +1416,7 @@ class MonitorState:
         guard_stages = (
             "WAVE_GUARD",
             "DAILY_PROFILE",
+            "ADAPTIVE_PROFILE",
             "PROFILE_HEALTH_SHORT_WINDOW",
             "SCORE",
             "SESSION",
@@ -1473,8 +1493,12 @@ class MonitorState:
                     "version": signal.daily_profile_version,
                     "selected": signal.daily_profile_selected,
                     "selection": deepcopy(self.active_daily_profile_selection),
-                    "7d": deepcopy(adaptive.get("7d", {"status": "NOT_AVAILABLE"})),
-                    "14d": deepcopy(adaptive.get("14d", {"status": "NOT_AVAILABLE"})),
+                    "7d": deepcopy(
+                        adaptive.get("fast_7d", {"status": "NOT_AVAILABLE"})
+                    ),
+                    "14d": deepcopy(
+                        adaptive.get("stable_14d", {"status": "NOT_AVAILABLE"})
+                    ),
                 },
                 "n12_n20": n12_n20,
                 "wave": {
@@ -1814,6 +1838,7 @@ class MonitorState:
         guard_stages = (
             "WAVE_GUARD",
             "DAILY_PROFILE",
+            "ADAPTIVE_PROFILE",
             "PROFILE_HEALTH_SHORT_WINDOW",
             "SCORE",
             "SESSION",
@@ -2085,6 +2110,8 @@ class MonitorState:
             "EDGE_TOO_SMALL": "SCORE",
             "SESSION_BLOCKED": "SESSION",
             "DAILY_PROFILE_NOT_SELECTED": "DAILY_PROFILE",
+            "ADAPTIVE_PROFILE_PAUSED": "ADAPTIVE_PROFILE",
+            "ADAPTIVE_PROFILE_SECOND_BLOCKED": "ADAPTIVE_PROFILE",
             "WAVE_DIRECTION_BLOCKED": "WAVE_GUARD",
             "PROFILE_GUARD_BLOCKED": "PROFILE_HEALTH",
             "HOLD_OPEN_ORDER": "CAPACITY",
@@ -2122,6 +2149,11 @@ class MonitorState:
                 self._profile_guard_shadow_source()
             )
         signal = self._attach_direction_pulse_shadow(signal, current_time=latest.close_time)
+        signal = self._attach_adaptive_profile_state(
+            signal,
+            current_time=latest.close_time,
+            daily_profile_required=daily_profile_required,
+        )
         candidate_origin = self._formal_candidate_origin(signal)
         if signal.candidate_origin != candidate_origin:
             signal = replace(signal, candidate_origin=candidate_origin)
@@ -2223,7 +2255,16 @@ class MonitorState:
                 "status": signal.wave_guard_status,
             },
         )
-        if daily_profile_required and not signal.daily_profile_selected:
+        qualification_state = str(
+            signal.adaptive_profile_state.get("qualification_state", "")
+        )
+        daily_profile_qualified = qualification_state in {
+            "QUALIFIED",
+            "QUALIFICATION_WATCH",
+        }
+        if daily_profile_required and (
+            not signal.daily_profile_selected or not daily_profile_qualified
+        ):
             run.trace(
                 "DAILY_PROFILE",
                 "BLOCK",
@@ -2233,6 +2274,7 @@ class MonitorState:
                     "selected": signal.daily_profile_selected,
                     "profile_key": signal.profile_key,
                     "version": signal.daily_profile_version,
+                    "qualification_state": qualification_state,
                 },
             )
             return self._block_order(
@@ -2252,7 +2294,65 @@ class MonitorState:
                 "selected": signal.daily_profile_selected,
                 "profile_key": signal.profile_key,
                 "version": signal.daily_profile_version,
+                "qualification_state": qualification_state,
             },
+        )
+
+        adaptive = signal.adaptive_profile_state
+        adaptive_status = str(
+            adaptive.get("status", "WARMUP")
+            if daily_profile_required and signal.daily_profile_selected
+            else "NOT_APPLICABLE"
+        )
+        adaptive_values = {
+            "profile_key": str(adaptive.get("profile_key", signal.profile_key)),
+            "qualification_state": str(adaptive.get("qualification_state", "")),
+            "status": adaptive_status,
+            "evaluated_at": int(adaptive.get("evaluated_at", 0) or 0),
+            "n12": deepcopy(adaptive.get("n12", {})),
+            "n20": deepcopy(adaptive.get("n20", {})),
+            "order_slot": signal.order_slot,
+            "order_slot_scope": signal.order_slot_scope,
+        }
+        if adaptive_status == "PAUSED":
+            run.trace(
+                "ADAPTIVE_PROFILE",
+                "BLOCK",
+                "ADAPTIVE_PROFILE_PAUSED",
+                adaptive_values,
+            )
+            return self._block_order(
+                signal,
+                latest,
+                "ADAPTIVE_PROFILE_PAUSED",
+                "当前完整画像即时状态为 PAUSED，仅继续记录独立观察",
+                should_observe=True,
+                run=run,
+            )
+        if adaptive_status == "WATCH" and signal.order_slot == "SECOND":
+            run.trace(
+                "ADAPTIVE_PROFILE",
+                "BLOCK",
+                "ADAPTIVE_PROFILE_SECOND_BLOCKED",
+                adaptive_values,
+            )
+            return self._block_order(
+                signal,
+                latest,
+                "ADAPTIVE_PROFILE_SECOND_BLOCKED",
+                "当前完整画像即时状态为 WATCH，禁止同方向第二席位",
+                should_observe=True,
+                run=run,
+            )
+        run.trace(
+            "ADAPTIVE_PROFILE",
+            "PASS",
+            (
+                f"ADAPTIVE_PROFILE_{adaptive_status}"
+                if adaptive_status != "NOT_APPLICABLE"
+                else "ADAPTIVE_PROFILE_NOT_APPLICABLE"
+            ),
+            adaptive_values,
         )
 
         health_decision = self._refresh_profile_health_guard(
@@ -2579,6 +2679,7 @@ class MonitorState:
                 batch_decision.allow_progression
                 and profile_decision.allow_progression
                 and health_decision.allow_progression
+                and adaptive_status != "WATCH"
             ),
             run=run,
         )
@@ -3122,6 +3223,63 @@ class MonitorState:
             return False
         return all(stored.get(key) == value for key, value in config.__dict__.items())
 
+    def _attach_adaptive_profile_state(
+        self,
+        signal: Signal,
+        *,
+        current_time: int,
+        daily_profile_required: bool,
+    ) -> Signal:
+        if not daily_profile_required:
+            return signal
+        direction = self._signal_direction(signal)
+        if direction not in {"LONG", "SHORT"}:
+            return signal
+        key = daily_profile_key(
+            signal.timeframe_minutes,
+            signal.strategy_family,
+            signal.strategy_tag,
+            direction,
+            signal.threshold_segment,
+        )
+        selection = self.active_daily_profile_selection or {}
+        qualification = next(
+            (
+                item
+                for item in selection.get("selected_profiles", [])
+                if isinstance(item, dict) and str(item.get("key", "")) == key
+            ),
+            None,
+        )
+        state = deepcopy(self.adaptive_profile_states.get(key))
+        if state is None:
+            state = evaluate_adaptive_profile_state((), key, int(current_time))
+        state.update(
+            {
+                "profile_key": key,
+                "qualification_state": (
+                    str(qualification.get("qualification_state") or "QUALIFIED")
+                    if qualification is not None
+                    else "NOT_QUALIFIED"
+                ),
+                "qualification_version": str(
+                    (qualification or {}).get("version") or QUALIFICATION_VERSION
+                ),
+                "qualification_evaluated_at": int(
+                    selection.get("evaluated_at", 0) or 0
+                ),
+                "daily_profile_version": str(selection.get("version", "")),
+                "joint_failure_runs": int(
+                    (qualification or {}).get("joint_failure_runs", 0) or 0
+                ),
+                "fast_7d": deepcopy((qualification or {}).get("fast_7d", {})),
+                "stable_14d": deepcopy(
+                    (qualification or {}).get("stable_14d", {})
+                ),
+            }
+        )
+        return replace(signal, adaptive_profile_state=state)
+
     def _select_daily_profile_signal(
         self,
         primary_signal: Signal,
@@ -3481,7 +3639,15 @@ class MonitorState:
         direction = signal.observe_direction or signal.direction
         if direction not in {"LONG", "SHORT"}:
             return None
-        key = self._observation_key(signal, direction)
+        adaptive_formal_block = decision in {
+            "ADAPTIVE_PROFILE_PAUSED",
+            "ADAPTIVE_PROFILE_SECOND_BLOCKED",
+        }
+        key = self._observation_key(
+            signal,
+            direction,
+            exact_profile=adaptive_formal_block,
+        )
         existing = next((item for item in self.observations if item.observation_key == key), None)
         if existing is not None:
             return None
@@ -3492,6 +3658,10 @@ class MonitorState:
                 if item.status == "OPEN"
                 and item.timeframe_minutes == signal.timeframe_minutes
                 and item.strategy_family == signal.strategy_family
+                and (
+                    not adaptive_formal_block
+                    or item.strategy_tag == signal.strategy_tag
+                )
                 and item.direction == direction
                 and item.threshold_segment == signal.threshold_segment
                 and latest.close_time < item.expires_at
@@ -3541,6 +3711,7 @@ class MonitorState:
             quality_score_components=dict(signal.quality_score_components),
             quality_score_inputs=dict(signal.quality_score_inputs),
             direction_pulse_shadow=dict(signal.direction_pulse_shadow),
+            adaptive_profile_state=deepcopy(signal.adaptive_profile_state),
             profile_health_status=signal.profile_health_status,
             profile_health_sample_size=signal.profile_health_sample_size,
             profile_health_win_rate=signal.profile_health_win_rate,
@@ -3705,6 +3876,13 @@ class MonitorState:
                     self.record_error(f"方向脉冲观察结算持久化失败: {exc}")
                     persisted = False
             if persisted:
+                affected_profile_keys = {
+                    self._adaptive_profile_key(item) for item in settled
+                }
+                self._refresh_adaptive_profile_keys(
+                    affected_profile_keys,
+                    max(int(item.settled_at) for item in settled) + 1,
+                )
                 self._refresh_direction_pulse_shadow(current_time)
             else:
                 for observation, previous_state in previous_states:
@@ -3727,6 +3905,100 @@ class MonitorState:
                 ),
             )
         return self.storage.load_observations(self.symbol)
+
+    def _load_adaptive_profile_observations(
+        self,
+        fallback: Sequence[ObservationSignal],
+        *,
+        evaluated_at: int,
+        profile_keys: set[str] | None = None,
+    ) -> list[ObservationSignal]:
+        loader = (
+            getattr(self.storage, "load_adaptive_profile_observations", None)
+            if self.storage
+            else None
+        )
+        if loader is not None:
+            return loader(
+                self.symbol,
+                lookback_days=15,
+                evaluated_at=evaluated_at,
+                profile_keys=profile_keys,
+            )
+        cutoff = evaluated_at - 15 * DAY_MS
+        rows = []
+        for observation in fallback:
+            if (
+                observation.status != "SETTLED"
+                or observation.result not in {"WIN", "LOSS"}
+                or observation.settled_at is None
+                or observation.settled_at < cutoff
+                or observation.settled_at >= evaluated_at
+            ):
+                continue
+            key = self._adaptive_profile_key(observation)
+            if profile_keys and key not in profile_keys:
+                continue
+            rows.append(observation)
+        return rows
+
+    @staticmethod
+    def _adaptive_profile_key(observation: ObservationSignal) -> str:
+        return daily_profile_key(
+            observation.timeframe_minutes,
+            observation.strategy_family,
+            observation.strategy_tag,
+            observation.direction,
+            observation.threshold_segment,
+        )
+
+    def _rebuild_all_adaptive_profile_states(self, evaluated_at: int) -> bool:
+        try:
+            states = rebuild_adaptive_profile_states(
+                self._adaptive_profile_observations,
+                evaluated_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - 启动失败保留可见错误和安全空状态。
+            self.last_error = f"自适应画像状态重建失败: {exc}"
+            return False
+        self.adaptive_profile_states = states
+        return True
+
+    def _refresh_adaptive_profile_keys(
+        self,
+        profile_keys: set[str],
+        evaluated_at: int,
+    ) -> bool:
+        keys = {str(item) for item in profile_keys if str(item)}
+        if not keys:
+            return True
+        try:
+            rows = self._load_adaptive_profile_observations(
+                self.observations,
+                evaluated_at=evaluated_at,
+                profile_keys=keys,
+            )
+            rebuilt = rebuild_adaptive_profile_states(rows, evaluated_at)
+            next_states = {}
+            for key in keys:
+                next_states[key] = rebuilt.get(key) or evaluate_adaptive_profile_state(
+                    (),
+                    key,
+                    evaluated_at,
+                )
+        except Exception as exc:  # noqa: BLE001 - 结算已提交，刷新失败只保留旧状态。
+            self.last_error = f"自适应画像状态刷新失败: {exc}"
+            return False
+        self._adaptive_profile_observations = [
+            item
+            for item in self._adaptive_profile_observations
+            if self._adaptive_profile_key(item) not in keys
+        ]
+        self._adaptive_profile_observations.extend(rows)
+        self.adaptive_profile_states.update(next_states)
+        if self.last_error and self.last_error.startswith("自适应画像状态刷新失败:"):
+            self.last_error = None
+        return True
 
     def _load_direction_pulse_history(
         self,
@@ -3812,8 +4084,27 @@ class MonitorState:
         return False
 
     @staticmethod
-    def _observation_key(signal: Signal, direction: str) -> str:
-        return f"{signal.open_time}|{signal.timeframe_minutes}|{direction}|{signal.strategy_tag}"
+    def _observation_key(
+        signal: Signal,
+        direction: str,
+        *,
+        exact_profile: bool = False,
+    ) -> str:
+        if not exact_profile:
+            return (
+                f"{signal.open_time}|{signal.timeframe_minutes}|"
+                f"{direction}|{signal.strategy_tag}"
+            )
+        return "|".join(
+            (
+                str(signal.open_time),
+                str(signal.timeframe_minutes),
+                signal.strategy_family,
+                signal.strategy_tag,
+                direction,
+                signal.threshold_segment,
+            )
+        )
 
     def _rolling_edge_status(self, signal: Signal, latest: Kline) -> dict:
         current_item = {

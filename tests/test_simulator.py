@@ -1344,6 +1344,39 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(settled, [])
         self.assertEqual(order.status, "OPEN")
 
+    def test_progression_disabled_order_neither_consumes_nor_creates_credit(self):
+        pending = StakeProgressionCredit(
+            source_order_id=7,
+            created_at=0,
+            direction="LONG",
+        )
+        simulator = AccountSimulator(
+            enable_stake_progression=True,
+            stake_progression_credits=[pending],
+        )
+
+        watch_signal = replace(
+            signal("LONG"),
+            adaptive_profile_state={"status": "WATCH"},
+        )
+        order, consumed = simulator.open_order_with_credit(
+            watch_signal,
+            entry_price=100.0,
+            opened_at=1_000,
+            allow_progression=False,
+        )
+        event = simulator.settle_expired_order_events(
+            order.expires_at,
+            101.0,
+        )[0]
+
+        self.assertEqual(order.adaptive_profile_state["status"], "WATCH")
+        self.assertEqual(order.stake, 10.0)
+        self.assertIsNone(consumed)
+        self.assertIsNone(event.progression_credit)
+        self.assertEqual(simulator.stake_progression.credits, [pending])
+        self.assertEqual(pending.status, "PENDING")
+
 
 if __name__ == "__main__":
     unittest.main()

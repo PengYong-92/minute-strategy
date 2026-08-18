@@ -328,8 +328,12 @@ class AccountSimulator:
             result,
             settled_at,
             allow_credit=(
-                order.wave_guard_mode != "RECOVERY"
-                or order.profile_degradation_probe is True
+                str(order.adaptive_profile_state.get("status", "")).upper()
+                != "WATCH"
+                and (
+                    order.wave_guard_mode != "RECOVERY"
+                    or order.profile_degradation_probe is True
+                )
             ),
             direction=order.direction,
         )
