@@ -6,7 +6,7 @@ import time
 import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import app.adaptive_profile_state as adaptive_module
 from app.adaptive_profile_state import (
@@ -211,6 +211,35 @@ def nested_overlap_rows(sample_size: int) -> list[ObservationSignal]:
         )
         for index in range(sample_size)
     ]
+
+
+def gap_insertion_rows(sample_size: int) -> list[ObservationSignal]:
+    if sample_size % 2:
+        raise ValueError("sample_size must be even")
+    base_count = sample_size // 2
+    settlement_start = CUTOFF - sample_size - 1
+    opened_start = settlement_start - (base_count + 2) * 20 * MINUTE_MS
+    rows = [
+        observation(
+            f"gap-base-{index:05d}",
+            "WIN" if index % 2 == 0 else "LOSS",
+            opened_start + index * 20 * MINUTE_MS,
+            settled_at=settlement_start + index,
+            decision_id=f"gap-base-decision-{index:05d}",
+        )
+        for index in range(base_count)
+    ]
+    rows.extend(
+        observation(
+            f"gap-delayed-{index:05d}",
+            "LOSS" if index % 2 == 0 else "WIN",
+            opened_start + index * 20 * MINUTE_MS - 5 * MINUTE_MS,
+            settled_at=settlement_start + base_count + index,
+            decision_id=f"gap-delayed-decision-{index:05d}",
+        )
+        for index in range(base_count)
+    )
+    return rows
 
 
 def state_trace_item(key: str, result: dict) -> tuple:
@@ -1213,6 +1242,239 @@ class AdaptiveProfileStateTest(unittest.TestCase):
             elapsed_by_size[10_000],
             elapsed_by_size[2_000] * 8 + 0.1,
         )
+
+    def test_rebuild_gap_insertions_do_not_materialize_full_selection(self):
+        elapsed_by_size = {}
+        selection_type = adaptive_module._IncrementalCanonicalSelection
+        for sample_size in (1_000, 2_000, 4_000, 10_000):
+            rows = gap_insertion_rows(sample_size)
+            started = time.perf_counter()
+            with patch.object(
+                selection_type,
+                "_canonical_signature",
+                create=True,
+                side_effect=AssertionError("updates must use local interval deltas"),
+            ):
+                with patch.object(
+                    selection_type,
+                    "selected_events",
+                    create=True,
+                    new_callable=PropertyMock,
+                    side_effect=AssertionError("N20 must use settlement tail index"),
+                ):
+                    with patch.object(
+                        adaptive_module,
+                        "classify_profile_state",
+                        wraps=adaptive_module.classify_profile_state,
+                    ) as classify:
+                        rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+            elapsed_by_size[sample_size] = time.perf_counter() - started
+            self.assertEqual(classify.call_count, sample_size)
+            self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 20)
+
+        self.assertLess(elapsed_by_size[10_000], 1.0)
+        self.assertLess(
+            elapsed_by_size[10_000],
+            elapsed_by_size[2_000] * 8 + 0.1,
+        )
+
+    def test_local_interval_repairs_match_progressive_reference(self):
+        start = CUTOFF - 1_000 * MINUTE_MS
+        cases = {
+            "replace-one": (
+                [
+                    observation(
+                        "one-a",
+                        "WIN",
+                        start + 20 * MINUTE_MS,
+                        settled_at=start + 200 * MINUTE_MS,
+                        decision_id="one-a-decision",
+                    ),
+                    observation(
+                        "one-b",
+                        "LOSS",
+                        start + 40 * MINUTE_MS,
+                        settled_at=start + 201 * MINUTE_MS,
+                        decision_id="one-b-decision",
+                    ),
+                    observation(
+                        "one-gap",
+                        "WIN",
+                        start + 35 * MINUTE_MS,
+                        settled_at=start + 202 * MINUTE_MS,
+                        decision_id="one-gap-decision",
+                    ),
+                ],
+                ["one-a", "one-gap"],
+            ),
+            "release-skipped": (
+                [
+                    observation(
+                        "release-blocker",
+                        "LOSS",
+                        start + 20 * MINUTE_MS,
+                        expires_at=start + 100 * MINUTE_MS,
+                        settled_at=start + 200 * MINUTE_MS,
+                        decision_id="release-blocker-decision",
+                    ),
+                    observation(
+                        "release-skipped",
+                        "WIN",
+                        start + 40 * MINUTE_MS,
+                        settled_at=start + 201 * MINUTE_MS,
+                        decision_id="release-skipped-decision",
+                    ),
+                    observation(
+                        "release-early",
+                        "WIN",
+                        start + 10 * MINUTE_MS,
+                        expires_at=start + 30 * MINUTE_MS,
+                        settled_at=start + 202 * MINUTE_MS,
+                        decision_id="release-early-decision",
+                    ),
+                ],
+                ["release-early", "release-skipped"],
+            ),
+            "remove-multiple": (
+                [
+                    observation(
+                        "multiple-a",
+                        "WIN",
+                        start + 20 * MINUTE_MS,
+                        settled_at=start + 200 * MINUTE_MS,
+                        decision_id="multiple-a-decision",
+                    ),
+                    observation(
+                        "multiple-b",
+                        "WIN",
+                        start + 40 * MINUTE_MS,
+                        settled_at=start + 201 * MINUTE_MS,
+                        decision_id="multiple-b-decision",
+                    ),
+                    observation(
+                        "multiple-c",
+                        "LOSS",
+                        start + 60 * MINUTE_MS,
+                        settled_at=start + 202 * MINUTE_MS,
+                        decision_id="multiple-c-decision",
+                    ),
+                    observation(
+                        "multiple-long",
+                        "LOSS",
+                        start + 10 * MINUTE_MS,
+                        expires_at=start + 65 * MINUTE_MS,
+                        settled_at=start + 203 * MINUTE_MS,
+                        decision_id="multiple-long-decision",
+                    ),
+                ],
+                ["multiple-long"],
+            ),
+            "unselected-owner": (
+                [
+                    observation(
+                        "owner-blocker",
+                        "WIN",
+                        start + 20 * MINUTE_MS,
+                        expires_at=start + 100 * MINUTE_MS,
+                        settled_at=start + 200 * MINUTE_MS,
+                        decision_id="owner-blocker-decision",
+                    ),
+                    observation(
+                        "owner-pair",
+                        "LOSS",
+                        start + 40 * MINUTE_MS,
+                        settled_at=start + 201 * MINUTE_MS,
+                        decision_id="owner-pair-decision",
+                    ),
+                    observation(
+                        "owner-pair",
+                        "WIN",
+                        start + 30 * MINUTE_MS,
+                        settled_at=start + 202 * MINUTE_MS,
+                        decision_id="owner-pair-decision",
+                    ),
+                ],
+                ["owner-blocker"],
+            ),
+        }
+
+        for name, (rows, expected_keys) in cases.items():
+            expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+            actual_trace = []
+            real_classify = adaptive_module.classify_profile_state
+
+            def recording_classify(*args, **kwargs):
+                result = real_classify(*args, **kwargs)
+                actual_trace.append(state_trace_item(args[1], result))
+                return result
+
+            with self.subTest(name=name), patch.object(
+                adaptive_module,
+                "classify_profile_state",
+                side_effect=recording_classify,
+            ):
+                actual = rebuild_adaptive_profile_states(list(reversed(rows)), CUTOFF)
+            public = independent_settled_samples(rows, PROFILE_KEY, CUTOFF)
+
+            self.assertEqual([item.observation_key for item in public], expected_keys)
+            self.assertEqual(actual_trace, expected_trace)
+            self.assertEqual(actual, expected)
+
+    def test_random_variable_expiry_touch_tie_delayed_replacements_match_reference(self):
+        for seed in range(30):
+            rng = random.Random(10_000 + seed)
+            start = CUTOFF - 5_000 * MINUTE_MS
+            rows = []
+            for index in range(36):
+                if index and index % 7 == 0:
+                    opened_at = rows[-1].expires_at
+                else:
+                    opened_at = start + rng.randint(0, 600) * MINUTE_MS
+                expires_at = opened_at + rng.randint(1, 30) * MINUTE_MS
+                rows.append(
+                    observation(
+                        f"variable-{seed:02d}-{index:02d}",
+                        rng.choice(("WIN", "LOSS")),
+                        opened_at,
+                        expires_at=expires_at,
+                        settled_at=CUTOFF - rng.randint(1, 12) * MINUTE_MS,
+                        decision_id=f"variable-decision-{seed:02d}-{index:02d}",
+                    )
+                )
+            for _ in range(6):
+                target = rows[rng.randrange(6, 30)]
+                opened_at = target.opened_at - rng.randint(0, 5) * MINUTE_MS
+                rows.append(
+                    observation(
+                        target.observation_key,
+                        rng.choice(("WIN", "LOSS")),
+                        opened_at,
+                        expires_at=opened_at + rng.randint(1, 30) * MINUTE_MS,
+                        settled_at=CUTOFF - rng.randint(1, 6) * MINUTE_MS,
+                        decision_id=target.decision_id,
+                    )
+                )
+            rng.shuffle(rows)
+
+            expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+            actual_trace = []
+            real_classify = adaptive_module.classify_profile_state
+
+            def recording_classify(*args, **kwargs):
+                result = real_classify(*args, **kwargs)
+                actual_trace.append(state_trace_item(args[1], result))
+                return result
+
+            with patch.object(
+                adaptive_module,
+                "classify_profile_state",
+                side_effect=recording_classify,
+            ):
+                actual = rebuild_adaptive_profile_states(rows, CUTOFF)
+
+            with self.subTest(seed=seed):
+                self.assertEqual(actual_trace, expected_trace)
+                self.assertEqual(actual, expected)
 
     def test_rebuild_replays_paused_then_watch_without_future_leak(self):
         start = CUTOFF - 30 * 20 * MINUTE_MS

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from bisect import bisect_left, bisect_right
-from collections import deque
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -45,7 +44,6 @@ class AdaptiveProfileStateConfig:
 
 @dataclass
 class _ProfileReplay:
-    samples: deque[ObservationSignal]
     selection: _IncrementalCanonicalSelection
     previous_status: str | None = None
 
@@ -54,13 +52,155 @@ class _ProfileReplay:
 class _ReplayCandidate:
     event: ObservationSignal
     order_key: tuple
+    settlement_key: tuple
     serial: int
 
 
 @dataclass(frozen=True)
 class _SelectionUpdate:
     changed: bool
-    append_only: ObservationSignal | None = None
+
+
+class _ChunkedSortedIndex:
+    _TARGET_BLOCK_SIZE = 192
+
+    def __init__(self) -> None:
+        self._blocks: list[list[tuple[tuple, _ReplayCandidate]]] = []
+        self._max_keys: list[tuple] = []
+
+    def insert(self, key: tuple, value: _ReplayCandidate) -> None:
+        if not self._blocks:
+            self._blocks.append([(key, value)])
+            self._max_keys.append(key)
+            return
+
+        block_index = bisect_left(self._max_keys, key)
+        if block_index == len(self._blocks):
+            block_index -= 1
+        block = self._blocks[block_index]
+        position = self._block_lower_bound(block, key)
+        if position < len(block) and block[position][0] == key:
+            raise ValueError("sorted index keys must be unique")
+        block.insert(position, (key, value))
+        self._max_keys[block_index] = block[-1][0]
+        if len(block) > self._TARGET_BLOCK_SIZE * 2:
+            midpoint = len(block) // 2
+            right = block[midpoint:]
+            del block[midpoint:]
+            self._blocks.insert(block_index + 1, right)
+            self._max_keys[block_index] = block[-1][0]
+            self._max_keys.insert(block_index + 1, right[-1][0])
+
+    def remove(self, key: tuple) -> _ReplayCandidate | None:
+        location = self._lower_bound_location(key)
+        if location is None:
+            return None
+        block_index, position = location
+        block = self._blocks[block_index]
+        if block[position][0] != key:
+            return None
+        _, value = block.pop(position)
+        if not block:
+            self._blocks.pop(block_index)
+            self._max_keys.pop(block_index)
+            return value
+        self._max_keys[block_index] = block[-1][0]
+        self._merge_small_block(block_index)
+        return value
+
+    def lower_bound(self, key: tuple) -> _ReplayCandidate | None:
+        location = self._lower_bound_location(key)
+        if location is None:
+            return None
+        block_index, position = location
+        return self._blocks[block_index][position][1]
+
+    def predecessor(self, key: tuple) -> _ReplayCandidate | None:
+        if not self._blocks:
+            return None
+        block_index = bisect_left(self._max_keys, key)
+        if block_index == len(self._blocks):
+            return self._blocks[-1][-1][1]
+        block = self._blocks[block_index]
+        position = self._block_lower_bound(block, key)
+        if position:
+            return block[position - 1][1]
+        if block_index:
+            return self._blocks[block_index - 1][-1][1]
+        return None
+
+    def replace_range(
+        self,
+        start_key: tuple,
+        end_key: tuple | None,
+        values: Sequence[_ReplayCandidate],
+    ) -> list[_ReplayCandidate]:
+        removed = []
+        while True:
+            candidate = self.lower_bound(start_key)
+            if candidate is None or (
+                end_key is not None and candidate.order_key >= end_key
+            ):
+                break
+            removed_candidate = self.remove(candidate.order_key)
+            if removed_candidate is not None:
+                removed.append(removed_candidate)
+        for candidate in values:
+            self.insert(candidate.order_key, candidate)
+        return removed
+
+    def tail_values(self, limit: int) -> list[_ReplayCandidate]:
+        if limit <= 0:
+            return []
+        tail = []
+        remaining = limit
+        for block in reversed(self._blocks):
+            take = min(remaining, len(block))
+            tail.extend(value for _, value in reversed(block[-take:]))
+            remaining -= take
+            if remaining == 0:
+                break
+        tail.reverse()
+        return tail
+
+    def _lower_bound_location(self, key: tuple) -> tuple[int, int] | None:
+        block_index = bisect_left(self._max_keys, key)
+        if block_index == len(self._blocks):
+            return None
+        block = self._blocks[block_index]
+        return block_index, self._block_lower_bound(block, key)
+
+    @staticmethod
+    def _block_lower_bound(
+        block: Sequence[tuple[tuple, _ReplayCandidate]],
+        key: tuple,
+    ) -> int:
+        keys = [entry[0] for entry in block]
+        return bisect_left(keys, key)
+
+    def _merge_small_block(self, block_index: int) -> None:
+        minimum = self._TARGET_BLOCK_SIZE // 2
+        block = self._blocks[block_index]
+        if len(block) >= minimum or len(self._blocks) == 1:
+            return
+        if block_index and (
+            len(self._blocks[block_index - 1]) + len(block)
+            <= self._TARGET_BLOCK_SIZE * 2
+        ):
+            left = self._blocks[block_index - 1]
+            left.extend(block)
+            self._blocks.pop(block_index)
+            self._max_keys[block_index - 1] = left[-1][0]
+            self._max_keys.pop(block_index)
+            return
+        if block_index + 1 < len(self._blocks) and (
+            len(block) + len(self._blocks[block_index + 1])
+            <= self._TARGET_BLOCK_SIZE * 2
+        ):
+            right = self._blocks.pop(block_index + 1)
+            block.extend(right)
+            self._max_keys[block_index] = block[-1][0]
+            self._max_keys.pop(block_index + 1)
 
 
 class _IdentityBindings:
@@ -101,22 +241,24 @@ class _IdentityBindings:
 class _IncrementalCanonicalSelection:
     def __init__(self) -> None:
         self._serial = 0
-        self._identity_selected: list[_ReplayCandidate] = []
-        self._identity_keys: list[tuple] = []
-        self._identity_opened_at: list[int] = []
-        self._interval_selected: list[_ReplayCandidate] = []
-        self._interval_keys: list[tuple] = []
+        self._identity_by_opened = _ChunkedSortedIndex()
+        self._canonical_by_opened = _ChunkedSortedIndex()
+        self._canonical_by_settlement = _ChunkedSortedIndex()
+        self._canonical_serials: set[int] = set()
         self._observation_owners: dict[str, _ReplayCandidate] = {}
         self._decision_owners: dict[str, _ReplayCandidate] = {}
 
-    @property
-    def selected_events(self) -> list[ObservationSignal]:
-        return [candidate.event for candidate in self._interval_selected]
+    def latest_selected_events(self, limit: int) -> list[ObservationSignal]:
+        return [
+            candidate.event
+            for candidate in self._canonical_by_settlement.tail_values(limit)
+        ]
 
     def add(self, event: ObservationSignal) -> _SelectionUpdate:
         candidate = _ReplayCandidate(
             event=event,
             order_key=(*_opened_sort_key(event), self._serial),
+            settlement_key=(*_settlement_sort_key(event), self._serial),
             serial=self._serial,
         )
         self._serial += 1
@@ -137,7 +279,7 @@ class _IncrementalCanonicalSelection:
 
         if not owners:
             self._insert_identity_candidate(candidate)
-            return self._add_unique_interval_candidate(candidate)
+            return _SelectionUpdate(self._repair_interval_selection(candidate.order_key))
 
         owner = owners[0]
         exact_owner_replacement = (
@@ -147,19 +289,20 @@ class _IncrementalCanonicalSelection:
         )
         if not exact_owner_replacement:
             return _SelectionUpdate(False)
-        before = self._canonical_signature()
-        self._replace_identity_candidate(owner, candidate)
-        self._repair_interval_suffix(
-            min(owner.order_key, candidate.order_key),
-            convergence_after=owner.order_key,
+        affected_key = min(owner.order_key, candidate.order_key)
+        convergence_after = (
+            owner.order_key if owner.serial in self._canonical_serials else None
         )
-        return _SelectionUpdate(self._canonical_signature() != before)
+        self._replace_identity_candidate(owner, candidate)
+        return _SelectionUpdate(
+            self._repair_interval_selection(
+                affected_key,
+                convergence_after=convergence_after,
+            )
+        )
 
     def _insert_identity_candidate(self, candidate: _ReplayCandidate) -> None:
-        position = bisect_right(self._identity_keys, candidate.order_key)
-        self._identity_keys.insert(position, candidate.order_key)
-        self._identity_opened_at.insert(position, candidate.event.opened_at)
-        self._identity_selected.insert(position, candidate)
+        self._identity_by_opened.insert(candidate.order_key, candidate)
         self._set_owner(candidate)
 
     def _replace_identity_candidate(
@@ -167,10 +310,7 @@ class _IncrementalCanonicalSelection:
         owner: _ReplayCandidate,
         candidate: _ReplayCandidate,
     ) -> None:
-        position = bisect_left(self._identity_keys, owner.order_key)
-        self._identity_keys.pop(position)
-        self._identity_opened_at.pop(position)
-        self._identity_selected.pop(position)
+        self._identity_by_opened.remove(owner.order_key)
         self._insert_identity_candidate(candidate)
 
     def _set_owner(self, candidate: _ReplayCandidate) -> None:
@@ -179,77 +319,48 @@ class _IncrementalCanonicalSelection:
         if candidate.event.decision_id:
             self._decision_owners[candidate.event.decision_id] = candidate
 
-    def _add_unique_interval_candidate(
-        self,
-        candidate: _ReplayCandidate,
-    ) -> _SelectionUpdate:
-        successor = bisect_left(self._interval_keys, candidate.order_key)
-        if successor:
-            predecessor = self._interval_selected[successor - 1]
-            if candidate.event.opened_at < predecessor.event.expires_at:
-                return _SelectionUpdate(False)
-        if (
-            successor == len(self._interval_selected)
-            or candidate.event.expires_at
-            <= self._interval_selected[successor].event.opened_at
-        ):
-            self._interval_keys.insert(successor, candidate.order_key)
-            self._interval_selected.insert(successor, candidate)
-            return _SelectionUpdate(True, append_only=candidate.event)
-
-        before = self._canonical_signature()
-        self._repair_interval_suffix(
-            candidate.order_key,
-            convergence_after=candidate.order_key,
-        )
-        return _SelectionUpdate(self._canonical_signature() != before)
-
-    def _repair_interval_suffix(
+    def _repair_interval_selection(
         self,
         affected_key: tuple,
         *,
         convergence_after: tuple | None = None,
-    ) -> None:
-        old_selected = self._interval_selected
-        old_keys = self._interval_keys
-        prefix_end = bisect_left(old_keys, affected_key)
-        selected = old_selected[:prefix_end]
-        next_independent_at = selected[-1].event.expires_at if selected else 0
-        old_expires = [candidate.event.expires_at for candidate in old_selected]
-        identity_start = bisect_left(self._identity_keys, affected_key)
-        identity_position = identity_start
+    ) -> bool:
+        predecessor = self._canonical_by_opened.predecessor(affected_key)
+        next_independent_at = predecessor.event.expires_at if predecessor else 0
+        search_key = max(affected_key, (next_independent_at,))
+        selected = []
+        convergence_key = None
 
-        while identity_position < len(self._identity_selected):
-            identity_position = bisect_left(
-                self._identity_opened_at,
-                next_independent_at,
-                identity_position,
-            )
-            if identity_position >= len(self._identity_selected):
+        while True:
+            candidate = self._identity_by_opened.lower_bound(search_key)
+            if candidate is None:
                 break
-            candidate = self._identity_selected[identity_position]
+            # Reusing the same selected node preserves the remaining greedy chain.
+            if (
+                candidate.serial in self._canonical_serials
+                and (
+                    convergence_after is None
+                    or candidate.order_key > convergence_after
+                )
+            ):
+                convergence_key = candidate.order_key
+                break
             selected.append(candidate)
             next_independent_at = candidate.event.expires_at
-            old_position = bisect_left(old_expires, next_independent_at)
-            if (
-                convergence_after is not None
-                and old_position < len(old_selected)
-                and old_expires[old_position] == next_independent_at
-                and old_selected[old_position].order_key >= convergence_after
-                and old_selected[old_position].order_key >= candidate.order_key
-            ):
-                selected.extend(old_selected[old_position + 1 :])
-                break
-            identity_position += 1
+            search_key = (next_independent_at,)
 
-        self._interval_selected = selected
-        self._interval_keys = [candidate.order_key for candidate in selected]
-
-    def _canonical_signature(self) -> tuple:
-        return tuple(
-            _observation_signature(candidate.event)
-            for candidate in self._interval_selected
+        removed = self._canonical_by_opened.replace_range(
+            affected_key,
+            convergence_key,
+            selected,
         )
+        for candidate in removed:
+            self._canonical_serials.remove(candidate.serial)
+            self._canonical_by_settlement.remove(candidate.settlement_key)
+        for candidate in selected:
+            self._canonical_serials.add(candidate.serial)
+            self._canonical_by_settlement.insert(candidate.settlement_key, candidate)
+        return bool(removed or selected)
 
 
 def evaluate_adaptive_profile_state(
@@ -428,7 +539,6 @@ def rebuild_adaptive_profile_states(
         replay = profiles.get(key)
         if replay is None:
             replay = _ProfileReplay(
-                samples=deque(maxlen=resolved.full_window_samples),
                 selection=_IncrementalCanonicalSelection(),
             )
             profiles[key] = replay
@@ -436,19 +546,13 @@ def rebuild_adaptive_profile_states(
         update = replay.selection.add(event)
         if not update.changed:
             continue
-        if update.append_only is not None:
-            replay.samples.append(update.append_only)
-        else:
-            replay.samples = deque(
-                sorted(replay.selection.selected_events, key=_settlement_sort_key)[
-                    -resolved.full_window_samples :
-                ],
-                maxlen=resolved.full_window_samples,
-            )
+        samples = replay.selection.latest_selected_events(
+            resolved.full_window_samples
+        )
 
         event_cutoff = int(event.settled_at) + 1
         states[key] = classify_profile_state(
-            replay.samples,
+            samples,
             key,
             event_cutoff,
             previous=replay.previous_status,
@@ -459,18 +563,6 @@ def rebuild_adaptive_profile_states(
     for state in states.values():
         state["evaluated_at"] = cutoff
     return states
-
-
-def _observation_signature(item: ObservationSignal) -> tuple:
-    return (
-        item.observation_key,
-        item.decision_id,
-        item.opened_at,
-        item.expires_at,
-        item.settled_at,
-        item.result,
-        float(item.pnl).hex(),
-    )
 
 
 def _resolve_config(config: AdaptiveProfileStateConfig | None) -> AdaptiveProfileStateConfig:
