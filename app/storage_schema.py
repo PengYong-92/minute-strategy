@@ -365,6 +365,8 @@ _ADDED_COLUMN_SPECS = {
     "orders": (
         _ColumnSpec("decision_id", "text", "TEXT"),
         _ColumnSpec("runtime_config_hash", "text", "TEXT"),
+        _ColumnSpec("exit_price", "real", "REAL"),
+        _ColumnSpec("pnl", "real not null default 0.0", "REAL", not_null=1, default="0.0"),
     ),
     "observation_signals": (
         _ColumnSpec("decision_id", "text", "TEXT"),
@@ -376,6 +378,8 @@ _ADDED_COLUMN_SPECS = {
         _ColumnSpec("entry_structure_state", "text", "TEXT"),
         _ColumnSpec("entry_structure_bias", "text", "TEXT"),
         _ColumnSpec("active_level_source", "text", "TEXT"),
+        _ColumnSpec("exit_price", "real", "REAL"),
+        _ColumnSpec("pnl", "real not null default 0.0", "REAL", not_null=1, default="0.0"),
     ),
     "order_entry_snapshots": (
         _ColumnSpec("decision_id", "text", "TEXT"),
@@ -876,9 +880,10 @@ def _ensure_added_columns(
     connection: sqlite3.Connection,
     table: str,
     columns: tuple[_ColumnSpec, ...],
-) -> None:
+) -> set[str]:
     _require_table(connection, table)
     existing = _column_rows_by_name(connection, table)
+    added: set[str] = set()
     for spec in columns:
         key = spec.name.casefold()
         row = existing.get(key)
@@ -889,8 +894,38 @@ def _ensure_added_columns(
             f"alter table {_quote_identifier(table)} "
             f"add column {_quote_identifier(spec.name)} {spec.declaration}"
         )
+        added.add(spec.name)
         existing = _column_rows_by_name(connection, table)
         _validate_column(table, spec, existing[key])
+    return added
+
+
+def _backfill_added_lifecycle_columns(
+    connection: sqlite3.Connection,
+    added_columns: dict[str, set[str]],
+) -> None:
+    for table in ("orders", "observation_signals"):
+        added = added_columns.get(table, set())
+        if "exit_price" in added:
+            connection.execute(
+                f"""
+                update {_quote_identifier(table)}
+                set exit_price = json_extract(payload, '$.exit_price')
+                where json_valid(payload)
+                  and json_type(payload, '$.exit_price') is not null
+                  and exit_price is null
+                """
+            )
+        if "pnl" in added:
+            connection.execute(
+                f"""
+                update {_quote_identifier(table)}
+                set pnl = json_extract(payload, '$.pnl')
+                where json_valid(payload)
+                  and json_type(payload, '$.pnl') is not null
+                  and pnl != json_extract(payload, '$.pnl')
+                """
+            )
 
 
 def _strip_outer_token_parentheses(
@@ -1212,6 +1247,24 @@ def migrate(connection: sqlite3.Connection) -> None:
         )
     if version == SCHEMA_VERSION:
         _validate_schema(connection, _TABLE_SPECS)
+        caller_in_transaction = connection.in_transaction
+        connection.execute(f"savepoint {_MIGRATION_SAVEPOINT}")
+        try:
+            added_columns = {
+                table: _ensure_added_columns(connection, table, column_specs)
+                for table, column_specs in _ADDED_COLUMN_SPECS.items()
+            }
+            _backfill_added_lifecycle_columns(connection, added_columns)
+            connection.execute(f"release savepoint {_MIGRATION_SAVEPOINT}")
+        except Exception as migration_error:
+            try:
+                _rollback_migration(
+                    connection,
+                    caller_in_transaction=caller_in_transaction,
+                )
+            except Exception as cleanup_error:
+                raise migration_error from cleanup_error
+            raise
         return
     if version == 2:
         _validate_schema(
@@ -1230,8 +1283,11 @@ def migrate(connection: sqlite3.Connection) -> None:
             connection.execute(table_spec.create_sql)
             _validate_table(connection, table_spec)
 
-        for table, column_specs in _ADDED_COLUMN_SPECS.items():
-            _ensure_added_columns(connection, table, column_specs)
+        added_columns = {
+            table: _ensure_added_columns(connection, table, column_specs)
+            for table, column_specs in _ADDED_COLUMN_SPECS.items()
+        }
+        _backfill_added_lifecycle_columns(connection, added_columns)
 
         _ensure_profile_tables_v3(connection)
 

@@ -22,6 +22,16 @@ _DECISION_CONTEXT_EXTENDED_COMPAT_FIELDS = {
     "entry_structure_shadow",
 }
 
+_DECISION_LINKED_LIFECYCLE_FIELDS = {
+    "id",
+    "observation_key",
+    "status",
+    "result",
+    "exit_price",
+    "settled_at",
+    "pnl",
+}
+
 
 def canonical_identity_hash(identity: dict[str, object]) -> str:
     payload = json.dumps(
@@ -87,6 +97,18 @@ def decision_linked_storage_payload(
     omitted = set(_DECISION_CONTEXT_CORE_COMPAT_FIELDS)
     if not retain_extended_views:
         omitted.update(_DECISION_CONTEXT_EXTENDED_COMPAT_FIELDS)
+    fully_canonical_model = bool(
+        linked
+        and not retain_extended_views
+        and isinstance(decision_inputs.get("signal"), dict)
+        and (hasattr(model, "id") or hasattr(model, "observation_key"))
+    )
+    if fully_canonical_model:
+        omitted.update(
+            item.name
+            for item in fields(model)
+            if item.name not in _DECISION_LINKED_LIFECYCLE_FIELDS
+        )
     payload = {
         item.name: deepcopy(getattr(model, item.name))
         for item in fields(model)

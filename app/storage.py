@@ -129,6 +129,49 @@ decision_contexts.input_payload as linked_input_payload,
 decision_contexts.outcome_payload as linked_outcome_payload
 """
 
+_ORDER_LIFECYCLE_COLUMNS = """
+orders.order_id as lifecycle_order_id,
+orders.status as lifecycle_status,
+orders.result as lifecycle_result,
+orders.opened_at as lifecycle_opened_at,
+orders.settled_at as lifecycle_settled_at,
+orders.exit_price as lifecycle_exit_price,
+orders.pnl as lifecycle_pnl
+"""
+
+_OBSERVATION_LIFECYCLE_COLUMNS = """
+observation_signals.observation_key as lifecycle_observation_key,
+observation_signals.status as lifecycle_status,
+observation_signals.result as lifecycle_result,
+observation_signals.opened_at as lifecycle_opened_at,
+observation_signals.expires_at as lifecycle_expires_at,
+observation_signals.settled_at as lifecycle_settled_at,
+observation_signals.exit_price as lifecycle_exit_price,
+observation_signals.pnl as lifecycle_pnl
+"""
+
+_MUTABLE_LIFECYCLE_FIELDS = {
+    "status",
+    "result",
+    "exit_price",
+    "settled_at",
+    "pnl",
+}
+
+_OBSERVATION_CANONICAL_FILTER_SQL = {
+    "direction": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.direction'), observation_signals.direction)",
+    "family": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.strategy_family'), json_extract(decision_contexts.input_payload, '$.signal.strategy_family'), observation_signals.strategy_family)",
+    "tag": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.strategy_tag'), json_extract(decision_contexts.input_payload, '$.signal.strategy_tag'), observation_signals.strategy_tag)",
+    "segment": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.threshold_segment'), json_extract(decision_contexts.input_payload, '$.signal.threshold_segment'), observation_signals.threshold_segment)",
+    "profile": "coalesce(decision_contexts.profile_key, json_extract(decision_contexts.input_payload, '$.identity.profile_key'), json_extract(decision_contexts.input_payload, '$.signal.profile_key'), '')",
+    "origin": "coalesce(decision_contexts.candidate_origin, observation_signals.candidate_origin, '')",
+    "qualification_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.qualification_state'), observation_signals.qualification_state, '')",
+    "adaptive_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.state'), json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.status'), observation_signals.adaptive_state, '')",
+    "entry_structure_state": "coalesce(json_extract(decision_contexts.input_payload, '$.entry_structure.entry_structure_state'), observation_signals.entry_structure_state, '')",
+    "entry_structure_bias": "coalesce(json_extract(decision_contexts.input_payload, '$.entry_structure.entry_structure_bias'), observation_signals.entry_structure_bias, '')",
+    "active_level_source": "coalesce(json_extract(decision_contexts.input_payload, '$.entry_structure.active_level_source'), observation_signals.active_level_source, '')",
+}
+
 
 def _joined_decision_context(row: Mapping[str, Any]) -> dict[str, Any] | None:
     row = dict(row)
@@ -175,15 +218,171 @@ def _require_matching_field(
         raise ValueError(f"persisted {field} does not match decision context")
 
 
+def _canonical_model_fields(
+    payload: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    inputs = context["inputs"]
+    identity = inputs.get("identity")
+    signal = inputs.get("signal", {})
+    score = inputs.get("score", {})
+    market = inputs.get("market", {})
+    if not all(isinstance(item, Mapping) for item in (identity, signal, score, market)):
+        raise ValueError("linked canonical model inputs are malformed")
+
+    is_order = "id" in payload
+    is_observation = "observation_key" in payload
+    if is_order == is_observation:
+        raise ValueError("linked decision model type is ambiguous")
+    model_type = SimulatedOrder if is_order else ObservationSignal
+    model_fields = {item.name for item in fields(model_type)}
+    canonical = {
+        field: deepcopy(value)
+        for field, value in signal.items()
+        if field in model_fields and field not in _MUTABLE_LIFECYCLE_FIELDS
+    }
+    for field in (
+        "direction",
+        "profile_key",
+        "strategy_family",
+        "strategy_tag",
+        "order_slot",
+        "order_slot_scope",
+        "timeframe_minutes",
+        "threshold_segment",
+        "level",
+    ):
+        if field in identity and field in model_fields:
+            canonical[field] = deepcopy(identity[field])
+
+    canonical.update(
+        {
+            "decision_id": context["decision_id"],
+            "context_version": context["context_version"],
+            "runtime_config_hash": context["runtime_config_hash"],
+            "strategy_build_id": context["strategy_build_id"],
+            "candidate_origin": context["candidate_origin"],
+            "decision_inputs": deepcopy(inputs),
+            "decision_trace": deepcopy(context["decision_trace"]),
+            "first_decisive_block": context["first_decisive_block"],
+            "quality_score": deepcopy(score.get("quality_score", 0.0)),
+            "quality_score_version": deepcopy(
+                score.get("quality_score_version", "")
+            ),
+            "quality_score_mode": deepcopy(score.get("quality_score_mode", "")),
+            "quality_score_context": deepcopy(
+                score.get("quality_score_context", "")
+            ),
+            "quality_score_components": deepcopy(
+                score.get("quality_score_components", {})
+            ),
+            "quality_score_inputs": deepcopy(
+                score.get("quality_score_inputs", {})
+            ),
+            "adaptive_profile_state": deepcopy(
+                signal.get("adaptive_profile_state", {})
+            ),
+            "entry_structure_shadow": deepcopy(
+                signal.get("entry_structure_shadow", {})
+            ),
+        }
+    )
+    opened_at = (
+        int(market["candidate_time_ms"])
+        if "candidate_time_ms" in market
+        else (
+            int(context["closed_kline_at_ms"])
+            if signal
+            else None
+        )
+    )
+    entry_price = market.get("entry_price", signal.get("price"))
+    timeframe_minutes = canonical.get("timeframe_minutes")
+
+    if is_order:
+        terms = context.get("selected_order_terms")
+        if not isinstance(terms, Mapping):
+            raise ValueError("linked order selected order terms are malformed")
+        term_fields = {
+            "stake": "stake",
+            "win_return": "win_return",
+            "progression_step": "stake_progression_step",
+            "progression_source_order_id": "stake_progression_source_order_id",
+            "progression_version": "stake_progression_version",
+            "expires_at": "expires_at",
+            "timeframe_minutes": "timeframe_minutes",
+            "order_slot": "order_slot",
+            "order_slot_scope": "order_slot_scope",
+            "direction": "direction",
+            "entry_price": "entry_price",
+        }
+        for source, target in term_fields.items():
+            if source in terms:
+                canonical[target] = deepcopy(terms[source])
+        if opened_at is not None:
+            canonical["opened_at"] = opened_at
+    else:
+        if opened_at is not None:
+            canonical["opened_at"] = opened_at
+        if entry_price is not None:
+            canonical["entry_price"] = float(entry_price)
+        if opened_at is not None and timeframe_minutes is not None:
+            canonical["expires_at"] = opened_at + int(timeframe_minutes) * 60_000
+        if "edge" in score:
+            canonical["edge"] = deepcopy(score["edge"])
+        canonical["source_decision"] = context["final_decision"]
+        canonical["observe_only"] = True
+    return {key: value for key, value in canonical.items() if key in model_fields}
+
+
+def _apply_lifecycle_row_authority(
+    payload: dict[str, Any],
+    row: Mapping[str, Any],
+    *,
+    has_context: bool,
+) -> dict[str, Any]:
+    row = dict(row)
+    if "lifecycle_order_id" in row:
+        if "id" in payload and int(payload["id"]) != int(row["lifecycle_order_id"]):
+            raise ValueError("persisted id does not match orders row")
+        payload["id"] = int(row["lifecycle_order_id"])
+    elif "lifecycle_observation_key" in row:
+        row_key = str(row["lifecycle_observation_key"])
+        if "observation_key" in payload and str(payload["observation_key"]) != row_key:
+            raise ValueError(
+                "persisted observation_key does not match observation row"
+            )
+        payload["observation_key"] = row_key
+
+    for field in ("opened_at", "expires_at"):
+        row_field = f"lifecycle_{field}"
+        if row_field not in row:
+            continue
+        row_value = int(row[row_field])
+        if has_context and field in payload and int(payload[field]) != row_value:
+            raise ValueError(f"persisted {field} does not match lifecycle row")
+        payload[field] = row_value
+
+    for field in _MUTABLE_LIFECYCLE_FIELDS:
+        row_field = f"lifecycle_{field}"
+        if row_field in row:
+            payload[field] = deepcopy(row[row_field])
+    return payload
+
+
 def _hydrate_decision_linked_payload(
     payload: dict[str, Any],
     row: Mapping[str, Any],
+    *,
+    apply_lifecycle_authority: bool = True,
 ) -> dict[str, Any]:
     context = _joined_decision_context(row)
     marker = payload.get("decision_context_ref")
     if context is None:
         if marker is not None:
             raise ValueError("decision context reference cannot be resolved")
+        if apply_lifecycle_authority:
+            return _apply_lifecycle_row_authority(payload, row, has_context=False)
         return payload
 
     inputs = context["inputs"]
@@ -226,42 +425,16 @@ def _hydrate_decision_linked_payload(
         if field in identity:
             _require_matching_field(payload, field, identity[field])
 
-    score = inputs.get("score", {})
-    signal = inputs.get("signal", {})
-    if not isinstance(score, dict) or not isinstance(signal, dict):
-        raise ValueError("linked canonical model views are malformed")
-    canonical_views = {
-        "decision_inputs": inputs,
-        "decision_trace": context["decision_trace"],
-        "first_decisive_block": context["first_decisive_block"],
-        "quality_score": score.get("quality_score", 0.0),
-        "quality_score_version": score.get("quality_score_version", ""),
-        "quality_score_mode": score.get("quality_score_mode", ""),
-        "quality_score_context": score.get("quality_score_context", ""),
-        "quality_score_components": score.get("quality_score_components", {}),
-        "quality_score_inputs": score.get("quality_score_inputs", {}),
-        "adaptive_profile_state": signal.get("adaptive_profile_state", {}),
-        "entry_structure_shadow": signal.get("entry_structure_shadow", {}),
-    }
-    if marker is None:
-        for field, expected in canonical_views.items():
-            _require_matching_field(payload, field, expected)
+    canonical_fields = _canonical_model_fields(payload, context)
+    for field, expected in canonical_fields.items():
+        _require_matching_field(payload, field, expected)
 
     payload = dict(payload)
     payload.pop("decision_context_ref", None)
-    for field, expected in canonical_views.items():
+    for field, expected in canonical_fields.items():
         payload[field] = deepcopy(expected)
-    for field in identity_fields:
-        if field in identity and field in payload:
-            payload[field] = deepcopy(identity[field])
-    for field in (
-        "decision_id",
-        "context_version",
-        "runtime_config_hash",
-        "strategy_build_id",
-        "candidate_origin",
-    ):
-        payload[field] = context[field]
+    if apply_lifecycle_authority:
+        return _apply_lifecycle_row_authority(payload, row, has_context=True)
     return payload
 
 
@@ -1832,15 +2005,17 @@ class SQLiteMonitorStore:
         connection.execute(
             """
             insert into orders(
-                symbol, order_id, status, result, opened_at, settled_at, payload,
-                decision_id, runtime_config_hash
+                symbol, order_id, status, result, opened_at, settled_at,
+                exit_price, pnl, payload, decision_id, runtime_config_hash
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(symbol, order_id) do update set
                 status=excluded.status,
                 result=excluded.result,
                 opened_at=excluded.opened_at,
                 settled_at=excluded.settled_at,
+                exit_price=excluded.exit_price,
+                pnl=excluded.pnl,
                 payload=excluded.payload,
                 decision_id=excluded.decision_id,
                 runtime_config_hash=excluded.runtime_config_hash,
@@ -1853,6 +2028,8 @@ class SQLiteMonitorStore:
                 order.result,
                 order.opened_at,
                 order.settled_at,
+                order.exit_price,
+                order.pnl,
                 json.dumps(decision_linked_storage_payload(order), ensure_ascii=False),
                 order.decision_id or None,
                 order.runtime_config_hash or None,
@@ -1870,8 +2047,8 @@ class SQLiteMonitorStore:
         payload = json.dumps(incoming, ensure_ascii=False)
         bound_order = connection.execute(
             """
-            select order_id, status, result, opened_at, settled_at, payload,
-                   decision_id, runtime_config_hash
+            select order_id, status, result, opened_at, settled_at,
+                   exit_price, pnl, payload, decision_id, runtime_config_hash
             from orders
             where symbol = ? and decision_id = ?
             """,
@@ -1905,6 +2082,8 @@ class SQLiteMonitorStore:
                 bound_order["status"] == order.status
                 and bound_order["result"] == order.result
                 and bound_order["settled_at"] == order.settled_at
+                and bound_order["exit_price"] == order.exit_price
+                and float(bound_order["pnl"]) == float(order.pnl)
                 and persisted == incoming
             ):
                 return
@@ -1912,10 +2091,10 @@ class SQLiteMonitorStore:
         connection.execute(
             """
             insert or ignore into orders(
-                symbol, order_id, status, result, opened_at, settled_at, payload,
-                decision_id, runtime_config_hash
+                symbol, order_id, status, result, opened_at, settled_at,
+                exit_price, pnl, payload, decision_id, runtime_config_hash
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 normalized_symbol,
@@ -1924,6 +2103,8 @@ class SQLiteMonitorStore:
                 order.result,
                 order.opened_at,
                 order.settled_at,
+                order.exit_price,
+                order.pnl,
                 payload,
                 order.decision_id,
                 order.runtime_config_hash,
@@ -1931,8 +2112,8 @@ class SQLiteMonitorStore:
         )
         row = connection.execute(
             """
-            select status, result, opened_at, settled_at, payload,
-                   decision_id, runtime_config_hash
+            select status, result, opened_at, settled_at, exit_price, pnl,
+                   payload, decision_id, runtime_config_hash
             from orders where symbol = ? and order_id = ?
             """,
             (normalized_symbol, order.id),
@@ -1942,6 +2123,8 @@ class SQLiteMonitorStore:
             order.result,
             order.opened_at,
             order.settled_at,
+            order.exit_price,
+            order.pnl,
             payload,
             order.decision_id,
             order.runtime_config_hash,
@@ -2151,6 +2334,7 @@ class SQLiteMonitorStore:
             f"""
             select orders.status, orders.result, orders.settled_at,
                    orders.payload, orders.decision_id, orders.runtime_config_hash,
+                   {_ORDER_LIFECYCLE_COLUMNS},
                    {_LINKED_CONTEXT_COLUMNS}
             from orders
             left join decision_contexts
@@ -2191,6 +2375,7 @@ class SQLiteMonitorStore:
             incoming_payload = _hydrate_decision_linked_payload(
                 incoming_storage_payload,
                 row,
+                apply_lifecycle_authority=False,
             )
         except ValueError as error:
             raise ValueError(
@@ -2228,7 +2413,8 @@ class SQLiteMonitorStore:
         connection.execute(
             """
             update orders
-            set status = ?, result = ?, settled_at = ?, payload = ?,
+            set status = ?, result = ?, settled_at = ?, exit_price = ?, pnl = ?,
+                payload = ?,
                 updated_at_ms = strftime('%s','now') * 1000
             where symbol = ? and order_id = ? and status = 'OPEN'
             """,
@@ -2236,6 +2422,8 @@ class SQLiteMonitorStore:
                 order.status,
                 order.result,
                 order.settled_at,
+                order.exit_price,
+                order.pnl,
                 expected_payload,
                 normalized_symbol,
                 order.id,
@@ -2394,6 +2582,7 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 f"""
                 select orders.payload,
+                       {_ORDER_LIFECYCLE_COLUMNS},
                        {_LINKED_CONTEXT_COLUMNS}
                 from orders
                 left join decision_contexts
@@ -2454,6 +2643,7 @@ class SQLiteMonitorStore:
             f"""
             select observation_signals.status, observation_signals.result,
                    observation_signals.settled_at, observation_signals.payload,
+                   {_OBSERVATION_LIFECYCLE_COLUMNS},
                    {_LINKED_CONTEXT_COLUMNS}
             from observation_signals
             left join decision_contexts
@@ -2494,6 +2684,7 @@ class SQLiteMonitorStore:
             incoming_payload = _hydrate_decision_linked_payload(
                 incoming_storage_payload,
                 row,
+                apply_lifecycle_authority=False,
             )
         except ValueError as error:
             raise ValueError(
@@ -2533,7 +2724,8 @@ class SQLiteMonitorStore:
         connection.execute(
             """
             update observation_signals
-            set status = ?, result = ?, settled_at = ?, payload = ?,
+            set status = ?, result = ?, settled_at = ?, exit_price = ?, pnl = ?,
+                payload = ?,
                 updated_at_ms = strftime('%s','now') * 1000
             where symbol = ? and observation_key = ? and status = 'OPEN'
             """,
@@ -2541,6 +2733,8 @@ class SQLiteMonitorStore:
                 observation.status,
                 observation.result,
                 observation.settled_at,
+                observation.exit_price,
+                observation.pnl,
                 expected_payload,
                 normalized_symbol,
                 observation.observation_key,
@@ -2589,6 +2783,8 @@ class SQLiteMonitorStore:
             "opened_at": observation.opened_at,
             "expires_at": observation.expires_at,
             "settled_at": observation.settled_at,
+            "exit_price": observation.exit_price,
+            "pnl": observation.pnl,
             "payload": json.dumps(payload, ensure_ascii=False),
             "decision_id": observation.decision_id or None,
             "runtime_config_hash": observation.runtime_config_hash or None,
@@ -2610,11 +2806,12 @@ class SQLiteMonitorStore:
                 symbol, observation_key, status, result, direction,
                 strategy_family, strategy_tag, timeframe_minutes,
                 threshold_segment, opened_at, expires_at, settled_at, payload,
+                exit_price, pnl,
                 decision_id, runtime_config_hash, context_version, candidate_origin,
                 qualification_state, adaptive_state, entry_structure_state,
                 entry_structure_bias, active_level_source
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(symbol, observation_key) do update set
                 status=excluded.status,
                 result=excluded.result,
@@ -2626,6 +2823,8 @@ class SQLiteMonitorStore:
                 opened_at=excluded.opened_at,
                 expires_at=excluded.expires_at,
                 settled_at=excluded.settled_at,
+                exit_price=excluded.exit_price,
+                pnl=excluded.pnl,
                 payload=excluded.payload,
                 decision_id=excluded.decision_id,
                 runtime_config_hash=excluded.runtime_config_hash,
@@ -2652,6 +2851,8 @@ class SQLiteMonitorStore:
                 values["expires_at"],
                 values["settled_at"],
                 values["payload"],
+                values["exit_price"],
+                values["pnl"],
                 values["decision_id"],
                 values["runtime_config_hash"],
                 values["context_version"],
@@ -2692,7 +2893,14 @@ class SQLiteMonitorStore:
                 (values["symbol"], values["observation_key"]),
             ).fetchone()
         if existing is not None:
-            mutable_columns = {"status", "result", "settled_at", "payload"}
+            mutable_columns = {
+                "status",
+                "result",
+                "settled_at",
+                "exit_price",
+                "pnl",
+                "payload",
+            }
             frozen_columns = tuple(
                 column for column in columns if column not in mutable_columns
             )
@@ -2752,6 +2960,7 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 f"""
                 select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
                        {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
@@ -2791,6 +3000,7 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 f"""
                 select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
                        {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
@@ -2900,6 +3110,13 @@ class SQLiteMonitorStore:
         tag: str = "",
         segment: str = "",
         result: str = "",
+        profile: str = "",
+        origin: str = "",
+        qualification_state: str = "",
+        adaptive_state: str = "",
+        entry_structure_state: str = "",
+        entry_structure_bias: str = "",
+        active_level_source: str = "",
     ) -> dict[str, Any]:
         normalized_symbol = symbol.upper()
         filters = {
@@ -2908,18 +3125,19 @@ class SQLiteMonitorStore:
             "tag": _clean_filter(tag),
             "segment": _clean_filter(segment),
             "result": _clean_filter(result),
+            "profile": _clean_filter(profile),
+            "origin": _clean_filter(origin),
+            "qualification_state": _clean_filter(qualification_state),
+            "adaptive_state": _clean_filter(adaptive_state),
+            "entry_structure_state": _clean_filter(entry_structure_state),
+            "entry_structure_bias": _clean_filter(entry_structure_bias),
+            "active_level_source": _clean_filter(active_level_source),
         }
         clauses = ["observation_signals.symbol = ?"]
         parameters: list[object] = [normalized_symbol]
-        column_filters = (
-            ("direction", "direction"),
-            ("family", "strategy_family"),
-            ("tag", "strategy_tag"),
-            ("segment", "threshold_segment"),
-        )
-        for filter_name, column_name in column_filters:
+        for filter_name, expression in _OBSERVATION_CANONICAL_FILTER_SQL.items():
             if filters[filter_name]:
-                clauses.append(f"upper(observation_signals.{column_name}) = ?")
+                clauses.append(f"upper({expression}) = ?")
                 parameters.append(filters[filter_name])
         if filters["result"] == "OPEN":
             clauses.append("upper(observation_signals.status) = 'OPEN'")
@@ -2932,7 +3150,14 @@ class SQLiteMonitorStore:
         with self._connect() as connection:
             total = int(
                 connection.execute(
-                    f"select count(*) from observation_signals where {where_sql}",
+                    f"""
+                    select count(*)
+                    from observation_signals
+                    left join decision_contexts
+                      on decision_contexts.symbol = observation_signals.symbol
+                     and decision_contexts.decision_id = observation_signals.decision_id
+                    where {where_sql}
+                    """,
                     parameters,
                 ).fetchone()[0]
             )
@@ -2944,6 +3169,7 @@ class SQLiteMonitorStore:
             rows = connection.execute(
                 f"""
                 select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
                        {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
@@ -2986,12 +3212,16 @@ class SQLiteMonitorStore:
         connection: sqlite3.Connection,
         symbol: str,
     ) -> dict[str, list[str] | list[int]]:
-        def distinct(column: str) -> list[str]:
+        def distinct(expression: str) -> list[str]:
             rows = connection.execute(
                 f"""
-                select distinct upper({column}) as value
+                select distinct upper({expression}) as value
                 from observation_signals
-                where symbol = ? and coalesce({column}, '') != ''
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                where observation_signals.symbol = ?
+                  and coalesce({expression}, '') != ''
                 order by value
                 """,
                 (symbol,),
@@ -3004,7 +3234,7 @@ class SQLiteMonitorStore:
                 case when upper(status) = 'OPEN'
                      then 'OPEN' else upper(coalesce(result, '')) end as value
             from observation_signals
-            where symbol = ?
+            where observation_signals.symbol = ?
             """,
             (symbol,),
         ).fetchall()
@@ -3014,10 +3244,9 @@ class SQLiteMonitorStore:
             key=lambda item: result_order.get(item, 99),
         )
         return {
-            "direction": distinct("direction"),
-            "family": distinct("strategy_family"),
-            "tag": distinct("strategy_tag"),
-            "segment": distinct("threshold_segment"),
+            key: distinct(expression)
+            for key, expression in _OBSERVATION_CANONICAL_FILTER_SQL.items()
+        } | {
             "result": results,
             "page_size": list(ORDER_PAGE_SIZES),
         }
@@ -4879,6 +5108,8 @@ class SQLiteMonitorStore:
                     result text,
                     opened_at integer not null,
                     settled_at integer,
+                    exit_price real,
+                    pnl real not null default 0.0,
                     payload text not null,
                     updated_at_ms integer not null default (strftime('%s','now') * 1000),
                     primary key(symbol, order_id)
@@ -4971,6 +5202,8 @@ class SQLiteMonitorStore:
                     opened_at integer not null,
                     expires_at integer not null,
                     settled_at integer,
+                    exit_price real,
+                    pnl real not null default 0.0,
                     payload text not null,
                     created_at_ms integer not null default (strftime('%s','now') * 1000),
                     updated_at_ms integer not null default (strftime('%s','now') * 1000),

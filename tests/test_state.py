@@ -1666,6 +1666,308 @@ class MonitorStateTest(unittest.TestCase):
                 if restart_store is not None:
                     restart_store.close()
 
+    def test_context_frozen_fields_and_sql_lifecycle_columns_are_authoritative(self):
+        with managed_sqlite_states() as (db_path, store, states):
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                min_order_gap_ms=0,
+            )
+            states.append(state)
+            self.assertEqual(
+                state._maybe_open_order(
+                    selected_profile_signal(119_999, reason="canonical lifecycle"),
+                    latest_kline(119_999),
+                ),
+                "OPENED",
+            )
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                original_order_payload = json.loads(
+                    connection.execute("select payload from orders").fetchone()[0]
+                )
+                original_observation_payload = json.loads(
+                    connection.execute(
+                        "select payload from observation_signals"
+                    ).fetchone()[0]
+                )
+
+            def write_payload(table, payload):
+                with closing(sqlite3.connect(db_path)) as connection:
+                    connection.execute(
+                        f"update {table} set payload = ?",
+                        (json.dumps(payload, ensure_ascii=False),),
+                    )
+                    connection.commit()
+
+            for field, value in (
+                ("score", 999.0),
+                ("threshold", 1.0),
+                ("calculated_threshold", 2.0),
+                ("reason", "tampered reason"),
+                ("direction", "SHORT"),
+                ("stake", 777.0),
+                ("opened_at", 42),
+            ):
+                tampered = deepcopy(original_order_payload)
+                tampered[field] = value
+                write_payload("orders", tampered)
+                with self.assertRaisesRegex(ValueError, field):
+                    store.load_orders("BTCUSDT")
+
+            for field, value in (
+                ("score", -999.0),
+                ("threshold", 1.0),
+                ("reason", "tampered observation"),
+                ("direction", "SHORT"),
+                ("opened_at", 42),
+            ):
+                tampered = deepcopy(original_observation_payload)
+                tampered[field] = value
+                write_payload("observation_signals", tampered)
+                with self.assertRaisesRegex(ValueError, field):
+                    store.load_observations("BTCUSDT")
+
+            payload_settled_order = deepcopy(original_order_payload)
+            payload_settled_order.update(
+                {
+                    "status": "SETTLED",
+                    "result": "WIN",
+                    "exit_price": 999.0,
+                    "settled_at": 719_999,
+                    "pnl": 989.0,
+                }
+            )
+            write_payload("orders", payload_settled_order)
+            payload_settled_observation = deepcopy(original_observation_payload)
+            payload_settled_observation.update(
+                {
+                    "status": "SETTLED",
+                    "result": "WIN",
+                    "exit_price": 999.0,
+                    "settled_at": 719_999,
+                    "pnl": 899.0,
+                }
+            )
+            write_payload("observation_signals", payload_settled_observation)
+
+            state.close()
+            store.close()
+            restart_store = SQLiteMonitorStore(db_path)
+            restarted = MonitorState(
+                symbol="BTCUSDT",
+                storage=restart_store,
+                max_open_orders=1,
+                min_order_gap_ms=0,
+            )
+            states.append(restarted)
+            restored_order = restarted.simulator.orders[0]
+            restored_observation = restart_store.load_observations("BTCUSDT")[0]
+            self.assertEqual(
+                (
+                    restored_order.status,
+                    restored_order.result,
+                    restored_order.exit_price,
+                    restored_order.settled_at,
+                    restored_order.pnl,
+                ),
+                ("OPEN", None, None, None, 0.0),
+            )
+            self.assertEqual(
+                (
+                    restored_observation.status,
+                    restored_observation.result,
+                    restored_observation.exit_price,
+                    restored_observation.settled_at,
+                    restored_observation.pnl,
+                ),
+                ("OPEN", None, None, None, 0.0),
+            )
+
+            blocked = restarted._maybe_open_order(
+                replace(
+                    selected_profile_signal(179_999, reason="must remain blocked"),
+                    profile_key="second-profile",
+                ),
+                latest_kline(179_999),
+            )
+            self.assertEqual(blocked, "HOLD_OPEN_ORDER")
+            with closing(sqlite3.connect(db_path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "select count(*) from orders where status = 'OPEN'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+            restored_order.status = "SETTLED"
+            restored_order.result = "WIN"
+            restored_order.exit_price = 101.0
+            restored_order.settled_at = restored_order.expires_at
+            restored_order.pnl = restored_order.win_return - restored_order.stake
+            restart_store.save_settled_order_with_credit(
+                restored_order,
+                "BTCUSDT",
+                None,
+            )
+            restored_observation.status = "SETTLED"
+            restored_observation.result = "WIN"
+            restored_observation.exit_price = 101.0
+            restored_observation.settled_at = restored_observation.expires_at
+            restored_observation.pnl = 8.0
+            restart_store.save_observation(restored_observation, "BTCUSDT")
+            settled_order = restart_store.load_orders("BTCUSDT")[0]
+            settled_observation = restart_store.load_observations("BTCUSDT")[0]
+            self.assertEqual(
+                (settled_order.status, settled_order.result, settled_order.exit_price),
+                ("SETTLED", "WIN", 101.0),
+            )
+            self.assertEqual(
+                (
+                    settled_observation.status,
+                    settled_observation.result,
+                    settled_observation.exit_price,
+                ),
+                ("SETTLED", "WIN", 101.0),
+            )
+
+    def test_observation_pages_filter_by_canonical_context_not_redundant_columns(self):
+        with managed_sqlite_states() as (db_path, store, states):
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                min_order_gap_ms=0,
+            )
+            states.append(state)
+            long_signal = replace(
+                selected_profile_signal(
+                    119_999,
+                    profile_key="canonical-long-profile",
+                    reason="canonical long observation",
+                ),
+                strategy_family="canonical_long_family",
+                strategy_tag="canonical_long_tag",
+                adaptive_profile_state={
+                    "qualification_state": "QUALIFIED",
+                    "status": "RESIDENT",
+                },
+                entry_structure_shadow={
+                    "entry_structure_state": "SUPPORT_RECLAIM",
+                    "entry_structure_bias": "LONG",
+                    "active_level_source": "RECENT_SWING",
+                },
+            )
+            self.assertEqual(
+                state._maybe_open_order(long_signal, latest_kline(119_999)),
+                "OPENED",
+            )
+            short_signal = replace(
+                selected_profile_signal(
+                    179_999,
+                    profile_key="canonical-short-profile",
+                    reason="canonical short observation",
+                ),
+                direction="WAIT",
+                observe_direction="SHORT",
+                observe_only=True,
+                strategy_family="canonical_short_family",
+                strategy_tag="canonical_short_tag",
+                threshold_segment="WD-23",
+                score=-88.0,
+                adaptive_profile_state={
+                    "qualification_state": "WATCH",
+                    "status": "CANDIDATE",
+                },
+                entry_structure_shadow={
+                    "entry_structure_state": "RESISTANCE_REJECT",
+                    "entry_structure_bias": "SHORT",
+                    "active_level_source": "ROUND_LEVEL",
+                },
+            )
+            self.assertTrue(
+                state._record_observation(
+                    short_signal,
+                    latest_kline(179_999),
+                    "RESEARCH_OBSERVE",
+                )
+            )
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    """
+                    update observation_signals
+                    set direction = 'SHORT', strategy_family = 'canonical_short_family',
+                        strategy_tag = 'canonical_short_tag',
+                        threshold_segment = 'WD-23',
+                        candidate_origin = 'RESEARCH_OBSERVATION',
+                        qualification_state = 'WATCH', adaptive_state = 'CANDIDATE',
+                        entry_structure_state = 'RESISTANCE_REJECT',
+                        entry_structure_bias = 'SHORT',
+                        active_level_source = 'ROUND_LEVEL'
+                    where json_extract(payload, '$.direction') = 'LONG'
+                    """
+                )
+                connection.commit()
+
+            long_page = store.page_observations("BTCUSDT", direction="LONG")
+            short_page = store.page_observations("BTCUSDT", direction="SHORT")
+            self.assertEqual(long_page["total"], 1)
+            self.assertEqual(short_page["total"], 1)
+            self.assertEqual(long_page["observations"][0]["direction"], "LONG")
+            self.assertEqual(short_page["observations"][0]["direction"], "SHORT")
+            self.assertEqual(
+                store.page_observations(
+                    "BTCUSDT", family="canonical_long_family"
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations("BTCUSDT", tag="canonical_long_tag")["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations("BTCUSDT", segment="WD-08")["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations(
+                    "BTCUSDT", profile="canonical-long-profile"
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations(
+                    "BTCUSDT", origin="NATIVE_ACTIONABLE"
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations(
+                    "BTCUSDT", entry_structure_state="SUPPORT_RECLAIM"
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations(
+                    "BTCUSDT", entry_structure_bias="LONG"
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                store.page_observations(
+                    "BTCUSDT", active_level_source="RECENT_SWING"
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                long_page["filter_options"]["direction"],
+                ["LONG", "SHORT"],
+            )
+            self.assertIn(
+                "CANONICAL_LONG_FAMILY",
+                long_page["filter_options"]["family"],
+            )
+
     def test_open_bundle_payload_size_and_5000_projection_fit_capacity_contract(self):
         with managed_sqlite_states() as (db_path, store, states):
             state = MonitorState(
