@@ -278,7 +278,7 @@ class MonitorState:
                 self._profile_summary_prepare_error = exc
         restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
         restored_observations = self._load_restored_observations()
-        adaptive_observations = self._load_adaptive_profile_observations(
+        adaptive_observations = self._load_adaptive_profile_observations_fail_safe(
             restored_observations,
             evaluated_at=int(self._now_ms()),
         )
@@ -662,7 +662,7 @@ class MonitorState:
             self.last_error = None
             restored_orders = self.storage.load_orders(self.symbol) if self.storage else []
             restored_observations = self._load_restored_observations()
-            adaptive_observations = self._load_adaptive_profile_observations(
+            adaptive_observations = self._load_adaptive_profile_observations_fail_safe(
                 restored_observations,
                 evaluated_at=int(self._now_ms()),
             )
@@ -3925,6 +3925,44 @@ class MonitorState:
                 evaluated_at=evaluated_at,
                 profile_keys=profile_keys,
             )
+        return self._filter_adaptive_profile_observations(
+            fallback,
+            evaluated_at=evaluated_at,
+            profile_keys=profile_keys,
+        )
+
+    def _load_adaptive_profile_observations_fail_safe(
+        self,
+        fallback: Sequence[ObservationSignal],
+        *,
+        evaluated_at: int,
+    ) -> list[ObservationSignal]:
+        try:
+            return self._load_adaptive_profile_observations(
+                fallback,
+                evaluated_at=evaluated_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - 恢复阶段使用已加载的目标币种历史降级。
+            self.last_error = f"自适应画像数据加载失败: {exc}"
+            try:
+                return self._filter_adaptive_profile_observations(
+                    fallback,
+                    evaluated_at=evaluated_at,
+                )
+            except Exception as fallback_exc:  # noqa: BLE001 - 保持构造/重置状态完整。
+                self.last_error = (
+                    f"自适应画像数据加载失败: {exc}; "
+                    f"fallback failed: {fallback_exc}"
+                )
+                return []
+
+    def _filter_adaptive_profile_observations(
+        self,
+        fallback: Sequence[ObservationSignal],
+        *,
+        evaluated_at: int,
+        profile_keys: set[str] | None = None,
+    ) -> list[ObservationSignal]:
         cutoff = evaluated_at - 15 * DAY_MS
         rows = []
         for observation in fallback:
@@ -3996,7 +4034,12 @@ class MonitorState:
         ]
         self._adaptive_profile_observations.extend(rows)
         self.adaptive_profile_states.update(next_states)
-        if self.last_error and self.last_error.startswith("自适应画像状态刷新失败:"):
+        adaptive_error_prefixes = (
+            "自适应画像数据加载失败:",
+            "自适应画像状态重建失败:",
+            "自适应画像状态刷新失败:",
+        )
+        if self.last_error and self.last_error.startswith(adaptive_error_prefixes):
             self.last_error = None
         return True
 

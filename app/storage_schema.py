@@ -2,8 +2,8 @@ import sqlite3
 from dataclasses import dataclass
 
 
-SCHEMA_VERSION = 4
-_MIGRATION_SAVEPOINT = "storage_schema_v4"
+SCHEMA_VERSION = 5
+_MIGRATION_SAVEPOINT = "storage_schema_v5"
 
 
 class SchemaConflictError(RuntimeError):
@@ -600,7 +600,24 @@ _V4_INDEX_SPECS = (
     ),
 )
 
-_INDEX_SPECS = _V3_INDEX_SPECS + _V4_INDEX_SPECS
+_V5_INDEX_SPECS = (
+    _IndexSpec(
+        name="idx_observation_signals_symbol_status_settled",
+        table="observation_signals",
+        create_sql="""
+            create index if not exists
+                idx_observation_signals_symbol_status_settled
+            on observation_signals(symbol, status, settled_at)
+        """,
+        terms=(
+            _IndexTermSpec("symbol"),
+            _IndexTermSpec("status"),
+            _IndexTermSpec("settled_at"),
+        ),
+    ),
+)
+
+_INDEX_SPECS = _V3_INDEX_SPECS + _V4_INDEX_SPECS + _V5_INDEX_SPECS
 
 _V3_DECISION_INDEX_NAMES = frozenset(
     {
@@ -1356,6 +1373,13 @@ def migrate(connection: sqlite3.Connection) -> None:
         }
         _backfill_added_lifecycle_columns(connection, added_columns)
         for index_spec in _V4_INDEX_SPECS:
+            if _schema_object(connection, index_spec.name) is not None:
+                _validate_index(connection, index_spec)
+            else:
+                connection.execute(index_spec.create_sql)
+            _validate_index(connection, index_spec)
+
+        for index_spec in _V5_INDEX_SPECS:
             if _schema_object(connection, index_spec.name) is not None:
                 _validate_index(connection, index_spec)
             else:

@@ -158,12 +158,25 @@ _MUTABLE_LIFECYCLE_FIELDS = {
     "pnl",
 }
 
+_OBSERVATION_CANONICAL_TIMEFRAME_SQL = "coalesce(json_extract(decision_contexts.input_payload, '$.identity.timeframe_minutes'), json_extract(decision_contexts.input_payload, '$.signal.timeframe_minutes'), observation_signals.timeframe_minutes)"
+_OBSERVATION_CANONICAL_DIRECTION_SQL = "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.identity.direction'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.direction'), ''), observation_signals.direction)"
+_OBSERVATION_CANONICAL_FAMILY_SQL = "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.identity.strategy_family'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.strategy_family'), ''), observation_signals.strategy_family)"
+_OBSERVATION_CANONICAL_TAG_SQL = "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.identity.strategy_tag'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.strategy_tag'), ''), observation_signals.strategy_tag)"
+_OBSERVATION_CANONICAL_SEGMENT_SQL = "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.identity.threshold_segment'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.threshold_segment'), ''), observation_signals.threshold_segment)"
+_OBSERVATION_CANONICAL_PROFILE_SQL = (
+    f"cast({_OBSERVATION_CANONICAL_TIMEFRAME_SQL} as text) || '|' || "
+    f"{_OBSERVATION_CANONICAL_FAMILY_SQL} || '|' || "
+    f"{_OBSERVATION_CANONICAL_TAG_SQL} || '|' || "
+    f"upper({_OBSERVATION_CANONICAL_DIRECTION_SQL}) || '|' || "
+    f"upper({_OBSERVATION_CANONICAL_SEGMENT_SQL})"
+)
+
 _OBSERVATION_CANONICAL_FILTER_SQL = {
-    "direction": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.direction'), observation_signals.direction)",
-    "family": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.strategy_family'), json_extract(decision_contexts.input_payload, '$.signal.strategy_family'), observation_signals.strategy_family)",
-    "tag": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.strategy_tag'), json_extract(decision_contexts.input_payload, '$.signal.strategy_tag'), observation_signals.strategy_tag)",
-    "segment": "coalesce(json_extract(decision_contexts.input_payload, '$.identity.threshold_segment'), json_extract(decision_contexts.input_payload, '$.signal.threshold_segment'), observation_signals.threshold_segment)",
-    "profile": "coalesce(nullif(decision_contexts.profile_key, ''), nullif(json_extract(decision_contexts.input_payload, '$.identity.profile_key'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.profile_key'), ''), nullif(json_extract(observation_signals.payload, '$.profile_key'), ''), cast(observation_signals.timeframe_minutes as text) || '|' || observation_signals.strategy_family || '|' || observation_signals.strategy_tag || '|' || upper(observation_signals.direction) || '|' || upper(observation_signals.threshold_segment))",
+    "direction": _OBSERVATION_CANONICAL_DIRECTION_SQL,
+    "family": _OBSERVATION_CANONICAL_FAMILY_SQL,
+    "tag": _OBSERVATION_CANONICAL_TAG_SQL,
+    "segment": _OBSERVATION_CANONICAL_SEGMENT_SQL,
+    "profile": "coalesce(nullif(decision_contexts.profile_key, ''), nullif(json_extract(decision_contexts.input_payload, '$.identity.profile_key'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.profile_key'), ''), nullif(json_extract(observation_signals.payload, '$.profile_key'), ''), '')",
     "origin": "coalesce(decision_contexts.candidate_origin, observation_signals.candidate_origin, '')",
     "qualification_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.qualification_state'), observation_signals.qualification_state, '')",
     "adaptive_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.state'), json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.status'), observation_signals.adaptive_state, '')",
@@ -3087,7 +3100,7 @@ class SQLiteMonitorStore:
             )
         )
         cutoff = evaluated_at - days * 86_400_000
-        profile_sql = _OBSERVATION_CANONICAL_FILTER_SQL["profile"]
+        profile_sql = _OBSERVATION_CANONICAL_PROFILE_SQL
         profile_filter = ""
         parameters: list[Any] = [symbol.upper(), cutoff, evaluated_at]
         if normalized_keys:
@@ -5360,6 +5373,11 @@ class SQLiteMonitorStore:
             )
             connection.execute(
                 "create index if not exists idx_observation_signals_symbol_family on observation_signals(symbol, strategy_family)"
+            )
+            connection.execute(
+                "create index if not exists "
+                "idx_observation_signals_symbol_status_settled "
+                "on observation_signals(symbol, status, settled_at)"
             )
             connection.execute(
                 """

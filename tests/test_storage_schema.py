@@ -395,6 +395,7 @@ def _downgrade_current_schema_to_v2(connection: sqlite3.Connection) -> None:
         "ux_observation_signals_symbol_decision_id",
         "idx_orders_symbol_status_opened",
         "idx_observation_signals_symbol_status_opened",
+        "idx_observation_signals_symbol_status_settled",
     ):
         connection.execute(f"drop index {index}")
     for table in (
@@ -444,7 +445,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(connection.total_changes, before_changes)
 
     def test_zero_and_v1_databases_upgrade_to_current_schema(self):
-        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(SCHEMA_VERSION, 5)
         for legacy_version in (0, 1):
             with self.subTest(legacy_version=legacy_version):
                 connection = sqlite3.connect(":memory:")
@@ -474,7 +475,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
 
         self._migrate(connection)
 
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 4)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
         self.assertEqual(
             connection.execute(
                 "select status, result, settled_at, exit_price, pnl from orders"
@@ -510,8 +514,34 @@ class StorageSchemaMigrationTest(unittest.TestCase):
             {
                 "idx_orders_symbol_status_opened",
                 "idx_observation_signals_symbol_status_opened",
+                "idx_observation_signals_symbol_status_settled",
             }.issubset(indexes)
         )
+
+    def test_v4_to_current_adds_adaptive_settled_range_index(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.close()
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "drop index idx_observation_signals_symbol_status_settled"
+                )
+                connection.execute("pragma user_version = 4")
+                connection.commit()
+
+                self._migrate(connection)
+
+                indexes = {
+                    row[1]
+                    for row in connection.execute(
+                        "pragma index_list(observation_signals)"
+                    )
+                }
+                version = connection.execute("pragma user_version").fetchone()[0]
+
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertIn("idx_observation_signals_symbol_status_settled", indexes)
 
     def test_v3_to_v4_failure_rolls_back_columns_rows_and_version(self):
         connection = sqlite3.connect(":memory:")
@@ -552,7 +582,7 @@ class StorageSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 3)
         self.assertEqual(_schema_snapshot(connection), before)
 
-    def test_v2_schema_runs_v3_then_v4_chain(self):
+    def test_v2_schema_runs_full_migration_chain(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         _create_legacy_schema(connection)
@@ -561,7 +591,10 @@ class StorageSchemaMigrationTest(unittest.TestCase):
 
         self._migrate(connection)
 
-        self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 4)
+        self.assertEqual(
+            connection.execute("pragma user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
         tables = {
             row[0]
             for row in connection.execute(

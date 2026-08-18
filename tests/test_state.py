@@ -10043,6 +10043,240 @@ class MonitorStateTest(unittest.TestCase):
         self.assertIn("startup adaptive rebuild failed", state.last_error)
         state.close()
 
+    def test_legacy_profile_incremental_refresh_equals_restart(self):
+        current_time = 1_800_000_000_000
+        legacy = replace(
+            settled_observation(
+                901,
+                "WIN",
+                current_time - 11 * MINUTE_MS,
+                family="drop_reclaim",
+                tag="live_profile",
+                segment="WD-08",
+            ),
+            profile_key="drop_reclaim|LONG|WD-08",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                now_ms=lambda: current_time,
+            )
+            store.save_observation(legacy, "BTCUSDT")
+
+            state._refresh_adaptive_profile_keys({PROFILE_KEY}, current_time)
+            incremental = deepcopy(state.adaptive_profile_states[PROFILE_KEY])
+            state.close()
+            restarted = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                now_ms=lambda: current_time,
+            )
+
+            self.assertEqual(incremental, restarted.adaptive_profile_states[PROFILE_KEY])
+            self.assertEqual(incremental["n12"]["sample_size"], 1)
+            restarted.close()
+            store.close()
+
+    def test_constructor_adaptive_load_failure_uses_fallback_and_recovers(self):
+        current_time = 1_800_000_000_000
+        row = settled_observation(
+            902,
+            "WIN",
+            current_time - 11 * MINUTE_MS,
+            family="drop_reclaim",
+            tag="live_profile",
+            segment="WD-08",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observation(row, "BTCUSDT")
+            original_loader = store.load_adaptive_profile_observations
+            calls = 0
+
+            def fail_once(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("adaptive loader unavailable")
+                return original_loader(*args, **kwargs)
+
+            with patch.object(
+                store,
+                "load_adaptive_profile_observations",
+                side_effect=fail_once,
+            ):
+                state = MonitorState(
+                    symbol="BTCUSDT",
+                    storage=store,
+                    now_ms=lambda: current_time,
+                )
+                self.assertEqual(
+                    state.adaptive_profile_states[PROFILE_KEY]["n12"]["sample_size"],
+                    1,
+                )
+                self.assertIn("adaptive loader unavailable", state.last_error)
+
+                state._refresh_adaptive_profile_keys({PROFILE_KEY}, current_time + 1)
+
+            self.assertIsNone(state.last_error)
+            state.close()
+            store.close()
+
+    def test_constructor_adaptive_load_and_fallback_failure_uses_empty_state(self):
+        current_time = 1_800_000_000_000
+
+        class BrokenAdaptiveStorage(RecordingStorage):
+            def load_observations(self, symbol):
+                return [
+                    replace(
+                        settled_observation(
+                            905,
+                            "WIN",
+                            current_time - 11 * MINUTE_MS,
+                        ),
+                        settled_at="invalid-settled-at",
+                    )
+                ]
+
+            def load_adaptive_profile_observations(self, *args, **kwargs):
+                raise OSError("dedicated adaptive load failed")
+
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=BrokenAdaptiveStorage(),
+            now_ms=lambda: current_time,
+        )
+
+        self.assertEqual(state.adaptive_profile_states, {})
+        self.assertIn("dedicated adaptive load failed", state.last_error)
+        self.assertIn("fallback", state.last_error)
+        state.close()
+
+    def test_reset_symbol_adaptive_load_failure_keeps_target_state_coherent(self):
+        current_time = 1_800_000_000_000
+        btc_order = SimulatedOrder(
+            id=41,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="btc old symbol",
+            entry_price=100.0,
+            opened_at=current_time - MINUTE_MS,
+            expires_at=current_time + 9 * MINUTE_MS,
+        )
+        eth_order = replace(btc_order, id=42, reason="eth target symbol")
+        eth_row = settled_observation(
+            903,
+            "WIN",
+            current_time - 11 * MINUTE_MS,
+            family="other",
+            tag="eth_profile",
+            segment="WD-09",
+        )
+        eth_key = "10|other|eth_profile|LONG|WD-09"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_order(btc_order, "BTCUSDT")
+            store.save_order(eth_order, "ETHUSDT")
+            store.save_observation(eth_row, "ETHUSDT")
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                now_ms=lambda: current_time,
+            )
+            original_loader = store.load_adaptive_profile_observations
+            calls = 0
+
+            def fail_once(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("reset adaptive loader unavailable")
+                return original_loader(*args, **kwargs)
+
+            with patch.object(
+                store,
+                "load_adaptive_profile_observations",
+                side_effect=fail_once,
+            ):
+                state.reset_symbol("ETHUSDT")
+                self.assertEqual(state.symbol, "ETHUSDT")
+                self.assertEqual([item.id for item in state.simulator.orders], [42])
+                self.assertEqual(
+                    {item.strategy_tag for item in state.observations},
+                    {"eth_profile"},
+                )
+                self.assertEqual(
+                    state.adaptive_profile_states[eth_key]["n12"]["sample_size"],
+                    1,
+                )
+                self.assertIn("reset adaptive loader unavailable", state.last_error)
+
+                state._refresh_adaptive_profile_keys({eth_key}, current_time + 1)
+
+            self.assertIsNone(state.last_error)
+            self.assertNotIn(PROFILE_KEY, state.adaptive_profile_states)
+            state.close()
+            store.close()
+
+    def test_reset_symbol_adaptive_rebuild_failure_keeps_target_state_coherent(self):
+        current_time = 1_800_000_000_000
+        target_order = SimulatedOrder(
+            id=52,
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="A",
+            reason="eth rebuild target",
+            entry_price=100.0,
+            opened_at=current_time - MINUTE_MS,
+            expires_at=current_time + 9 * MINUTE_MS,
+        )
+        target_row = settled_observation(
+            904,
+            "WIN",
+            current_time - 11 * MINUTE_MS,
+            family="other",
+            tag="eth_rebuild_profile",
+            segment="WD-10",
+        )
+        target_key = "10|other|eth_rebuild_profile|LONG|WD-10"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_order(target_order, "ETHUSDT")
+            store.save_observation(target_row, "ETHUSDT")
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                now_ms=lambda: current_time,
+            )
+
+            with patch(
+                "app.state.rebuild_adaptive_profile_states",
+                side_effect=RuntimeError("reset adaptive rebuild failed"),
+            ):
+                state.reset_symbol("ETHUSDT")
+
+            self.assertEqual(state.symbol, "ETHUSDT")
+            self.assertEqual([item.id for item in state.simulator.orders], [52])
+            self.assertEqual(
+                {item.strategy_tag for item in state.observations},
+                {"eth_rebuild_profile"},
+            )
+            self.assertEqual(state.adaptive_profile_states, {})
+            self.assertIn("reset adaptive rebuild failed", state.last_error)
+
+            state._refresh_adaptive_profile_keys({target_key}, current_time + 1)
+
+            self.assertEqual(
+                state.adaptive_profile_states[target_key]["n12"]["sample_size"],
+                1,
+            )
+            self.assertIsNone(state.last_error)
+            state.close()
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

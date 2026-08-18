@@ -4123,6 +4123,76 @@ class AtomicDecisionBundleTest(unittest.TestCase):
                 )
             store.close()
 
+    def test_adaptive_loader_legacy_profile_key_matches_complete_structured_key(self):
+        evaluated_at = 1_800_000_000_000
+        complete_key = (
+            "10|short_extension|normal_down_short_extension_observe|SHORT|WD-02"
+        )
+        legacy = replace(
+            observation(
+                "adaptive-legacy-profile-key",
+                opened_at=evaluated_at - 11 * 60_000,
+            ),
+            profile_key="short_extension|SHORT|WD-02",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observation(legacy, "BTCUSDT")
+
+            full = store.load_adaptive_profile_observations(
+                "BTCUSDT",
+                lookback_days=15,
+                evaluated_at=evaluated_at,
+            )
+            exact = store.load_adaptive_profile_observations(
+                "BTCUSDT",
+                lookback_days=15,
+                evaluated_at=evaluated_at,
+                profile_keys={complete_key},
+            )
+            store.close()
+
+        self.assertEqual([item.observation_key for item in full], [legacy.observation_key])
+        self.assertEqual([item.observation_key for item in exact], [legacy.observation_key])
+
+    def test_adaptive_loader_uses_settled_at_range_index(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.close()
+            with closing(sqlite3.connect(db_path)) as connection:
+                indexes = {
+                    row[1]
+                    for row in connection.execute(
+                        "pragma index_list(observation_signals)"
+                    )
+                }
+                plan = connection.execute(
+                    """
+                    explain query plan
+                    select observation_signals.payload
+                    from observation_signals
+                    left join decision_contexts
+                      on decision_contexts.symbol = observation_signals.symbol
+                     and decision_contexts.decision_id = observation_signals.decision_id
+                    where observation_signals.symbol = ?
+                      and observation_signals.status = 'SETTLED'
+                      and observation_signals.settled_at >= ?
+                      and observation_signals.settled_at < ?
+                    order by observation_signals.settled_at,
+                             observation_signals.opened_at,
+                             observation_signals.observation_key
+                    """,
+                    ("BTCUSDT", 1_000, 2_000),
+                ).fetchall()
+
+        index_name = "idx_observation_signals_symbol_status_settled"
+        self.assertIn(index_name, indexes)
+        detail = " ".join(str(row[3]) for row in plan)
+        self.assertIn(index_name, detail)
+        self.assertIn("settled_at>?", detail)
+        self.assertIn("settled_at<?", detail)
+
 
 if __name__ == "__main__":
     unittest.main()
