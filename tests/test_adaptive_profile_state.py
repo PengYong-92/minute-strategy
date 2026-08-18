@@ -156,6 +156,48 @@ def duplicate_replacement_rows(sample_size: int) -> list[ObservationSignal]:
     ]
 
 
+def same_observation_conflict_rows(sample_size: int) -> list[ObservationSignal]:
+    settlement_start = CUTOFF - sample_size - 1
+    opened_start = settlement_start - (sample_size + 2) * 20 * MINUTE_MS
+    return [
+        observation(
+            "bound-observation",
+            "WIN" if index % 2 == 0 else "LOSS",
+            opened_start + (sample_size - 1 - index) * 20 * MINUTE_MS,
+            settled_at=settlement_start + index,
+            decision_id=f"conflicting-decision-{index:05d}",
+        )
+        for index in range(sample_size)
+    ]
+
+
+def cross_linked_conflict_rows(sample_size: int) -> list[ObservationSignal]:
+    binding_count = sample_size // 2
+    settlement_start = CUTOFF - sample_size - 1
+    opened_start = settlement_start - (sample_size + 2) * 20 * MINUTE_MS
+    rows = [
+        observation(
+            f"bound-observation-{index:05d}",
+            "WIN" if index % 2 == 0 else "LOSS",
+            opened_start + (binding_count + index) * 20 * MINUTE_MS,
+            settled_at=settlement_start + index,
+            decision_id=f"bound-decision-{index:05d}",
+        )
+        for index in range(binding_count)
+    ]
+    rows.extend(
+        observation(
+            f"bound-observation-{index:05d}",
+            "WIN",
+            opened_start + index * 20 * MINUTE_MS,
+            settled_at=settlement_start + binding_count + index,
+            decision_id=f"bound-decision-{(index + 1) % binding_count:05d}",
+        )
+        for index in range(sample_size - binding_count)
+    )
+    return rows
+
+
 def state_trace_item(key: str, result: dict) -> tuple:
     return (
         key,
@@ -555,7 +597,7 @@ class AdaptiveProfileStateTest(unittest.TestCase):
             rows[8].observation_key,
             "WIN",
             rows[20].opened_at,
-            decision_id="duplicate-reference-decision",
+            decision_id=rows[8].decision_id,
         )
         mixed = list(reversed(rows + other_key_rows + [overlap, duplicate]))
         expected, expected_trace = progressive_reference_rebuild(mixed, CUTOFF)
@@ -633,7 +675,7 @@ class AdaptiveProfileStateTest(unittest.TestCase):
             start - 20 * MINUTE_MS,
             settled_at=rows[-1].settled_at + MINUTE_MS,
             pnl=0.0,
-            decision_id="delayed-boundary-decision",
+            decision_id=rows[-1].decision_id,
         )
         mixed = list(reversed(rows + [delayed]))
 
@@ -703,7 +745,7 @@ class AdaptiveProfileStateTest(unittest.TestCase):
                         rng.choice(("WIN", "LOSS")),
                         opened_at,
                         settled_at=CUTOFF - rng.randint(1, 120) * MINUTE_MS,
-                        decision_id=f"duplicate-decision-{seed:02d}-{duplicate_index:02d}",
+                        decision_id=target.decision_id,
                     )
                 )
             for overlap_index in range(5):
@@ -740,15 +782,8 @@ class AdaptiveProfileStateTest(unittest.TestCase):
                 self.assertEqual(actual_trace, expected_trace)
                 self.assertEqual(actual, expected)
 
-    def test_rebuild_cross_linked_identities_release_skipped_successor(self):
+    def test_cross_linked_identity_conflicts_are_rejected_without_rebinding(self):
         start = CUTOFF - 100 * MINUTE_MS
-        delayed = observation(
-            "shared-observation",
-            "WIN",
-            start,
-            settled_at=start + 80 * MINUTE_MS,
-            decision_id="first-decision",
-        )
         initially_selected = observation(
             "shared-observation",
             "LOSS",
@@ -763,8 +798,28 @@ class AdaptiveProfileStateTest(unittest.TestCase):
             settled_at=start + 60 * MINUTE_MS,
             decision_id="shared-decision",
         )
-        rows = [released_successor, delayed, initially_selected]
+        conflicting_observation = observation(
+            "shared-observation",
+            "WIN",
+            start,
+            settled_at=start + 80 * MINUTE_MS,
+            decision_id="first-decision",
+        )
+        exact_pair = observation(
+            "shared-observation",
+            "WIN",
+            start - 20 * MINUTE_MS,
+            settled_at=start + 90 * MINUTE_MS,
+            decision_id="shared-decision",
+        )
+        rows = [
+            released_successor,
+            exact_pair,
+            conflicting_observation,
+            initially_selected,
+        ]
         expected, expected_trace = progressive_reference_rebuild(rows, CUTOFF)
+        public = independent_settled_samples(rows, PROFILE_KEY, CUTOFF)
         actual_trace = []
         real_classify = adaptive_module.classify_profile_state
 
@@ -780,12 +835,15 @@ class AdaptiveProfileStateTest(unittest.TestCase):
         ):
             actual = rebuild_adaptive_profile_states(rows, CUTOFF)
 
-        self.assertEqual(expected[PROFILE_KEY]["n12"]["sample_size"], 2)
-        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 2)
+        self.assertEqual([item.decision_id for item in public], ["shared-decision"])
+        self.assertEqual(public[0].result, "WIN")
+        self.assertEqual(len(expected_trace), 2)
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["sample_size"], 1)
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 1)
         self.assertEqual(actual_trace, expected_trace)
         self.assertEqual(actual, expected)
 
-    def test_rebuild_partial_identity_replacement_releases_old_decision(self):
+    def test_partial_identity_conflict_does_not_release_old_decision(self):
         start = CUTOFF - 100 * MINUTE_MS
         delayed = observation(
             "shared-observation",
@@ -825,10 +883,35 @@ class AdaptiveProfileStateTest(unittest.TestCase):
         ):
             actual = rebuild_adaptive_profile_states(rows, CUTOFF)
 
-        self.assertEqual(expected[PROFILE_KEY]["n12"]["sample_size"], 2)
-        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 2)
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["sample_size"], 1)
+        self.assertEqual(expected[PROFILE_KEY]["n12"]["wins"], 0)
         self.assertEqual(actual_trace, expected_trace)
         self.assertEqual(actual, expected)
+
+    def test_same_time_binding_conflict_uses_deterministic_causal_tie_break(self):
+        settled_at = CUTOFF - 1
+        earlier = observation(
+            "same-binding-observation",
+            "LOSS",
+            CUTOFF - 40 * MINUTE_MS,
+            settled_at=settled_at,
+            decision_id="z-earlier-decision",
+        )
+        later = observation(
+            "same-binding-observation",
+            "WIN",
+            CUTOFF - 20 * MINUTE_MS,
+            settled_at=settled_at,
+            decision_id="a-later-decision",
+        )
+
+        first = rebuild_adaptive_profile_states([later, earlier], CUTOFF)
+        second = rebuild_adaptive_profile_states([earlier, later], CUTOFF)
+        public = independent_settled_samples([later, earlier], PROFILE_KEY, CUTOFF)
+
+        self.assertEqual([item.decision_id for item in public], ["z-earlier-decision"])
+        self.assertEqual(first, second)
+        self.assertEqual(first[PROFILE_KEY]["n12"]["wins"], 0)
 
     def test_rebuild_progressive_overlap_replacement_preserves_transition_history(self):
         start = CUTOFF - 60 * 20 * MINUTE_MS
@@ -918,6 +1001,54 @@ class AdaptiveProfileStateTest(unittest.TestCase):
         self.assertEqual(classify.call_count, 10_000)
         self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 1)
         self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["wins"], 1)
+        self.assertLess(elapsed, 5.0)
+
+    def test_rebuild_ten_thousand_same_observation_conflicts_are_linear(self):
+        rows = same_observation_conflict_rows(10_000)
+        started = time.perf_counter()
+        real_add = adaptive_module._IncrementalCanonicalSelection.add
+
+        def recording_add(selection, event):
+            return real_add(selection, event)
+
+        with patch.object(
+            adaptive_module._IncrementalCanonicalSelection,
+            "add",
+            autospec=True,
+            side_effect=recording_add,
+        ) as add:
+            with patch.object(
+                adaptive_module,
+                "classify_profile_state",
+                wraps=adaptive_module.classify_profile_state,
+            ) as classify:
+                rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(add.call_count, 1)
+        self.assertEqual(classify.call_count, 1)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 1)
+        self.assertLess(elapsed, 5.0)
+
+    def test_rebuild_ten_thousand_cross_linked_conflicts_are_linear(self):
+        rows = cross_linked_conflict_rows(10_000)
+        started = time.perf_counter()
+        real_add = adaptive_module._IncrementalCanonicalSelection.add
+
+        def recording_add(selection, event):
+            return real_add(selection, event)
+
+        with patch.object(
+            adaptive_module._IncrementalCanonicalSelection,
+            "add",
+            autospec=True,
+            side_effect=recording_add,
+        ) as add:
+            rebuilt = rebuild_adaptive_profile_states(rows, CUTOFF)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(add.call_count, 5_000)
+        self.assertEqual(rebuilt[PROFILE_KEY]["n20"]["sample_size"], 20)
         self.assertLess(elapsed, 5.0)
 
     def test_rebuild_replays_paused_then_watch_without_future_leak(self):

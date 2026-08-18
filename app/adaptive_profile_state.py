@@ -46,6 +46,7 @@ class AdaptiveProfileStateConfig:
 @dataclass
 class _ProfileReplay:
     samples: deque[ObservationSignal]
+    bindings: _IdentityBindings
     selection: _IncrementalCanonicalSelection
     previous_status: str | None = None
 
@@ -63,11 +64,42 @@ class _SelectionUpdate:
     append_only: ObservationSignal | None = None
 
 
+class _IdentityBindings:
+    def __init__(self) -> None:
+        self._decisions_by_observation: dict[str, str] = {}
+        self._observations_by_decision: dict[str, str] = {}
+
+    def accept(self, event: ObservationSignal) -> bool:
+        observation_identity = event.observation_key
+        decision_identity = event.decision_id
+        if (
+            observation_identity
+            and observation_identity in self._decisions_by_observation
+            and self._decisions_by_observation[observation_identity] != decision_identity
+        ):
+            return False
+        if (
+            decision_identity
+            and decision_identity in self._observations_by_decision
+            and self._observations_by_decision[decision_identity] != observation_identity
+        ):
+            return False
+        if observation_identity:
+            self._decisions_by_observation.setdefault(
+                observation_identity,
+                decision_identity,
+            )
+        if decision_identity:
+            self._observations_by_decision.setdefault(
+                decision_identity,
+                observation_identity,
+            )
+        return True
+
+
 class _IncrementalCanonicalSelection:
     def __init__(self) -> None:
         self._serial = 0
-        self._ordered: list[_ReplayCandidate] = []
-        self._ordered_keys: list[tuple] = []
         self._identity_selected: list[_ReplayCandidate] = []
         self._identity_keys: list[tuple] = []
         self._interval_selected: list[_ReplayCandidate] = []
@@ -86,9 +118,6 @@ class _IncrementalCanonicalSelection:
             serial=self._serial,
         )
         self._serial += 1
-        position = bisect_right(self._ordered_keys, candidate.order_key)
-        self._ordered_keys.insert(position, candidate.order_key)
-        self._ordered.insert(position, candidate)
 
         observation_owner = (
             self._observation_owners.get(event.observation_key)
@@ -114,16 +143,14 @@ class _IncrementalCanonicalSelection:
             and owner.event.observation_key == event.observation_key
             and owner.event.decision_id == event.decision_id
         )
+        if not exact_owner_replacement:
+            return _SelectionUpdate(False)
         before = self._canonical_signature()
-        if exact_owner_replacement:
-            self._replace_identity_candidate(owner, candidate)
-            self._repair_interval_suffix(
-                min(owner.order_key, candidate.order_key),
-                convergence_after=owner.order_key,
-            )
-        else:
-            self._rebuild_identity_suffix(candidate.order_key)
-            self._repair_interval_suffix(candidate.order_key)
+        self._replace_identity_candidate(owner, candidate)
+        self._repair_interval_suffix(
+            min(owner.order_key, candidate.order_key),
+            convergence_after=owner.order_key,
+        )
         return _SelectionUpdate(self._canonical_signature() != before)
 
     def _insert_identity_candidate(self, candidate: _ReplayCandidate) -> None:
@@ -141,40 +168,6 @@ class _IncrementalCanonicalSelection:
         self._identity_keys.pop(position)
         self._identity_selected.pop(position)
         self._insert_identity_candidate(candidate)
-
-    def _rebuild_identity_suffix(self, affected_key: tuple) -> None:
-        prefix_end = bisect_left(self._identity_keys, affected_key)
-        selected = self._identity_selected[:prefix_end]
-        seen_observation_keys = {
-            candidate.event.observation_key
-            for candidate in selected
-            if candidate.event.observation_key
-        }
-        seen_decision_ids = {
-            candidate.event.decision_id
-            for candidate in selected
-            if candidate.event.decision_id
-        }
-        ordered_start = bisect_left(self._ordered_keys, affected_key)
-        for candidate in self._ordered[ordered_start:]:
-            observation_identity = candidate.event.observation_key
-            decision_identity = candidate.event.decision_id
-            if observation_identity and observation_identity in seen_observation_keys:
-                continue
-            if decision_identity and decision_identity in seen_decision_ids:
-                continue
-            selected.append(candidate)
-            if observation_identity:
-                seen_observation_keys.add(observation_identity)
-            if decision_identity:
-                seen_decision_ids.add(decision_identity)
-
-        self._identity_selected = selected
-        self._identity_keys = [candidate.order_key for candidate in selected]
-        self._observation_owners.clear()
-        self._decision_owners.clear()
-        for candidate in selected:
-            self._set_owner(candidate)
 
     def _set_owner(self, candidate: _ReplayCandidate) -> None:
         if candidate.event.observation_key:
@@ -363,7 +356,7 @@ def _canonical_independent_samples(
     candidates: Sequence[ObservationSignal],
     evaluated_at: int,
 ) -> list[ObservationSignal]:
-    ordered = sorted(candidates, key=_opened_sort_key)
+    ordered = sorted(_causally_bound_candidates(candidates), key=_opened_sort_key)
 
     deduplicated = []
     seen_observation_keys: set[str] = set()
@@ -384,6 +377,17 @@ def _canonical_independent_samples(
     # The daily selector owns the opened/expires overlap boundary: touching
     # intervals are independent, while opened_at < previous expires_at overlaps.
     return _independent_samples(deduplicated, -(2**63), evaluated_at)
+
+
+def _causally_bound_candidates(
+    candidates: Sequence[ObservationSignal],
+) -> list[ObservationSignal]:
+    bindings = _IdentityBindings()
+    accepted = []
+    for event in sorted(candidates, key=_causal_observation_sort_key):
+        if bindings.accept(event):
+            accepted.append(event)
+    return accepted
 
 
 def rebuild_adaptive_profile_states(
@@ -408,10 +412,13 @@ def rebuild_adaptive_profile_states(
         if replay is None:
             replay = _ProfileReplay(
                 samples=deque(maxlen=resolved.full_window_samples),
+                bindings=_IdentityBindings(),
                 selection=_IncrementalCanonicalSelection(),
             )
             profiles[key] = replay
 
+        if not replay.bindings.accept(event):
+            continue
         update = replay.selection.add(event)
         if not update.changed:
             continue
@@ -623,15 +630,23 @@ def _settlement_sort_key(item: ObservationSignal) -> tuple:
     )
 
 
-def _prepared_event_sort_key(prepared: tuple[str, ObservationSignal]) -> tuple:
-    key, item = prepared
+def _causal_observation_sort_key(item: ObservationSignal) -> tuple:
     return (
         item.settled_at,
-        key,
         item.opened_at,
         item.observation_key,
         item.decision_id,
         item.expires_at,
         item.result,
         float(item.pnl).hex(),
+    )
+
+
+def _prepared_event_sort_key(prepared: tuple[str, ObservationSignal]) -> tuple:
+    key, item = prepared
+    causal_key = _causal_observation_sort_key(item)
+    return (
+        causal_key[0],
+        key,
+        *causal_key[1:],
     )
