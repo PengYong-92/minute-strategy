@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import math
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Sequence
 from zoneinfo import ZoneInfo
@@ -15,44 +16,77 @@ QUALIFICATION_VERSION = "DAILY_PROFILE_QUALIFICATION_V2"
 @dataclass(frozen=True)
 class DailyProfileSelectorConfig:
     lookback_days: int = 7
-    stable_lookback_days: int = 14
     min_samples: int = 20
     weekend_min_samples: int = 10
     min_win_rate: float = 0.60
     min_ev: float = 0.0
     exit_win_rate: float = 0.60
     exit_ev: float = 0.0
-    degraded_runs_to_exit: int = 1
-    joint_failures_to_exit: int = 2
+    degraded_runs_to_exit: int = 2
     max_active_profiles: int = 0
     evaluation_hour: int = 7
     evaluation_minute: int = 50
     activation_hour: int = 8
     activation_minute: int = 0
+    stable_lookback_days: int = 14
+    joint_failures_to_exit: int | None = None
+    joint_failures_source: str = field(default="", init=False)
 
     def normalized(self) -> "DailyProfileSelectorConfig":
-        lookback_days = max(1, int(self.lookback_days))
-        stable_lookback_days = max(
-            lookback_days,
-            max(1, int(self.stable_lookback_days)),
-        )
-        return DailyProfileSelectorConfig(
+        lookback_days = int(self.lookback_days)
+        stable_lookback_days = int(self.stable_lookback_days)
+        degraded_runs_to_exit = int(self.degraded_runs_to_exit)
+        if lookback_days <= 0:
+            raise ValueError("lookback_days must be positive")
+        if stable_lookback_days <= 0:
+            raise ValueError("stable_lookback_days must be positive")
+        if stable_lookback_days < lookback_days:
+            raise ValueError("stable_lookback_days must not be shorter than lookback_days")
+        if degraded_runs_to_exit <= 0:
+            raise ValueError("degraded_runs_to_exit must be positive")
+
+        min_win_rate = float(self.min_win_rate)
+        exit_win_rate = float(self.exit_win_rate)
+        if not math.isfinite(min_win_rate) or not 0.0 <= min_win_rate <= 1.0:
+            raise ValueError("min_win_rate must be between 0 and 1")
+        if not math.isfinite(exit_win_rate) or not 0.0 <= exit_win_rate <= 1.0:
+            raise ValueError("exit_win_rate must be between 0 and 1")
+        min_ev = float(self.min_ev)
+        exit_ev = float(self.exit_ev)
+        if not math.isfinite(min_ev) or not math.isfinite(exit_ev):
+            raise ValueError("EV thresholds must be finite")
+
+        if self.joint_failures_to_exit is None:
+            effective_failures = degraded_runs_to_exit
+            source = (
+                self.joint_failures_source
+                or ("default" if degraded_runs_to_exit == 2 else "degraded_runs_to_exit")
+            )
+        else:
+            effective_failures = int(self.joint_failures_to_exit)
+            source = self.joint_failures_source or "joint_failures_to_exit"
+        if effective_failures <= 0:
+            raise ValueError("joint_failures_to_exit must be positive")
+
+        normalized = DailyProfileSelectorConfig(
             lookback_days=lookback_days,
-            stable_lookback_days=stable_lookback_days,
             min_samples=max(1, int(self.min_samples)),
             weekend_min_samples=max(1, int(self.weekend_min_samples)),
-            min_win_rate=min(1.0, max(0.0, float(self.min_win_rate))),
-            min_ev=float(self.min_ev),
-            exit_win_rate=min(1.0, max(0.0, float(self.exit_win_rate))),
-            exit_ev=float(self.exit_ev),
-            degraded_runs_to_exit=max(1, int(self.degraded_runs_to_exit)),
-            joint_failures_to_exit=max(1, int(self.joint_failures_to_exit)),
+            min_win_rate=min_win_rate,
+            min_ev=min_ev,
+            exit_win_rate=exit_win_rate,
+            exit_ev=exit_ev,
+            degraded_runs_to_exit=degraded_runs_to_exit,
             max_active_profiles=max(0, int(self.max_active_profiles)),
             evaluation_hour=min(23, max(0, int(self.evaluation_hour))),
             evaluation_minute=min(59, max(0, int(self.evaluation_minute))),
             activation_hour=min(23, max(0, int(self.activation_hour))),
             activation_minute=min(59, max(0, int(self.activation_minute))),
+            stable_lookback_days=stable_lookback_days,
+            joint_failures_to_exit=effective_failures,
         )
+        object.__setattr__(normalized, "joint_failures_source", source)
+        return normalized
 
 
 def profile_key(
@@ -136,9 +170,12 @@ def build_daily_selection(
     for key in previous_by_key:
         grouped.setdefault(key, [])
 
-    same_evaluation_day = (
-        previous_snapshot.get("effective_from") == fast_window["effective_from"]
+    evaluation_key = fast_window["lookback_end"]
+    previous_evaluation_key = previous_snapshot.get(
+        "evaluation_key",
+        previous_snapshot.get("lookback_end"),
     )
+    same_evaluation_day = previous_evaluation_key == evaluation_key
     candidates = [
         _candidate_summary(
             key,
@@ -147,6 +184,7 @@ def build_daily_selection(
             resolved,
             fast_window,
             stable_window,
+            evaluation_key=evaluation_key,
             same_evaluation_day=same_evaluation_day,
         )
         for key, rows in grouped.items()
@@ -169,14 +207,23 @@ def build_daily_selection(
     candidates.sort(key=_candidate_sort_key)
     selected_profiles = [item for item in candidates if item["key"] in selected_keys]
     effective_local = datetime.fromtimestamp(fast_window["effective_from"] / 1000, tz=SHANGHAI)
+    config_snapshot = asdict(resolved)
+    config_snapshot.update(
+        {
+            "effective_joint_failures_to_exit": resolved.joint_failures_to_exit,
+            "retention_min_win_rate": resolved.exit_win_rate,
+            "retention_min_ev": resolved.exit_ev,
+        }
+    )
     return {
         "version": f"DPS-{effective_local.strftime('%Y%m%d-%H%M')}",
         "status": "READY",
         "evaluated_at": int(evaluated_at_ms),
+        "evaluation_key": evaluation_key,
         **fast_window,
         "fast_7d": _window_metadata(fast_window, resolved.lookback_days),
         "stable_14d": _window_metadata(stable_window, resolved.stable_lookback_days),
-        "config": asdict(resolved),
+        "config": config_snapshot,
         "candidates": candidates,
         "selected_profiles": selected_profiles,
         "selected_count": len(selected_profiles),
@@ -240,6 +287,7 @@ def _candidate_summary(
     fast_window: dict,
     stable_window: dict,
     *,
+    evaluation_key: int,
     same_evaluation_day: bool,
 ) -> dict:
     parts = key.split("|", 4)
@@ -262,6 +310,13 @@ def _candidate_summary(
     joint_failure_runs = 0
     selected = False
     previously_selected = bool(previous and previous.get("_previously_selected"))
+    candidate_same_evaluation = bool(
+        previous
+        and previous.get("evaluation_key", previous.get("lookback_end")) == evaluation_key
+    )
+    same_evaluation_day = same_evaluation_day or candidate_same_evaluation
+    migration_state = str((previous or {}).get("migration_state", ""))
+    migration_evaluation_key = (previous or {}).get("migration_evaluation_key")
     legacy_selected = previously_selected and not any(
         field in previous
         for field in (
@@ -271,13 +326,20 @@ def _candidate_summary(
             "joint_failure_runs",
         )
     )
-    if legacy_selected:
+    same_day_migration = bool(
+        previously_selected
+        and migration_state == "LEGACY_SELECTED_MIGRATED"
+        and migration_evaluation_key == evaluation_key
+    )
+    if legacy_selected or same_day_migration:
         selected = True
         qualification_state = "QUALIFIED"
         state = "RETAINED"
         reason = "旧版已启用画像迁移为双窗口合格状态"
+        migration_state = "LEGACY_SELECTED_MIGRATED"
+        migration_evaluation_key = evaluation_key
     elif previously_selected:
-        if fast["qualified"] or stable["qualified"]:
+        if fast["retention_qualified"] or stable["retention_qualified"]:
             selected = True
             qualification_state = "QUALIFIED"
             state = "RETAINED"
@@ -318,6 +380,9 @@ def _candidate_summary(
         "strategy_tag": parts[2],
         "direction": parts[3],
         "threshold_segment": parts[4],
+        "evaluation_key": evaluation_key,
+        "migration_state": migration_state,
+        "migration_evaluation_key": migration_evaluation_key,
         "fast_7d": fast,
         "stable_14d": stable,
         "sample_size": fast["sample_size"],
@@ -348,13 +413,20 @@ def _window_summary(
     samples = _independent_samples(rows, window["lookback_start"], window["lookback_end"])
     sample_size = len(samples)
     wins = sum(1 for item in samples if item.result == "WIN")
-    pnl = round(sum(float(item.pnl) for item in samples), 4)
-    win_rate = wins / sample_size if sample_size else 0.0
-    ev = round(pnl / sample_size, 4) if sample_size else 0.0
+    raw_pnl = math.fsum(float(item.pnl) for item in samples)
+    raw_win_rate = wins / sample_size if sample_size else 0.0
+    raw_ev = raw_pnl / sample_size if sample_size else 0.0
+    entry_win_rate_qualified = raw_win_rate >= config.min_win_rate
+    entry_ev_qualified = raw_ev >= config.min_ev
     qualified = (
         sample_size >= min_samples
-        and win_rate >= config.min_win_rate
-        and ev >= config.min_ev
+        and entry_win_rate_qualified
+        and entry_ev_qualified
+    )
+    retention_qualified = (
+        sample_size >= min_samples
+        and raw_win_rate >= config.exit_win_rate
+        and raw_ev >= config.exit_ev
     )
     return {
         "lookback_days": lookback_days,
@@ -364,10 +436,13 @@ def _window_summary(
         "min_samples_required": min_samples,
         "wins": wins,
         "losses": sample_size - wins,
-        "win_rate": round(win_rate, 6),
-        "pnl": pnl,
-        "ev": ev,
+        "win_rate": _display_number(raw_win_rate, 6),
+        "pnl": _display_number(raw_pnl, 4),
+        "ev": _display_number(raw_ev, 4),
         "qualified": qualified,
+        "win_rate_qualified": entry_win_rate_qualified,
+        "ev_qualified": entry_ev_qualified,
+        "retention_qualified": retention_qualified,
     }
 
 
@@ -408,7 +483,7 @@ def _entry_failure(
             "INSUFFICIENT_SAMPLES",
             f"独立样本 {fast['sample_size']} < {fast['min_samples_required']}",
         )
-    if fast["win_rate"] < config.min_win_rate:
+    if not fast["win_rate_qualified"]:
         return (
             "LOW_WIN_RATE",
             f"胜率 {fast['win_rate']:.2%} < {config.min_win_rate:.2%}",
@@ -429,6 +504,11 @@ def _non_negative_int(value: object) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _display_number(value: float, digits: int) -> float:
+    displayed = round(value, digits)
+    return 0.0 if displayed == 0 else displayed
 
 
 def _candidate_sort_key(item: dict) -> tuple:

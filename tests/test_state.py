@@ -13,7 +13,11 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app import storage as storage_module
-from app.daily_profile_selector import DailyProfileSelectorConfig
+from app.daily_profile_selector import (
+    DailyProfileSelectorConfig,
+    build_daily_selection,
+    profile_key as daily_profile_key,
+)
 from app.decision_context import DecisionContext
 from app.models import (
     FearGreedContext,
@@ -6375,6 +6379,106 @@ class MonitorStateTest(unittest.TestCase):
 
         self.assertEqual(len(storage.daily_profile_selections), 1)
         self.assertEqual(state.active_daily_profile_selection["version"], "DPS-20260730-0800")
+
+    def test_profile_restore_uses_stable_window_for_startup_and_symbol_reset(self):
+        class ProfileRestoreStorage(RecordingStorage):
+            def __init__(self):
+                super().__init__()
+                self.profile_loads = []
+
+            def load_observations_for_profile(self, symbol, *, lookback_days=7):
+                self.profile_loads.append((symbol, lookback_days))
+                return []
+
+        storage = ProfileRestoreStorage()
+        state = MonitorState(
+            symbol="BTCUSDT",
+            storage=storage,
+            observation_profile_lookback_days=10,
+            daily_profile_selector_config=DailyProfileSelectorConfig(
+                lookback_days=7,
+                stable_lookback_days=18,
+            ),
+        )
+
+        state.reset_symbol("ETHUSDT")
+
+        self.assertEqual(storage.profile_loads, [("BTCUSDT", 18), ("ETHUSDT", 18)])
+        state.close()
+
+    def test_restart_loaded_history_matches_full_history_dual_window_selection(self):
+        cutoff = shanghai_timestamp("2026-07-30T07:50:00")
+        config = DailyProfileSelectorConfig()
+        results = [
+            (["WIN"] * 11 + ["LOSS"] * 9, cutoff - 2 * 86_400_000),
+            (["WIN"] * 13 + ["LOSS"] * 7, cutoff - 10 * 86_400_000),
+        ]
+        rows = []
+        row_index = 0
+        for outcomes, end in results:
+            start = end - len(outcomes) * 20 * 60_000
+            for offset, result in enumerate(outcomes):
+                rows.append(
+                    settled_observation(
+                        row_index,
+                        result,
+                        start + offset * 20 * 60_000,
+                        family="short_observe",
+                        tag="generic_short_observe",
+                        direction="SHORT",
+                        segment="WD-02",
+                    )
+                )
+                row_index += 1
+        key = daily_profile_key(
+            10,
+            "short_observe",
+            "generic_short_observe",
+            "SHORT",
+            "WD-02",
+        )
+        selected = {
+            "key": key,
+            "qualification_state": "QUALIFIED",
+            "selection_state": "RETAINED",
+            "joint_failure_runs": 0,
+            "fast_7d": {},
+            "stable_14d": {},
+        }
+        previous = {
+            "lookback_end": cutoff - 86_400_000,
+            "candidates": [selected],
+            "selected_profiles": [selected],
+        }
+        full = build_daily_selection(
+            rows,
+            cutoff,
+            config=config,
+            previous_snapshot=previous,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            for row in rows:
+                store.save_observation(row, "BTCUSDT")
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                daily_profile_selector_config=config,
+            )
+            restarted = build_daily_selection(
+                state.observations,
+                cutoff,
+                config=config,
+                previous_snapshot=previous,
+            )
+            state.close()
+
+        full_item = next(item for item in full["candidates"] if item["key"] == key)
+        restarted_item = next(item for item in restarted["candidates"] if item["key"] == key)
+        self.assertEqual(restarted_item, full_item)
+        self.assertEqual(restarted_item["selection_state"], "RETAINED")
+        self.assertEqual(restarted_item["stable_14d"]["sample_size"], 40)
 
     def test_daily_profile_selection_re_evaluates_same_day_when_config_changes(self):
         current = shanghai_timestamp("2026-07-30T08:00:00")

@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -86,10 +87,14 @@ def candidate(snapshot: dict, tag: str = "generic_short_observe") -> dict:
 
 
 def prior_selection(cutoff: int, item: dict, *, selected: bool = True) -> dict:
+    previous_window = selection_window(cutoff - 86_400_000)
+    previous_item = {**item, "evaluation_key": previous_window["lookback_end"]}
     return {
-        "effective_from": selection_window(cutoff - 86_400_000)["effective_from"],
-        "candidates": [dict(item)],
-        "selected_profiles": [dict(item)] if selected else [],
+        "evaluation_key": previous_window["lookback_end"],
+        "lookback_end": previous_window["lookback_end"],
+        "effective_from": previous_window["effective_from"],
+        "candidates": [previous_item],
+        "selected_profiles": [dict(previous_item)] if selected else [],
     }
 
 
@@ -99,15 +104,70 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertEqual(defaults.lookback_days, 7)
         self.assertEqual(defaults.stable_lookback_days, 14)
         self.assertEqual(defaults.joint_failures_to_exit, 2)
+        self.assertEqual(defaults.joint_failures_source, "default")
 
-        normalized = DailyProfileSelectorConfig(
-            lookback_days=9,
-            stable_lookback_days=0,
-            joint_failures_to_exit=0,
+        invalid_configs = [
+            DailyProfileSelectorConfig(lookback_days=0),
+            DailyProfileSelectorConfig(stable_lookback_days=0),
+            DailyProfileSelectorConfig(lookback_days=15, stable_lookback_days=14),
+            DailyProfileSelectorConfig(degraded_runs_to_exit=0),
+            DailyProfileSelectorConfig(joint_failures_to_exit=0),
+            DailyProfileSelectorConfig(min_win_rate=-0.01),
+            DailyProfileSelectorConfig(min_win_rate=1.01),
+            DailyProfileSelectorConfig(exit_win_rate=-0.01),
+            DailyProfileSelectorConfig(exit_win_rate=1.01),
+        ]
+        for invalid in invalid_configs:
+            with self.subTest(config=invalid):
+                with self.assertRaises(ValueError):
+                    invalid.normalized()
+
+    def test_new_fields_preserve_all_legacy_positional_arguments(self):
+        config = DailyProfileSelectorConfig(
+            9,
+            21,
+            11,
+            0.61,
+            0.2,
+            0.57,
+            -0.1,
+            5,
+            3,
+            6,
+            45,
+            9,
+            15,
+        )
+
+        self.assertEqual(
+            (
+                config.lookback_days,
+                config.min_samples,
+                config.weekend_min_samples,
+                config.min_win_rate,
+                config.min_ev,
+                config.exit_win_rate,
+                config.exit_ev,
+                config.degraded_runs_to_exit,
+                config.max_active_profiles,
+                config.evaluation_hour,
+                config.evaluation_minute,
+                config.activation_hour,
+                config.activation_minute,
+            ),
+            (9, 21, 11, 0.61, 0.2, 0.57, -0.1, 5, 3, 6, 45, 9, 15),
+        )
+        normalized = config.normalized()
+        self.assertEqual(normalized.stable_lookback_days, 14)
+        self.assertEqual(normalized.joint_failures_to_exit, 5)
+        self.assertEqual(normalized.joint_failures_source, "degraded_runs_to_exit")
+
+        explicit = DailyProfileSelectorConfig(
+            degraded_runs_to_exit=5,
+            joint_failures_to_exit=3,
         ).normalized()
-        self.assertEqual(normalized.lookback_days, 9)
-        self.assertEqual(normalized.stable_lookback_days, 9)
-        self.assertEqual(normalized.joint_failures_to_exit, 1)
+        self.assertEqual(explicit.joint_failures_to_exit, 3)
+        self.assertEqual(explicit.joint_failures_source, "joint_failures_to_exit")
 
     def test_weekend_profiles_use_attainable_sample_floor_in_seven_day_window(self):
         cutoff = timestamp("2026-08-08T07:50:00")
@@ -311,6 +371,46 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertEqual(by_tag["we-short"]["selection_state"], "INSUFFICIENT_SAMPLES")
         self.assertEqual(by_tag["negative-ev"]["selection_state"], "LOW_EV")
 
+    def test_qualification_uses_unrounded_ev_and_normalizes_display_zero(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        rows = [
+            observation("tiny-negative", "WIN", cutoff - 30 * 60_000, tag="tiny-negative", pnl=-0.0000005),
+            observation("zero", "WIN", cutoff - 15 * 60_000, tag="zero", pnl=0.0),
+        ]
+        config = DailyProfileSelectorConfig(
+            min_samples=1,
+            weekend_min_samples=1,
+            min_win_rate=1.0,
+            min_ev=0.0,
+        )
+
+        snapshot = build_daily_selection(rows, cutoff, config=config)
+        tiny_negative = candidate(snapshot, "tiny-negative")
+        zero = candidate(snapshot, "zero")
+
+        self.assertEqual(tiny_negative["selection_state"], "LOW_EV")
+        self.assertEqual(tiny_negative["fast_7d"]["ev"], 0.0)
+        self.assertEqual(str(tiny_negative["fast_7d"]["ev"]), "0.0")
+        self.assertEqual(zero["selection_state"], "SELECTED")
+
+    def test_unrounded_win_ratio_drives_failure_reason(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        rows = result_rows(
+            cutoff,
+            ["WIN", "WIN", "LOSS"],
+            prefix="raw-win-rate",
+            pnl_by_result={"WIN": 0.0, "LOSS": 0.0},
+        )
+        config = DailyProfileSelectorConfig(
+            min_samples=3,
+            min_win_rate=(2 / 3) + 0.0000001,
+            min_ev=0.0,
+        )
+
+        snapshot = build_daily_selection(rows, cutoff, config=config)
+
+        self.assertEqual(candidate(snapshot)["selection_state"], "LOW_WIN_RATE")
+
     def test_5999_percent_win_rate_is_below_entry_boundary(self):
         cutoff = timestamp("2026-07-30T07:50:00")
         rows = result_rows(
@@ -408,6 +508,80 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertEqual(item["qualification_state"], "QUALIFIED")
         self.assertEqual(item["joint_failure_runs"], 0)
 
+    def test_selected_profile_uses_exit_thresholds_for_retention(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        rows = result_rows(
+            cutoff,
+            ["WIN"] * 12 + ["LOSS"] * 8,
+            prefix="boundary",
+            pnl_by_result={"WIN": 0.0, "LOSS": 0.0},
+        )
+        selected = build_daily_selection(rows, cutoff)
+        previous = prior_selection(cutoff, candidate(selected))
+
+        retained = build_daily_selection(
+            rows,
+            cutoff,
+            config=DailyProfileSelectorConfig(exit_win_rate=0.60, exit_ev=0.0),
+            previous_snapshot=previous,
+        )
+        watched = build_daily_selection(
+            rows,
+            cutoff,
+            config=DailyProfileSelectorConfig(exit_win_rate=0.61, exit_ev=0.0),
+            previous_snapshot=previous,
+        )
+
+        self.assertEqual(candidate(retained)["selection_state"], "RETAINED")
+        self.assertEqual(candidate(watched)["selection_state"], "QUALIFICATION_WATCH")
+
+    def test_legacy_degraded_runs_remains_failure_limit_compatibility_source(self):
+        cutoff = timestamp("2026-07-30T07:50:00")
+        rows = result_rows(cutoff, ["LOSS"], prefix="failure")
+        key = profile_key(10, "short_observe", "generic_short_observe", "SHORT", "WD-02")
+        selected_item = {
+            "key": key,
+            "qualification_state": "QUALIFIED",
+            "selection_state": "RETAINED",
+            "joint_failure_runs": 0,
+            "fast_7d": {},
+            "stable_14d": {},
+        }
+        config = DailyProfileSelectorConfig(
+            min_samples=1,
+            min_win_rate=0.0,
+            min_ev=-10.0,
+            exit_win_rate=1.0,
+            exit_ev=0.0,
+            degraded_runs_to_exit=5,
+        )
+        previous = prior_selection(cutoff, selected_item)
+
+        states = []
+        for day in range(5):
+            snapshot = build_daily_selection(
+                rows,
+                cutoff + day * 86_400_000,
+                config=config,
+                previous_snapshot=previous,
+            )
+            item = candidate(snapshot)
+            states.append((item["selection_state"], item["joint_failure_runs"]))
+            previous = snapshot
+
+        self.assertEqual(
+            states,
+            [
+                ("QUALIFICATION_WATCH", 1),
+                ("QUALIFICATION_WATCH", 2),
+                ("QUALIFICATION_WATCH", 3),
+                ("QUALIFICATION_WATCH", 4),
+                ("DEGRADED_EXIT", 5),
+            ],
+        )
+        self.assertEqual(snapshot["config"]["joint_failures_to_exit"], 5)
+        self.assertEqual(snapshot["config"]["joint_failures_source"], "degraded_runs_to_exit")
+
     def test_legacy_selected_profile_migrates_before_counting_first_failure(self):
         cutoff = timestamp("2026-07-30T07:50:00")
         rows = result_rows(cutoff, ["WIN"] * 11 + ["LOSS"] * 9, prefix="failing", pnl_by_result={"WIN": 0.0, "LOSS": 0.0})
@@ -422,6 +596,22 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertEqual(migrated_item["selection_state"], "RETAINED")
         self.assertEqual(migrated_item["qualification_state"], "QUALIFIED")
         self.assertEqual(migrated_item["joint_failure_runs"], 0)
+        self.assertEqual(migrated_item["migration_state"], "LEGACY_SELECTED_MIGRATED")
+        self.assertEqual(migrated_item["migration_evaluation_key"], cutoff)
+
+        serialized = json.loads(json.dumps(migrated, ensure_ascii=False))
+        same_day = build_daily_selection(rows, cutoff, previous_snapshot=serialized)
+        self.assertEqual(same_day, migrated)
+
+        activation_changed = build_daily_selection(
+            rows,
+            cutoff,
+            config=DailyProfileSelectorConfig(activation_hour=9),
+            previous_snapshot=serialized,
+        )
+        self.assertEqual(candidate(activation_changed), migrated_item)
+        self.assertNotEqual(activation_changed["effective_from"], migrated["effective_from"])
+        self.assertEqual(activation_changed["evaluation_key"], migrated["evaluation_key"])
 
         next_day = build_daily_selection(rows, cutoff + 86_400_000, previous_snapshot=migrated)
         next_item = candidate(next_day)
@@ -438,6 +628,11 @@ class DailyProfileSelectorTest(unittest.TestCase):
         self.assertIn("reason", snapshot)
         self.assertIn("fast_7d", snapshot)
         self.assertIn("stable_14d", snapshot)
+        self.assertEqual(snapshot["evaluation_key"], snapshot["lookback_end"])
+        self.assertEqual(snapshot["config"]["effective_joint_failures_to_exit"], 2)
+        self.assertEqual(snapshot["config"]["joint_failures_source"], "default")
+        self.assertEqual(snapshot["config"]["retention_min_win_rate"], 0.60)
+        self.assertEqual(snapshot["config"]["retention_min_ev"], 0.0)
         self.assertEqual(item["sample_size"], item["fast_7d"]["sample_size"])
         self.assertEqual(item["win_rate"], item["fast_7d"]["win_rate"])
         self.assertEqual(item["ev"], item["fast_7d"]["ev"])

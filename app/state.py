@@ -3563,6 +3563,7 @@ class MonitorState:
                 lookback_days=max(
                     self.observation_profile_lookback_days,
                     self.daily_profile_selector_config.lookback_days,
+                    self.daily_profile_selector_config.stable_lookback_days,
                 ),
             )
         return self.storage.load_observations(self.symbol)
