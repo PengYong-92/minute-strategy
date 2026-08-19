@@ -181,6 +181,9 @@ button:disabled {
 }
 
 .analysis-panel {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
   min-height: 150px;
 }
 
@@ -274,8 +277,10 @@ button:disabled {
 }
 
 .table-wrap {
+  width: 100%;
   max-width: 100%;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
 
 .orders-head {
@@ -284,9 +289,13 @@ button:disabled {
 
 .order-filters {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px;
   margin: 10px 0 12px;
+}
+
+.observation-filters {
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
 }
 
 .order-filters label {
@@ -297,6 +306,8 @@ button:disabled {
 }
 
 .order-filters select {
+  min-width: 0;
+  height: 40px;
   width: 100%;
 }
 
@@ -402,8 +413,41 @@ button:disabled {
 
 table {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
   margin-top: 12px;
+}
+
+.orders-panel table {
+  width: 2100px;
+  min-width: 2100px;
+  table-layout: fixed;
+}
+
+.orders-panel th,
+.orders-panel td {
+  width: 104px;
+}
+
+.orders-panel th:nth-child(6),
+.orders-panel td:nth-child(6) {
+  width: 230px;
+}
+
+.orders-panel th[data-column="entry-structure"],
+.orders-panel td[data-column="entry-structure"] {
+  width: 250px;
+  min-width: 250px;
+}
+
+.orders-panel th:last-child,
+.orders-panel td:last-child {
+  width: 380px;
+}
+
+.observation-summary-panel table,
+.observations-panel table {
+  min-width: 1500px;
 }
 
 th,
@@ -422,6 +466,12 @@ td.reason {
   white-space: normal;
   min-width: 360px;
   line-height: 1.45;
+}
+
+td.diagnostic-cell {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 td.reason span {

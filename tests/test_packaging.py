@@ -122,6 +122,137 @@ class PackagingTest(unittest.TestCase):
         self.assertNotIn("price: (state) => fmtPrice(state.latest_price)", app_js)
         self.assertNotIn("function renderSignals", app_js)
 
+    def test_dashboard_has_compact_adaptive_and_structure_diagnostics(self):
+        index_html = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        styles_css = (ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertEqual(index_html.count('id="latest-analysis"'), 1)
+        orders_head = index_html.split('<section class="panel orders-panel">', 1)[1].split("</thead>", 1)[0]
+        self.assertEqual(orders_head.count("</th>"), 18)
+        self.assertIn('data-column="entry-structure"', index_html)
+        self.assertIn('id="obs-window-filter"', index_html)
+        self.assertIn('<option value="14d" selected>14天</option>', index_html)
+        self.assertIn('id="obs-structure-state-filter"', index_html)
+        self.assertIn('id="obs-structure-bias-filter"', index_html)
+        self.assertIn('id="obs-origin-filter"', index_html)
+        self.assertIn('colspan="18"', app_js)
+        self.assertIn("function formatAdaptiveProfile", app_js)
+        self.assertIn("function formatEntryStructure", app_js)
+        self.assertIn("entry_structure_state", app_js)
+        self.assertIn("entry_structure_bias", app_js)
+        self.assertIn("candidate_origin", app_js)
+        self.assertIn("overflow-x: auto", styles_css)
+        self.assertIn(".orders-panel table", styles_css)
+        self.assertIn("min-width: 2100px", styles_css)
+
+    def test_dashboard_formats_and_escapes_dynamic_diagnostics(self):
+        script = """
+const fs = require("fs");
+const elements = new Map();
+global.document = {
+  getElementById(id) {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        addEventListener() {},
+        className: "",
+        disabled: false,
+        innerHTML: "",
+        textContent: "",
+        value: id === "obs-window-filter" ? "14d" : "",
+      });
+    }
+    return elements.get(id);
+  },
+};
+global.fetch = () => new Promise(() => {});
+global.setInterval = () => 0;
+const source = fs.readFileSync(process.argv[1], "utf8");
+eval(source + `\n
+const adaptive = formatAdaptiveProfile({
+  qualification_state: "QUALIFIED",
+  status: "ACTIVE",
+  fast_7d: {sample_size: 24, win_rate: 0.625, ev: 0.8333},
+  stable_14d: {sample_size: 40, win_rate: 0.6, ev: 0.8},
+  n12: {sample_size: 12, wins: 7},
+  n20: {sample_size: 20, ev: 0.4},
+});
+const structure = formatEntryStructure({
+  entry_structure_state: "RESISTANCE_REJECTION",
+  entry_structure_bias: "CONFIRMED",
+  active_level_source: "SWING",
+  candidate_origin: "NATIVE_ACTIONABLE",
+});
+const malicious = '<img src=x onerror="alert(1)">';
+renderOrders([{
+  id: malicious,
+  direction: "LONG",
+  timeframe_minutes: 10,
+  level: "A",
+  threshold_segment: "WD-02",
+  strategy_tag: malicious,
+  strategy_family: "base",
+  threshold: 10,
+  score: 11,
+  calculated_threshold: 10,
+  stake: 10,
+  entry_price: 100,
+  opened_at: 1,
+  exit_price: null,
+  settled_at: null,
+  status: "OPEN",
+  result: "",
+  pnl: 0,
+  reason: malicious,
+  entry_structure_shadow: {
+    entry_structure_state: malicious,
+    entry_structure_bias: "CONFIRMED",
+  },
+}]);
+fillFilter("obs-origin-filter", [malicious], "origin");
+elements.get("obs-structure-state-filter").value = "RESISTANCE_REJECTION";
+elements.get("obs-structure-bias-filter").value = "CONFLICT";
+elements.get("obs-origin-filter").value = "PROFILE_PROMOTED_WAIT";
+process.stdout.write(JSON.stringify({
+  adaptive,
+  structure,
+  missingAdaptive: formatAdaptiveProfile(null),
+  missingStructure: formatEntryStructure({}),
+  orderHtml: elements.get("orders").innerHTML,
+  optionHtml: elements.get("obs-origin-filter").innerHTML,
+  observationQuery: observationQuery(),
+  summaryQuery: observationSummaryQuery(),
+}));`);
+"""
+        result = run(
+            ["node", "-e", script, str(ROOT / "app" / "static" / "app.js")],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload["adaptive"],
+            "QUALIFIED · 7d N24 62.50% EV +0.83U · 14d N40 60.00% EV +0.80U · ACTIVE N12 7/12 N20 EV +0.40U",
+        )
+        self.assertEqual(
+            payload["structure"],
+            "RESISTANCE_REJECTION · CONFIRMED · SWING · NATIVE_ACTIONABLE",
+        )
+        self.assertEqual(payload["missingAdaptive"], "-")
+        self.assertEqual(payload["missingStructure"], "-")
+        self.assertNotIn("<img", payload["orderHtml"])
+        self.assertIn("&lt;img", payload["orderHtml"])
+        self.assertNotIn("<img", payload["optionHtml"])
+        self.assertIn("&quot;alert(1)&quot;", payload["optionHtml"])
+        self.assertIn("entry_structure_state=RESISTANCE_REJECTION", payload["observationQuery"])
+        self.assertIn("entry_structure_bias=CONFLICT", payload["observationQuery"])
+        self.assertIn("candidate_origin=PROFILE_PROMOTED_WAIT", payload["observationQuery"])
+        self.assertEqual(payload["summaryQuery"], "window=14d")
+
     def test_dashboard_formats_two_stage_runtime_states(self):
         script = """
 const fs = require("fs");

@@ -56,6 +56,48 @@ function fmtTime(ms) {
   return new Date(ms).toLocaleString();
 }
 
+function formatAdaptiveProfile(profile) {
+  if (!profile || typeof profile !== "object" || !Object.keys(profile).length) return DASH;
+  const parts = [];
+  const qualification = profile.qualification_state;
+  if (qualification && qualification !== "UNKNOWN") parts.push(String(qualification));
+
+  const formatWindow = (label, window) => {
+    if (!window || typeof window !== "object" || window.sample_size === undefined) return "";
+    return `${label} N${num(window.sample_size)} ${fmtPct(window.win_rate)} EV ${fmtMoney(window.ev)}`;
+  };
+  const fast = formatWindow("7d", profile.fast_7d);
+  const stable = formatWindow("14d", profile.stable_14d);
+  if (fast) parts.push(fast);
+  if (stable) parts.push(stable);
+
+  const status = profile.status || profile.state;
+  if (status && status !== "UNKNOWN") {
+    let immediate = String(status);
+    const n12 = profile.n12;
+    if (n12 && typeof n12 === "object" && n12.sample_size !== undefined) {
+      immediate += ` N12 ${num(n12.wins)}/${num(n12.sample_size)}`;
+    }
+    const n20 = profile.n20;
+    if (n20 && typeof n20 === "object" && n20.sample_size !== undefined) {
+      immediate += ` N20 EV ${fmtMoney(n20.ev)}`;
+    }
+    parts.push(immediate);
+  }
+  return parts.length ? parts.join(" · ") : DASH;
+}
+
+function formatEntryStructure(structure) {
+  if (!structure || typeof structure !== "object" || !Object.keys(structure).length) return DASH;
+  const values = [
+    structure.entry_structure_state || structure.state,
+    structure.entry_structure_bias || structure.bias,
+    structure.active_level_source,
+    structure.candidate_origin,
+  ].filter((value) => value && value !== "UNKNOWN");
+  return values.length ? values.map(String).join(" · ") : DASH;
+}
+
 function fmtFearGreed(fearGreed) {
   if (!fearGreed || fearGreed.value === null || fearGreed.value === undefined) return DASH;
   return `${fearGreed.value} ${fearGreed.classification || ""} · ${fearGreed.trend || "unknown"}`;
@@ -505,6 +547,8 @@ const selectedSignalFields = [
   ["波段批次", (s) => s.wave_batch_id || DASH],
   ["波段守卫", (s) => `${s.wave_guard_status || "UNKNOWN"} · ${s.wave_guard_mode || "NORMAL"}`],
   ["守卫原因", (s) => s.wave_guard_reason || DASH],
+  ["自适应画像", (s) => formatAdaptiveProfile(s.adaptive_profile_state)],
+  ["价格结构", (s) => formatEntryStructure(s.entry_structure_shadow)],
 ];
 
 const signalFields = [
@@ -585,6 +629,9 @@ const observationFilterIds = [
   "obs-tag-filter",
   "obs-segment-filter",
   "obs-result-filter",
+  "obs-structure-state-filter",
+  "obs-structure-bias-filter",
+  "obs-origin-filter",
 ];
 
 function setText(id, value) {
@@ -611,19 +658,20 @@ function renderOrders(orders) {
       <td>${escapeHtml(order.level)}</td>
       <td>${escapeHtml(order.threshold_segment || DASH)}</td>
       <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_status || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span>${order.profile_degradation_probe === true ? '<br><span class="order-probe-label">基础试探</span>' : ""}</td>
-      <td>${fmtPct(order.session_win_rate)} / ${fmtMoney(order.session_ev)}</td>
-      <td>${num(order.threshold).toFixed(1)}<br><span>评分 ${Math.abs(num(order.score)).toFixed(1)} · 原始 ${orderCalculatedThreshold(order).toFixed(1)}</span></td>
-      <td>${fmtMoney(order.stake)}</td>
-      <td>${fmtPrice(order.entry_price)}</td>
-      <td>${fmtTime(order.opened_at)}</td>
-      <td>${fmtPrice(order.exit_price)}</td>
-      <td>${fmtTime(order.settled_at)}</td>
+      <td>${escapeHtml(fmtPct(order.session_win_rate))} / ${escapeHtml(fmtMoney(order.session_ev))}</td>
+      <td>${escapeHtml(num(order.threshold).toFixed(1))}<br><span>评分 ${escapeHtml(Math.abs(num(order.score)).toFixed(1))} · 原始 ${escapeHtml(orderCalculatedThreshold(order).toFixed(1))}</span></td>
+      <td data-column="entry-structure" class="diagnostic-cell">${escapeHtml(formatEntryStructure(order.entry_structure_shadow))}</td>
+      <td>${escapeHtml(fmtMoney(order.stake))}</td>
+      <td>${escapeHtml(fmtPrice(order.entry_price))}</td>
+      <td>${escapeHtml(fmtTime(order.opened_at))}</td>
+      <td>${escapeHtml(fmtPrice(order.exit_price))}</td>
+      <td>${escapeHtml(fmtTime(order.settled_at))}</td>
       <td>${escapeHtml(order.status)}</td>
       <td>${escapeHtml(order.result || DASH)}</td>
-      <td class="${num(order.pnl) >= 0 ? "long" : "short"}">${order.status === "SETTLED" ? fmtMoney(order.pnl) : DASH}</td>
+      <td class="${num(order.pnl) >= 0 ? "long" : "short"}">${escapeHtml(order.status === "SETTLED" ? fmtMoney(order.pnl) : DASH)}</td>
       <td class="reason">${escapeHtml(order.reason)}<br><span>状态 ${escapeHtml(order.regime || "UNKNOWN")}</span></td>
     </tr>
-  `).join("") : `<tr><td colspan="17" class="empty-row">没有符合筛选条件的订单</td></tr>`;
+  `).join("") : `<tr><td colspan="18" class="empty-row">没有符合筛选条件的订单</td></tr>`;
 }
 
 function renderObservations(observations) {
@@ -634,15 +682,15 @@ function renderObservations(observations) {
       <td>${escapeHtml(item.strategy_tag || "unknown")}</td>
       <td>${escapeHtml(item.timeframe_minutes)}分钟</td>
       <td>${escapeHtml(item.threshold_segment || DASH)}</td>
-      <td>${num(item.edge).toFixed(1)}</td>
-      <td>${fmtPrice(item.entry_price)}</td>
-      <td>${fmtTime(item.opened_at)}</td>
-      <td>${fmtPrice(item.exit_price)}</td>
-      <td>${fmtTime(item.settled_at)}</td>
+      <td>${escapeHtml(num(item.edge).toFixed(1))}</td>
+      <td>${escapeHtml(fmtPrice(item.entry_price))}</td>
+      <td>${escapeHtml(fmtTime(item.opened_at))}</td>
+      <td>${escapeHtml(fmtPrice(item.exit_price))}</td>
+      <td>${escapeHtml(fmtTime(item.settled_at))}</td>
       <td>${escapeHtml(item.status)}</td>
       <td>${escapeHtml(item.result || DASH)}</td>
-      <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${item.status === "SETTLED" ? fmtMoney(item.pnl) : DASH}</td>
-      <td class="reason">${escapeHtml(item.reason)}<br><span>${escapeHtml(item.source_decision || "OBSERVE")}</span></td>
+      <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${escapeHtml(item.status === "SETTLED" ? fmtMoney(item.pnl) : DASH)}</td>
+      <td class="reason">${escapeHtml(item.reason)}<br><span>${escapeHtml(item.source_decision || "OBSERVE")}</span><br><span>画像 ${escapeHtml(formatAdaptiveProfile(item.adaptive_profile_state))} · 结构 ${escapeHtml(formatEntryStructure(item.entry_structure_shadow || item))}</span></td>
     </tr>
   `).join("") : `<tr><td colspan="14" class="empty-row">没有符合筛选条件的观察信号</td></tr>`;
 }
@@ -659,13 +707,13 @@ function renderObservationSummary(summary) {
       <td>${escapeHtml(item.threshold_segment || DASH)}</td>
       <td>${escapeHtml(item.signals || 0)} / 未结 ${escapeHtml(item.open || 0)}</td>
       <td>${escapeHtml(item.settled || 0)}</td>
-      <td>${fmtPct(item.win_rate)}</td>
-      <td>${fmtMoney(item.ev)}</td>
-      <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${fmtMoney(item.pnl)}</td>
+      <td>${escapeHtml(fmtPct(item.win_rate))}</td>
+      <td>${escapeHtml(fmtMoney(item.ev))}</td>
+      <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${escapeHtml(fmtMoney(item.pnl))}</td>
       <td class="${observationActionClass(item.action)}">${escapeHtml(observationActionLabel(item.action))}</td>
       <td class="${dailySelectionClass(item.selection_state)}" title="${escapeHtml(item.selection_reason || "")}">${escapeHtml(dailySelectionLabel(item.selection_state))}</td>
       <td>${escapeHtml(item.confidence || DASH)}</td>
-      <td>${fmtTime(item.last_opened_at)}</td>
+      <td>${escapeHtml(fmtTime(item.last_opened_at))}</td>
     </tr>
   `).join("") : `<tr><td colspan="14" class="empty-row">暂无观察画像统计</td></tr>`;
 
@@ -676,8 +724,9 @@ function renderObservationSummary(summary) {
 function renderObservationSummaryInfo(summary) {
   const total = summary && summary.total ? summary.total : {};
   const actionCounts = summary && summary.action_counts ? summary.action_counts : {};
+  const windowLabel = summary && summary.window ? summary.window : ($("obs-window-filter").value || "14d");
   $("observation-summary-info").textContent = (
-    `订单画像缓存 ${profileCacheStatusLabel(lastOrderProfile)} · `
+    `窗口 ${windowLabel} · 订单画像缓存 ${profileCacheStatusLabel(lastOrderProfile)} · `
     + `信号 ${total.signals || 0} · 结算 ${total.settled || 0} · `
     + `胜率 ${fmtPct(total.win_rate)} · EV ${fmtMoney(total.ev)} · `
     + `重点 ${actionCounts.PROMOTE_WATCH || 0} / 风险 ${actionCounts.BLOCK_WATCH || 0}`
@@ -736,9 +785,9 @@ function renderOrderProfile(summary) {
     <tr class="${num(item.ev) < 0 ? "row-loss" : "row-win"}">
       <td>${escapeHtml(riskHintLabel(item.key))}<br><span>${escapeHtml(item.key || DASH)}</span></td>
       <td>${escapeHtml(item.orders || 0)}</td>
-      <td>${fmtPct(item.win_rate)}</td>
-      <td>${fmtMoney(item.ev)}</td>
-      <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${fmtMoney(item.pnl)}</td>
+      <td>${escapeHtml(fmtPct(item.win_rate))}</td>
+      <td>${escapeHtml(fmtMoney(item.ev))}</td>
+      <td class="${num(item.pnl) >= 0 ? "long" : "short"}">${escapeHtml(fmtMoney(item.pnl))}</td>
     </tr>
   `).join("") : `<tr><td colspan="5" class="empty-row">${escapeHtml(emptyMessage)}</td></tr>`;
 
@@ -962,6 +1011,9 @@ function applyObservationFilterOptions(options) {
   fillFilter("obs-tag-filter", options.tag || [], "tag");
   fillFilter("obs-segment-filter", options.segment || [], "segment");
   fillFilter("obs-result-filter", options.result || [], "result");
+  fillFilter("obs-structure-state-filter", options.entry_structure_state || [], "entry_structure_state");
+  fillFilter("obs-structure-bias-filter", options.entry_structure_bias || [], "entry_structure_bias");
+  fillFilter("obs-origin-filter", options.candidate_origin || options.origin || [], "candidate_origin");
 }
 
 function orderQuery() {
@@ -987,12 +1039,19 @@ function observationQuery() {
     "obs-tag-filter": "tag",
     "obs-segment-filter": "segment",
     "obs-result-filter": "result",
+    "obs-structure-state-filter": "entry_structure_state",
+    "obs-structure-bias-filter": "entry_structure_bias",
+    "obs-origin-filter": "candidate_origin",
   };
   for (const id of observationFilterIds) {
     const value = $(id).value;
     if (value) params.set(names[id], value);
   }
   return params.toString();
+}
+
+function observationSummaryQuery() {
+  return new URLSearchParams({ window: $("obs-window-filter").value || "14d" }).toString();
 }
 
 async function loadOrders() {
@@ -1022,7 +1081,7 @@ async function loadObservations() {
 }
 
 async function loadObservationSummary() {
-  const response = await fetch("/api/observation-summary");
+  const response = await fetch(`/api/observation-summary?${observationSummaryQuery()}`);
   const summary = await response.json();
   renderObservationSummary(summary);
 }
@@ -1123,6 +1182,8 @@ for (const id of [...observationFilterIds, "obs-page-size-filter"]) {
     await loadObservations();
   });
 }
+
+$("obs-window-filter").addEventListener("change", loadObservationSummary);
 
 $("prev-page").addEventListener("click", async () => {
   ordersPage = Math.max(1, ordersPage - 1);
