@@ -562,6 +562,10 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertIn("adaptive_jump_cache_entries", large)
         self.assertIn("adaptive_jump_cache_entry_bound", large)
         self.assertIn("adaptive_retained_index_events", large)
+        self.assertIn("adaptive_dynamic_claim_heap_entries", large)
+        self.assertIn("adaptive_dynamic_claim_heap_entry_bound", large)
+        self.assertIn("adaptive_dynamic_claim_heap_compactions", large)
+        self.assertIn("adaptive_dynamic_claim_heap_compaction_input_rows", large)
         self.assertLessEqual(
             large["adaptive_jump_cache_entries"],
             large["adaptive_jump_cache_entry_bound"],
@@ -1091,6 +1095,87 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertLessEqual(
             large["global_identity_claim_index_entries"],
             large["max_global_window_events"] * 2,
+        )
+
+    def test_adaptive_descending_opened_pair_claim_heaps_are_geometrically_bounded(self):
+        lookback_ms = 100 * 60_000
+
+        def workload_for(count):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    "descending-opened-shared-pair",
+                    "WIN" if index % 3 else "LOSS",
+                    start - index * 60_000,
+                    settled_at=start + (index + 20) * 60_000,
+                )
+                for index in range(count)
+            ]
+            key = replay_module._observation_profile_key(rows[0])
+            tracker = AdaptiveProfileWindowReplay(key, lookback_ms=lookback_ms)
+            checkpoints = {99, 100, count // 2, count - 1}
+            for index, row in enumerate(rows):
+                evaluated_at = int(row.settled_at) + 1
+                actual = tracker.advance(row, evaluated_at)
+                actual_heap_entries = sum(
+                    len(heap) for heap in tracker._pair_claim_heaps.values()
+                )
+                self.assertEqual(
+                    tracker.workload["dynamic_claim_heap_entries"],
+                    actual_heap_entries,
+                )
+                self.assertLessEqual(
+                    actual_heap_entries,
+                    tracker.workload["dynamic_claim_heap_entry_bound"],
+                    f"heap bound exceeded at event {index}",
+                )
+                if index not in checkpoints:
+                    continue
+                window = [
+                    event
+                    for event in rows[: index + 1]
+                    if evaluated_at - lookback_ms
+                    <= int(event.settled_at)
+                    < evaluated_at
+                ]
+                expected = rebuild_adaptive_profile_states(window, evaluated_at)[key]
+                with self.subTest(count=count, index=index):
+                    self.assertEqual(actual, expected)
+            return dict(tracker.workload)
+
+        small = workload_for(2_000)
+        large = workload_for(4_000)
+
+        for count, workload in ((2_000, small), (4_000, large)):
+            with self.subTest(count=count):
+                self.assertEqual(workload["max_window_events"], 100)
+                self.assertLessEqual(
+                    workload["dynamic_claim_heap_entries"],
+                    workload["dynamic_claim_heap_entry_bound"],
+                )
+                self.assertLessEqual(
+                    workload["dynamic_claim_heap_entry_bound"],
+                    workload["max_window_events"] * 2,
+                )
+                self.assertGreater(
+                    workload["dynamic_claim_heap_compactions"],
+                    0,
+                )
+                self.assertLessEqual(
+                    workload["dynamic_claim_heap_compaction_input_rows"],
+                    count * 2,
+                )
+                self.assertGreaterEqual(
+                    workload["dynamic_work_units"],
+                    workload["dynamic_claim_heap_compaction_input_rows"],
+                )
+        self.assertLessEqual(
+            large["dynamic_claim_heap_compaction_input_rows"],
+            small["dynamic_claim_heap_compaction_input_rows"] * 2.5,
+        )
+        self.assertLessEqual(
+            large["window_rebuild_input_rows"],
+            small["window_rebuild_input_rows"] * 2.2,
         )
 
     def test_adaptive_single_opened_inversion_recovers_without_window_rebuilds(self):
@@ -1678,7 +1763,7 @@ class DailyProfileReplayTest(unittest.TestCase):
                 "WIN" if index % 3 else "LOSS",
                 start + index * 11 * 60_000,
             )
-            for index in range(40)
+            for index in range(100)
         ]
 
         report = self.replay(rows)

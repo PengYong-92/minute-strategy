@@ -16,6 +16,7 @@ from app.models import ObservationSignal
 ADAPTIVE_PROFILE_STATE_VERSION = "ADAPTIVE_PROFILE_STATE_V1"
 _PROFILE_SEGMENT = re.compile(r"(?:WD|WE)-(?:0[0-9]|1[0-9]|2[0-3])\Z")
 _KNOWN_STATES = {"WARMUP", "ACTIVE", "WATCH", "PAUSED"}
+_DYNAMIC_CLAIM_HEAP_BOUND_FACTOR = 2
 
 
 @dataclass(frozen=True)
@@ -544,6 +545,9 @@ class AdaptiveProfileWindowReplay:
         self._pair_claim_heaps: dict[tuple[str, str], list[tuple[tuple, int]]] = {}
         self._pair_owner_tokens: dict[tuple[str, str], tuple[int, int]] = {}
         self._anonymous_tokens: dict[int, int] = {}
+        self._active_pair_claims = 0
+        self._dynamic_claim_heap_entries = 0
+        self._dynamic_claim_heap_work_units = 0
         self._dynamic_selection: _SlidingIntervalSelection | None = None
         self._retired_dynamic_work_units = 0
         self._bindings = _IdentityBindings()
@@ -566,6 +570,10 @@ class AdaptiveProfileWindowReplay:
             "jump_cache_entries": 0,
             "successor_cache_entries": 0,
             "dynamic_work_units": 0,
+            "dynamic_claim_heap_entries": 0,
+            "dynamic_claim_heap_entry_bound": 0,
+            "dynamic_claim_heap_compactions": 0,
+            "dynamic_claim_heap_compaction_input_rows": 0,
         }
 
     def advance(
@@ -799,6 +807,9 @@ class AdaptiveProfileWindowReplay:
             return
         heap = self._pair_claim_heaps.setdefault(pair, [])
         heapq.heappush(heap, (_opened_sort_key(event), serial))
+        self._active_pair_claims += 1
+        self._dynamic_claim_heap_entries += 1
+        self._dynamic_claim_heap_work_units += 1
         self._sync_pair_owner(pair)
 
     def _remove_dynamic_claim(self, serial: int, event: ObservationSignal) -> None:
@@ -810,7 +821,9 @@ class AdaptiveProfileWindowReplay:
             self._active_window_serials.remove(serial)
             return
         self._active_window_serials.remove(serial)
+        self._active_pair_claims -= 1
         self._sync_pair_owner(pair)
+        self._compact_dynamic_claim_heaps_if_needed()
 
     def _sync_pair_owner(self, pair: tuple[str, str]) -> None:
         if self._dynamic_selection is None:
@@ -818,6 +831,8 @@ class AdaptiveProfileWindowReplay:
         heap = self._pair_claim_heaps[pair]
         while heap and heap[0][1] not in self._active_window_serials:
             heapq.heappop(heap)
+            self._dynamic_claim_heap_entries -= 1
+            self._dynamic_claim_heap_work_units += 1
         new_owner = heap[0][1] if heap else None
         current = self._pair_owner_tokens.get(pair)
         if current is not None and current[0] == new_owner:
@@ -831,6 +846,30 @@ class AdaptiveProfileWindowReplay:
         token = self._dynamic_selection.activate(self._events_by_serial[new_owner])
         self._pair_owner_tokens[pair] = (new_owner, token)
 
+    def _compact_dynamic_claim_heaps_if_needed(self) -> None:
+        bound = self._active_pair_claims * _DYNAMIC_CLAIM_HEAP_BOUND_FACTOR
+        if self._dynamic_claim_heap_entries <= bound:
+            return
+        rebuilt: dict[tuple[str, str], list[tuple[tuple, int]]] = {}
+        input_rows = 0
+        for serial, event in zip(self._event_serials, self._events):
+            pair = self._identity_pair(event)
+            if not pair[0] and not pair[1]:
+                continue
+            rebuilt.setdefault(pair, []).append(
+                (_opened_sort_key(event), serial)
+            )
+            input_rows += 1
+        if input_rows != self._active_pair_claims:
+            raise RuntimeError("adaptive dynamic claim index is inconsistent")
+        for heap in rebuilt.values():
+            heapq.heapify(heap)
+        self._pair_claim_heaps = rebuilt
+        self._dynamic_claim_heap_entries = input_rows
+        self._dynamic_claim_heap_work_units += input_rows
+        self.workload["dynamic_claim_heap_compactions"] += 1
+        self.workload["dynamic_claim_heap_compaction_input_rows"] += input_rows
+
     def _has_dynamic_hazard(self) -> bool:
         return bool(
             self._duplicate_identities
@@ -843,6 +882,8 @@ class AdaptiveProfileWindowReplay:
         self._pair_claim_heaps = {}
         self._pair_owner_tokens = {}
         self._anonymous_tokens = {}
+        self._active_pair_claims = 0
+        self._dynamic_claim_heap_entries = 0
         for serial, event in zip(self._event_serials, self._events):
             self._add_dynamic_claim(serial, event)
 
@@ -853,6 +894,8 @@ class AdaptiveProfileWindowReplay:
         self._pair_claim_heaps = {}
         self._pair_owner_tokens = {}
         self._anonymous_tokens = {}
+        self._active_pair_claims = 0
+        self._dynamic_claim_heap_entries = 0
 
     def _dynamic_window_state(self, evaluated_at: int) -> dict | None:
         if self._dynamic_selection is None:
@@ -947,7 +990,15 @@ class AdaptiveProfileWindowReplay:
             else 0
         )
         self.workload["dynamic_work_units"] = (
-            self._retired_dynamic_work_units + active_dynamic_work
+            self._retired_dynamic_work_units
+            + active_dynamic_work
+            + self._dynamic_claim_heap_work_units
+        )
+        self.workload["dynamic_claim_heap_entries"] = (
+            self._dynamic_claim_heap_entries
+        )
+        self.workload["dynamic_claim_heap_entry_bound"] = (
+            self._active_pair_claims * _DYNAMIC_CLAIM_HEAP_BOUND_FACTOR
         )
 
     def _rebuild_window(self, evaluated_at: int) -> None:
@@ -999,6 +1050,8 @@ class AdaptiveGlobalProfileWindowReplay:
         "algorithm_work_units",
         "bounded_work_units",
         "dynamic_work_units",
+        "dynamic_claim_heap_compactions",
+        "dynamic_claim_heap_compaction_input_rows",
     )
 
     def __init__(
@@ -1134,6 +1187,14 @@ class AdaptiveGlobalProfileWindowReplay:
         totals["jump_cache_entry_bound"] = sum(
             int(tracker.workload["retained_index_events"])
             * (int(tracker.workload["retained_index_events"]).bit_length() + 1)
+            for tracker in self._trackers.values()
+        )
+        totals["dynamic_claim_heap_entries"] = sum(
+            int(tracker.workload["dynamic_claim_heap_entries"])
+            for tracker in self._trackers.values()
+        )
+        totals["dynamic_claim_heap_entry_bound"] = sum(
+            int(tracker.workload["dynamic_claim_heap_entry_bound"])
             for tracker in self._trackers.values()
         )
         totals["global_identity_claim_index_entries"] = sum(
