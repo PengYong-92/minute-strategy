@@ -1077,6 +1077,7 @@ class AdaptiveGlobalProfileWindowReplay:
         self._observation_bindings: dict[str, _IdentityOwner] = {}
         self._decision_bindings: dict[str, _IdentityOwner] = {}
         self._trackers: dict[str, AdaptiveProfileWindowReplay] = {}
+        self._accepted_profile_counts: dict[str, int] = {}
         self._retired_profile_workload = {
             key: 0 for key in self._PROFILE_WORKLOAD_KEYS
         }
@@ -1111,14 +1112,16 @@ class AdaptiveGlobalProfileWindowReplay:
         if int(prepared_event.settled_at) < window_start:
             raise ValueError("event is outside the adaptive lookback window")
 
-        if self._expire_before(window_start):
-            self._rebuild_active_window()
+        if self._expire_before(window_start, cutoff):
+            self._rebuild_active_window(cutoff)
         serial = self._next_serial
         self._next_serial += 1
         accepted = self._accept(key, prepared_event, serial)
         entry = _GlobalWindowEntry(serial, key, prepared_event, accepted)
         self._events.append(entry)
         self._entries_by_serial[serial] = entry
+        if accepted:
+            self._increment_accepted_profile(key)
         self._register_claim(
             prepared_event.observation_key,
             (prepared_event.decision_id, key),
@@ -1197,14 +1200,22 @@ class AdaptiveGlobalProfileWindowReplay:
             int(tracker.workload["dynamic_claim_heap_entry_bound"])
             for tracker in self._trackers.values()
         )
+        totals["active_profile_trackers"] = len(self._trackers)
+        totals["retained_profile_tracker_events"] = sum(
+            len(tracker._events) for tracker in self._trackers.values()
+        )
+        totals["retained_profile_tracker_event_bound"] = sum(
+            self._accepted_profile_counts.values()
+        )
         totals["global_identity_claim_index_entries"] = sum(
             len(claims) for claims in self._observation_claims.values()
         ) + sum(len(claims) for claims in self._decision_claims.values())
         return totals
 
-    def _expire_before(self, window_start: int) -> bool:
+    def _expire_before(self, window_start: int, cutoff: int) -> bool:
         released_observations: dict[str, tuple[str, str]] = {}
         released_decisions: dict[str, tuple[str, str]] = {}
+        affected_profiles: set[str] = set()
         while self._events and int(self._events[0].event.settled_at) < window_start:
             entry = self._events.popleft()
             event = entry.event
@@ -1225,6 +1236,8 @@ class AdaptiveGlobalProfileWindowReplay:
             )
             if not entry.accepted:
                 continue
+            self._decrement_accepted_profile(entry.profile_key)
+            affected_profiles.add(entry.profile_key)
             released = self._release_binding(
                 event.observation_key,
                 entry.serial,
@@ -1257,7 +1270,33 @@ class AdaptiveGlobalProfileWindowReplay:
         self.workload["global_identity_fast_transfers"] += (
             len(observation_transfers) + len(decision_transfers)
         )
+        self._sync_affected_trackers(affected_profiles, cutoff)
         return False
+
+    def _increment_accepted_profile(self, profile_key: str) -> None:
+        self._accepted_profile_counts[profile_key] = (
+            self._accepted_profile_counts.get(profile_key, 0) + 1
+        )
+
+    def _decrement_accepted_profile(self, profile_key: str) -> None:
+        count = self._accepted_profile_counts[profile_key]
+        if count == 1:
+            del self._accepted_profile_counts[profile_key]
+        else:
+            self._accepted_profile_counts[profile_key] = count - 1
+
+    def _sync_affected_trackers(
+        self,
+        profile_keys: set[str],
+        cutoff: int,
+    ) -> None:
+        for profile_key in sorted(profile_keys):
+            tracker = self._trackers.get(profile_key)
+            if tracker is None:
+                raise RuntimeError("accepted adaptive profile has no tracker")
+            tracker.state_at(cutoff)
+            if profile_key not in self._accepted_profile_counts:
+                self._retire_tracker(profile_key)
 
     def _accept(self, key: str, event: ObservationSignal, serial: int) -> bool:
         observation_binding = (event.decision_id, key)
@@ -1387,12 +1426,13 @@ class AdaptiveGlobalProfileWindowReplay:
             transfers[identity] = _IdentityOwner(binding, first.serial)
         return transfers
 
-    def _rebuild_active_window(self) -> None:
+    def _rebuild_active_window(self, cutoff: int) -> None:
         self.workload["global_identity_rebuilds"] += 1
         self.workload["global_identity_rebuild_input_rows"] += len(self._events)
         self._observation_bindings = {}
         self._decision_bindings = {}
         self._retire_trackers()
+        self._accepted_profile_counts = {}
         for entry in self._events:
             entry.accepted = self._accept(
                 entry.profile_key,
@@ -1401,6 +1441,7 @@ class AdaptiveGlobalProfileWindowReplay:
             )
             if not entry.accepted:
                 continue
+            self._increment_accepted_profile(entry.profile_key)
             tracker = self._trackers.get(entry.profile_key)
             if tracker is None:
                 tracker = AdaptiveProfileWindowReplay(
@@ -1410,13 +1451,18 @@ class AdaptiveGlobalProfileWindowReplay:
                 )
                 self._trackers[entry.profile_key] = tracker
             tracker.advance(entry.event, int(entry.event.settled_at) + 1)
+        for tracker in self._trackers.values():
+            tracker.state_at(cutoff)
         self._record_profile_window_maximum()
 
     def _retire_trackers(self) -> None:
-        for tracker in self._trackers.values():
-            for key in self._PROFILE_WORKLOAD_KEYS:
-                self._retired_profile_workload[key] += int(tracker.workload[key])
-        self._trackers = {}
+        for profile_key in list(self._trackers):
+            self._retire_tracker(profile_key)
+
+    def _retire_tracker(self, profile_key: str) -> None:
+        tracker = self._trackers.pop(profile_key)
+        for key in self._PROFILE_WORKLOAD_KEYS:
+            self._retired_profile_workload[key] += int(tracker.workload[key])
 
     def _record_profile_window_maximum(self) -> None:
         current_maximum = max(

@@ -894,6 +894,15 @@ def _build_adaptive_event_rows(
         workload["adaptive_dynamic_claim_heap_compaction_input_rows"] = (
             tracker_workload["dynamic_claim_heap_compaction_input_rows"]
         )
+        workload["adaptive_active_profile_trackers"] = tracker_workload[
+            "active_profile_trackers"
+        ]
+        workload["adaptive_retained_profile_tracker_events"] = tracker_workload[
+            "retained_profile_tracker_events"
+        ]
+        workload["adaptive_retained_profile_tracker_event_bound"] = (
+            tracker_workload["retained_profile_tracker_event_bound"]
+        )
     return rows
 
 

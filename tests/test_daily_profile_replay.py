@@ -4,6 +4,7 @@ import random
 import sqlite3
 import tempfile
 import unittest
+from collections import Counter
 from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime
@@ -566,6 +567,9 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertIn("adaptive_dynamic_claim_heap_entry_bound", large)
         self.assertIn("adaptive_dynamic_claim_heap_compactions", large)
         self.assertIn("adaptive_dynamic_claim_heap_compaction_input_rows", large)
+        self.assertIn("adaptive_active_profile_trackers", large)
+        self.assertIn("adaptive_retained_profile_tracker_events", large)
+        self.assertIn("adaptive_retained_profile_tracker_event_bound", large)
         self.assertLessEqual(
             large["adaptive_jump_cache_entries"],
             large["adaptive_jump_cache_entry_bound"],
@@ -913,6 +917,92 @@ class DailyProfileReplayTest(unittest.TestCase):
             actual = tracker.advance(row, evaluated_at)
             with self.subTest(index=index):
                 self.assertEqual(actual, expected)
+                self.assertEqual(
+                    tracker._accepted_profile_counts,
+                    Counter(
+                        entry.profile_key
+                        for entry in tracker._events
+                        if entry.accepted
+                    ),
+                )
+        self.assertGreater(
+            tracker.workload_report()["global_identity_rebuilds"],
+            0,
+        )
+
+    def test_adaptive_global_retires_one_time_profile_trackers_with_window(self):
+        lookback_ms = 100 * 60_000
+
+        def workload_for(count):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    f"one-time-profile-{index:04d}",
+                    "WIN" if index % 3 else "LOSS",
+                    start + index * 60_000,
+                    tag=f"one_time_short_observe_{index:04d}",
+                )
+                for index in range(count)
+            ]
+            tracker = AdaptiveGlobalProfileWindowReplay(
+                lookback_ms=lookback_ms,
+            )
+            checkpoints = {99, 100, count // 2, count - 1}
+            for index, row in enumerate(rows):
+                evaluated_at = int(row.settled_at) + 1
+                actual = tracker.advance(row, evaluated_at)
+                active_limit = min(index + 1, 100)
+                retained_events = sum(
+                    len(profile_tracker._events)
+                    for profile_tracker in tracker._trackers.values()
+                )
+                self.assertLessEqual(len(tracker._trackers), active_limit)
+                self.assertLessEqual(retained_events, active_limit)
+                if index not in checkpoints:
+                    continue
+                window = [
+                    event
+                    for event in rows[: index + 1]
+                    if evaluated_at - lookback_ms
+                    <= int(event.settled_at)
+                    < evaluated_at
+                ]
+                key = replay_module._observation_profile_key(row)
+                expected = rebuild_adaptive_profile_states(window, evaluated_at)[key]
+                with self.subTest(count=count, index=index):
+                    self.assertEqual(actual, expected)
+            workload = tracker.workload_report()
+            workload["actual_tracker_count"] = len(tracker._trackers)
+            workload["actual_tracker_events"] = sum(
+                len(profile_tracker._events)
+                for profile_tracker in tracker._trackers.values()
+            )
+            return workload
+
+        small = workload_for(2_000)
+        large = workload_for(4_000)
+
+        for workload in (small, large):
+            self.assertEqual(workload["active_profile_trackers"], 100)
+            self.assertEqual(workload["actual_tracker_count"], 100)
+            self.assertEqual(workload["retained_profile_tracker_events"], 100)
+            self.assertEqual(workload["actual_tracker_events"], 100)
+            self.assertLessEqual(
+                workload["retained_profile_tracker_events"],
+                workload["retained_profile_tracker_event_bound"],
+            )
+            self.assertLessEqual(
+                workload["retained_profile_tracker_event_bound"],
+                workload["max_global_window_events"],
+            )
+        self.assertEqual(
+            large["active_profile_trackers"],
+            small["active_profile_trackers"],
+        )
+        self.assertEqual(
+            large["retained_profile_tracker_events"],
+            small["retained_profile_tracker_events"],
+        )
 
     def test_adaptive_global_random_multi_profile_windows_match_full_rebuild(self):
         rng = random.Random(20260820)
@@ -976,6 +1066,14 @@ class DailyProfileReplayTest(unittest.TestCase):
             actual = tracker.advance(row, evaluated_at)
             with self.subTest(index=index):
                 self.assertEqual(actual, expected)
+                self.assertEqual(
+                    tracker._accepted_profile_counts,
+                    Counter(
+                        entry.profile_key
+                        for entry in tracker._events
+                        if entry.accepted
+                    ),
+                )
 
     def test_adaptive_global_window_skips_rebuild_when_all_claims_expire_together(self):
         start = timestamp("2026-01-01T00:00:00")
@@ -1084,6 +1182,14 @@ class DailyProfileReplayTest(unittest.TestCase):
             )
             for row in rows:
                 tracker.advance(row, int(row.settled_at) + 1)
+            self.assertEqual(
+                tracker._accepted_profile_counts,
+                Counter(
+                    entry.profile_key
+                    for entry in tracker._events
+                    if entry.accepted
+                ),
+            )
             return tracker.workload_report()
 
         small = workload_for(2_000)
