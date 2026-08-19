@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本文汇总 `minute-strategy` 截至2026-08-15的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
+本文汇总 `minute-strategy` 截至2026-08-19的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
 
 `docs/release-handoff.md` 是项目唯一的发布交接文档。后续发布只更新或追加本文，不再创建带日期、提交号或版本号的交接文档副本。
 
@@ -12,14 +12,14 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `721388ac2ece2a9e3d87015646807d5aaf25a637`（WebSocket低延迟行情、08:00今日统计、12:00-18:00影子时段守卫） |
-| 固化标签 | `v2026.08.15-time-period-shadow-guard` |
-| 当前生产提交 | `721388ac2ece2a9e3d87015646807d5aaf25a637` |
-| 当前生产事实 | 第39节 |
-| 本地未部署功能 | 无；第37节仅为待优化设计，未实现 |
-| 下一开发计划 | 第34节10分钟入场价格结构确认、第37节08:00交易日内按方向动态调节；均未实施 |
+| 当前功能基线 | `6474dd81b005ca8c1d011a739bca71335f26b1e6`（方向脉冲影子与结算即更新） |
+| 固化标签 | `v2026.08.16-direction-pulse-shadow` |
+| 当前生产提交 | `6474dd81b005ca8c1d011a739bca71335f26b1e6` |
+| 当前生产事实 | 第41节 |
+| 本地未部署功能 | `feature/adaptive-resident-profiles` 的自适应常驻画像、价格结构影子、V2审计/容量治理及严格因果发布门槛，见第42节 |
+| 下一开发检查点 | 使用复制的SQLite完成第42节回放；硬门槛全部通过前不得发布 |
 
-第2至38节是历史发布、本地开发或较早分析快照；如与第39节冲突，以第39节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 和 `feature/websocket-low-latency` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
+第2至41节是历史发布、本地开发或生产事实快照；生产现状以第41节为准。第42节只记录当前功能分支的本地实现和发布前门槛，不代表生产已经切换。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 和 `feature/websocket-low-latency` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
 
 ## 2. 发布身份
 
@@ -2075,3 +2075,91 @@ python3 -m pip install -r requirements.txt
 6. 预热为`READY`、154080根，`last_error=null`。页面和`/api/state.direction_pulse_shadow`均已上线；恢复结果为LONG N12/N16均50.00%，SHORT N12 58.33%，SHORT N16 43.75%/`WATCH`，但真实订单口径未被收紧。
 7. 合并后的完整测试为523项通过；Python编译、`node --check app/static/app.js`、`bash -n scripts/run.sh`及`git diff --check`通过。生产发布目录也通过Python编译和模块导入检查。
 8. 生产事件证据已确认结算即更新：服务启动快照`evaluated_at=1786861974285`；下一笔LONG独立观察于2026-08-16 14:34:59 CST结算后，`evaluated_at`和LONG `last_settled_at`均立即推进到`1786862099999`，未等待下一4小时边界，`last_error`仍为空。该证据作为标签后的文档提交，不移动发布标签。
+
+## 42. 2026-08-19自适应常驻画像严格因果回放（本地未部署）
+
+### 42.1 分支、版本与实现状态
+
+| 项目 | 当前值 |
+|---|---|
+| 开发分支 | `feature/adaptive-resident-profiles` |
+| Task 17起点 | `bcc33c246eb684d700812eb7cf9e8b816e93e2b7` |
+| 决策上下文 | `DECISION_CONTEXT_V2` |
+| 信号审计 | `SIGNAL_AUDIT_V2` |
+| 每日资格 | `DAILY_PROFILE_QUALIFICATION_V2` |
+| 即时画像 | `ADAPTIVE_PROFILE_STATE_V1`，N12/N20逐笔结算更新 |
+| 价格结构 | `ENTRY_STRUCTURE_SHADOW_V1`，保持`SHADOW_ONLY` |
+| 金额叠加 | `TWO_STAGE_V1` |
+| 当前状态 | 本地实现完成，**未部署**、未合并`main`、未推送、未打标签、未清空订单 |
+
+`scripts/replay_daily_profile_selector.py`现在拒绝任何缺少生产执行参数的运行，不再沿用旧`max_open_orders=5`。全局并发、LONG/SHORT方向并发、同方向冷却/最小开单间隔、基础`stake`、`win_return`、金额叠加开关、级数、并行第二级上限、第二级金额及仅基础金额时段均必须显式提供。
+
+回放按`settled_at -> opened_at -> observation_key`生成结算事件时间线。每个候选只读取其开单时点已经结算的事件；每日07:50快照严格排除`settled_at >= 07:50`的数据。baseline、structure-shadow和adaptive candidate使用相同生产配置独立执行；结构 equality 报告真实逐笔比较订单ID、方向、开结算/到期时间、stake、progression字段和Webhook计数，不使用固定相等结论。
+
+### 42.2 迁移与容量行为
+
+本分支的SQLite变更保持增量兼容：V2表、索引和列通过事务迁移增加，迁移失败整体回滚；旧订单、旧观察和旧审计继续可读，不重写、不删除、不执行固定TTL清理。Task 17回放本身只读取指定SQLite并写JSON报告，不修改数据库，不生成生产订单，不发送真实Webhook。正式复核必须先复制源SQLite，再对副本运行回放。
+
+单文件容量门槛保持：
+
+| 状态 | 文件大小 | 行为 |
+|---|---:|---|
+| `NORMAL` | `< 2.5GiB` | 正常写入V2核心数据和紧凑审计 |
+| `WARNING` | `>= 2.5GiB` | API和页面持续告警 |
+| `COMPACT_ONLY` | `>= 2.75GiB` | 停止普通WAIT可选审计，保留订单、观察、状态变化和决定性阻止 |
+| `HARD_LIMIT` | `>= 3GiB`（`3221225472`字节） | 禁止继续分配SQLite页面；核心持久化失败时暂停新开单 |
+
+3GiB上限内至少为核心表保留256MiB。容量降级不得删除历史订单或观察，也不得创建无法持久化的订单。
+
+### 42.3 可复现回放命令
+
+以下命令以复制到`/private/tmp`的SQLite为输入，参数对应当前生产总并发2、LONG 1、SHORT 2、同方向间隔2分钟和10U/18U两阶段金额：
+
+```bash
+python3 scripts/replay_daily_profile_selector.py \
+  --db-path /private/tmp/monitor-replay.sqlite3 \
+  --symbol BTCUSDT \
+  --lookback-days 7 \
+  --stable-lookback-days 14 \
+  --min-samples 20 \
+  --min-win-rate 0.60 \
+  --min-ev 0 \
+  --degraded-runs-to-exit 2 \
+  --joint-failures-to-exit 2 \
+  --max-open-orders 2 \
+  --max-open-long-orders 1 \
+  --max-open-short-orders 2 \
+  --min-order-gap-minutes 2 \
+  --stake 10 \
+  --win-return 18 \
+  --stake-progression \
+  --stake-progression-max-orders 2 \
+  --stake-progression-max-active 1 \
+  --stake-progression-second-stake 18 \
+  --stake-progression-base-only-segments "" \
+  --output /private/tmp/adaptive-profile-release-gates.json
+```
+
+不得直接对生产SQLite做试验性写入。命令缺少任一显式并发、冷却、金额或progression参数时必须由CLI返回错误，不得猜测生产值。
+
+### 42.4 发布验收门槛
+
+| 门槛 | 最低要求 |
+|---|---:|
+| 样本外总胜率 | `>= 60%` |
+| LONG样本外胜率 | `>= 55.56%` |
+| SHORT样本外胜率 | `>= 55.56%` |
+| 总订单保留率 | `>= 80%` |
+| LONG订单保留率 | `>= 70%` |
+| SHORT订单保留率 | `>= 70%` |
+| 10U基础首单保留率 | `>= 85%` |
+| 总EV、LONG EV、SHORT EV | 各自`>= 0` |
+| 三个按时间顺序的OOS窗口 | 至少2个窗口EV为正 |
+| 最大回撤 | 不得高于baseline |
+| 最长连亏 | 不得长于baseline |
+
+所有硬门槛通过的配置才进入排序，顺序固定为总胜率降序、订单数降序、最大回撤升序。报告同时输出baseline和candidate的总计、LONG/SHORT、胜率、EV、PnL、最大回撤、最长连亏、每日最佳/最差、每类guard rejection、基础首单和三个OOS窗口。任一门槛失败时`acceptance.passed=false`，本分支继续保持**未部署**。
+
+### 42.5 本地验证
+
+Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。当前定向结果为`python3 -m unittest tests.test_daily_profile_replay -v`共11项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0并列出全部必填生产执行参数。生产SQLite的复制回放与完整测试属于后续发布检查点，未完成前不改变本节的**未部署**结论。
