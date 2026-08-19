@@ -2,11 +2,13 @@
 import argparse
 import json
 import math
+import sqlite3
 import sys
 from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from contextlib import closing
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +32,11 @@ from app.daily_profile_selector import (
 )
 from app.models import ObservationSignal
 from app.stake_progression import TWO_STAGE_VERSION, TwoStageStakeProgression
-from scripts.analyze_observations_db import load_observations
+from app.storage import (
+    _LINKED_CONTEXT_COLUMNS,
+    _OBSERVATION_LIFECYCLE_COLUMNS,
+    _hydrate_decision_linked_payload,
+)
 
 
 ACCEPTANCE = {
@@ -131,6 +137,8 @@ class ReplayExecutionConfig:
             amounts[name] = round(amount, 4)
         if amounts["win_return"] <= amounts["stake"]:
             raise ValueError("win_return must exceed stake")
+        if float(self.stake_progression_second_stake) != float(self.win_return):
+            raise ValueError("stake_progression_second_stake must equal win_return")
 
         if isinstance(self.stake_progression_base_only_segments, str):
             raise ValueError("stake_progression_base_only_segments must be a sequence")
@@ -143,6 +151,8 @@ class ReplayExecutionConfig:
                 }
             )
         )
+        if segments:
+            raise ValueError("stake_progression_base_only_segments must be empty")
         return ReplayExecutionConfig(
             **normalized_integers,
             min_order_gap_ms=min_order_gap_ms,
@@ -172,6 +182,116 @@ class ReplayExecutionConfig:
 
 
 ProductionReplayConfig = ReplayExecutionConfig
+
+
+def load_replay_observations(
+    db_path: str | Path,
+    symbol: str,
+) -> list[ObservationSignal]:
+    path = Path(db_path).resolve()
+    uri = f"{path.as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("pragma query_only = on")
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "select name from sqlite_master where type = 'table'"
+            )
+        }
+        if "observation_signals" not in tables:
+            raise ValueError("observation_signals table is missing")
+        observation_columns = {
+            str(row["name"])
+            for row in connection.execute("pragma table_info(observation_signals)")
+        }
+        context_columns = (
+            {
+                str(row["name"])
+                for row in connection.execute("pragma table_info(decision_contexts)")
+            }
+            if "decision_contexts" in tables
+            else set()
+        )
+        lifecycle_columns = {
+            "observation_key",
+            "status",
+            "result",
+            "opened_at",
+            "expires_at",
+            "settled_at",
+            "exit_price",
+            "pnl",
+        }
+        linked_observation_columns = lifecycle_columns | {"decision_id"}
+        linked_context_columns = {
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "symbol",
+            "closed_kline_at_ms",
+            "candidate_origin",
+            "input_payload",
+            "outcome_payload",
+        }
+        where = "where observation_signals.symbol = ?"
+        if "status" in observation_columns:
+            where += " and observation_signals.status = 'SETTLED'"
+        if (
+            linked_observation_columns <= observation_columns
+            and linked_context_columns <= context_columns
+        ):
+            rows = connection.execute(
+                f"""
+                select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
+                       {_LINKED_CONTEXT_COLUMNS}
+                from observation_signals
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                {where}
+                order by observation_signals.settled_at,
+                         observation_signals.opened_at,
+                         observation_signals.observation_key
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+            hydrate_lifecycle = True
+        elif lifecycle_columns <= observation_columns:
+            rows = connection.execute(
+                f"""
+                select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS}
+                from observation_signals
+                {where}
+                order by observation_signals.settled_at,
+                         observation_signals.opened_at,
+                         observation_signals.observation_key
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+            hydrate_lifecycle = True
+        else:
+            rows = connection.execute(
+                f"select observation_signals.payload from observation_signals {where}",
+                (symbol.upper(),),
+            ).fetchall()
+            hydrate_lifecycle = False
+
+    accepted = {item.name for item in fields(ObservationSignal)}
+    observations = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if hydrate_lifecycle:
+            payload = _hydrate_decision_linked_payload(payload, row)
+        observations.append(
+            ObservationSignal(
+                **{key: value for key, value in payload.items() if key in accepted}
+            )
+        )
+    return sorted(observations, key=_settlement_event_key)
 
 
 def replay_daily_profile_selection(
@@ -602,25 +722,25 @@ def _build_adaptive_event_rows(
 ) -> list[dict[str, Any]]:
     history_by_profile: dict[str, list[ObservationSignal]] = defaultdict(list)
     states: dict[str, dict[str, Any]] = {}
-    observation_bindings: dict[str, tuple[str, str]] = {}
-    decision_bindings: dict[str, tuple[str, str]] = {}
     rows = []
     for item in observations:
         key = _observation_profile_key(item)
         before = states.get(key) or _adaptive_state((), key, int(item.settled_at))
         after = before
-        if _is_adaptive_profile_key(key) and _accept_adaptive_binding(
-            key,
-            item,
-            observation_bindings,
-            decision_bindings,
-        ):
-            history_by_profile[key].append(item)
+        if _is_adaptive_profile_key(key):
+            evaluated_at = int(item.settled_at) + 1
+            cutoff = evaluated_at - 15 * 86_400_000
+            history_by_profile[key] = [
+                event
+                for event in (*history_by_profile[key], item)
+                if event.settled_at is not None
+                and cutoff <= event.settled_at < evaluated_at
+            ]
             rebuilt = rebuild_adaptive_profile_states(
                 history_by_profile[key],
-                int(item.settled_at) + 1,
+                evaluated_at,
             )
-            after = rebuilt.get(key) or before
+            after = rebuilt.get(key) or _adaptive_state((), key, evaluated_at)
             states[key] = after
         rows.append(
             {
@@ -641,41 +761,6 @@ def _build_adaptive_event_rows(
             }
         )
     return rows
-
-
-def _accept_adaptive_binding(
-    profile_key_value: str,
-    event: ObservationSignal,
-    observation_bindings: dict[str, tuple[str, str]],
-    decision_bindings: dict[str, tuple[str, str]],
-) -> bool:
-    observation_identity = event.observation_key
-    decision_identity = event.decision_id
-    if (
-        observation_identity
-        and observation_identity in observation_bindings
-        and observation_bindings[observation_identity]
-        != (decision_identity, profile_key_value)
-    ):
-        return False
-    if (
-        decision_identity
-        and decision_identity in decision_bindings
-        and decision_bindings[decision_identity]
-        != (observation_identity, profile_key_value)
-    ):
-        return False
-    if observation_identity:
-        observation_bindings.setdefault(
-            observation_identity,
-            (decision_identity, profile_key_value),
-        )
-    if decision_identity:
-        decision_bindings.setdefault(
-            decision_identity,
-            (observation_identity, profile_key_value),
-        )
-    return True
 
 
 def _adaptive_timeline(
@@ -795,8 +880,6 @@ def _execute_replay(
             order_id = len(trades) + 1
             progression_allowed = bool(
                 execution.stake_progression_enabled
-                and chosen.threshold_segment
-                not in execution.stake_progression_base_only_segments
                 and not (apply_adaptive and adaptive["status"] == "WATCH")
             )
             if progression_allowed:
@@ -1355,7 +1438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (TypeError, ValueError) as error:
         parser.error(str(error))
     result = replay_daily_profile_selection(
-        load_observations(args.db_path, args.symbol),
+        load_replay_observations(args.db_path, args.symbol),
         config,
         execution=execution,
         require_full_lookback=not args.allow_partial_lookback,

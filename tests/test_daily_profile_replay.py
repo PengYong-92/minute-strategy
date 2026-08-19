@@ -1,13 +1,21 @@
+import hashlib
+import json
+import sqlite3
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import datetime
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import ObservationSignal
+from app.storage import SQLiteMonitorStore
 from scripts import replay_daily_profile_selector as replay_module
+from tests.test_storage import ENTRY_STRUCTURE_FIXTURE, structured_atomic_bundle
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -101,6 +109,25 @@ class DailyProfileReplayTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit production execution settings"):
             replay_module.replay_daily_profile_selection([], selector_config())
 
+    def test_execution_rejects_second_stake_that_differs_from_win_return(self):
+        for second_stake in (17.0, 18.00001):
+            with self.subTest(second_stake=second_stake), self.assertRaisesRegex(
+                ValueError,
+                "stake_progression_second_stake must equal win_return",
+            ):
+                self.production_execution(
+                    stake_progression_second_stake=second_stake
+                ).normalized()
+
+    def test_execution_rejects_nonempty_base_only_segments(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "stake_progression_base_only_segments must be empty",
+        ):
+            self.production_execution(
+                stake_progression_base_only_segments=("WD-01",)
+            ).normalized()
+
     def test_cli_rejects_missing_production_settings_and_help_lists_every_setting(self):
         with redirect_stderr(StringIO()) as stderr:
             with self.assertRaises(SystemExit) as raised:
@@ -160,7 +187,17 @@ class DailyProfileReplayTest(unittest.TestCase):
             "--stake-progression-base-only-segments", "",
         ]
         with (
-            patch.object(replay_module, "load_observations", return_value=[]),
+            patch.object(
+                replay_module,
+                "load_replay_observations",
+                return_value=[],
+            ) as loader,
+            patch.object(
+                replay_module,
+                "load_observations",
+                side_effect=AssertionError("payload-only loader must not be used"),
+                create=True,
+            ),
             patch.object(
                 replay_module,
                 "replay_daily_profile_selection",
@@ -170,6 +207,7 @@ class DailyProfileReplayTest(unittest.TestCase):
         ):
             self.assertEqual(replay_module.main(args), 0)
 
+        loader.assert_called_once_with(Path("/tmp/replay.sqlite3"), "BTCUSDT")
         execution = replay.call_args.kwargs["execution"]
         self.assertEqual(execution.max_open_orders, 2)
         self.assertEqual(execution.max_open_long_orders, 1)
@@ -181,6 +219,78 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(execution.stake_progression_max_orders, 2)
         self.assertEqual(execution.stake_progression_max_active, 1)
         self.assertEqual(execution.stake_progression_second_stake, 18.0)
+
+    def test_read_only_loader_hydrates_v2_structured_bundle_like_storage(self):
+        self.assertTrue(
+            hasattr(replay_module, "load_replay_observations"),
+            "replay must provide a dedicated read-only V2 loader",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                structured_atomic_bundle()
+            )
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+                observation=observed,
+            )
+            persisted = store.load_observations(context.symbol)[0]
+            settled = replace(
+                persisted,
+                status="SETTLED",
+                result="WIN",
+                settled_at=persisted.expires_at,
+                exit_price=persisted.entry_price + 1.0,
+                pnl=8.0,
+            )
+            store.save_observation(settled, context.symbol)
+            expected = store.load_adaptive_profile_observations(
+                context.symbol,
+                evaluated_at=settled.settled_at + 1,
+            )
+            store.close()
+            before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+            actual = replay_module.load_replay_observations(db_path, context.symbol)
+
+            after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        self.assertEqual(
+            [item.to_dict() for item in actual],
+            [item.to_dict() for item in expected],
+        )
+        self.assertEqual(actual[0].entry_structure_shadow, ENTRY_STRUCTURE_FIXTURE)
+        self.assertEqual(actual[0].decision_inputs, context.to_dict()["inputs"])
+        self.assertEqual(after, before)
+
+    def test_read_only_loader_keeps_legacy_payload_fixture_compatible(self):
+        self.assertTrue(hasattr(replay_module, "load_replay_observations"))
+        legacy = observation("legacy", "LOSS", timestamp("2026-07-20T08:00:00"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "legacy.sqlite3"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "create table observation_signals "
+                    "(symbol text not null, status text not null, payload text not null)"
+                )
+                connection.execute(
+                    "insert into observation_signals(symbol, status, payload) values (?, ?, ?)",
+                    ("BTCUSDT", "SETTLED", json.dumps(legacy.to_dict())),
+                )
+            before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+            actual = replay_module.load_replay_observations(db_path, "btcusdt")
+
+            after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        self.assertEqual([item.to_dict() for item in actual], [legacy.to_dict()])
+        self.assertEqual(after, before)
 
     def test_replay_is_settlement_causal_and_cutoff_safe(self):
         start = timestamp("2026-07-19T22:00:00")
@@ -228,6 +338,36 @@ class DailyProfileReplayTest(unittest.TestCase):
         )
         self.assertEqual(candidate["adaptive_state_before"], "ACTIVE")
         self.assertLessEqual(candidate["adaptive_evaluated_through"], candidate["opened_at"])
+
+    def test_adaptive_event_rows_use_only_the_trailing_fifteen_days(self):
+        old_start = timestamp("2026-07-01T00:00:00")
+        recent = observation(
+            "recent-win",
+            "WIN",
+            timestamp("2026-07-20T08:00:00"),
+        )
+        rows = [
+            observation(f"old-win-{index:02d}", "WIN", old_start + index * 11 * 60_000)
+            for index in range(11)
+        ]
+        rows.append(recent)
+
+        events = replay_module._build_adaptive_event_rows(
+            sorted(
+                rows,
+                key=lambda item: (
+                    item.settled_at,
+                    item.opened_at,
+                    item.observation_key,
+                ),
+            )
+        )
+
+        recent_event = events[-1]
+        self.assertEqual(recent_event["observation_key"], "recent-win")
+        self.assertEqual(recent_event["adaptive_state_after"], "WARMUP")
+        self.assertEqual(recent_event["n12_after"]["sample_size"], 1)
+        self.assertEqual(recent_event["n20_after"]["sample_size"], 1)
 
     def test_replay_applies_direction_capacity_and_progression_on_each_settlement(self):
         rows = [
