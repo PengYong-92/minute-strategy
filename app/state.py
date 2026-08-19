@@ -1,7 +1,9 @@
 import json
+import math
 import threading
 import time
 from bisect import bisect_left
+from collections.abc import Mapping
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -813,18 +815,28 @@ class MonitorState:
                 cache = {}
                 self._entry_structure_market_cache = cache
             cached = cache.get(cache_key)
-            if cached is not None:
-                return cached
-            flight = self._entry_structure_inflight.get(cache_key)
-            owner = flight is None
-            if flight is None:
-                flight = _EntryStructureFlight()
-                self._entry_structure_inflight[cache_key] = flight
+            if cached is None:
+                flight = self._entry_structure_inflight.get(cache_key)
+                owner = flight is None
+                if flight is None:
+                    flight = _EntryStructureFlight()
+                    self._entry_structure_inflight[cache_key] = flight
+
+        if cached is not None:
+            return self._copy_entry_structure_market(
+                cached,
+                latest,
+                "CACHE_COPY",
+            )
 
         if not owner:
             flight.event.wait()
             if flight.result is not None:
-                return flight.result
+                return self._copy_entry_structure_market(
+                    flight.result,
+                    latest,
+                    "SINGLEFLIGHT_COPY",
+                )
             return self._entry_structure_error_market(
                 latest,
                 "SINGLEFLIGHT_RESULT",
@@ -888,7 +900,22 @@ class MonitorState:
             if self._entry_structure_inflight.get(cache_key) is flight:
                 self._entry_structure_inflight.pop(cache_key, None)
             flight.event.set()
-        return market
+        return self._copy_entry_structure_market(
+            market,
+            latest,
+            "OWNER_COPY",
+        )
+
+    def _copy_entry_structure_market(
+        self,
+        market: dict[str, object],
+        latest: Kline,
+        stage: str,
+    ) -> dict[str, object]:
+        try:
+            return deepcopy(market)
+        except Exception as exc:  # noqa: BLE001 - 缓存副本失败不得污染或阻断主流程。
+            return self._entry_structure_error_market(latest, stage, exc)
 
     def _current_entry_structure_market(self, latest: Kline) -> dict[str, object]:
         context = (self.symbol, self._symbol_generation)
@@ -1000,13 +1027,38 @@ class MonitorState:
         )
         return normalized
 
-    @staticmethod
+    @classmethod
+    def _canonical_entry_structure_value(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            normalized = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("entry structure mapping keys must be strings")
+                normalized[key] = cls._canonical_entry_structure_value(item)
+            return normalized
+        if isinstance(value, (list, tuple)):
+            return [cls._canonical_entry_structure_value(item) for item in value]
+        if value is None or isinstance(value, (bool, int, str)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("entry structure numbers must be finite")
+            return value
+        raise TypeError(
+            f"unsupported entry structure value type: {type(value).__name__}"
+        )
+
+    @classmethod
     def _freeze_entry_structure_payload(
+        cls,
         payload: dict[str, object],
     ) -> dict[str, object]:
         frozen = deepcopy(payload)
-        json.dumps(frozen, allow_nan=False)
-        return frozen
+        canonical = cls._canonical_entry_structure_value(frozen)
+        if not isinstance(canonical, dict):
+            raise TypeError("entry structure payload must be a mapping")
+        json.dumps(canonical, allow_nan=False)
+        return canonical
 
     def _entry_structure_error_snapshot(
         self,
@@ -2098,6 +2150,7 @@ class MonitorState:
         )
         payload = context.to_dict()
         canonical_inputs = payload["inputs"]
+        canonical_structure = canonical_inputs.get("entry_structure", {})
         quality_score_inputs = canonical_inputs.get("score", {}).get(
             "quality_score_inputs",
             {},
@@ -2110,6 +2163,11 @@ class MonitorState:
             strategy_build_id=context.strategy_build_id,
             candidate_origin=context.candidate_origin,
             quality_score_inputs=quality_score_inputs,
+            entry_structure_shadow=(
+                deepcopy(canonical_structure)
+                if isinstance(canonical_structure, dict)
+                else {}
+            ),
             decision_inputs=canonical_inputs,
             decision_trace=payload["decision_trace"],
             first_decisive_block=context.first_decisive_block,
@@ -2180,47 +2238,17 @@ class MonitorState:
                 "commit_status": "NOT_COMMITTED",
             },
         }
-        entry_structure = {
-            "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
-            "entry_structure_mode": "SHADOW_ONLY",
-            "entry_structure_evaluated_at": int(latest.close_time),
-            "entry_structure_state": "NOT_AVAILABLE",
-            "entry_structure_bias": "NOT_AVAILABLE",
-            "entry_structure_reason_code": "NOT_EVALUATED",
-            "candidate_origin": str(run.identity["candidate_origin"]),
-            "active_level_source": "NOT_AVAILABLE",
-            "active_level_lower": None,
-            "active_level_upper": None,
-            "active_level_touch_count": 0,
-            "active_level_confirmed_at": 0,
-            "nearest_support_lower": None,
-            "nearest_support_upper": None,
-            "nearest_resistance_lower": None,
-            "nearest_resistance_upper": None,
-            "support_distance_price": None,
-            "support_distance_bps": None,
-            "support_distance_atr": None,
-            "resistance_distance_price": None,
-            "resistance_distance_bps": None,
-            "resistance_distance_atr": None,
-            "breakout_direction": "NOT_AVAILABLE",
-            "breakout_closed_bars": 0,
-            "breakout_buffer_atr": None,
-            "retest_status": "NOT_AVAILABLE",
-            "round_level_price": None,
-            "round_level_step": None,
-            "audit_only": True,
-            "evaluated_at": int(latest.close_time),
-            "state": "NOT_AVAILABLE",
-            "bias": "NOT_AVAILABLE",
-            "reason_code": "NOT_EVALUATED",
-            "version": "ENTRY_STRUCTURE_SHADOW_V1",
-            "mode": "SHADOW_ONLY",
-            "status": "NOT_AVAILABLE",
-            "reason": "NOT_EVALUATED",
-        }
-        if isinstance(signal.entry_structure_shadow, dict) and signal.entry_structure_shadow:
-            entry_structure = deepcopy(signal.entry_structure_shadow)
+        entry_structure = self._entry_structure_error_snapshot(
+            latest,
+            str(run.identity["candidate_origin"]),
+            self._signal_direction(signal),
+            "DECISION_FREEZE",
+            freeze_error,
+        )
+        fallback_signal = replace(
+            signal,
+            entry_structure_shadow=deepcopy(entry_structure),
+        )
         return {
             "identity": deepcopy(run.identity),
             "market": {
@@ -2290,8 +2318,8 @@ class MonitorState:
                 },
             },
             "admission": admission,
-            "entry_structure": entry_structure,
-            "signal": self._signal_context_payload(signal),
+            "entry_structure": deepcopy(entry_structure),
+            "signal": self._signal_context_payload(fallback_signal),
             "audit_snapshot": {
                 "freeze_error_type": type(freeze_error).__name__,
                 "freeze_error": str(freeze_error)[:200],

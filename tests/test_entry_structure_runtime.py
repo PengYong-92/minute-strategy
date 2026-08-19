@@ -106,6 +106,23 @@ class EntryStructureRuntimeTest(unittest.TestCase):
                 "candidate_direction": direction,
             }
 
+    class IntegerKeyGate:
+        def attach(self, signal, market_snapshot, candidate_origin):
+            return {
+                "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+                "entry_structure_mode": "SHADOW_ONLY",
+                "entry_structure_evaluated_at": market_snapshot.get(
+                    "evaluated_at",
+                    0,
+                ),
+                "entry_structure_state": "NO_NEARBY_LEVEL",
+                "entry_structure_bias": "NEUTRAL",
+                "entry_structure_reason_code": "STRUCTURE_NO_NEARBY_LEVEL",
+                "candidate_origin": candidate_origin,
+                "candidate_direction": signal.direction,
+                "detail": {1: "integer-key"},
+            }
+
     class BlockingDetector:
         config = StructureConfig()
 
@@ -130,6 +147,7 @@ class EntryStructureRuntimeTest(unittest.TestCase):
                 "levels": [],
                 "nearest_support": None,
                 "nearest_resistance": None,
+                "detail": {"levels": [99.0, 101.0]},
             }
 
     class RecordingWebhook:
@@ -663,6 +681,25 @@ class EntryStructureRuntimeTest(unittest.TestCase):
             "ERROR",
         )
 
+    def test_integer_key_structure_degrades_without_blocking_order(self):
+        bars = self.bars()
+        latest = bars[-1]
+        state = self.new_state(enable_observation_profile_promotion=False)
+        self.addCleanup(state.close)
+        state.klines = bars
+        state._entry_structure_gate = self.IntegerKeyGate()
+
+        decision = state._maybe_open_order(self.signal(latest), latest)
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(len(state.simulator.orders), 1)
+        for structure in (
+            state.selected_signal.entry_structure_shadow,
+            state.simulator.orders[0].entry_structure_shadow,
+        ):
+            self.assertEqual(structure["entry_structure_state"], "ERROR")
+            self.assertEqual(structure["candidate_direction"], "LONG")
+
     def test_structure_snapshot_singleflight_does_not_block_state_lock_or_reset(self):
         bars = self.bars()
         state = self.new_state(enable_observation_profile_promotion=False)
@@ -709,17 +746,87 @@ class EntryStructureRuntimeTest(unittest.TestCase):
         self.assertEqual(state.capture_symbol_context(), ("ETHUSDT", 1))
         self.assertNotIn(cache_key, state._entry_structure_market_cache)
 
-    def test_candidate_error_fallback_preserves_structure_alias_equality(self):
+    def test_structure_snapshot_returns_isolated_owner_waiter_and_cache_copies(self):
+        bars = self.bars()
+        state = self.new_state(enable_observation_profile_promotion=False)
+        self.addCleanup(state.close)
+        detector = self.BlockingDetector()
+        state._entry_structure_detector = detector
+        state._entry_structure_state_machine = self.EmptyStateMachine()
+        context = state.capture_symbol_context()
+        cache_key = (context[0], context[1], bars[-1].close_time)
+        results = {}
+
+        def detect_snapshot(name):
+            results[name] = state._entry_structure_market_snapshot(bars, context)
+
+        owner = threading.Thread(target=detect_snapshot, args=("owner",))
+        waiter = threading.Thread(target=detect_snapshot, args=("waiter",))
+        owner.start()
+        self.assertTrue(detector.started.wait(1))
+        waiter.start()
+        detector.release.set()
+        owner.join(2)
+        waiter.join(2)
+        results["cache_hit"] = state._entry_structure_market_snapshot(bars, context)
+
+        self.assertEqual(detector.calls, 1)
+        self.assertTrue(all(not thread.is_alive() for thread in (owner, waiter)))
+        self.assertIsNot(results["owner"], results["waiter"])
+        self.assertIsNot(results["owner"], results["cache_hit"])
+        self.assertIsNot(results["waiter"], results["cache_hit"])
+        results["owner"]["detail"]["levels"].append(102.0)
+        results["waiter"]["detail"]["levels"].append(103.0)
+        results["cache_hit"]["detail"]["levels"].append(104.0)
+
+        fresh = state._entry_structure_market_snapshot(bars, context)
+
+        self.assertEqual(fresh["detail"]["levels"], [99.0, 101.0])
+        self.assertEqual(
+            state._entry_structure_market_cache[cache_key]["detail"]["levels"],
+            [99.0, 101.0],
+        )
+
+    def test_uncopyable_cached_structure_returns_error_without_mutating_cache(self):
+        bars = self.bars()
+        latest = bars[-1]
+        state = self.new_state(enable_observation_profile_promotion=False)
+        self.addCleanup(state.close)
+        context = state.capture_symbol_context()
+        cache_key = (context[0], context[1], latest.close_time)
+        cached = {
+            "version": "ENTRY_STRUCTURE_SHADOW_V1",
+            "mode": "SHADOW_ONLY",
+            "status": "READY",
+            "evaluated_at": latest.close_time,
+            "states": [],
+            "detail": self.Uncopyable(),
+        }
+        state._entry_structure_market_cache[cache_key] = cached
+
+        returned = state._entry_structure_market_snapshot(bars, context)
+
+        self.assertEqual(returned["status"], "ERROR")
+        self.assertIn("CACHE_COPY_ERROR", returned["reason_code"])
+        self.assertIs(state._entry_structure_market_cache[cache_key], cached)
+        self.assertIsInstance(cached["detail"], self.Uncopyable)
+
+    def test_candidate_error_fallback_replaces_invalid_structure_with_clean_error(self):
         bars = self.bars()
         latest = bars[-1]
         state = self.new_state(enable_observation_profile_promotion=False)
         self.addCleanup(state.close)
         state.klines = bars
-        state._entry_structure_gate = self.NestedGate()
-        signal = state._attach_entry_structure_snapshot(
+        invalid_structure = {
+            "entry_structure_evaluated_at": latest.close_time,
+            "candidate_origin": "NATIVE_ACTIONABLE",
+            "candidate_direction": "LONG",
+            "detail": {1: "integer-key"},
+        }
+        signal = replace(
             self.signal(latest),
-            latest,
-            "NATIVE_ACTIONABLE",
+            candidate_origin="NATIVE_ACTIONABLE",
+            entry_structure_shadow=invalid_structure,
         )
         run = state._new_decision_run(
             signal,
@@ -743,10 +850,13 @@ class EntryStructureRuntimeTest(unittest.TestCase):
             inputs["entry_structure"],
             inputs["signal"]["entry_structure_shadow"],
         )
-        self.assertIsNot(
-            inputs["entry_structure"]["detail"],
-            inputs["signal"]["entry_structure_shadow"]["detail"],
+        self.assertEqual(inputs["entry_structure"]["entry_structure_state"], "ERROR")
+        self.assertEqual(
+            inputs["signal"]["entry_structure_shadow"]["entry_structure_state"],
+            "ERROR",
         )
+        self.assertNotIn("detail", inputs["entry_structure"])
+        self.assertNotIn("detail", inputs["signal"]["entry_structure_shadow"])
 
 
 if __name__ == "__main__":
