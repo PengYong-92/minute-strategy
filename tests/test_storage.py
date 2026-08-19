@@ -739,6 +739,48 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                     {key: 0 for key in atomic_bundle_counts(db_path)},
                 )
 
+    def test_open_bundle_requires_signal_entry_snapshot_structure(self):
+        for label, include_top_level in (
+            ("all structure aliases missing", False),
+            ("top-level alias cannot replace signal snapshot", True),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "monitor.sqlite3"
+                store = SQLiteMonitorStore(db_path)
+                config, context, order, audit, entry_snapshot, observed = (
+                    structured_atomic_bundle()
+                )
+                snapshot_signal = dict(entry_snapshot["signal"])
+                snapshot_signal.pop("entry_structure_shadow")
+                entry_snapshot = {
+                    **entry_snapshot,
+                    "signal": snapshot_signal,
+                }
+                if include_top_level:
+                    entry_snapshot["entry_structure_shadow"] = json.loads(
+                        json.dumps(ENTRY_STRUCTURE_FIXTURE)
+                    )
+                else:
+                    entry_snapshot.pop("entry_structure_shadow", None)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "entry_snapshot signal entry structure",
+                ):
+                    store.save_open_order_decision(
+                        config=config,
+                        context=context,
+                        order=order,
+                        credit=None,
+                        entry_snapshot=entry_snapshot,
+                        audit=audit,
+                        observation=observed,
+                    )
+                self.assertEqual(
+                    atomic_bundle_counts(db_path),
+                    {key: 0 for key in atomic_bundle_counts(db_path)},
+                )
+
     def test_blocked_bundle_structure_mismatch_rolls_back_every_member(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
@@ -799,6 +841,13 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             config, context, order, audit, entry_snapshot, observed = (
                 atomic_bundle_fixture()
             )
+            snapshot_signal = dict(entry_snapshot["signal"])
+            snapshot_signal.pop("entry_structure_shadow")
+            entry_snapshot = {
+                **entry_snapshot,
+                "signal": snapshot_signal,
+            }
+            entry_snapshot.pop("entry_structure_shadow", None)
             store.save_open_order_decision(
                 config=config,
                 context=context,

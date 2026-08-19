@@ -1804,6 +1804,13 @@ class SQLiteMonitorStore:
             snapshot_signal = entry_snapshot.get("signal")
             if not isinstance(snapshot_signal, Mapping):
                 raise ValueError("entry_snapshot must contain signal metadata")
+            if (
+                canonical_structure
+                and "entry_structure_shadow" not in snapshot_signal
+            ):
+                raise ValueError(
+                    "entry_snapshot signal entry structure is required"
+                )
             if "entry_structure_shadow" in snapshot_signal:
                 _require_matching_entry_structure(
                     snapshot_signal["entry_structure_shadow"],
