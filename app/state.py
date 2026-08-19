@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from bisect import bisect_left
@@ -127,6 +128,13 @@ class _DecisionRun:
 
     def extend(self, records: Sequence[dict[str, object]]) -> None:
         self.trace_records.extend(deepcopy(list(records)))
+
+
+@dataclass
+class _EntryStructureFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, object] | None = None
+
 
 def strategy_source_build_id(
     paths: Sequence[Path] | None = None,
@@ -274,6 +282,10 @@ class MonitorState:
         )
         self._entry_structure_market_cache: dict[
             tuple[str, int, int], dict[str, object]
+        ] = {}
+        self._entry_structure_cache_lock = threading.Lock()
+        self._entry_structure_inflight: dict[
+            tuple[str, int, int], _EntryStructureFlight
         ] = {}
         self._profile_source_cached = False
         self._cached_profile_source = None
@@ -740,7 +752,8 @@ class MonitorState:
             self._realtime_price_event_time_ms = 0
             self._realtime_price_received_at_ms = 0
             self._market_stream_status = "STARTING"
-            self._entry_structure_market_cache.clear()
+            with self._entry_structure_cache_lock:
+                self._entry_structure_market_cache.clear()
             self._opened_signal_keys.clear()
             self._last_order_opened_at = self._latest_order_opened_at_by_direction(
                 restored_orders
@@ -794,7 +807,7 @@ class MonitorState:
             int(operation_context[1]),
             int(latest.close_time),
         )
-        with self._lock:
+        with self._entry_structure_cache_lock:
             cache = self._entry_structure_market_cache
             if not isinstance(cache, dict):
                 cache = {}
@@ -802,64 +815,83 @@ class MonitorState:
             cached = cache.get(cache_key)
             if cached is not None:
                 return cached
-            try:
-                detected = self._entry_structure_detector.detect(
-                    cache_key[0],
-                    closed_klines,
-                )
-            except Exception as exc:  # noqa: BLE001 - 影子检测失败不得影响主流程。
+            flight = self._entry_structure_inflight.get(cache_key)
+            owner = flight is None
+            if flight is None:
+                flight = _EntryStructureFlight()
+                self._entry_structure_inflight[cache_key] = flight
+
+        if not owner:
+            flight.event.wait()
+            if flight.result is not None:
+                return flight.result
+            return self._entry_structure_error_market(
+                latest,
+                "SINGLEFLIGHT_RESULT",
+            )
+
+        try:
+            detected = self._entry_structure_detector.detect(
+                cache_key[0],
+                closed_klines,
+            )
+        except Exception as exc:  # noqa: BLE001 - 影子检测失败不得影响主流程。
+            market = self._entry_structure_error_market(
+                latest,
+                "DETECTOR",
+                exc,
+            )
+        else:
+            if not isinstance(detected, dict):
                 market = self._entry_structure_error_market(
                     latest,
-                    "DETECTOR",
-                    exc,
+                    "DETECTOR_RESULT",
                 )
             else:
-                if not isinstance(detected, dict):
+                try:
+                    states = self._entry_structure_state_machine.evaluate(
+                        detected,
+                        closed_klines,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 状态影子失败不得影响主流程。
                     market = self._entry_structure_error_market(
                         latest,
-                        "DETECTOR_RESULT",
+                        "STATE_MACHINE",
+                        exc,
                     )
                 else:
-                    try:
-                        states = self._entry_structure_state_machine.evaluate(
-                            detected,
-                            closed_klines,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - 状态影子失败不得影响主流程。
+                    if not isinstance(states, (list, tuple)):
                         market = self._entry_structure_error_market(
                             latest,
-                            "STATE_MACHINE",
-                            exc,
+                            "STATE_MACHINE_RESULT",
                         )
                     else:
-                        if not isinstance(states, (list, tuple)):
+                        try:
+                            market = {
+                                **deepcopy(detected),
+                                "states": deepcopy(list(states)),
+                            }
+                        except Exception as exc:  # noqa: BLE001 - 原始影子快照必须故障隔离。
                             market = self._entry_structure_error_market(
                                 latest,
-                                "STATE_MACHINE_RESULT",
+                                "SNAPSHOT_FREEZE",
+                                exc,
                             )
-                        else:
-                            try:
-                                market = {
-                                    **deepcopy(detected),
-                                    "states": deepcopy(list(states)),
-                                }
-                            except Exception as exc:  # noqa: BLE001 - 原始影子快照必须故障隔离。
-                                market = self._entry_structure_error_market(
-                                    latest,
-                                    "SNAPSHOT_FREEZE",
-                                    exc,
-                                )
-            cache[cache_key] = market
-            while len(cache) > 256:
-                cache.pop(next(iter(cache)))
-            return market
+
+        with self._entry_structure_cache_lock:
+            flight.result = market
+            if operation_context == (self.symbol, self._symbol_generation):
+                cache = self._entry_structure_market_cache
+                cache[cache_key] = market
+                while len(cache) > 256:
+                    cache.pop(next(iter(cache)))
+            if self._entry_structure_inflight.get(cache_key) is flight:
+                self._entry_structure_inflight.pop(cache_key, None)
+            flight.event.set()
+        return market
 
     def _current_entry_structure_market(self, latest: Kline) -> dict[str, object]:
         context = (self.symbol, self._symbol_generation)
-        key = (self.symbol, self._symbol_generation, int(latest.close_time))
-        cached = self._entry_structure_market_cache.get(key)
-        if cached is not None:
-            return cached
         closed_klines = list(self.klines)
         if not closed_klines or closed_klines[-1].close_time != latest.close_time:
             closed_klines = [item for item in closed_klines if item.close_time < latest.close_time]
@@ -968,6 +1000,30 @@ class MonitorState:
         )
         return normalized
 
+    @staticmethod
+    def _freeze_entry_structure_payload(
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        frozen = deepcopy(payload)
+        json.dumps(frozen, allow_nan=False)
+        return frozen
+
+    def _entry_structure_error_snapshot(
+        self,
+        latest: Kline,
+        candidate_origin: str,
+        candidate_direction: str,
+        stage: str,
+        error: Exception | None = None,
+    ) -> dict[str, object]:
+        payload = self._normalize_entry_structure_payload(
+            self._entry_structure_error_market(latest, stage, error),
+            latest,
+            candidate_origin,
+            candidate_direction,
+        )
+        return self._freeze_entry_structure_payload(payload)
+
     def _attach_entry_structure_snapshot(
         self,
         signal: Signal,
@@ -975,53 +1031,80 @@ class MonitorState:
         candidate_origin: str,
         market_snapshot: dict[str, object] | None = None,
     ) -> Signal:
-        direction = str(signal.direction or "").upper()
+        direction = self._signal_direction(signal)
         existing = signal.entry_structure_shadow
         if isinstance(existing, dict) and existing:
-            existing_origin = str(existing.get("candidate_origin", ""))
-            existing_direction = str(existing.get("candidate_direction", ""))
-            existing_evaluated_at = existing.get(
-                "entry_structure_evaluated_at",
-                existing.get("evaluated_at"),
+            try:
+                existing_origin = str(existing.get("candidate_origin", ""))
+                existing_direction = str(existing.get("candidate_direction", ""))
+                existing_evaluated_at = existing.get(
+                    "entry_structure_evaluated_at",
+                    existing.get("evaluated_at"),
+                )
+                reusable = (
+                    existing_origin in {"", candidate_origin}
+                    and existing_direction in {"", direction}
+                    and type(existing_evaluated_at) is int
+                    and existing_evaluated_at == int(latest.close_time)
+                )
+                payload = (
+                    self._freeze_entry_structure_payload(
+                        self._normalize_entry_structure_payload(
+                            existing,
+                            latest,
+                            candidate_origin,
+                            direction,
+                        )
+                    )
+                    if reusable
+                    else None
+                )
+            except Exception as exc:  # noqa: BLE001 - 输入影子不得影响真实准入。
+                payload = self._entry_structure_error_snapshot(
+                    latest,
+                    candidate_origin,
+                    direction,
+                    "EXISTING_SNAPSHOT",
+                    exc,
+                )
+            if payload is not None:
+                return replace(
+                    signal,
+                    candidate_origin=candidate_origin,
+                    entry_structure_shadow=payload,
+                )
+        try:
+            market = market_snapshot or self._current_entry_structure_market(latest)
+            payload = self._entry_structure_gate.attach(
+                replace(signal, direction=direction),
+                market,
+                candidate_origin,
             )
-            if (
-                existing_origin in {"", candidate_origin}
-                and existing_direction in {"", direction}
-                and type(existing_evaluated_at) is int
-                and existing_evaluated_at == int(latest.close_time)
-            ):
-                payload = self._normalize_entry_structure_payload(
-                    existing,
+            if not isinstance(payload, dict):
+                payload = self._entry_structure_error_market(
+                    latest,
+                    "ATTACH_RESULT",
+                )
+            payload = self._freeze_entry_structure_payload(
+                self._normalize_entry_structure_payload(
+                    payload,
                     latest,
                     candidate_origin,
                     direction,
                 )
-                return replace(
-                    signal,
-                    candidate_origin=candidate_origin,
-                    entry_structure_shadow=deepcopy(payload),
-                )
-        market = market_snapshot or self._current_entry_structure_market(latest)
-        payload = self._entry_structure_gate.attach(
-            signal,
-            market,
-            candidate_origin,
-        )
-        if not isinstance(payload, dict):
-            payload = self._entry_structure_error_market(
-                latest,
-                "ATTACH_RESULT",
             )
-        payload = self._normalize_entry_structure_payload(
-            payload,
-            latest,
-            candidate_origin,
-            direction,
-        )
+        except Exception as exc:  # noqa: BLE001 - 影子映射不得影响真实准入。
+            payload = self._entry_structure_error_snapshot(
+                latest,
+                candidate_origin,
+                direction,
+                "ATTACH_SNAPSHOT",
+                exc,
+            )
         return replace(
             signal,
             candidate_origin=candidate_origin,
-            entry_structure_shadow=deepcopy(payload),
+            entry_structure_shadow=payload,
         )
 
     @staticmethod
@@ -2335,6 +2418,17 @@ class MonitorState:
         daily_profile_required: bool = False,
     ) -> str:
         with self._lock:
+            operation_context = (self.symbol, self._symbol_generation)
+            closed_klines = list(self.klines)
+        if not closed_klines or closed_klines[-1].close_time != latest.close_time:
+            closed_klines = [
+                item for item in closed_klines if item.close_time < latest.close_time
+            ]
+            closed_klines.append(latest)
+        self._entry_structure_market_snapshot(closed_klines, operation_context)
+        with self._lock:
+            if not self._matches_symbol_context(operation_context):
+                return "STALE_CONTEXT"
             return self._maybe_open_order_locked(
                 signal,
                 latest,
@@ -2368,12 +2462,23 @@ class MonitorState:
             not self.enable_daily_profile_selector
             and self.enable_observation_profile_promotion
         ):
+            precomputed_gate = self.order_policy.evaluate(
+                signal,
+                latest,
+                self.simulator.orders,
+                self._last_order_opened_at,
+                self._opened_signal_keys,
+            )
             promotion_candidate = self._observation_profile_promoted_signal(
                 signal,
                 latest,
-                "SESSION_BLOCKED",
+                precomputed_gate.code,
             )
             if promotion_candidate is not None:
+                signal = self._attach_quality_score(
+                    promotion_candidate,
+                    current_time=latest.close_time,
+                )
                 precomputed_gate = self.order_policy.evaluate(
                     signal,
                     latest,
@@ -2381,16 +2486,6 @@ class MonitorState:
                     self._last_order_opened_at,
                     self._opened_signal_keys,
                 )
-            if (
-                promotion_candidate is not None
-                and precomputed_gate is not None
-                and precomputed_gate.code == "SESSION_BLOCKED"
-            ):
-                signal = self._attach_quality_score(
-                    promotion_candidate,
-                    current_time=latest.close_time,
-                )
-                precomputed_gate = None
         candidate_origin = self._formal_candidate_origin(signal)
         if signal.candidate_origin != candidate_origin:
             signal = replace(signal, candidate_origin=candidate_origin)

@@ -1,3 +1,4 @@
+import threading
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
@@ -5,9 +6,9 @@ from unittest.mock import patch
 from app.daily_profile_selector import profile_key as daily_profile_key
 from app.entry_structure_shadow import EntryStructureGate, StructureConfig
 from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
-from app.order_policy import OrderGate
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import MonitorState
+from app.wave_state import WaveSnapshot
 
 
 class EntryStructureRuntimeTest(unittest.TestCase):
@@ -84,6 +85,51 @@ class EntryStructureRuntimeTest(unittest.TestCase):
                 "entry_structure_reason_code": "STRUCTURE_INSUFFICIENT_DATA",
                 "candidate_origin": candidate_origin,
                 "candidate_direction": signal.direction,
+            }
+
+    class DirectionAwareGate:
+        def attach(self, signal, market_snapshot, candidate_origin):
+            direction = signal.direction
+            return {
+                "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+                "entry_structure_mode": "SHADOW_ONLY",
+                "entry_structure_evaluated_at": market_snapshot.get(
+                    "evaluated_at",
+                    0,
+                ),
+                "entry_structure_state": "SUPPORT_REJECTED",
+                "entry_structure_bias": (
+                    "CONFIRMED" if direction in {"LONG", "SHORT"} else "NEUTRAL"
+                ),
+                "entry_structure_reason_code": "STRUCTURE_SUPPORT_REJECTED",
+                "candidate_origin": candidate_origin,
+                "candidate_direction": direction,
+            }
+
+    class BlockingDetector:
+        config = StructureConfig()
+
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self._lock = threading.Lock()
+
+        def detect(self, symbol, closed_klines):
+            with self._lock:
+                self.calls += 1
+            self.started.set()
+            if not self.release.wait(5):
+                raise TimeoutError("detector release timed out")
+            return {
+                "version": "ENTRY_STRUCTURE_SHADOW_V1",
+                "mode": "SHADOW_ONLY",
+                "status": "READY",
+                "symbol": symbol,
+                "evaluated_at": closed_klines[-1].close_time,
+                "levels": [],
+                "nearest_support": None,
+                "nearest_resistance": None,
             }
 
     class RecordingWebhook:
@@ -305,7 +351,7 @@ class EntryStructureRuntimeTest(unittest.TestCase):
             "PROFILE_PROMOTED_WAIT",
         )
 
-    def test_legacy_promotion_precedes_decision_identity(self):
+    def test_actionable_candidate_uses_real_policy_without_scanning_legacy_profile(self):
         bars = self.bars()
         latest = bars[-1]
         state = self.new_state(
@@ -319,43 +365,81 @@ class EntryStructureRuntimeTest(unittest.TestCase):
         self.addCleanup(state.close)
         state.klines = bars
         history_start = latest.close_time - 2 * 86_400_000
-        state.observations.extend(
+        observations = [
             self.settled_observation(index, history_start + index * 660_000)
             for index in range(12)
-        )
+        ]
+        observations[0].pnl = object()
+        state.observations.extend(observations)
         signal = replace(
             self.signal(latest),
             score=81.0,
             threshold=70.0,
-            session_allowed=False,
+            session_allowed=True,
         )
-        base_evaluate = state.order_policy.evaluate
-        policy_calls = []
 
-        def evaluate_once_as_session_blocked(_policy, *args, **kwargs):
-            policy_calls.append(args[0].candidate_origin)
-            if len(policy_calls) == 1:
-                return OrderGate(code="SESSION_BLOCKED")
-            return base_evaluate(*args, **kwargs)
-
-        with patch(
-            "app.order_policy.OrderPolicy.evaluate",
-            autospec=True,
-            side_effect=evaluate_once_as_session_blocked,
-        ):
-            decision = state._maybe_open_order(signal, latest)
+        decision = state._maybe_open_order(signal, latest)
 
         self.assertEqual(decision, "OPENED")
-        self.assertEqual(len(policy_calls), 2)
-        self.assertEqual(state.selected_signal.candidate_origin, "PROFILE_PROMOTED_WAIT")
+        self.assertEqual(state.selected_signal.candidate_origin, "NATIVE_ACTIONABLE")
         self.assertEqual(
             state.selected_signal.decision_inputs["identity"]["candidate_origin"],
-            "PROFILE_PROMOTED_WAIT",
+            "NATIVE_ACTIONABLE",
         )
         self.assertEqual(
             state.simulator.orders[0].entry_structure_shadow["candidate_origin"],
-            "PROFILE_PROMOTED_WAIT",
+            "NATIVE_ACTIONABLE",
         )
+
+    def test_wave_blocked_runtime_structures_use_final_direction(self):
+        bars = self.bars()
+        latest = bars[-1]
+        for direction, allowed_direction in (("LONG", "SHORT"), ("SHORT", "LONG")):
+            with self.subTest(direction=direction):
+                state = self.new_state(
+                    enable_wave_guard=True,
+                    enable_observation_profile_promotion=False,
+                )
+                self.addCleanup(state.close)
+                state.klines = bars
+                state._entry_structure_gate = self.DirectionAwareGate()
+                signal = replace(
+                    self.signal(latest),
+                    direction=direction,
+                    observe_direction=direction,
+                    score=90.0 if direction == "LONG" else -90.0,
+                    candidate_origin="NATIVE_ACTIONABLE",
+                )
+                wave = WaveSnapshot(
+                    state="UP_LEG" if allowed_direction == "LONG" else "DOWN_LEG",
+                    raw_state="UP_LEG" if allowed_direction == "LONG" else "DOWN_LEG",
+                    window=8,
+                    efficiency=0.8,
+                    direction_ratio=0.8,
+                    atr_strength=2.0,
+                    range_position=0.5,
+                    confirmations=2,
+                    confirmed_at=latest.close_time - 60_000,
+                    allowed_directions=(allowed_direction,),
+                )
+
+                guarded = state._apply_wave_guard(signal, wave)
+                decision = state._maybe_open_order(guarded, latest)
+
+                self.assertEqual(guarded.direction, "WAIT")
+                self.assertEqual(decision, "WAVE_DIRECTION_BLOCKED")
+                final_signal = state.selected_signal
+                observation = state.observations[-1]
+                for candidate in (final_signal, observation):
+                    self.assertEqual(candidate.direction, direction)
+                    self.assertEqual(
+                        candidate.entry_structure_shadow["candidate_direction"],
+                        direction,
+                    )
+                    self.assertEqual(
+                        candidate.entry_structure_shadow["entry_structure_bias"],
+                        "CONFIRMED",
+                    )
 
     def test_native_candidate_evaluates_order_policy_once(self):
         bars = self.bars()
@@ -512,6 +596,118 @@ class EntryStructureRuntimeTest(unittest.TestCase):
             latest.close_time,
         )
         self.assertEqual(structure["entry_structure_state"], "NO_NEARBY_LEVEL")
+
+    def test_uncopyable_existing_structure_degrades_without_blocking_order(self):
+        bars = self.bars()
+        latest = bars[-1]
+        state = self.new_state(enable_observation_profile_promotion=False)
+        self.addCleanup(state.close)
+        state.klines = bars
+        existing = {
+            "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+            "entry_structure_mode": "SHADOW_ONLY",
+            "entry_structure_evaluated_at": latest.close_time,
+            "entry_structure_state": "SUPPORT_REJECTED",
+            "entry_structure_bias": "CONFIRMED",
+            "entry_structure_reason_code": "STRUCTURE_SUPPORT_REJECTED",
+            "candidate_origin": "NATIVE_ACTIONABLE",
+            "candidate_direction": "LONG",
+            "detail": self.Uncopyable(),
+        }
+
+        decision = state._maybe_open_order(
+            replace(self.signal(latest), entry_structure_shadow=existing),
+            latest,
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(
+            state.selected_signal.entry_structure_shadow["entry_structure_state"],
+            "ERROR",
+        )
+        self.assertEqual(
+            state.simulator.orders[0].entry_structure_shadow["entry_structure_state"],
+            "ERROR",
+        )
+
+    def test_non_json_existing_structure_degrades_without_blocking_order(self):
+        bars = self.bars()
+        latest = bars[-1]
+        state = self.new_state(enable_observation_profile_promotion=False)
+        self.addCleanup(state.close)
+        state.klines = bars
+        existing = {
+            "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+            "entry_structure_mode": "SHADOW_ONLY",
+            "entry_structure_evaluated_at": latest.close_time,
+            "entry_structure_state": "NO_NEARBY_LEVEL",
+            "entry_structure_bias": "NEUTRAL",
+            "entry_structure_reason_code": "STRUCTURE_NO_NEARBY_LEVEL",
+            "candidate_origin": "NATIVE_ACTIONABLE",
+            "candidate_direction": "LONG",
+            "detail": {"levels": {99.0, 101.0}},
+        }
+
+        decision = state._maybe_open_order(
+            replace(self.signal(latest), entry_structure_shadow=existing),
+            latest,
+        )
+
+        self.assertEqual(decision, "OPENED")
+        self.assertEqual(
+            state.selected_signal.entry_structure_shadow["entry_structure_state"],
+            "ERROR",
+        )
+        self.assertEqual(
+            state.simulator.orders[0].entry_structure_shadow["entry_structure_state"],
+            "ERROR",
+        )
+
+    def test_structure_snapshot_singleflight_does_not_block_state_lock_or_reset(self):
+        bars = self.bars()
+        state = self.new_state(enable_observation_profile_promotion=False)
+        self.addCleanup(state.close)
+        detector = self.BlockingDetector()
+        state._entry_structure_detector = detector
+        state._entry_structure_state_machine = self.EmptyStateMachine()
+        context = state.capture_symbol_context()
+        cache_key = (context[0], context[1], bars[-1].close_time)
+        results = []
+
+        def detect_snapshot():
+            results.append(state._entry_structure_market_snapshot(bars, context))
+
+        first = threading.Thread(target=detect_snapshot)
+        second = threading.Thread(target=detect_snapshot)
+        first.start()
+        self.assertTrue(detector.started.wait(1))
+        second.start()
+
+        snapshot_done = threading.Event()
+        snapshot_thread = threading.Thread(
+            target=lambda: (state.snapshot(), snapshot_done.set())
+        )
+        snapshot_thread.start()
+        snapshot_responsive = snapshot_done.wait(1)
+
+        reset_done = threading.Event()
+        reset_thread = threading.Thread(
+            target=lambda: (state.reset_symbol("ETHUSDT"), reset_done.set())
+        )
+        reset_thread.start()
+        reset_responsive = reset_done.wait(1)
+
+        detector.release.set()
+        for thread in (first, second, snapshot_thread, reset_thread):
+            thread.join(2)
+
+        self.assertTrue(snapshot_responsive)
+        self.assertTrue(reset_responsive)
+        self.assertTrue(all(not thread.is_alive() for thread in (first, second)))
+        self.assertEqual(detector.calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(state.capture_symbol_context(), ("ETHUSDT", 1))
+        self.assertNotIn(cache_key, state._entry_structure_market_cache)
 
     def test_candidate_error_fallback_preserves_structure_alias_equality(self):
         bars = self.bars()
