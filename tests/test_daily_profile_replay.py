@@ -1,5 +1,6 @@
 import hashlib
 import json
+import random
 import sqlite3
 import tempfile
 import unittest
@@ -558,6 +559,13 @@ class DailyProfileReplayTest(unittest.TestCase):
             small["adaptive_incremental_adds"] * 2,
         )
         self.assertGreater(large["adaptive_max_window_events"], 256)
+        self.assertIn("adaptive_jump_cache_entries", large)
+        self.assertIn("adaptive_jump_cache_entry_bound", large)
+        self.assertIn("adaptive_retained_index_events", large)
+        self.assertLessEqual(
+            large["adaptive_jump_cache_entries"],
+            large["adaptive_jump_cache_entry_bound"],
+        )
         self.assertFalse(hasattr(replay_module, "ADAPTIVE_REBUILD_MAX_EVENTS"))
 
     def test_adaptive_public_window_replay_matches_full_rebuild_beyond_256_events(self):
@@ -823,6 +831,148 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(workload["adaptive_window_rebuilds"], 2)
         self.assertLessEqual(workload["adaptive_window_rebuild_input_rows"], 400)
 
+    def test_adaptive_global_owner_expiry_prefers_earlier_conflict_over_same_binding(self):
+        start = timestamp("2026-01-01T00:00:00")
+        owner = replace(
+            observation("owner", "WIN", start),
+            observation_key="reviewer-shared-observation",
+            decision_id="reviewer-owner-decision",
+        )
+        earlier_conflict = replace(
+            observation(
+                "earlier-conflict",
+                "LOSS",
+                start + 86_400_000,
+                direction="LONG",
+                tag="reviewer_long_conflict",
+            ),
+            observation_key="reviewer-shared-observation",
+            decision_id="reviewer-conflict-decision",
+            threshold_segment="WD-15",
+        )
+        later_same_binding = replace(
+            observation("later-same-binding", "LOSS", start + 2 * 86_400_000),
+            observation_key="reviewer-shared-observation",
+            decision_id="reviewer-owner-decision",
+        )
+        rows = [
+            owner,
+            earlier_conflict,
+            later_same_binding,
+            observation("filler-short", "WIN", start + 3 * 86_400_000),
+            observation(
+                "filler-long",
+                "WIN",
+                start + 4 * 86_400_000,
+                direction="LONG",
+                tag="reviewer_long_conflict",
+            ),
+            replace(
+                observation(
+                    "conflict-follow-up",
+                    "WIN",
+                    start + 15 * 86_400_000 + 60 * 60_000,
+                    direction="LONG",
+                    tag="reviewer_long_conflict",
+                ),
+                observation_key="reviewer-shared-observation",
+                decision_id="reviewer-conflict-decision",
+                threshold_segment="WD-15",
+            ),
+            observation(
+                "conflict-profile-unique",
+                "WIN",
+                start + 15 * 86_400_000 + 2 * 60 * 60_000,
+                direction="LONG",
+                tag="reviewer_long_conflict",
+            ),
+        ]
+        ordered = sorted(rows, key=replay_module.adaptive_replay_event_sort_key)
+        tracker = AdaptiveGlobalProfileWindowReplay(
+            lookback_ms=15 * 86_400_000,
+        )
+        prefix = []
+        for index, row in enumerate(ordered):
+            prefix.append(row)
+            evaluated_at = int(row.settled_at) + 1
+            window = [
+                event
+                for event in prefix
+                if evaluated_at - 15 * 86_400_000
+                <= int(event.settled_at)
+                < evaluated_at
+            ]
+            key = replay_module._observation_profile_key(row)
+            expected = rebuild_adaptive_profile_states(window, evaluated_at).get(key)
+            if expected is None:
+                expected = replay_module._adaptive_state((), key, evaluated_at)
+            actual = tracker.advance(row, evaluated_at)
+            with self.subTest(index=index):
+                self.assertEqual(actual, expected)
+
+    def test_adaptive_global_random_multi_profile_windows_match_full_rebuild(self):
+        rng = random.Random(20260820)
+        start = timestamp("2026-01-01T00:00:00")
+        rows = []
+        for index in range(360):
+            direction = "LONG" if index % 3 == 0 else "SHORT"
+            row = replace(
+                observation(
+                    f"random-global-{index:03d}",
+                    "WIN" if rng.random() >= 0.42 else "LOSS",
+                    start + index * 90 * 60_000,
+                    direction=direction,
+                    tag=(
+                        "random_long_observe"
+                        if direction == "LONG"
+                        else "random_short_observe"
+                    ),
+                ),
+                threshold_segment="WD-15" if direction == "LONG" else "WE-04",
+            )
+            if index >= 20:
+                mode = rng.randrange(12)
+                source = rows[index - rng.randint(5, 20)]
+                if mode == 0:
+                    row = replace(
+                        row,
+                        observation_key=source.observation_key,
+                        decision_id=source.decision_id,
+                        strategy_family=source.strategy_family,
+                        strategy_tag=source.strategy_tag,
+                        direction=source.direction,
+                        threshold_segment=source.threshold_segment,
+                    )
+                elif mode == 1:
+                    row = replace(row, observation_key=source.observation_key)
+                elif mode == 2:
+                    row = replace(row, decision_id=source.decision_id)
+            rows.append(row)
+
+        ordered = sorted(rows, key=replay_module.adaptive_replay_event_sort_key)
+        tracker = AdaptiveGlobalProfileWindowReplay(
+            lookback_ms=15 * 86_400_000,
+        )
+        left = 0
+        for index, row in enumerate(ordered):
+            evaluated_at = int(row.settled_at) + 1
+            while (
+                left <= index
+                and int(ordered[left].settled_at)
+                < evaluated_at - 15 * 86_400_000
+            ):
+                left += 1
+            key = replay_module._observation_profile_key(row)
+            expected = rebuild_adaptive_profile_states(
+                ordered[left : index + 1],
+                evaluated_at,
+            ).get(key)
+            if expected is None:
+                expected = replay_module._adaptive_state((), key, evaluated_at)
+            actual = tracker.advance(row, evaluated_at)
+            with self.subTest(index=index):
+                self.assertEqual(actual, expected)
+
     def test_adaptive_global_window_skips_rebuild_when_all_claims_expire_together(self):
         start = timestamp("2026-01-01T00:00:00")
         owner = replace(
@@ -869,6 +1019,166 @@ class DailyProfileReplayTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the adaptive lookback window"):
             tracker.advance(row, int(row.settled_at) + lookback_ms + 2)
 
+    def test_adaptive_advance_rejects_cutoff_before_last_state_evaluation(self):
+        start = timestamp("2026-07-01T00:00:00")
+        first = observation("cutoff-first", "WIN", start)
+        second = observation("cutoff-second", "WIN", start + 11 * 60_000)
+        tracker = AdaptiveProfileWindowReplay(
+            replay_module._observation_profile_key(first),
+            lookback_ms=15 * 86_400_000,
+        )
+        tracker.advance(first, int(first.settled_at) + 1)
+        tracker.state_at(int(second.settled_at) + 60_000)
+
+        with self.assertRaisesRegex(ValueError, "evaluated_at must advance monotonically"):
+            tracker.advance(second, int(second.settled_at) + 1)
+
+    def test_adaptive_duplicate_identity_work_is_near_linear_across_window(self):
+        def workload_for(count):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    f"duplicate-owner-{index // 2:04d}",
+                    "WIN" if index % 3 else "LOSS",
+                    start + index * 11 * 60_000,
+                )
+                for index in range(count)
+            ]
+            tracker = AdaptiveProfileWindowReplay(
+                replay_module._observation_profile_key(rows[0]),
+                lookback_ms=15 * 86_400_000,
+            )
+            for row in rows:
+                tracker.advance(row, int(row.settled_at) + 1)
+            return tracker.workload
+
+        small = workload_for(2_000)
+        self.assertLessEqual(small["window_rebuild_input_rows"], 2_000 * 4)
+        large = workload_for(4_000)
+        self.assertLessEqual(
+            large["window_rebuild_input_rows"],
+            max(1, small["window_rebuild_input_rows"]) * 2.5,
+        )
+        self.assertLessEqual(
+            large["dynamic_work_units"],
+            4_000 * ((4_000).bit_length() + 4),
+        )
+
+    def test_adaptive_global_duplicate_identity_transfers_owner_without_rebuild(self):
+        def workload_for(count):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    f"global-duplicate-owner-{index // 2:04d}",
+                    "WIN" if index % 3 else "LOSS",
+                    start + index * 11 * 60_000,
+                )
+                for index in range(count)
+            ]
+            tracker = AdaptiveGlobalProfileWindowReplay(
+                lookback_ms=15 * 86_400_000,
+            )
+            for row in rows:
+                tracker.advance(row, int(row.settled_at) + 1)
+            return tracker.workload_report()
+
+        small = workload_for(2_000)
+        large = workload_for(4_000)
+
+        self.assertEqual(small["global_identity_rebuild_input_rows"], 0)
+        self.assertEqual(large["global_identity_rebuild_input_rows"], 0)
+        self.assertGreater(large["global_identity_fast_transfers"], 0)
+        self.assertLessEqual(
+            large["global_identity_claim_index_entries"],
+            large["max_global_window_events"] * 2,
+        )
+
+    def test_adaptive_single_opened_inversion_recovers_without_window_rebuilds(self):
+        def workload_for(count):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    f"inversion-{index:04d}",
+                    "WIN" if index % 3 else "LOSS",
+                    start + index * 11 * 60_000,
+                )
+                for index in range(count)
+            ]
+            inverted_opened_at = rows[99].opened_at - 60_000
+            rows[100] = replace(
+                rows[100],
+                opened_at=inverted_opened_at,
+                expires_at=inverted_opened_at + 10 * 60_000,
+            )
+            tracker = AdaptiveProfileWindowReplay(
+                replay_module._observation_profile_key(rows[0]),
+                lookback_ms=15 * 86_400_000,
+            )
+            for row in rows:
+                tracker.advance(row, int(row.settled_at) + 1)
+            return tracker.workload
+
+        small = workload_for(2_000)
+        self.assertLessEqual(small["window_rebuild_input_rows"], 2_000 * 4)
+        large = workload_for(4_000)
+        self.assertLessEqual(
+            large["window_rebuild_input_rows"],
+            max(1, small["window_rebuild_input_rows"]) * 2.5,
+        )
+        self.assertLessEqual(
+            large["dynamic_work_units"],
+            4_000 * ((4_000).bit_length() + 4),
+        )
+
+    def test_adaptive_duplicate_and_inversion_paths_match_full_window_rebuild(self):
+        start = timestamp("2026-01-01T00:00:00")
+        duplicate_rows = [
+            observation(
+                f"differential-duplicate-{index // 2:04d}",
+                "WIN" if index % 4 else "LOSS",
+                start + index * 11 * 60_000,
+            )
+            for index in range(2_200)
+        ]
+        inversion_rows = [
+            observation(
+                f"differential-inversion-{index:04d}",
+                "WIN" if index % 3 else "LOSS",
+                start + index * 11 * 60_000,
+            )
+            for index in range(2_200)
+        ]
+        inverted_opened_at = inversion_rows[99].opened_at - 60_000
+        inversion_rows[100] = replace(
+            inversion_rows[100],
+            opened_at=inverted_opened_at,
+            expires_at=inverted_opened_at + 10 * 60_000,
+        )
+        checkpoints = {1_963, 1_964, 2_000, 2_199}
+        lookback_ms = 15 * 86_400_000
+
+        for name, rows in (
+            ("duplicate", duplicate_rows),
+            ("inversion", inversion_rows),
+        ):
+            key = replay_module._observation_profile_key(rows[0])
+            tracker = AdaptiveProfileWindowReplay(key, lookback_ms=lookback_ms)
+            for index, row in enumerate(rows):
+                evaluated_at = int(row.settled_at) + 1
+                actual = tracker.advance(row, evaluated_at)
+                if index not in checkpoints:
+                    continue
+                window = [
+                    event
+                    for event in rows[: index + 1]
+                    if evaluated_at - lookback_ms
+                    <= int(event.settled_at)
+                    < evaluated_at
+                ]
+                expected = rebuild_adaptive_profile_states(window, evaluated_at)[key]
+                with self.subTest(path=name, index=index):
+                    self.assertEqual(actual, expected)
+
     def test_adaptive_window_work_is_near_linear_across_fifteen_day_boundary(self):
         def workload_for(count, spacing_minutes):
             start = timestamp("2026-01-01T00:00:00")
@@ -899,6 +1209,11 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertLessEqual(
             non_overlapping_large["retained_index_events"],
             non_overlapping_large["max_window_events"] * 2,
+        )
+        self.assertLessEqual(
+            non_overlapping_large["jump_cache_entries"],
+            non_overlapping_large["retained_index_events"]
+            * (non_overlapping_large["retained_index_events"].bit_length() + 1),
         )
         self.assertLessEqual(
             non_overlapping_large["bounded_work_units"],

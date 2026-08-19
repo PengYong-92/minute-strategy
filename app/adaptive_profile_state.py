@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from bisect import bisect_left
@@ -243,6 +244,7 @@ class _IdentityBindings:
 class _IncrementalCanonicalSelection:
     def __init__(self) -> None:
         self._serial = 0
+        self.work_units = 0
         self._identity_by_opened = _ChunkedSortedIndex()
         self._canonical_by_opened = _ChunkedSortedIndex()
         self._canonical_by_settlement = _ChunkedSortedIndex()
@@ -257,6 +259,7 @@ class _IncrementalCanonicalSelection:
         ]
 
     def add(self, event: ObservationSignal) -> _SelectionUpdate:
+        self.work_units += 1
         candidate = _ReplayCandidate(
             event=event,
             order_key=(*_opened_sort_key(event), self._serial),
@@ -334,6 +337,7 @@ class _IncrementalCanonicalSelection:
         convergence_key = None
 
         while True:
+            self.work_units += 1
             candidate = self._identity_by_opened.lower_bound(search_key)
             if candidate is None:
                 break
@@ -362,7 +366,46 @@ class _IncrementalCanonicalSelection:
         for candidate in selected:
             self._canonical_serials.add(candidate.serial)
             self._canonical_by_settlement.insert(candidate.settlement_key, candidate)
+        self.work_units += len(removed) + len(selected)
         return bool(removed or selected)
+
+
+class _SlidingIntervalSelection(_IncrementalCanonicalSelection):
+    """Maintain greedy interval selection for externally canonical candidates."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._active_candidates: dict[int, _ReplayCandidate] = {}
+
+    @property
+    def selected_count(self) -> int:
+        return len(self._canonical_serials)
+
+    def activate(self, event: ObservationSignal) -> int:
+        self.work_units += 1
+        serial = self._serial
+        self._serial += 1
+        candidate = _ReplayCandidate(
+            event=event,
+            order_key=(*_opened_sort_key(event), serial),
+            settlement_key=(*_settlement_sort_key(event), serial),
+            serial=serial,
+        )
+        self._active_candidates[serial] = candidate
+        self._identity_by_opened.insert(candidate.order_key, candidate)
+        self._repair_interval_selection(candidate.order_key)
+        return serial
+
+    def deactivate(self, serial: int) -> None:
+        self.work_units += 1
+        candidate = self._active_candidates.pop(serial)
+        self._identity_by_opened.remove(candidate.order_key)
+        if serial not in self._canonical_serials:
+            return
+        self._canonical_serials.remove(serial)
+        self._canonical_by_opened.remove(candidate.order_key)
+        self._canonical_by_settlement.remove(candidate.settlement_key)
+        self._repair_interval_selection(candidate.order_key)
 
 
 class _MonotonicWindowIndex:
@@ -383,6 +426,14 @@ class _MonotonicWindowIndex:
         self.opened_at.append(int(event.opened_at))
         self.work_units += 1
         return monotonic
+
+    @property
+    def jump_cache_entries(self) -> int:
+        return len(self._jumps)
+
+    @property
+    def successor_cache_entries(self) -> int:
+        return len(self._successors)
 
     def selected_tail(
         self,
@@ -476,12 +527,25 @@ class AdaptiveProfileWindowReplay:
         self.lookback_ms = lookback_ms
         self.config = _resolve_config(config)
         self._events: deque[ObservationSignal] = deque()
+        self._event_serials: deque[int] = deque()
+        self._next_window_serial = 0
+        self._active_window_serials: set[int] = set()
+        self._events_by_serial: dict[int, ObservationSignal] = {}
+        self._serial_by_event_id: dict[int, int] = {}
         self._index = _MonotonicWindowIndex()
         self._active_start = 0
-        self._opened_monotonic = True
+        self._opened_inversion_members: dict[int, int] = {}
         self._observation_counts: dict[str, int] = {}
         self._decision_counts: dict[str, int] = {}
         self._duplicate_identities = 0
+        self._observation_variants: dict[str, dict[str, int]] = {}
+        self._decision_variants: dict[str, dict[str, int]] = {}
+        self._identity_conflicts = 0
+        self._pair_claim_heaps: dict[tuple[str, str], list[tuple[tuple, int]]] = {}
+        self._pair_owner_tokens: dict[tuple[str, str], tuple[int, int]] = {}
+        self._anonymous_tokens: dict[int, int] = {}
+        self._dynamic_selection: _SlidingIntervalSelection | None = None
+        self._retired_dynamic_work_units = 0
         self._bindings = _IdentityBindings()
         self._replay = _ProfileReplay(selection=_IncrementalCanonicalSelection())
         self._incremental_window_valid = True
@@ -499,6 +563,9 @@ class AdaptiveProfileWindowReplay:
             "index_compactions": 0,
             "index_compaction_input_rows": 0,
             "retained_index_events": 0,
+            "jump_cache_entries": 0,
+            "successor_cache_entries": 0,
+            "dynamic_work_units": 0,
         }
 
     def advance(
@@ -507,6 +574,8 @@ class AdaptiveProfileWindowReplay:
         evaluated_at: int,
     ) -> dict:
         cutoff = _validated_evaluated_at(evaluated_at)
+        if self._last_evaluated_at is not None and cutoff < self._last_evaluated_at:
+            raise ValueError("evaluated_at must advance monotonically")
         prepared = _prepare_event(event, cutoff)
         if prepared is None or prepared[0] != self.profile_key:
             raise ValueError("event is not eligible for this adaptive profile window")
@@ -519,13 +588,33 @@ class AdaptiveProfileWindowReplay:
             raise ValueError("event is outside the adaptive lookback window")
         self._expire_before(window_start)
 
+        serial = self._next_window_serial
+        self._next_window_serial += 1
+        if self._events and _opened_sort_key(self._events[-1]) > _opened_sort_key(event):
+            self._add_opened_inversion(self._event_serials[-1], serial)
         self._events.append(event)
-        self._opened_monotonic = (
-            self._index.append(event) and self._opened_monotonic
-        )
+        self._event_serials.append(serial)
+        self._active_window_serials.add(serial)
+        self._events_by_serial[serial] = event
+        self._serial_by_event_id[id(event)] = serial
+        self._index.append(event)
         self.workload["retained_index_events"] = len(self._index.events)
         self._add_identity(event.observation_key, self._observation_counts)
         self._add_identity(event.decision_id, self._decision_counts)
+        self._add_identity_variant(
+            event.observation_key,
+            event.decision_id,
+            self._observation_variants,
+        )
+        self._add_identity_variant(
+            event.decision_id,
+            event.observation_key,
+            self._decision_variants,
+        )
+        if self._dynamic_selection is None and self._has_dynamic_hazard():
+            self._rebuild_dynamic_selection()
+        elif self._dynamic_selection is not None:
+            self._add_dynamic_claim(serial, event)
         self._last_event_key = event_key
         self._last_evaluated_at = cutoff
         self.workload["incremental_adds"] += 1
@@ -558,13 +647,42 @@ class AdaptiveProfileWindowReplay:
     def _expire_before(self, window_start: int) -> None:
         removed = False
         while self._events and int(self._events[0].settled_at) < window_start:
+            if (
+                len(self._events) >= 2
+                and _opened_sort_key(self._events[0])
+                > _opened_sort_key(self._events[1])
+            ):
+                self._remove_opened_inversion(
+                    self._event_serials[0],
+                    self._event_serials[1],
+                )
             expired = self._events.popleft()
+            serial = self._event_serials.popleft()
+            if self._dynamic_selection is None:
+                self._active_window_serials.remove(serial)
+            else:
+                self._remove_dynamic_claim(serial, expired)
+            self._remove_identity_variant(
+                expired.observation_key,
+                expired.decision_id,
+                self._observation_variants,
+            )
+            self._remove_identity_variant(
+                expired.decision_id,
+                expired.observation_key,
+                self._decision_variants,
+            )
             self._remove_identity(expired.observation_key, self._observation_counts)
             self._remove_identity(expired.decision_id, self._decision_counts)
+            self._events_by_serial.pop(serial, None)
+            if self._serial_by_event_id.get(id(expired)) == serial:
+                self._serial_by_event_id.pop(id(expired), None)
             self._active_start += 1
             removed = True
         if removed:
             self._incremental_window_valid = False
+            if self._dynamic_selection is not None and not self._has_dynamic_hazard():
+                self._drop_dynamic_selection()
             self._compact_index_if_geometric()
 
     def _compact_index_if_geometric(self) -> None:
@@ -574,17 +692,16 @@ class AdaptiveProfileWindowReplay:
         if active_count and self._active_start < active_count:
             return
         compacted = _MonotonicWindowIndex()
-        monotonic = True
         for event in self._events:
-            monotonic = compacted.append(event) and monotonic
+            compacted.append(event)
         self._index = compacted
         self._active_start = 0
-        self._opened_monotonic = monotonic
         self.workload["index_compactions"] += 1
         self.workload["index_compaction_input_rows"] += active_count
         self.workload["algorithm_work_units"] += active_count
         self.workload["bounded_work_units"] += active_count
         self.workload["retained_index_events"] = active_count
+        self._sync_index_workload()
 
     def _apply_incremental(
         self,
@@ -621,6 +738,146 @@ class AdaptiveProfileWindowReplay:
         else:
             counts[identity] = previous - 1
 
+    def _add_identity_variant(
+        self,
+        identity: str,
+        binding: str,
+        variants: dict[str, dict[str, int]],
+    ) -> None:
+        if not identity:
+            return
+        bindings = variants.setdefault(identity, {})
+        was_conflicting = len(bindings) > 1
+        bindings[binding] = bindings.get(binding, 0) + 1
+        if not was_conflicting and len(bindings) > 1:
+            self._identity_conflicts += 1
+
+    def _remove_identity_variant(
+        self,
+        identity: str,
+        binding: str,
+        variants: dict[str, dict[str, int]],
+    ) -> None:
+        if not identity:
+            return
+        bindings = variants[identity]
+        was_conflicting = len(bindings) > 1
+        count = bindings[binding]
+        if count == 1:
+            del bindings[binding]
+        else:
+            bindings[binding] = count - 1
+        if was_conflicting and len(bindings) <= 1:
+            self._identity_conflicts -= 1
+        if not bindings:
+            del variants[identity]
+
+    def _add_opened_inversion(self, left_serial: int, right_serial: int) -> None:
+        for serial in (left_serial, right_serial):
+            self._opened_inversion_members[serial] = (
+                self._opened_inversion_members.get(serial, 0) + 1
+            )
+
+    def _remove_opened_inversion(self, left_serial: int, right_serial: int) -> None:
+        for serial in (left_serial, right_serial):
+            count = self._opened_inversion_members[serial]
+            if count == 1:
+                del self._opened_inversion_members[serial]
+            else:
+                self._opened_inversion_members[serial] = count - 1
+
+    @staticmethod
+    def _identity_pair(event: ObservationSignal) -> tuple[str, str]:
+        return event.observation_key, event.decision_id
+
+    def _add_dynamic_claim(self, serial: int, event: ObservationSignal) -> None:
+        if self._dynamic_selection is None:
+            raise RuntimeError("dynamic interval selection is not initialized")
+        pair = self._identity_pair(event)
+        if not pair[0] and not pair[1]:
+            self._anonymous_tokens[serial] = self._dynamic_selection.activate(event)
+            return
+        heap = self._pair_claim_heaps.setdefault(pair, [])
+        heapq.heappush(heap, (_opened_sort_key(event), serial))
+        self._sync_pair_owner(pair)
+
+    def _remove_dynamic_claim(self, serial: int, event: ObservationSignal) -> None:
+        if self._dynamic_selection is None:
+            raise RuntimeError("dynamic interval selection is not initialized")
+        pair = self._identity_pair(event)
+        if not pair[0] and not pair[1]:
+            self._dynamic_selection.deactivate(self._anonymous_tokens.pop(serial))
+            self._active_window_serials.remove(serial)
+            return
+        self._active_window_serials.remove(serial)
+        self._sync_pair_owner(pair)
+
+    def _sync_pair_owner(self, pair: tuple[str, str]) -> None:
+        if self._dynamic_selection is None:
+            raise RuntimeError("dynamic interval selection is not initialized")
+        heap = self._pair_claim_heaps[pair]
+        while heap and heap[0][1] not in self._active_window_serials:
+            heapq.heappop(heap)
+        new_owner = heap[0][1] if heap else None
+        current = self._pair_owner_tokens.get(pair)
+        if current is not None and current[0] == new_owner:
+            return
+        if current is not None:
+            self._dynamic_selection.deactivate(current[1])
+            del self._pair_owner_tokens[pair]
+        if new_owner is None:
+            del self._pair_claim_heaps[pair]
+            return
+        token = self._dynamic_selection.activate(self._events_by_serial[new_owner])
+        self._pair_owner_tokens[pair] = (new_owner, token)
+
+    def _has_dynamic_hazard(self) -> bool:
+        return bool(
+            self._duplicate_identities
+            or self._opened_inversion_members
+            or self._identity_conflicts
+        )
+
+    def _rebuild_dynamic_selection(self) -> None:
+        self._dynamic_selection = _SlidingIntervalSelection()
+        self._pair_claim_heaps = {}
+        self._pair_owner_tokens = {}
+        self._anonymous_tokens = {}
+        for serial, event in zip(self._event_serials, self._events):
+            self._add_dynamic_claim(serial, event)
+
+    def _drop_dynamic_selection(self) -> None:
+        if self._dynamic_selection is not None:
+            self._retired_dynamic_work_units += self._dynamic_selection.work_units
+        self._dynamic_selection = None
+        self._pair_claim_heaps = {}
+        self._pair_owner_tokens = {}
+        self._anonymous_tokens = {}
+
+    def _dynamic_window_state(self, evaluated_at: int) -> dict | None:
+        if self._dynamic_selection is None:
+            raise RuntimeError("dynamic interval selection is not initialized")
+        tail = self._dynamic_selection.latest_selected_events(
+            self.config.full_window_samples + 2
+        )
+        selected_count = self._dynamic_selection.selected_count
+        if self._opened_inversion_members:
+            if selected_count <= self.config.full_window_samples + 2:
+                return None
+            tail_serials = [
+                self._serial_by_event_id.get(id(event), self._next_window_serial)
+                for event in tail
+            ]
+            if max(self._opened_inversion_members) >= min(tail_serials):
+                return None
+        return _state_from_monotonic_selected_tail(
+            tail,
+            selected_count,
+            self.profile_key,
+            evaluated_at,
+            self.config,
+        )
+
     def _evaluate_window(self, evaluated_at: int) -> dict:
         if not self._events:
             self._state = evaluate_adaptive_profile_state(
@@ -629,7 +886,10 @@ class AdaptiveProfileWindowReplay:
                 evaluated_at,
                 config=self.config,
             )
-        elif self._opened_monotonic and self._duplicate_identities == 0:
+        elif (
+            not self._opened_inversion_members
+            and self._duplicate_identities == 0
+        ):
             before_work = self._index.work_units
             tail, selected_count = self._index.selected_tail(
                 self._active_start,
@@ -647,6 +907,16 @@ class AdaptiveProfileWindowReplay:
             self.workload["algorithm_work_units"] += (
                 self._index.work_units - before_work
             )
+        elif self._identity_conflicts == 0:
+            dynamic_state = self._dynamic_window_state(evaluated_at)
+            if dynamic_state is None:
+                self._rebuild_window(evaluated_at)
+            else:
+                self._state = dynamic_state
+                self.workload["fast_path_events"] += 1
+                self.workload["algorithm_work_units"] += (
+                    self.config.full_window_samples + 2
+                )
         else:
             self._rebuild_window(evaluated_at)
         return self._copy_state_at(evaluated_at)
@@ -662,7 +932,23 @@ class AdaptiveProfileWindowReplay:
         state = dict(self._state)
         state["evaluated_at"] = evaluated_at
         self._state = state
+        self._sync_index_workload()
         return deepcopy(state)
+
+    def _sync_index_workload(self) -> None:
+        self.workload["retained_index_events"] = len(self._index.events)
+        self.workload["jump_cache_entries"] = self._index.jump_cache_entries
+        self.workload["successor_cache_entries"] = (
+            self._index.successor_cache_entries
+        )
+        active_dynamic_work = (
+            self._dynamic_selection.work_units
+            if self._dynamic_selection is not None
+            else 0
+        )
+        self.workload["dynamic_work_units"] = (
+            self._retired_dynamic_work_units + active_dynamic_work
+        )
 
     def _rebuild_window(self, evaluated_at: int) -> None:
         self.workload["window_rebuilds"] += 1
@@ -685,9 +971,22 @@ class AdaptiveProfileWindowReplay:
 
 @dataclass
 class _GlobalWindowEntry:
+    serial: int
     profile_key: str
     event: ObservationSignal
     accepted: bool
+
+
+@dataclass(frozen=True)
+class _IdentityOwner:
+    binding: tuple[str, str]
+    serial: int
+
+
+@dataclass(frozen=True)
+class _IdentityClaim:
+    binding: tuple[str, str]
+    serial: int
 
 
 class AdaptiveGlobalProfileWindowReplay:
@@ -699,6 +998,7 @@ class AdaptiveGlobalProfileWindowReplay:
         "fast_path_events",
         "algorithm_work_units",
         "bounded_work_units",
+        "dynamic_work_units",
     )
 
     def __init__(
@@ -712,10 +1012,17 @@ class AdaptiveGlobalProfileWindowReplay:
         self.lookback_ms = lookback_ms
         self.config = _resolve_config(config)
         self._events: deque[_GlobalWindowEntry] = deque()
-        self._observation_claims: dict[str, int] = {}
-        self._decision_claims: dict[str, int] = {}
-        self._observation_bindings: dict[str, tuple[tuple[str, str], int]] = {}
-        self._decision_bindings: dict[str, tuple[tuple[str, str], int]] = {}
+        self._entries_by_serial: dict[int, _GlobalWindowEntry] = {}
+        self._observation_claims: dict[str, deque[_IdentityClaim]] = {}
+        self._decision_claims: dict[str, deque[_IdentityClaim]] = {}
+        self._observation_claim_bindings: dict[
+            str, dict[tuple[str, str], int]
+        ] = {}
+        self._decision_claim_bindings: dict[
+            str, dict[tuple[str, str], int]
+        ] = {}
+        self._observation_bindings: dict[str, _IdentityOwner] = {}
+        self._decision_bindings: dict[str, _IdentityOwner] = {}
         self._trackers: dict[str, AdaptiveProfileWindowReplay] = {}
         self._retired_profile_workload = {
             key: 0 for key in self._PROFILE_WORKLOAD_KEYS
@@ -723,10 +1030,12 @@ class AdaptiveGlobalProfileWindowReplay:
         self._max_profile_window_events = 0
         self._last_event_key: tuple | None = None
         self._last_evaluated_at: int | None = None
+        self._next_serial = 0
         self.workload = {
             "events": 0,
             "global_identity_rebuilds": 0,
             "global_identity_rebuild_input_rows": 0,
+            "global_identity_fast_transfers": 0,
             "max_global_window_events": 0,
         }
 
@@ -751,16 +1060,26 @@ class AdaptiveGlobalProfileWindowReplay:
 
         if self._expire_before(window_start):
             self._rebuild_active_window()
-        self._increment_claim(
+        serial = self._next_serial
+        self._next_serial += 1
+        accepted = self._accept(key, prepared_event, serial)
+        entry = _GlobalWindowEntry(serial, key, prepared_event, accepted)
+        self._events.append(entry)
+        self._entries_by_serial[serial] = entry
+        self._register_claim(
             prepared_event.observation_key,
+            (prepared_event.decision_id, key),
+            serial,
             self._observation_claims,
+            self._observation_claim_bindings,
         )
-        self._increment_claim(
+        self._register_claim(
             prepared_event.decision_id,
+            (prepared_event.observation_key, key),
+            serial,
             self._decision_claims,
+            self._decision_claim_bindings,
         )
-        accepted = self._accept(key, prepared_event)
-        self._events.append(_GlobalWindowEntry(key, prepared_event, accepted))
         self._last_event_key = event_key
         self._last_evaluated_at = cutoff
         self.workload["events"] += 1
@@ -799,37 +1118,87 @@ class AdaptiveGlobalProfileWindowReplay:
         totals.update(self.workload)
         totals["incremental_adds"] = int(self.workload["events"])
         totals["max_window_events"] = self._max_profile_window_events
+        retained_events = sum(
+            int(tracker.workload["retained_index_events"])
+            for tracker in self._trackers.values()
+        )
+        totals["retained_index_events"] = retained_events
+        totals["jump_cache_entries"] = sum(
+            int(tracker.workload["jump_cache_entries"])
+            for tracker in self._trackers.values()
+        )
+        totals["successor_cache_entries"] = sum(
+            int(tracker.workload["successor_cache_entries"])
+            for tracker in self._trackers.values()
+        )
+        totals["jump_cache_entry_bound"] = sum(
+            int(tracker.workload["retained_index_events"])
+            * (int(tracker.workload["retained_index_events"]).bit_length() + 1)
+            for tracker in self._trackers.values()
+        )
+        totals["global_identity_claim_index_entries"] = sum(
+            len(claims) for claims in self._observation_claims.values()
+        ) + sum(len(claims) for claims in self._decision_claims.values())
         return totals
 
     def _expire_before(self, window_start: int) -> bool:
-        released_observations: set[str] = set()
-        released_decisions: set[str] = set()
+        released_observations: dict[str, tuple[str, str]] = {}
+        released_decisions: dict[str, tuple[str, str]] = {}
         while self._events and int(self._events[0].event.settled_at) < window_start:
             entry = self._events.popleft()
             event = entry.event
-            self._decrement_claim(event.observation_key, self._observation_claims)
-            self._decrement_claim(event.decision_id, self._decision_claims)
+            self._entries_by_serial.pop(entry.serial)
+            self._unregister_claim(
+                event.observation_key,
+                (event.decision_id, entry.profile_key),
+                entry.serial,
+                self._observation_claims,
+                self._observation_claim_bindings,
+            )
+            self._unregister_claim(
+                event.decision_id,
+                (event.observation_key, entry.profile_key),
+                entry.serial,
+                self._decision_claims,
+                self._decision_claim_bindings,
+            )
             if not entry.accepted:
                 continue
-            if self._release_binding(
+            released = self._release_binding(
                 event.observation_key,
+                entry.serial,
                 self._observation_bindings,
-            ):
-                released_observations.add(event.observation_key)
-            if self._release_binding(
+            )
+            if released is not None:
+                released_observations[event.observation_key] = released
+            released = self._release_binding(
                 event.decision_id,
+                entry.serial,
                 self._decision_bindings,
-            ):
-                released_decisions.add(event.decision_id)
-        return any(
-            identity in self._observation_claims
-            for identity in released_observations
-        ) or any(
-            identity in self._decision_claims
-            for identity in released_decisions
-        )
+            )
+            if released is not None:
+                released_decisions[event.decision_id] = released
 
-    def _accept(self, key: str, event: ObservationSignal) -> bool:
+        observation_transfers = self._safe_owner_transfers(
+            released_observations,
+            self._observation_claims,
+            self._observation_claim_bindings,
+        )
+        decision_transfers = self._safe_owner_transfers(
+            released_decisions,
+            self._decision_claims,
+            self._decision_claim_bindings,
+        )
+        if observation_transfers is None or decision_transfers is None:
+            return True
+        self._observation_bindings.update(observation_transfers)
+        self._decision_bindings.update(decision_transfers)
+        self.workload["global_identity_fast_transfers"] += (
+            len(observation_transfers) + len(decision_transfers)
+        )
+        return False
+
+    def _accept(self, key: str, event: ObservationSignal, serial: int) -> bool:
         observation_binding = (event.decision_id, key)
         decision_binding = (event.observation_key, key)
         if not self._binding_matches(
@@ -847,11 +1216,13 @@ class AdaptiveGlobalProfileWindowReplay:
         self._retain_binding(
             event.observation_key,
             observation_binding,
+            serial,
             self._observation_bindings,
         )
         self._retain_binding(
             event.decision_id,
             decision_binding,
+            serial,
             self._decision_bindings,
         )
         return True
@@ -860,53 +1231,100 @@ class AdaptiveGlobalProfileWindowReplay:
     def _binding_matches(
         identity: str,
         binding: tuple[str, str],
-        bindings: dict[str, tuple[tuple[str, str], int]],
+        bindings: dict[str, _IdentityOwner],
     ) -> bool:
         return (
             not identity
             or identity not in bindings
-            or bindings[identity][0] == binding
+            or bindings[identity].binding == binding
         )
 
     @staticmethod
     def _retain_binding(
         identity: str,
         binding: tuple[str, str],
-        bindings: dict[str, tuple[tuple[str, str], int]],
+        serial: int,
+        bindings: dict[str, _IdentityOwner],
     ) -> None:
         if not identity:
             return
-        current = bindings.get(identity)
-        bindings[identity] = (binding, 1 if current is None else current[1] + 1)
+        bindings.setdefault(identity, _IdentityOwner(binding, serial))
 
     @staticmethod
     def _release_binding(
         identity: str,
-        bindings: dict[str, tuple[tuple[str, str], int]],
-    ) -> bool:
+        serial: int,
+        bindings: dict[str, _IdentityOwner],
+    ) -> tuple[str, str] | None:
         if not identity:
-            return False
-        binding, count = bindings[identity]
-        if count > 1:
-            bindings[identity] = (binding, count - 1)
-            return False
+            return None
+        owner = bindings.get(identity)
+        if owner is None or owner.serial != serial:
+            return None
         del bindings[identity]
-        return True
+        return owner.binding
 
     @staticmethod
-    def _increment_claim(identity: str, claims: dict[str, int]) -> None:
-        if identity:
-            claims[identity] = claims.get(identity, 0) + 1
-
-    @staticmethod
-    def _decrement_claim(identity: str, claims: dict[str, int]) -> None:
+    def _register_claim(
+        identity: str,
+        binding: tuple[str, str],
+        serial: int,
+        claims: dict[str, deque[_IdentityClaim]],
+        claim_bindings: dict[str, dict[tuple[str, str], int]],
+    ) -> None:
         if not identity:
             return
-        count = claims[identity]
-        if count == 1:
+        claims.setdefault(identity, deque()).append(_IdentityClaim(binding, serial))
+        bindings = claim_bindings.setdefault(identity, {})
+        bindings[binding] = bindings.get(binding, 0) + 1
+
+    @staticmethod
+    def _unregister_claim(
+        identity: str,
+        binding: tuple[str, str],
+        serial: int,
+        claims: dict[str, deque[_IdentityClaim]],
+        claim_bindings: dict[str, dict[tuple[str, str], int]],
+    ) -> None:
+        if not identity:
+            return
+        identity_claims = claims[identity]
+        claim = identity_claims.popleft()
+        if claim.serial != serial or claim.binding != binding:
+            raise RuntimeError("adaptive identity claims expired out of causal order")
+        if not identity_claims:
             del claims[identity]
+        bindings = claim_bindings[identity]
+        count = bindings[binding]
+        if count == 1:
+            del bindings[binding]
         else:
-            claims[identity] = count - 1
+            bindings[binding] = count - 1
+        if not bindings:
+            del claim_bindings[identity]
+
+    def _safe_owner_transfers(
+        self,
+        released: dict[str, tuple[str, str]],
+        claims: dict[str, deque[_IdentityClaim]],
+        claim_bindings: dict[str, dict[tuple[str, str], int]],
+    ) -> dict[str, _IdentityOwner] | None:
+        transfers = {}
+        for identity, binding in released.items():
+            identity_claims = claims.get(identity)
+            if not identity_claims:
+                continue
+            variants = claim_bindings[identity]
+            first = identity_claims[0]
+            if (
+                len(variants) != 1
+                or binding not in variants
+                or first.binding != binding
+                or not self._entries_by_serial[first.serial].accepted
+            ):
+                return None
+            transfers[identity] = _IdentityOwner(binding, first.serial)
+        return transfers
 
     def _rebuild_active_window(self) -> None:
         self.workload["global_identity_rebuilds"] += 1
@@ -915,7 +1333,11 @@ class AdaptiveGlobalProfileWindowReplay:
         self._decision_bindings = {}
         self._retire_trackers()
         for entry in self._events:
-            entry.accepted = self._accept(entry.profile_key, entry.event)
+            entry.accepted = self._accept(
+                entry.profile_key,
+                entry.event,
+                entry.serial,
+            )
             if not entry.accepted:
                 continue
             tracker = self._trackers.get(entry.profile_key)

@@ -867,6 +867,21 @@ def _build_adaptive_event_rows(
         workload["adaptive_max_window_events"] = tracker_workload[
             "max_window_events"
         ]
+        workload["adaptive_retained_index_events"] = tracker_workload[
+            "retained_index_events"
+        ]
+        workload["adaptive_jump_cache_entries"] = tracker_workload[
+            "jump_cache_entries"
+        ]
+        workload["adaptive_successor_cache_entries"] = tracker_workload[
+            "successor_cache_entries"
+        ]
+        workload["adaptive_jump_cache_entry_bound"] = tracker_workload[
+            "jump_cache_entry_bound"
+        ]
+        workload["adaptive_dynamic_work_units"] = tracker_workload[
+            "dynamic_work_units"
+        ]
     return rows
 
 
