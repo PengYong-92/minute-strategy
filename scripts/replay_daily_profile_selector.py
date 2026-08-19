@@ -196,14 +196,11 @@ class ReplayExecutionConfig:
 ProductionReplayConfig = ReplayExecutionConfig
 
 
-def _observation_lifecycle_select(columns: set[str]) -> str:
-    return ",\n                       ".join(
-        (
-            f"observation_signals.{field} as lifecycle_{field}"
-            if field in columns
-            else f"null as lifecycle_{field}"
-        )
+def _observation_lifecycle_select(columns: set[str]) -> tuple[str, ...]:
+    return tuple(
+        f"observation_signals.{field} as lifecycle_{field}"
         for field in OBSERVATION_LIFECYCLE_FIELDS
+        if field in columns
     )
 
 
@@ -255,11 +252,16 @@ def load_replay_observations(
             "decision_id" in observation_columns
             and linked_context_columns <= context_columns
         ):
+            select_columns = ",\n                       ".join(
+                (
+                    "observation_signals.payload",
+                    *lifecycle_select,
+                    _LINKED_CONTEXT_COLUMNS.strip(),
+                )
+            )
             rows = connection.execute(
                 f"""
-                select observation_signals.payload,
-                       {lifecycle_select},
-                       {_LINKED_CONTEXT_COLUMNS}
+                select {select_columns}
                 from observation_signals
                 left join decision_contexts
                   on decision_contexts.symbol = observation_signals.symbol
@@ -273,10 +275,12 @@ def load_replay_observations(
             ).fetchall()
             hydrate_lifecycle = True
         elif REQUIRED_OBSERVATION_LIFECYCLE_FIELDS <= observation_columns:
+            select_columns = ",\n                       ".join(
+                ("observation_signals.payload", *lifecycle_select)
+            )
             rows = connection.execute(
                 f"""
-                select observation_signals.payload,
-                       {lifecycle_select}
+                select {select_columns}
                 from observation_signals
                 {where}
                 order by observation_signals.settled_at,

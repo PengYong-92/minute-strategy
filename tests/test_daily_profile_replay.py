@@ -280,26 +280,65 @@ class DailyProfileReplayTest(unittest.TestCase):
 
     def test_read_only_loader_keeps_legacy_payload_fixture_compatible(self):
         self.assertTrue(hasattr(replay_module, "load_replay_observations"))
-        legacy = observation("legacy", "LOSS", timestamp("2026-07-20T08:00:00"))
+        legacy_rows = [
+            observation("legacy-train", "WIN", timestamp("2026-07-20T01:00:00")),
+            observation("legacy-trade", "WIN", timestamp("2026-07-20T08:00:00")),
+        ]
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "legacy.sqlite3"
             with closing(sqlite3.connect(db_path)) as connection:
                 connection.execute(
-                    "create table observation_signals "
-                    "(symbol text not null, status text not null, payload text not null)"
+                    """
+                    create table observation_signals (
+                        symbol text not null,
+                        observation_key text not null,
+                        status text not null,
+                        result text,
+                        opened_at integer not null,
+                        expires_at integer not null,
+                        settled_at integer,
+                        payload text not null
+                    )
+                    """
                 )
-                connection.execute(
-                    "insert into observation_signals(symbol, status, payload) values (?, ?, ?)",
-                    ("BTCUSDT", "SETTLED", json.dumps(legacy.to_dict())),
+                connection.executemany(
+                    """
+                    insert into observation_signals(
+                        symbol, observation_key, status, result, opened_at,
+                        expires_at, settled_at, payload
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            "BTCUSDT",
+                            item.observation_key,
+                            item.status,
+                            item.result,
+                            item.opened_at,
+                            item.expires_at,
+                            item.settled_at,
+                            json.dumps(item.to_dict()),
+                        )
+                        for item in legacy_rows
+                    ],
                 )
                 connection.commit()
             before = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
             actual = replay_module.load_replay_observations(db_path, "btcusdt")
+            try:
+                report = self.replay(actual)
+            except TypeError as error:
+                self.fail(f"legacy compact replay failed: {error}")
 
             after = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
-        self.assertEqual([item.to_dict() for item in actual], [legacy.to_dict()])
+        self.assertEqual(
+            [item.to_dict() for item in actual],
+            [item.to_dict() for item in legacy_rows],
+        )
+        self.assertEqual([item.pnl for item in actual], [8.0, 8.0])
+        self.assertIn("acceptance", report)
         self.assertEqual(after, before)
 
     def test_read_only_loader_hydrates_v3_compact_lifecycle_schema(self):
@@ -360,8 +399,6 @@ class DailyProfileReplayTest(unittest.TestCase):
                            observation_signals.opened_at as lifecycle_opened_at,
                            observation_signals.expires_at as lifecycle_expires_at,
                            observation_signals.settled_at as lifecycle_settled_at,
-                           null as lifecycle_exit_price,
-                           null as lifecycle_pnl,
                            {_LINKED_CONTEXT_COLUMNS}
                     from observation_signals
                     left join decision_contexts
@@ -393,6 +430,10 @@ class DailyProfileReplayTest(unittest.TestCase):
             after = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
         self.assertEqual([item.to_dict() for item in actual], [expected.to_dict()])
+        self.assertEqual(actual[0].result, "WIN")
+        self.assertEqual(actual[0].settled_at, 601_000)
+        self.assertEqual(actual[0].exit_price, 101.0)
+        self.assertEqual(actual[0].pnl, 8.0)
         self.assertEqual(after, before)
 
     def test_replay_is_settlement_causal_and_cutoff_safe(self):

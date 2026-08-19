@@ -2100,7 +2100,7 @@ python3 -m pip install -r requirements.txt
 
 ### 42.2 迁移与容量行为
 
-本分支的SQLite变更保持增量兼容：V2表、索引和列通过事务迁移增加，迁移失败整体回滚；旧订单、旧观察和旧审计继续可读，不重写、不删除、不执行固定TTL清理。Task 17使用回放专用加载器以SQLite URI `mode=ro`并启用`query_only`打开源库，不执行`SQLiteMonitorStore`初始化或任何迁移。V2记录按`app.storage`生产契约联结`decision_contexts`，水合完整decision-linked payload和生命周期列；V3紧凑库即使`observation_signals`缺少后加的可空`exit_price/pnl`列，也会按现有列动态生成生命周期投影，缺列投影为`null as lifecycle_*`，并仅依据`decision_id`和完整context schema联结生产水合路径。旧`observation_signals` payload fixture仍可读取。回放只写指定JSON报告，不修改数据库，不生成生产订单，不发送真实Webhook。正式复核仍应先复制源SQLite，再对副本运行回放。
+本分支的SQLite变更保持增量兼容：V2表、索引和列通过事务迁移增加，迁移失败整体回滚；旧订单、旧观察和旧审计继续可读，不重写、不删除、不执行固定TTL清理。Task 17使用回放专用加载器以SQLite URI `mode=ro`并启用`query_only`打开源库，不执行`SQLiteMonitorStore`初始化或任何迁移。V2记录按`app.storage`生产契约联结`decision_contexts`，水合完整decision-linked payload和生命周期列；V3及legacy紧凑库即使`observation_signals`缺少后加的`exit_price/pnl`列，也只为数据库实际存在的生命周期列生成alias，缺失列完全不进入`sqlite.Row`，从而保留紧凑payload中的有效生命周期值。是否联结生产context水合路径只取决于observation的`decision_id`和完整context schema。旧`observation_signals` payload fixture仍可读取。回放只写指定JSON报告，不修改数据库，不生成生产订单，不发送真实Webhook。正式复核仍应先复制源SQLite，再对副本运行回放。
 
 单文件容量门槛保持：
 
@@ -2164,4 +2164,6 @@ python3 scripts/replay_daily_profile_selector.py \
 
 ### 42.5 本地验证
 
-Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。后续规格修复也逐项确认红灯：V3紧凑库错误落入payload-only路径、高精度金额被提前舍入、globally disabled错误绕过ledger、WATCH条款被回放层重复舍入，以及CLI未展示生产约束，均在实现前由定向测试复现。`python3 -m unittest tests.test_daily_profile_replay -v`共20项通过；完整关联模块中storage schema 33项、`AccountSimulator` 55项、stake progression 48项，共136项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0。覆盖范围包括只读V3/V2/legacy加载、15天滚动、生产progression拒绝约束，以及enabled/disabled/WATCH高精度金额与`AccountSimulator`一致性。生产SQLite的复制回放与完整测试属于后续发布检查点，未完成前不改变本节的**未部署**结论。
+Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。后续规格修复也逐项确认红灯：V3紧凑库错误落入payload-only路径、高精度金额被提前舍入、globally disabled错误绕过ledger、WATCH条款被回放层重复舍入、缺失生命周期列的NULL alias覆盖payload有效值，以及CLI未展示生产约束，均在实现前由定向测试复现。`python3 -m unittest tests.test_daily_profile_replay -v`共20项通过；完整关联模块中storage schema 33项、`AccountSimulator` 55项、stake progression 48项，共136项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0。覆盖范围包括只读V3/V2/legacy加载、15天滚动、生产progression拒绝约束，以及enabled/disabled/WATCH高精度金额与`AccountSimulator`一致性。
+
+已按42.3命令实际回放`/private/tmp/monitor-replay.sqlite3`：共加载4997条结算观察，4次日快照评估，`leakage_violations=0`，结构影子 equality 为true。验收输出为`acceptance.passed=false`：总胜率53.5519%、SHORT胜率51.6949%、总/LONG/SHORT EV及正EV OOS窗口数未过门槛；LONG胜率、订单保留、最大回撤和最长连亏门槛通过。源库回放前后SHA-256均为`69095ea164818bd80f715c61e7906b37a8523f7af4d113238c8a1ae28d5e5414`，确认只读且未迁移。该结果不满足发布门槛，本节继续保持**未部署**。
