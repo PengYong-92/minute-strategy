@@ -107,6 +107,9 @@ class DecisionAudit:
     audit_context: Mapping[str, Any] | None = None
     event_kind: str = ""
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "signal", deepcopy(self.signal))
+
 
 def _compact_json(value: object) -> str:
     return json.dumps(
@@ -804,24 +807,11 @@ def _signal_audit_payload(
     reason_code: str,
 ) -> dict[str, object]:
     structure = signal.entry_structure_shadow
-    compact_structure = {}
-    if isinstance(structure, Mapping):
-        structure_keys = (
-            "entry_structure_version",
-            "entry_structure_mode",
-            "entry_structure_state",
-            "entry_structure_bias",
-            "entry_structure_reason_code",
-            "active_level_source",
-            "active_level_lower",
-            "active_level_upper",
-            "active_level_touch_count",
-            "active_level_confirmed_at",
-            "active_level_distance_atr",
-        )
-        compact_structure = {
-            key: structure[key] for key in structure_keys if key in structure
-        }
+    canonical_structure = (
+        deepcopy(_plain_entry_structure(structure))
+        if isinstance(structure, Mapping)
+        else {}
+    )
     adaptive = signal.adaptive_profile_state
     compact_adaptive = {}
     if isinstance(adaptive, Mapping):
@@ -895,7 +885,7 @@ def _signal_audit_payload(
             "profile_health_ev": signal.profile_health_ev,
             "adaptive": compact_adaptive,
         },
-        "structure": compact_structure,
+        "structure": canonical_structure,
         "guards": _signal_audit_guard_states(signal, audit_context),
         "direction_pulse": _compact_direction_pulse(signal),
         "state_code": _signal_audit_state_code(signal, audit_context),
@@ -1918,6 +1908,15 @@ class SQLiteMonitorStore:
             raise ValueError("stored decision context JSON is malformed") from error
         if not isinstance(inputs, dict):
             raise ValueError("stored decision context inputs must be an object")
+        signal_inputs = inputs.get("signal", {})
+        has_structure_view = "entry_structure" in inputs or (
+            isinstance(signal_inputs, Mapping)
+            and "entry_structure_shadow" in signal_inputs
+        )
+        try:
+            canonical_structure = _canonical_entry_structure(inputs)
+        except ValueError as error:
+            raise ValueError("stored decision context structure is malformed") from error
         legacy_outcome_keys = _DECISION_OUTCOME_KEYS - {"selected_order_terms"}
         if not isinstance(outcome, dict) or frozenset(outcome) not in {
             frozenset(_DECISION_OUTCOME_KEYS),
@@ -1951,7 +1950,13 @@ class SQLiteMonitorStore:
             raise ValueError("stored decision context is malformed") from error
         if any(row[column] != expected[column] for column in _DECISION_CONTEXT_COLUMNS):
             raise ValueError("stored decision context metadata does not match its payload")
-        return restored_context.to_dict()
+        restored = restored_context.to_dict()
+        if has_structure_view:
+            restored["inputs"]["entry_structure"] = deepcopy(canonical_structure)
+            restored["inputs"]["signal"]["entry_structure_shadow"] = deepcopy(
+                canonical_structure
+            )
+        return restored
 
     def load_decision_context_for_candidate(
         self,

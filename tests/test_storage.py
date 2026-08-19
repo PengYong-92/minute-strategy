@@ -436,6 +436,73 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
 
             restored = SQLiteMonitorStore(db_path).load_orders(context.symbol)[0]
             self.assertEqual(restored.entry_structure_shadow, ENTRY_STRUCTURE_FIXTURE)
+            restored_context = SQLiteMonitorStore(db_path).load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            self.assertEqual(
+                restored_context["inputs"]["signal"]["entry_structure_shadow"],
+                ENTRY_STRUCTURE_FIXTURE,
+            )
+
+    def test_load_decision_context_rejects_tampered_structure_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, _order, _audit, _entry_snapshot, _observed = (
+                structured_atomic_bundle()
+            )
+            store.save_runtime_config_snapshot(config)
+            store.save_decision_context(context)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                payload = json.loads(
+                    connection.execute(
+                        "select input_payload from decision_contexts"
+                    ).fetchone()[0]
+                )
+                payload["signal"]["entry_structure_shadow"]["detail"][
+                    "levels"
+                ][1] = 101.0
+                connection.execute(
+                    "update decision_contexts set input_payload = ?",
+                    (
+                        json.dumps(
+                            payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ),
+                    ),
+                )
+                connection.commit()
+
+            with self.assertRaisesRegex(ValueError, "structure"):
+                SQLiteMonitorStore(db_path).load_decision_context(
+                    context.symbol,
+                    context.decision_id,
+                )
+
+    def test_load_decision_context_normalizes_legacy_structure_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, _order, _audit, _entry_snapshot, _observed = (
+                structured_atomic_bundle(legacy_without_top_level=True)
+            )
+            store.save_runtime_config_snapshot(config)
+            store.save_decision_context(context)
+
+            restored = SQLiteMonitorStore(db_path).load_decision_context(
+                context.symbol,
+                context.decision_id,
+            )
+            top_level = restored["inputs"]["entry_structure"]
+            signal_alias = restored["inputs"]["signal"]["entry_structure_shadow"]
+            self.assertEqual(top_level, ENTRY_STRUCTURE_FIXTURE)
+            self.assertEqual(signal_alias, ENTRY_STRUCTURE_FIXTURE)
+            self.assertIsNot(top_level, signal_alias)
+            self.assertIsNot(top_level["detail"], signal_alias["detail"])
 
     def test_structure_snapshot_roundtrips_and_reopens_with_canonical_denormalization(self):
         for legacy in (False, True):
@@ -482,13 +549,10 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                     restored_context["inputs"]["signal"]["entry_structure_shadow"],
                     ENTRY_STRUCTURE_FIXTURE,
                 )
-                if legacy:
-                    self.assertNotIn("entry_structure", restored_context["inputs"])
-                else:
-                    self.assertEqual(
-                        restored_context["inputs"]["entry_structure"],
-                        ENTRY_STRUCTURE_FIXTURE,
-                    )
+                self.assertEqual(
+                    restored_context["inputs"]["entry_structure"],
+                    ENTRY_STRUCTURE_FIXTURE,
+                )
                 with closing(sqlite3.connect(db_path)) as connection:
                     denormalized = connection.execute(
                         "select candidate_origin, entry_structure_state, "
@@ -504,6 +568,66 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                         ENTRY_STRUCTURE_FIXTURE["active_level_source"],
                     ),
                 )
+
+    def test_decision_audit_deep_copies_signal_structure_snapshot(self):
+        _config, _context, _order, audit, _entry_snapshot, _observed = (
+            structured_atomic_bundle()
+        )
+        source_structure = json.loads(json.dumps(ENTRY_STRUCTURE_FIXTURE))
+        source_signal = replace(
+            audit.signal,
+            entry_structure_shadow=source_structure,
+        )
+
+        snapshot = DecisionAudit(
+            signal=source_signal,
+            decision=audit.decision,
+            created_at_ms=audit.created_at_ms,
+            audit_context=audit.audit_context,
+            event_kind=audit.event_kind,
+        )
+        source_structure["detail"]["levels"].append(102.0)
+
+        self.assertIsNot(snapshot.signal, source_signal)
+        self.assertIsNot(snapshot.signal.entry_structure_shadow, source_structure)
+        self.assertIsNot(
+            snapshot.signal.entry_structure_shadow["detail"],
+            source_structure["detail"],
+        )
+        self.assertEqual(
+            snapshot.signal.entry_structure_shadow,
+            ENTRY_STRUCTURE_FIXTURE,
+        )
+
+    def test_decision_audit_roundtrips_complete_canonical_structure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            config, context, order, audit, entry_snapshot, observed = (
+                structured_atomic_bundle()
+            )
+            store.save_open_order_decision(
+                config=config,
+                context=context,
+                order=order,
+                credit=None,
+                entry_snapshot=entry_snapshot,
+                audit=audit,
+                observation=observed,
+            )
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                payload = json.loads(
+                    connection.execute(
+                        "select payload from signal_audit"
+                    ).fetchone()[0]
+                )
+
+            self.assertEqual(payload["structure"], ENTRY_STRUCTURE_FIXTURE)
+            self.assertEqual(
+                payload["structure"]["detail"]["retest"]["bars"],
+                [1, 2],
+            )
 
     def test_structure_context_aliases_must_be_deeply_equal(self):
         cases = {
