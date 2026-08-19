@@ -322,13 +322,16 @@ class Task7ProfileMaterializationReviewTest(unittest.TestCase):
             second.close()
 
     def test_profile_materialization_is_current_schema_managed(self):
-        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(SCHEMA_VERSION, 5)
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"
             store = SQLiteMonitorStore(db_path)
             store.close()
             with closing(sqlite3.connect(db_path)) as connection:
-                self.assertEqual(connection.execute("pragma user_version").fetchone()[0], 4)
+                self.assertEqual(
+                    connection.execute("pragma user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
                 columns = {
                     row[1]
                     for row in connection.execute(
@@ -944,7 +947,7 @@ class Task7DecisionLifecycleReviewTest(unittest.TestCase):
                 old_payloads = connection.execute(
                     "select count(*) from profile_summary_materializations"
                 ).fetchone()[0]
-            self.assertEqual(version, 4)
+            self.assertEqual(version, SCHEMA_VERSION)
             self.assertEqual((entry_count, revision, old_payloads), (1, 1, 0))
             self.assertEqual(snapshot["cache_status"], "PREPARING")
             upgraded.close()
