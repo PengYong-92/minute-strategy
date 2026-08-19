@@ -180,12 +180,12 @@ _OBSERVATION_CANONICAL_FILTER_SQL = {
     "tag": _OBSERVATION_CANONICAL_TAG_SQL,
     "segment": _OBSERVATION_CANONICAL_SEGMENT_SQL,
     "profile": _OBSERVATION_CANONICAL_PROFILE_SQL,
-    "origin": "coalesce(decision_contexts.candidate_origin, observation_signals.candidate_origin, '')",
-    "qualification_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.qualification_state'), observation_signals.qualification_state, '')",
-    "adaptive_state": "coalesce(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.state'), json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.status'), observation_signals.adaptive_state, '')",
-    "entry_structure_state": "coalesce(json_extract(decision_contexts.input_payload, '$.entry_structure.entry_structure_state'), observation_signals.entry_structure_state, '')",
-    "entry_structure_bias": "coalesce(json_extract(decision_contexts.input_payload, '$.entry_structure.entry_structure_bias'), observation_signals.entry_structure_bias, '')",
-    "active_level_source": "coalesce(json_extract(decision_contexts.input_payload, '$.entry_structure.active_level_source'), observation_signals.active_level_source, '')",
+    "origin": "coalesce(nullif(decision_contexts.candidate_origin, ''), nullif(observation_signals.candidate_origin, ''), 'UNKNOWN')",
+    "qualification_state": "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.qualification_state'), ''), nullif(observation_signals.qualification_state, ''), 'UNKNOWN')",
+    "adaptive_state": "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.state'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.adaptive_profile_state.status'), ''), nullif(observation_signals.adaptive_state, ''), 'UNKNOWN')",
+    "entry_structure_state": "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.entry_structure.entry_structure_state'), ''), nullif(observation_signals.entry_structure_state, ''), 'UNKNOWN')",
+    "entry_structure_bias": "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.entry_structure.entry_structure_bias'), ''), nullif(observation_signals.entry_structure_bias, ''), 'UNKNOWN')",
+    "active_level_source": "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.entry_structure.active_level_source'), ''), nullif(observation_signals.active_level_source, ''), 'UNKNOWN')",
 }
 
 

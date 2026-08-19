@@ -2697,6 +2697,85 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["observations"][0]["strategy_tag"], "normal_down_short_extension_observe")
 
+    def test_observation_filters_normalize_legacy_empty_values_to_unknown(self):
+        modern_values = {
+            "origin": "NATIVE_ACTIONABLE",
+            "qualification_state": "QUALIFIED",
+            "adaptive_state": "RESIDENT",
+            "entry_structure_state": "SUPPORT_REJECTED",
+            "entry_structure_bias": "CONFIRMED",
+            "active_level_source": "RECENT_SWING",
+        }
+        modern = replace(
+            observation("modern", opened_at=3_000),
+            candidate_origin=modern_values["origin"],
+            adaptive_profile_state={
+                "qualification_state": modern_values["qualification_state"],
+                "state": modern_values["adaptive_state"],
+            },
+            entry_structure_shadow={
+                "entry_structure_state": modern_values["entry_structure_state"],
+                "entry_structure_bias": modern_values["entry_structure_bias"],
+                "active_level_source": modern_values["active_level_source"],
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.save_observations(
+                [
+                    observation(f"legacy-{index}", opened_at=index * 1_000)
+                    for index in range(1, 12)
+                ]
+                + [modern],
+                "BTCUSDT",
+            )
+            legacy_columns = (
+                "candidate_origin",
+                "qualification_state",
+                "adaptive_state",
+                "entry_structure_state",
+                "entry_structure_bias",
+                "active_level_source",
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    f"update observation_signals set "
+                    f"{', '.join(f'{column} = ?' for column in legacy_columns)} "
+                    "where observation_key like 'legacy-%'",
+                    ("",) * len(legacy_columns),
+                )
+                connection.commit()
+
+            for filter_name, modern_value in modern_values.items():
+                with self.subTest(filter_name=filter_name):
+                    legacy_page = store.page_observations(
+                        "BTCUSDT",
+                        page=2,
+                        page_size=10,
+                        **{filter_name: "UNKNOWN"},
+                    )
+                    modern_page = store.page_observations(
+                        "BTCUSDT",
+                        **{filter_name: modern_value},
+                    )
+
+                    self.assertEqual(legacy_page["total"], 11)
+                    self.assertEqual(legacy_page["total_pages"], 2)
+                    self.assertEqual(legacy_page["page"], 2)
+                    self.assertEqual(len(legacy_page["observations"]), 1)
+                    self.assertIn(
+                        "UNKNOWN", legacy_page["filter_options"][filter_name]
+                    )
+                    self.assertIn(
+                        modern_value, legacy_page["filter_options"][filter_name]
+                    )
+                    self.assertEqual(modern_page["total"], 1)
+                    self.assertEqual(
+                        modern_page["observations"][0]["observation_key"],
+                        "modern",
+                    )
+
     def test_persists_daily_profile_selection_idempotently_and_loads_effective_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
