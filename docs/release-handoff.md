@@ -17,7 +17,7 @@
 | 当前生产提交 | `6474dd81b005ca8c1d011a739bca71335f26b1e6` |
 | 当前生产事实 | 第41节 |
 | 本地未部署功能 | `feature/adaptive-resident-profiles` 的自适应常驻画像、价格结构影子、V2审计/容量治理及严格因果发布门槛，见第42节 |
-| 下一开发检查点 | 使用复制的SQLite完成第42节回放；硬门槛全部通过前不得发布 |
+| 下一开发检查点 | 当前候选未通过第42节发布硬门槛；硬门槛全部通过前不得发布 |
 
 第2至41节是历史发布、本地开发或生产事实快照；生产现状以第41节为准。第42节只记录当前功能分支的本地实现和发布前门槛，不代表生产已经切换。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 和 `feature/websocket-low-latency` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
 
@@ -2083,7 +2083,7 @@ python3 -m pip install -r requirements.txt
 | 项目 | 当前值 |
 |---|---|
 | 开发分支 | `feature/adaptive-resident-profiles` |
-| Task 17起点 | `bcc33c246eb684d700812eb7cf9e8b816e93e2b7` |
+| Task 17起点 | `29390cee3166a95cbf931ee8b2a3ae66116b123b`（首个Task 17提交的直接父提交） |
 | 决策上下文 | `DECISION_CONTEXT_V2` |
 | 信号审计 | `SIGNAL_AUDIT_V2` |
 | 每日资格 | `DAILY_PROFILE_QUALIFICATION_V2` |
@@ -2160,10 +2160,10 @@ python3 scripts/replay_daily_profile_selector.py \
 | 最大回撤 | 不得高于baseline |
 | 最长连亏 | 不得长于baseline |
 
-所有硬门槛通过的配置才进入排序，顺序固定为总胜率降序、订单数降序、最大回撤升序。报告同时输出baseline和candidate的总计、LONG/SHORT、胜率、EV、PnL、最大回撤、最长连亏、每日最佳/最差、每类guard rejection、基础首单和三个OOS窗口。任一门槛失败时`acceptance.passed=false`，本分支继续保持**未部署**。
+所有硬门槛通过的配置才进入排序，顺序固定为总胜率降序、订单数降序、最大回撤升序。报告同时输出baseline和candidate的总计、LONG/SHORT、胜率、EV、PnL、最大回撤、最长连亏、每日最佳/最差、每类guard rejection、基础首单和三个OOS窗口。报告字段保持原有展示精度，`acceptance.gates.*.actual`最多展示6位；但`passed`不读取已经舍入的展示胜率或EV，而是以原始胜/订单计数、逐笔PnL/订单数和原始订单计数比率判定。正OOS窗口也按窗口逐笔原始PnL的严格正号统计，微小负值不会因展示为`-0.0`而被计为正窗口。任一门槛失败时`acceptance.passed=false`，本分支继续保持**未部署**。
 
 ### 42.5 本地验证
 
-Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。后续规格修复也逐项确认红灯：V3紧凑库错误落入payload-only路径、高精度金额被提前舍入、globally disabled错误绕过ledger、WATCH条款被回放层重复舍入、缺失生命周期列的NULL alias覆盖payload有效值，以及CLI未展示生产约束，均在实现前由定向测试复现。`python3 -m unittest tests.test_daily_profile_replay -v`共20项通过；完整关联模块中storage schema 33项、`AccountSimulator` 55项、stake progression 48项，共136项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0。覆盖范围包括只读V3/V2/legacy加载、15天滚动、生产progression拒绝约束，以及enabled/disabled/WATCH高精度金额与`AccountSimulator`一致性。
+Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。后续规格修复也逐项确认红灯：V3紧凑库错误落入payload-only路径、高精度金额被提前舍入、globally disabled错误绕过ledger、WATCH条款被回放层重复舍入、缺失生命周期列的NULL alias覆盖payload有效值、CLI未展示生产约束，以及硬门槛误用已舍入胜率/EV/retention和OOS EV，均在实现前由定向测试复现。全精度门槛红测覆盖每方向3胜2负但PnL仅`-0.0001`、`1394/2509=0.5555998405...`、舍入后看似达到订单保留阈值的原始比率，以及展示为`-0.0`的微小负OOS。`python3 -m unittest tests.test_daily_profile_replay -v`共23项通过；完整关联模块中storage schema 33项、`AccountSimulator` 55项、stake progression 48项，共136项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0。覆盖范围包括只读V3/V2/legacy加载、15天滚动、生产progression拒绝约束、enabled/disabled/WATCH高精度金额与`AccountSimulator`一致性，以及全精度发布门槛。
 
-已按42.3命令实际回放`/private/tmp/monitor-replay.sqlite3`：共加载4997条结算观察，4次日快照评估，`leakage_violations=0`，结构影子 equality 为true。验收输出为`acceptance.passed=false`：总胜率53.5519%、SHORT胜率51.6949%、总/LONG/SHORT EV及正EV OOS窗口数未过门槛；LONG胜率、订单保留、最大回撤和最长连亏门槛通过。源库回放前后SHA-256均为`69095ea164818bd80f715c61e7906b37a8523f7af4d113238c8a1ae28d5e5414`，确认只读且未迁移。该结果不满足发布门槛，本节继续保持**未部署**。
+已按42.3命令实际回放`/private/tmp/monitor-replay.sqlite3`：共加载4997条结算观察，4次日快照评估，`leakage_violations=0`，结构影子 equality 为true。全精度验收输出为`acceptance.passed=false`：总胜率actual为`0.535519`、SHORT胜率为`0.516949`，总/LONG/SHORT EV分别为`-0.395628/-0.172308/-0.518644`，三个OOS窗口仅1个原始PnL为正；LONG胜率、订单保留、最大回撤和最长连亏门槛通过。源库回放前后SHA-256均为`69095ea164818bd80f715c61e7906b37a8523f7af4d113238c8a1ae28d5e5414`，确认只读且未迁移。实际复制库回放已经完成，但候选不满足发布硬门槛，本节继续保持**未部署**。

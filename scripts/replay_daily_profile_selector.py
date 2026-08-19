@@ -407,9 +407,12 @@ def replay_daily_profile_selection(
     )
     compact_schedule = [_compact_snapshot(item) for item in snapshots]
     data = _data_summary(settled, snapshots, require_full_lookback)
-    base_first_retention = _retention(
-        candidate["base_first_orders"],
-        baseline["base_first_orders"],
+    base_first_retention = round(
+        _retention(
+            candidate["base_first_orders"],
+            baseline["base_first_orders"],
+        ),
+        6,
     )
     return {
         "config": _config_snapshot(config),
@@ -447,7 +450,8 @@ def summarize_trades(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(trades, key=_trade_settlement_key)
     wins = sum(1 for item in ordered if item["result"] == "WIN")
     losses = len(ordered) - wins
-    pnl = round(sum(float(item["pnl"]) for item in ordered), 4)
+    raw_pnl = math.fsum(float(item["pnl"]) for item in ordered)
+    pnl = round(raw_pnl, 4)
     win_rate = wins / len(ordered) if ordered else 0.0
     low, high = _wilson_interval(wins, len(ordered))
     equity = 0.0
@@ -478,7 +482,7 @@ def summarize_trades(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "win_rate": round(win_rate, 6),
         "win_rate_ci95": [round(low, 6), round(high, 6)],
         "pnl": pnl,
-        "ev": round(pnl / len(ordered), 4) if ordered else 0.0,
+        "ev": round(raw_pnl / len(ordered), 4) if ordered else 0.0,
         "max_drawdown": round(max_drawdown, 4),
         "max_loss_streak": max_loss_streak,
         "first_trade": _iso(by_opened[0]["opened_at"]) if by_opened else None,
@@ -496,6 +500,7 @@ def evaluate_release_gates(
     candidate_total = candidate["total"]
     baseline_by_direction = baseline["by_direction"]
     candidate_by_direction = candidate["by_direction"]
+    candidate_trades = candidate.get("trade_rows")
 
     gates: dict[str, dict[str, Any]] = {}
 
@@ -513,11 +518,35 @@ def evaluate_release_gates(
             "passed": float(actual) <= float(baseline_value),
         }
 
-    minimum("total_win_rate", candidate_total["win_rate"], thresholds["total_win_rate_min"])
+    def win_rate(summary: dict[str, Any]) -> float:
+        orders = int(summary["orders"])
+        return int(summary["wins"]) / orders if orders > 0 else 0.0
+
+    def ev(summary: dict[str, Any], trades: Sequence[dict[str, Any]] | None) -> float:
+        orders = int(summary["orders"])
+        if orders <= 0:
+            return 0.0
+        pnl = (
+            math.fsum(float(item["pnl"]) for item in trades)
+            if trades is not None
+            else float(summary["pnl"])
+        )
+        return pnl / orders
+
+    direction_trades = {
+        direction: (
+            [item for item in candidate_trades if item["direction"] == direction]
+            if candidate_trades is not None
+            else None
+        )
+        for direction in ("LONG", "SHORT")
+    }
+
+    minimum("total_win_rate", win_rate(candidate_total), thresholds["total_win_rate_min"])
     for direction in ("LONG", "SHORT"):
         minimum(
             f"{direction.lower()}_win_rate",
-            candidate_by_direction[direction]["win_rate"],
+            win_rate(candidate_by_direction[direction]),
             thresholds["direction_win_rate_min"],
         )
     minimum(
@@ -539,10 +568,30 @@ def evaluate_release_gates(
         _retention(candidate["base_first_orders"], baseline["base_first_orders"]),
         thresholds["base_first_order_retention_min"],
     )
-    minimum("total_ev", candidate_total["ev"], thresholds["ev_min"])
-    minimum("long_ev", candidate_by_direction["LONG"]["ev"], thresholds["ev_min"])
-    minimum("short_ev", candidate_by_direction["SHORT"]["ev"], thresholds["ev_min"])
-    positive_windows = sum(1 for item in candidate["oos_windows"] if item["ev"] > 0)
+    minimum("total_ev", ev(candidate_total, candidate_trades), thresholds["ev_min"])
+    minimum(
+        "long_ev",
+        ev(candidate_by_direction["LONG"], direction_trades["LONG"]),
+        thresholds["ev_min"],
+    )
+    minimum(
+        "short_ev",
+        ev(candidate_by_direction["SHORT"], direction_trades["SHORT"]),
+        thresholds["ev_min"],
+    )
+    positive_windows = 0
+    for item in candidate["oos_windows"]:
+        if candidate_trades is None:
+            window_pnl = float(item["pnl"])
+        else:
+            lower = int(item["start_at"])
+            upper = int(item["end_at"])
+            window_pnl = math.fsum(
+                float(trade["pnl"])
+                for trade in candidate_trades
+                if lower <= int(trade["opened_at"]) < upper
+            )
+        positive_windows += int(window_pnl > 0.0)
     minimum(
         "positive_oos_windows",
         positive_windows,
@@ -1290,7 +1339,7 @@ def _trade_settlement_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
 def _retention(candidate_count: int, baseline_count: int) -> float:
     if int(baseline_count) <= 0:
         return 1.0 if int(candidate_count) <= 0 else 1.0
-    return round(int(candidate_count) / int(baseline_count), 6)
+    return int(candidate_count) / int(baseline_count)
 
 
 def _wilson_interval(

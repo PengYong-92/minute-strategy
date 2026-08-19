@@ -780,7 +780,11 @@ class DailyProfileReplayTest(unittest.TestCase):
             "total": dict(summary),
             "by_direction": {"LONG": dict(summary), "SHORT": dict(summary)},
             "base_first_orders": 10,
-            "oos_windows": [{"ev": 1.0}, {"ev": 2.0}, {"ev": -1.0}],
+            "oos_windows": [
+                {"pnl": 1.0, "ev": 1.0},
+                {"pnl": 2.0, "ev": 2.0},
+                {"pnl": -1.0, "ev": -1.0},
+            ],
         }
         candidate = {
             "total": {**summary, "orders": 9, "max_drawdown": 9.0},
@@ -789,7 +793,11 @@ class DailyProfileReplayTest(unittest.TestCase):
                 "SHORT": {**summary, "orders": 7},
             },
             "base_first_orders": 9,
-            "oos_windows": [{"ev": 1.0}, {"ev": 2.0}, {"ev": -1.0}],
+            "oos_windows": [
+                {"pnl": 1.0, "ev": 1.0},
+                {"pnl": 2.0, "ev": 2.0},
+                {"pnl": -1.0, "ev": -1.0},
+            ],
         }
 
         accepted = replay_module.evaluate_release_gates(baseline, candidate)
@@ -800,12 +808,203 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertTrue(accepted["gates"]["maximum_drawdown_not_worse"]["passed"])
         self.assertTrue(accepted["gates"]["longest_loss_streak_not_worse"]["passed"])
 
-        candidate["by_direction"]["SHORT"]["ev"] = -0.01
+        candidate["by_direction"]["SHORT"]["pnl"] = -0.01
+        candidate["by_direction"]["SHORT"]["ev"] = -0.0
         candidate["total"]["max_drawdown"] = 10.01
         rejected = replay_module.evaluate_release_gates(baseline, candidate)
         self.assertFalse(rejected["passed"])
         self.assertFalse(rejected["gates"]["short_ev"]["passed"])
         self.assertFalse(rejected["gates"]["maximum_drawdown_not_worse"]["passed"])
+
+    def test_release_gates_reject_tiny_negative_raw_ev_and_oos_pnl(self):
+        trades = []
+        for direction_index, direction in enumerate(("LONG", "SHORT")):
+            for trade_index, (result, pnl) in enumerate(
+                (
+                    ("WIN", 1.0),
+                    ("WIN", 1.0),
+                    ("WIN", 1.0),
+                    ("LOSS", -1.5),
+                    ("LOSS", -1.5001),
+                )
+            ):
+                opened_at = direction_index * 10 + trade_index
+                trades.append(
+                    {
+                        "observation_key": f"{direction}-{trade_index}",
+                        "order_id": len(trades) + 1,
+                        "direction": direction,
+                        "result": result,
+                        "pnl": pnl,
+                        "opened_at": opened_at,
+                        "settled_at": opened_at + 1,
+                    }
+                )
+        candidate_total = replay_module.summarize_trades(trades)
+        candidate_directions = {
+            direction: replay_module.summarize_trades(
+                [item for item in trades if item["direction"] == direction]
+            )
+            for direction in ("LONG", "SHORT")
+        }
+        baseline_total = {**candidate_total, "pnl": 1.0, "ev": 0.1}
+        baseline_directions = {
+            direction: {**summary, "pnl": 0.5, "ev": 0.1}
+            for direction, summary in candidate_directions.items()
+        }
+        baseline = {
+            "total": baseline_total,
+            "by_direction": baseline_directions,
+            "base_first_orders": 10,
+            "oos_windows": [],
+        }
+        candidate = {
+            "total": candidate_total,
+            "by_direction": candidate_directions,
+            "base_first_orders": 10,
+            "oos_windows": [
+                {
+                    "start_at": 0,
+                    "end_at": 100,
+                    **replay_module.summarize_trades(trades),
+                },
+                {
+                    "start_at": 100,
+                    "end_at": 200,
+                    **replay_module.summarize_trades([]),
+                },
+                {
+                    "start_at": 200,
+                    "end_at": 300,
+                    **replay_module.summarize_trades([]),
+                },
+            ],
+            "trade_rows": trades,
+        }
+
+        result = replay_module.evaluate_release_gates(baseline, candidate)
+
+        self.assertEqual(candidate["total"]["ev"], -0.0)
+        self.assertEqual(candidate["by_direction"]["LONG"]["pnl"], -0.0001)
+        self.assertEqual(candidate["by_direction"]["SHORT"]["pnl"], -0.0001)
+        self.assertEqual(candidate["by_direction"]["LONG"]["ev"], -0.0)
+        self.assertEqual(candidate["by_direction"]["SHORT"]["ev"], -0.0)
+        self.assertFalse(result["gates"]["total_ev"]["passed"])
+        self.assertFalse(result["gates"]["long_ev"]["passed"])
+        self.assertFalse(result["gates"]["short_ev"]["passed"])
+        self.assertEqual(candidate["oos_windows"][0]["ev"], -0.0)
+        self.assertEqual(result["gates"]["positive_oos_windows"]["actual"], 0.0)
+        self.assertFalse(result["gates"]["positive_oos_windows"]["passed"])
+
+    def test_release_gates_reject_unrounded_direction_win_rate_below_threshold(self):
+        direction_orders = 2509
+        direction_wins = 1394
+        rounded_rate = round(direction_wins / direction_orders, 6)
+        self.assertEqual(rounded_rate, 0.5556)
+        total = {
+            "orders": direction_orders * 2,
+            "wins": direction_wins + direction_orders,
+            "losses": direction_orders - direction_wins,
+            "win_rate": round(
+                (direction_wins + direction_orders) / (direction_orders * 2), 6
+            ),
+            "pnl": 10.0,
+            "ev": 1.0,
+            "max_drawdown": 1.0,
+            "max_loss_streak": 1,
+        }
+        long_summary = {
+            **total,
+            "orders": direction_orders,
+            "wins": direction_wins,
+            "losses": direction_orders - direction_wins,
+            "win_rate": rounded_rate,
+            "pnl": 5.0,
+        }
+        short_summary = {
+            **total,
+            "orders": direction_orders,
+            "wins": direction_orders,
+            "losses": 0,
+            "win_rate": 1.0,
+            "pnl": 5.0,
+        }
+        baseline = {
+            "total": dict(total),
+            "by_direction": {
+                "LONG": dict(long_summary),
+                "SHORT": dict(short_summary),
+            },
+            "base_first_orders": 100,
+            "oos_windows": [],
+        }
+        candidate = {
+            "total": dict(total),
+            "by_direction": {
+                "LONG": dict(long_summary),
+                "SHORT": dict(short_summary),
+            },
+            "base_first_orders": 100,
+            "oos_windows": [
+                {"pnl": 1.0, "ev": 1.0},
+                {"pnl": 1.0, "ev": 1.0},
+                {"pnl": -1.0, "ev": -1.0},
+            ],
+        }
+
+        result = replay_module.evaluate_release_gates(baseline, candidate)
+
+        self.assertEqual(result["gates"]["long_win_rate"]["actual"], 0.5556)
+        self.assertFalse(result["gates"]["long_win_rate"]["passed"])
+
+    def test_release_gates_reject_retention_rounded_up_to_threshold(self):
+        def summary(orders):
+            return {
+                "orders": orders,
+                "wins": orders,
+                "losses": 0,
+                "win_rate": 1.0,
+                "pnl": 1.0,
+                "ev": 1.0,
+                "max_drawdown": 0.0,
+                "max_loss_streak": 0,
+            }
+
+        baseline = {
+            "total": summary(2_500_001),
+            "by_direction": {
+                "LONG": summary(2_500_001),
+                "SHORT": summary(1),
+            },
+            "base_first_orders": 2_000_001,
+            "oos_windows": [],
+        }
+        candidate = {
+            "total": summary(2_000_000),
+            "by_direction": {
+                "LONG": summary(1_750_000),
+                "SHORT": summary(1),
+            },
+            "base_first_orders": 1_700_000,
+            "oos_windows": [
+                {"pnl": 1.0, "ev": 1.0},
+                {"pnl": 1.0, "ev": 1.0},
+                {"pnl": -1.0, "ev": -1.0},
+            ],
+        }
+
+        result = replay_module.evaluate_release_gates(baseline, candidate)
+
+        for gate_name, displayed_threshold in (
+            ("total_order_retention", 0.8),
+            ("long_order_retention", 0.7),
+            ("base_first_order_retention", 0.85),
+        ):
+            with self.subTest(gate=gate_name):
+                self.assertEqual(
+                    result["gates"][gate_name]["actual"], displayed_threshold
+                )
+                self.assertFalse(result["gates"][gate_name]["passed"])
 
     def test_passing_configurations_rank_by_win_rate_orders_then_drawdown(self):
         self.assertTrue(hasattr(replay_module, "rank_passing_configurations"))
