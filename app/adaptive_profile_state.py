@@ -365,6 +365,100 @@ class _IncrementalCanonicalSelection:
         return bool(removed or selected)
 
 
+class _MonotonicWindowIndex:
+    """Index greedy interval successors for monotonic opened-time events."""
+
+    def __init__(self) -> None:
+        self.events: list[ObservationSignal] = []
+        self.opened_at: list[int] = []
+        self._successors: dict[int, int] = {}
+        self._jumps: dict[tuple[int, int], int] = {}
+        self.work_units = 0
+
+    def append(self, event: ObservationSignal) -> bool:
+        monotonic = not self.events or (
+            _opened_sort_key(self.events[-1]) <= _opened_sort_key(event)
+        )
+        self.events.append(event)
+        self.opened_at.append(int(event.opened_at))
+        self.work_units += 1
+        return monotonic
+
+    def selected_tail(
+        self,
+        start: int,
+        end: int,
+        limit: int,
+    ) -> tuple[list[ObservationSignal], int]:
+        if not 0 <= start <= end < len(self.events):
+            raise ValueError("active monotonic window indices are invalid")
+        current = start
+        selected_count = 1
+        max_power = max(0, (end - start + 1).bit_length() - 1)
+        for power in range(max_power, -1, -1):
+            target = self._jump(current, power)
+            if target is not None and target <= end:
+                current = target
+                selected_count += 1 << power
+
+        tail_count = min(limit, selected_count)
+        skip = selected_count - tail_count
+        current = start
+        power = 0
+        while skip:
+            if skip & 1:
+                target = self._jump(current, power)
+                if target is None or target > end:
+                    raise RuntimeError("monotonic interval jump index is inconsistent")
+                current = target
+            skip >>= 1
+            power += 1
+
+        tail = [self.events[current]]
+        while len(tail) < tail_count:
+            target = self._successor(current)
+            if target is None or target > end:
+                raise RuntimeError("monotonic interval tail is incomplete")
+            current = target
+            tail.append(self.events[current])
+        self.work_units += len(tail)
+        return tail, selected_count
+
+    def _successor(self, index: int) -> int | None:
+        cached = self._successors.get(index)
+        if cached is not None:
+            return cached
+        self.work_units += 1
+        target = bisect_left(
+            self.opened_at,
+            int(self.events[index].expires_at),
+            index + 1,
+        )
+        if target == len(self.events):
+            return None
+        self._successors[index] = target
+        return target
+
+    def _jump(self, index: int, power: int) -> int | None:
+        if power == 0:
+            return self._successor(index)
+        if index + (1 << power) >= len(self.events):
+            return None
+        cache_key = (index, power)
+        cached = self._jumps.get(cache_key)
+        if cached is not None:
+            return cached
+        midpoint = self._jump(index, power - 1)
+        if midpoint is None:
+            return None
+        target = self._jump(midpoint, power - 1)
+        if target is None:
+            return None
+        self._jumps[cache_key] = target
+        self.work_units += 1
+        return target
+
+
 class AdaptiveProfileWindowReplay:
     """Replay causally ordered events over an exact settlement-time window."""
 
@@ -382,15 +476,29 @@ class AdaptiveProfileWindowReplay:
         self.lookback_ms = lookback_ms
         self.config = _resolve_config(config)
         self._events: deque[ObservationSignal] = deque()
+        self._index = _MonotonicWindowIndex()
+        self._active_start = 0
+        self._opened_monotonic = True
+        self._observation_counts: dict[str, int] = {}
+        self._decision_counts: dict[str, int] = {}
+        self._duplicate_identities = 0
         self._bindings = _IdentityBindings()
         self._replay = _ProfileReplay(selection=_IncrementalCanonicalSelection())
+        self._incremental_window_valid = True
         self._state: dict | None = None
         self._last_event_key: tuple | None = None
+        self._last_evaluated_at: int | None = None
         self.workload = {
             "incremental_adds": 0,
             "window_rebuilds": 0,
             "window_rebuild_input_rows": 0,
             "max_window_events": 0,
+            "fast_path_events": 0,
+            "algorithm_work_units": 0,
+            "bounded_work_units": 0,
+            "index_compactions": 0,
+            "index_compaction_input_rows": 0,
+            "retained_index_events": 0,
         }
 
     def advance(
@@ -407,48 +515,78 @@ class AdaptiveProfileWindowReplay:
             raise ValueError("events must advance in causal settlement order")
 
         window_start = cutoff - self.lookback_ms
-        removed = False
-        while self._events and int(self._events[0].settled_at) < window_start:
-            self._events.popleft()
-            removed = True
-        if removed:
-            self._rebuild_window(cutoff)
+        if int(event.settled_at) < window_start:
+            raise ValueError("event is outside the adaptive lookback window")
+        self._expire_before(window_start)
 
         self._events.append(event)
-        self._apply_prepared(prepared)
+        self._opened_monotonic = (
+            self._index.append(event) and self._opened_monotonic
+        )
+        self.workload["retained_index_events"] = len(self._index.events)
+        self._add_identity(event.observation_key, self._observation_counts)
+        self._add_identity(event.decision_id, self._decision_counts)
         self._last_event_key = event_key
+        self._last_evaluated_at = cutoff
         self.workload["incremental_adds"] += 1
+        self.workload["bounded_work_units"] += (
+            self.config.full_window_samples
+            + len(self._index.events).bit_length()
+            + 1
+        )
         self.workload["max_window_events"] = max(
             self.workload["max_window_events"],
             len(self._events),
         )
-        if self._state is None:
-            self._state = evaluate_adaptive_profile_state(
-                (),
-                self.profile_key,
-                cutoff,
-                config=self.config,
+        if self._incremental_window_valid:
+            self._apply_incremental(prepared)
+            self.workload["algorithm_work_units"] += (
+                min(len(self._events), self.config.full_window_samples) + 1
             )
-        state = dict(self._state)
-        state["evaluated_at"] = cutoff
-        self._state = state
-        return deepcopy(state)
+            return self._copy_state_at(cutoff)
+        return self._evaluate_window(cutoff)
 
-    def _rebuild_window(self, evaluated_at: int) -> None:
-        self.workload["window_rebuilds"] += 1
-        self.workload["window_rebuild_input_rows"] += len(self._events)
-        self._bindings = _IdentityBindings()
-        self._replay = _ProfileReplay(selection=_IncrementalCanonicalSelection())
-        self._state = None
-        prepared_events = []
+    def state_at(self, evaluated_at: int) -> dict:
+        """Return the exact state after expiring rows outside the window."""
+        cutoff = _validated_evaluated_at(evaluated_at)
+        if self._last_evaluated_at is not None and cutoff < self._last_evaluated_at:
+            raise ValueError("evaluated_at must advance monotonically")
+        self._expire_before(cutoff - self.lookback_ms)
+        self._last_evaluated_at = cutoff
+        return self._evaluate_window(cutoff)
+
+    def _expire_before(self, window_start: int) -> None:
+        removed = False
+        while self._events and int(self._events[0].settled_at) < window_start:
+            expired = self._events.popleft()
+            self._remove_identity(expired.observation_key, self._observation_counts)
+            self._remove_identity(expired.decision_id, self._decision_counts)
+            self._active_start += 1
+            removed = True
+        if removed:
+            self._incremental_window_valid = False
+            self._compact_index_if_geometric()
+
+    def _compact_index_if_geometric(self) -> None:
+        active_count = len(self._events)
+        if self._active_start == 0:
+            return
+        if active_count and self._active_start < active_count:
+            return
+        compacted = _MonotonicWindowIndex()
+        monotonic = True
         for event in self._events:
-            prepared = _prepare_event(event, evaluated_at)
-            if prepared is not None:
-                prepared_events.append(prepared)
-        for prepared in sorted(prepared_events, key=_prepared_event_sort_key):
-            self._apply_prepared(prepared)
+            monotonic = compacted.append(event) and monotonic
+        self._index = compacted
+        self._active_start = 0
+        self._opened_monotonic = monotonic
+        self.workload["index_compactions"] += 1
+        self.workload["index_compaction_input_rows"] += active_count
+        self.workload["algorithm_work_units"] += active_count
+        self.workload["bounded_work_units"] += active_count
+        self.workload["retained_index_events"] = active_count
 
-    def _apply_prepared(
+    def _apply_incremental(
         self,
         prepared: tuple[str, ObservationSignal],
     ) -> None:
@@ -463,6 +601,415 @@ class AdaptiveProfileWindowReplay:
         )
         if state is not None:
             self._state = state
+
+    def _add_identity(self, identity: str, counts: dict[str, int]) -> None:
+        if not identity:
+            return
+        previous = counts.get(identity, 0)
+        counts[identity] = previous + 1
+        if previous == 1:
+            self._duplicate_identities += 1
+
+    def _remove_identity(self, identity: str, counts: dict[str, int]) -> None:
+        if not identity:
+            return
+        previous = counts[identity]
+        if previous == 2:
+            self._duplicate_identities -= 1
+        if previous == 1:
+            del counts[identity]
+        else:
+            counts[identity] = previous - 1
+
+    def _evaluate_window(self, evaluated_at: int) -> dict:
+        if not self._events:
+            self._state = evaluate_adaptive_profile_state(
+                (),
+                self.profile_key,
+                evaluated_at,
+                config=self.config,
+            )
+        elif self._opened_monotonic and self._duplicate_identities == 0:
+            before_work = self._index.work_units
+            tail, selected_count = self._index.selected_tail(
+                self._active_start,
+                len(self._index.events) - 1,
+                self.config.full_window_samples + 2,
+            )
+            self._state = _state_from_monotonic_selected_tail(
+                tail,
+                selected_count,
+                self.profile_key,
+                evaluated_at,
+                self.config,
+            )
+            self.workload["fast_path_events"] += 1
+            self.workload["algorithm_work_units"] += (
+                self._index.work_units - before_work
+            )
+        else:
+            self._rebuild_window(evaluated_at)
+        return self._copy_state_at(evaluated_at)
+
+    def _copy_state_at(self, evaluated_at: int) -> dict:
+        if self._state is None:
+            self._state = evaluate_adaptive_profile_state(
+                (),
+                self.profile_key,
+                evaluated_at,
+                config=self.config,
+            )
+        state = dict(self._state)
+        state["evaluated_at"] = evaluated_at
+        self._state = state
+        return deepcopy(state)
+
+    def _rebuild_window(self, evaluated_at: int) -> None:
+        self.workload["window_rebuilds"] += 1
+        self.workload["window_rebuild_input_rows"] += len(self._events)
+        self.workload["algorithm_work_units"] += len(self._events)
+        rebuilt = rebuild_adaptive_profile_states(
+            list(self._events),
+            evaluated_at,
+            config=self.config,
+        )
+        self._state = rebuilt.get(self.profile_key)
+        if self._state is None:
+            self._state = evaluate_adaptive_profile_state(
+                (),
+                self.profile_key,
+                evaluated_at,
+                config=self.config,
+            )
+
+
+@dataclass
+class _GlobalWindowEntry:
+    profile_key: str
+    event: ObservationSignal
+    accepted: bool
+
+
+class AdaptiveGlobalProfileWindowReplay:
+    """Replay a global identity-bound window across every adaptive profile."""
+
+    _PROFILE_WORKLOAD_KEYS = (
+        "window_rebuilds",
+        "window_rebuild_input_rows",
+        "fast_path_events",
+        "algorithm_work_units",
+        "bounded_work_units",
+    )
+
+    def __init__(
+        self,
+        *,
+        lookback_ms: int,
+        config: AdaptiveProfileStateConfig | None = None,
+    ) -> None:
+        if type(lookback_ms) is not int or lookback_ms <= 0:
+            raise ValueError("lookback_ms must be a positive integer")
+        self.lookback_ms = lookback_ms
+        self.config = _resolve_config(config)
+        self._events: deque[_GlobalWindowEntry] = deque()
+        self._observation_claims: dict[str, int] = {}
+        self._decision_claims: dict[str, int] = {}
+        self._observation_bindings: dict[str, tuple[tuple[str, str], int]] = {}
+        self._decision_bindings: dict[str, tuple[tuple[str, str], int]] = {}
+        self._trackers: dict[str, AdaptiveProfileWindowReplay] = {}
+        self._retired_profile_workload = {
+            key: 0 for key in self._PROFILE_WORKLOAD_KEYS
+        }
+        self._max_profile_window_events = 0
+        self._last_event_key: tuple | None = None
+        self._last_evaluated_at: int | None = None
+        self.workload = {
+            "events": 0,
+            "global_identity_rebuilds": 0,
+            "global_identity_rebuild_input_rows": 0,
+            "max_global_window_events": 0,
+        }
+
+    def advance(
+        self,
+        event: ObservationSignal,
+        evaluated_at: int,
+    ) -> dict:
+        cutoff = _validated_evaluated_at(evaluated_at)
+        prepared = _prepare_event(event, cutoff)
+        if prepared is None:
+            raise ValueError("event is not eligible for the adaptive global window")
+        key, prepared_event = prepared
+        event_key = _prepared_event_sort_key(prepared)
+        if self._last_event_key is not None and event_key < self._last_event_key:
+            raise ValueError("events must advance in causal settlement order")
+        if self._last_evaluated_at is not None and cutoff < self._last_evaluated_at:
+            raise ValueError("evaluated_at must advance monotonically")
+        window_start = cutoff - self.lookback_ms
+        if int(prepared_event.settled_at) < window_start:
+            raise ValueError("event is outside the adaptive lookback window")
+
+        if self._expire_before(window_start):
+            self._rebuild_active_window()
+        self._increment_claim(
+            prepared_event.observation_key,
+            self._observation_claims,
+        )
+        self._increment_claim(
+            prepared_event.decision_id,
+            self._decision_claims,
+        )
+        accepted = self._accept(key, prepared_event)
+        self._events.append(_GlobalWindowEntry(key, prepared_event, accepted))
+        self._last_event_key = event_key
+        self._last_evaluated_at = cutoff
+        self.workload["events"] += 1
+        self.workload["max_global_window_events"] = max(
+            self.workload["max_global_window_events"],
+            len(self._events),
+        )
+
+        tracker = self._trackers.get(key)
+        if accepted:
+            if tracker is None:
+                tracker = AdaptiveProfileWindowReplay(
+                    key,
+                    lookback_ms=self.lookback_ms,
+                    config=self.config,
+                )
+                self._trackers[key] = tracker
+            state = tracker.advance(prepared_event, cutoff)
+        elif tracker is None:
+            state = evaluate_adaptive_profile_state(
+                (),
+                key,
+                cutoff,
+                config=self.config,
+            )
+        else:
+            state = tracker.state_at(cutoff)
+        self._record_profile_window_maximum()
+        return state
+
+    def workload_report(self) -> dict[str, int]:
+        totals = dict(self._retired_profile_workload)
+        for tracker in self._trackers.values():
+            for key in self._PROFILE_WORKLOAD_KEYS:
+                totals[key] += int(tracker.workload[key])
+        totals.update(self.workload)
+        totals["incremental_adds"] = int(self.workload["events"])
+        totals["max_window_events"] = self._max_profile_window_events
+        return totals
+
+    def _expire_before(self, window_start: int) -> bool:
+        released_observations: set[str] = set()
+        released_decisions: set[str] = set()
+        while self._events and int(self._events[0].event.settled_at) < window_start:
+            entry = self._events.popleft()
+            event = entry.event
+            self._decrement_claim(event.observation_key, self._observation_claims)
+            self._decrement_claim(event.decision_id, self._decision_claims)
+            if not entry.accepted:
+                continue
+            if self._release_binding(
+                event.observation_key,
+                self._observation_bindings,
+            ):
+                released_observations.add(event.observation_key)
+            if self._release_binding(
+                event.decision_id,
+                self._decision_bindings,
+            ):
+                released_decisions.add(event.decision_id)
+        return any(
+            identity in self._observation_claims
+            for identity in released_observations
+        ) or any(
+            identity in self._decision_claims
+            for identity in released_decisions
+        )
+
+    def _accept(self, key: str, event: ObservationSignal) -> bool:
+        observation_binding = (event.decision_id, key)
+        decision_binding = (event.observation_key, key)
+        if not self._binding_matches(
+            event.observation_key,
+            observation_binding,
+            self._observation_bindings,
+        ):
+            return False
+        if not self._binding_matches(
+            event.decision_id,
+            decision_binding,
+            self._decision_bindings,
+        ):
+            return False
+        self._retain_binding(
+            event.observation_key,
+            observation_binding,
+            self._observation_bindings,
+        )
+        self._retain_binding(
+            event.decision_id,
+            decision_binding,
+            self._decision_bindings,
+        )
+        return True
+
+    @staticmethod
+    def _binding_matches(
+        identity: str,
+        binding: tuple[str, str],
+        bindings: dict[str, tuple[tuple[str, str], int]],
+    ) -> bool:
+        return (
+            not identity
+            or identity not in bindings
+            or bindings[identity][0] == binding
+        )
+
+    @staticmethod
+    def _retain_binding(
+        identity: str,
+        binding: tuple[str, str],
+        bindings: dict[str, tuple[tuple[str, str], int]],
+    ) -> None:
+        if not identity:
+            return
+        current = bindings.get(identity)
+        bindings[identity] = (binding, 1 if current is None else current[1] + 1)
+
+    @staticmethod
+    def _release_binding(
+        identity: str,
+        bindings: dict[str, tuple[tuple[str, str], int]],
+    ) -> bool:
+        if not identity:
+            return False
+        binding, count = bindings[identity]
+        if count > 1:
+            bindings[identity] = (binding, count - 1)
+            return False
+        del bindings[identity]
+        return True
+
+    @staticmethod
+    def _increment_claim(identity: str, claims: dict[str, int]) -> None:
+        if identity:
+            claims[identity] = claims.get(identity, 0) + 1
+
+    @staticmethod
+    def _decrement_claim(identity: str, claims: dict[str, int]) -> None:
+        if not identity:
+            return
+        count = claims[identity]
+        if count == 1:
+            del claims[identity]
+        else:
+            claims[identity] = count - 1
+
+    def _rebuild_active_window(self) -> None:
+        self.workload["global_identity_rebuilds"] += 1
+        self.workload["global_identity_rebuild_input_rows"] += len(self._events)
+        self._observation_bindings = {}
+        self._decision_bindings = {}
+        self._retire_trackers()
+        for entry in self._events:
+            entry.accepted = self._accept(entry.profile_key, entry.event)
+            if not entry.accepted:
+                continue
+            tracker = self._trackers.get(entry.profile_key)
+            if tracker is None:
+                tracker = AdaptiveProfileWindowReplay(
+                    entry.profile_key,
+                    lookback_ms=self.lookback_ms,
+                    config=self.config,
+                )
+                self._trackers[entry.profile_key] = tracker
+            tracker.advance(entry.event, int(entry.event.settled_at) + 1)
+        self._record_profile_window_maximum()
+
+    def _retire_trackers(self) -> None:
+        for tracker in self._trackers.values():
+            for key in self._PROFILE_WORKLOAD_KEYS:
+                self._retired_profile_workload[key] += int(tracker.workload[key])
+        self._trackers = {}
+
+    def _record_profile_window_maximum(self) -> None:
+        current_maximum = max(
+            (
+                int(tracker.workload["max_window_events"])
+                for tracker in self._trackers.values()
+            ),
+            default=0,
+        )
+        self._max_profile_window_events = max(
+            self._max_profile_window_events,
+            current_maximum,
+        )
+
+
+def _state_from_monotonic_selected_tail(
+    tail: Sequence[ObservationSignal],
+    selected_count: int,
+    profile_key: str,
+    evaluated_at: int,
+    config: AdaptiveProfileStateConfig,
+) -> dict:
+    if not tail or selected_count <= 0:
+        return evaluate_adaptive_profile_state(
+            (),
+            profile_key,
+            evaluated_at,
+            config=config,
+        )
+
+    if selected_count == len(tail):
+        previous = None
+        state = None
+        samples = []
+        for event in tail:
+            samples.append(event)
+            state = classify_profile_state(
+                samples[-config.full_window_samples :],
+                profile_key,
+                evaluated_at,
+                previous=previous,
+                config=config,
+            )
+            previous = state["status"]
+        return state
+
+    if len(tail) != config.full_window_samples + 2:
+        raise RuntimeError("adaptive monotonic tail does not cover final transitions")
+    antepenultimate_index = len(tail) - 3
+    antepenultimate = classify_profile_state(
+        tail[
+            antepenultimate_index - config.full_window_samples + 1
+            : antepenultimate_index + 1
+        ],
+        profile_key,
+        evaluated_at,
+        config=config,
+    )
+    penultimate_index = len(tail) - 2
+    penultimate = classify_profile_state(
+        tail[
+            penultimate_index - config.full_window_samples + 1
+            : penultimate_index + 1
+        ],
+        profile_key,
+        evaluated_at,
+        previous=antepenultimate["status"],
+        config=config,
+    )
+    return classify_profile_state(
+        tail[-config.full_window_samples :],
+        profile_key,
+        evaluated_at,
+        previous=penultimate["status"],
+        config=config,
+    )
 
 
 def evaluate_adaptive_profile_state(
@@ -858,11 +1405,19 @@ def _causal_observation_sort_key(item: ObservationSignal) -> tuple:
     )
 
 
-def _prepared_event_sort_key(prepared: tuple[str, ObservationSignal]) -> tuple:
-    key, item = prepared
+def adaptive_replay_event_sort_key(item: ObservationSignal) -> tuple:
+    """Return the production causal order for global adaptive replay."""
+    if not isinstance(item, ObservationSignal):
+        raise TypeError("adaptive replay events must be ObservationSignal values")
+    key = _safe_observation_profile_key(item) or ""
     causal_key = _causal_observation_sort_key(item)
     return (
         causal_key[0],
         key,
         *causal_key[1:],
     )
+
+
+def _prepared_event_sort_key(prepared: tuple[str, ObservationSignal]) -> tuple:
+    _key, item = prepared
+    return adaptive_replay_event_sort_key(item)

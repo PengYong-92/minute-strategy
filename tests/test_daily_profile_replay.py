@@ -12,6 +12,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app.adaptive_profile_state import (
+    AdaptiveGlobalProfileWindowReplay,
     AdaptiveProfileWindowReplay,
     rebuild_adaptive_profile_states,
 )
@@ -602,6 +603,353 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(tracker.workload["incremental_adds"], len(rows))
         self.assertEqual(tracker.workload["window_rebuilds"], 0)
         self.assertEqual(tracker.workload["max_window_events"], len(rows))
+
+    def test_adaptive_event_rows_match_global_window_rebuild_across_profiles(self):
+        start = timestamp("2026-07-01T00:00:00")
+        owner = replace(
+            observation(
+                "shared-observation",
+                "WIN",
+                start,
+                direction="LONG",
+                tag="generic_long_observe",
+            ),
+            decision_id="long-owner-decision",
+            threshold_segment="WD-01",
+        )
+        rows = [owner]
+        rows.append(
+            replace(
+                observation(
+                    "shared-observation",
+                    "LOSS",
+                    start + 11 * 60_000,
+                    direction="SHORT",
+                    tag="generic_short_observe",
+                ),
+                decision_id="short-conflicting-decision",
+                threshold_segment="WE-04",
+            )
+        )
+        short_owner = replace(
+            observation(
+                "short-owner-observation",
+                "WIN",
+                start + 22 * 60_000,
+                direction="SHORT",
+                tag="short_pulse_observe",
+            ),
+            decision_id="shared-decision",
+            threshold_segment="WD-08",
+        )
+        rows.append(short_owner)
+        rows.append(
+            replace(
+                observation(
+                    "long-conflicting-observation",
+                    "LOSS",
+                    start + 33 * 60_000,
+                    direction="LONG",
+                    tag="long_reversal_observe",
+                ),
+                decision_id="shared-decision",
+                threshold_segment="WD-15",
+            )
+        )
+        rows.extend(
+            replace(
+                observation(
+                    f"normal-{index:02d}",
+                    "WIN" if index % 3 else "LOSS",
+                    start + (44 + index * 11) * 60_000,
+                    direction="LONG" if index % 2 else "SHORT",
+                    tag=(
+                        "generic_long_observe"
+                        if index % 2
+                        else "generic_short_observe"
+                    ),
+                ),
+                threshold_segment="WD-01" if index % 2 else "WE-04",
+            )
+            for index in range(24)
+        )
+
+        ordered = sorted(rows, key=replay_module._settlement_event_key)
+        actual_rows = replay_module._build_adaptive_event_rows(ordered)
+        lookback_ms = 15 * 86_400_000
+        prefix = []
+        for index, (event, actual) in enumerate(zip(ordered, actual_rows)):
+            prefix.append(event)
+            evaluated_at = int(event.settled_at) + 1
+            window = [
+                item
+                for item in prefix
+                if evaluated_at - lookback_ms <= int(item.settled_at) < evaluated_at
+            ]
+            key = replay_module._observation_profile_key(event)
+            expected = rebuild_adaptive_profile_states(window, evaluated_at).get(key)
+            if expected is None:
+                expected = replay_module._adaptive_state((), key, evaluated_at)
+            with self.subTest(index=index, profile=key):
+                self.assertEqual(actual["adaptive_state_after"], expected["status"])
+                self.assertEqual(actual["n12_after"], expected["n12"])
+                self.assertEqual(actual["n20_after"], expected["n20"])
+                self.assertEqual(actual["adaptive_evaluated_at"], evaluated_at)
+
+    def test_adaptive_event_rows_use_production_global_tie_order(self):
+        settled_at = timestamp("2026-07-01T01:00:00")
+        earlier_opened = replace(
+            observation(
+                "tied-global-identity",
+                "LOSS",
+                timestamp("2026-07-01T00:30:00"),
+                direction="SHORT",
+                tag="z_short_observe",
+                settled_at=settled_at,
+            ),
+            decision_id="short-tied-decision",
+            threshold_segment="WE-04",
+        )
+        later_opened = replace(
+            observation(
+                "tied-global-identity",
+                "WIN",
+                timestamp("2026-07-01T00:40:00"),
+                direction="LONG",
+                tag="a_long_observe",
+                settled_at=settled_at,
+            ),
+            decision_id="long-tied-decision",
+            threshold_segment="WD-15",
+        )
+
+        actual = replay_module._build_adaptive_event_rows(
+            [earlier_opened, later_opened]
+        )
+        expected_events = sorted(
+            [earlier_opened, later_opened],
+            key=replay_module.adaptive_replay_event_sort_key,
+        )
+
+        self.assertEqual(
+            [row["profile_key"] for row in actual],
+            [
+                replay_module._observation_profile_key(event)
+                for event in expected_events
+            ],
+        )
+        accepted_key = replay_module._observation_profile_key(expected_events[0])
+        expected = rebuild_adaptive_profile_states(
+            expected_events,
+            settled_at + 1,
+        )[accepted_key]
+        accepted_row = actual[0]
+        self.assertEqual(accepted_row["n12_after"], expected["n12"])
+
+    def test_adaptive_global_identity_owner_transfer_matches_window_rebuild(self):
+        start = timestamp("2026-01-01T00:00:00")
+        rows = []
+        for index in range(230):
+            direction = "LONG" if index % 2 else "SHORT"
+            row = replace(
+                observation(
+                    f"transfer-{index:03d}",
+                    "WIN" if index % 4 else "LOSS",
+                    start + index * 2 * 60 * 60_000,
+                    direction=direction,
+                    tag=(
+                        "long_transfer_observe"
+                        if direction == "LONG"
+                        else "short_transfer_observe"
+                    ),
+                ),
+                threshold_segment="WD-15" if direction == "LONG" else "WE-04",
+            )
+            rows.append(row)
+        rows[20] = replace(
+            rows[20],
+            observation_key="expiring-cross-profile-observation",
+            decision_id="expiring-observation-owner",
+        )
+        rows[30] = replace(
+            rows[30],
+            observation_key="expiring-cross-profile-observation",
+            decision_id="waiting-observation-claim",
+            direction="LONG",
+            strategy_tag="long_waiting_observe",
+            threshold_segment="WD-15",
+        )
+        rows[40] = replace(
+            rows[40],
+            observation_key="expiring-decision-owner",
+            decision_id="expiring-cross-tag-decision",
+        )
+        rows[50] = replace(
+            rows[50],
+            observation_key="waiting-decision-claim",
+            decision_id="expiring-cross-tag-decision",
+            direction="LONG",
+            strategy_tag="long_decision_waiting_observe",
+            threshold_segment="WD-15",
+        )
+
+        ordered = sorted(rows, key=replay_module._settlement_event_key)
+        workload = {}
+        actual_rows = replay_module._build_adaptive_event_rows(
+            ordered,
+            workload=workload,
+        )
+        lookback_ms = 15 * 86_400_000
+        left = 0
+        for index, (event, actual) in enumerate(zip(ordered, actual_rows)):
+            evaluated_at = int(event.settled_at) + 1
+            while (
+                left <= index
+                and int(ordered[left].settled_at) < evaluated_at - lookback_ms
+            ):
+                left += 1
+            expected_states = rebuild_adaptive_profile_states(
+                ordered[left : index + 1],
+                evaluated_at,
+            )
+            key = replay_module._observation_profile_key(event)
+            expected = expected_states.get(key)
+            if expected is None:
+                expected = replay_module._adaptive_state((), key, evaluated_at)
+            with self.subTest(index=index, profile=key):
+                self.assertEqual(actual["adaptive_state_after"], expected["status"])
+                self.assertEqual(actual["n12_after"], expected["n12"])
+                self.assertEqual(actual["n20_after"], expected["n20"])
+        self.assertEqual(workload["adaptive_window_rebuilds"], 2)
+        self.assertLessEqual(workload["adaptive_window_rebuild_input_rows"], 400)
+
+    def test_adaptive_global_window_skips_rebuild_when_all_claims_expire_together(self):
+        start = timestamp("2026-01-01T00:00:00")
+        owner = replace(
+            observation("expiring-owner", "WIN", start),
+            observation_key="joint-expiry-identity",
+            decision_id="joint-expiry-owner",
+        )
+        conflict = replace(
+            observation("expiring-conflict", "LOSS", start + 60_000),
+            observation_key="joint-expiry-identity",
+            decision_id="joint-expiry-conflict",
+            direction="LONG",
+            strategy_tag="long_joint_expiry_observe",
+            threshold_segment="WD-15",
+        )
+        later = observation(
+            "after-joint-expiry",
+            "WIN",
+            start + 16 * 86_400_000,
+        )
+        tracker = AdaptiveGlobalProfileWindowReplay(
+            lookback_ms=15 * 86_400_000,
+        )
+        for row in sorted(
+            [owner, conflict, later],
+            key=replay_module.adaptive_replay_event_sort_key,
+        ):
+            tracker.advance(row, int(row.settled_at) + 1)
+
+        self.assertEqual(tracker.workload_report()["global_identity_rebuilds"], 0)
+
+    def test_adaptive_public_window_replay_rejects_event_before_window(self):
+        row = observation(
+            "outside-window",
+            "WIN",
+            timestamp("2026-07-01T00:00:00"),
+        )
+        lookback_ms = 15 * 86_400_000
+        tracker = AdaptiveProfileWindowReplay(
+            replay_module._observation_profile_key(row),
+            lookback_ms=lookback_ms,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside the adaptive lookback window"):
+            tracker.advance(row, int(row.settled_at) + lookback_ms + 2)
+
+    def test_adaptive_window_work_is_near_linear_across_fifteen_day_boundary(self):
+        def workload_for(count, spacing_minutes):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    f"work-{spacing_minutes}-{index:04d}",
+                    "WIN" if index % 3 else "LOSS",
+                    start + index * spacing_minutes * 60_000,
+                )
+                for index in range(count)
+            ]
+            key = replay_module._observation_profile_key(rows[0])
+            tracker = AdaptiveProfileWindowReplay(
+                key,
+                lookback_ms=15 * 86_400_000,
+            )
+            for row in rows:
+                tracker.advance(row, int(row.settled_at) + 1)
+            return tracker.workload
+
+        non_overlapping_small = workload_for(2_000, 11)
+        self.assertLessEqual(
+            non_overlapping_small["window_rebuild_input_rows"],
+            2_000 * 4,
+        )
+        non_overlapping_large = workload_for(4_000, 11)
+        self.assertEqual(non_overlapping_large["window_rebuild_input_rows"], 0)
+        self.assertLessEqual(
+            non_overlapping_large["retained_index_events"],
+            non_overlapping_large["max_window_events"] * 2,
+        )
+        self.assertLessEqual(
+            non_overlapping_large["bounded_work_units"],
+            non_overlapping_small["bounded_work_units"] * 2.3,
+        )
+
+        overlapping_small = workload_for(3_000, 8)
+        overlapping_large = workload_for(6_000, 8)
+        self.assertLessEqual(
+            overlapping_small["window_rebuild_input_rows"],
+            3_000 * 4,
+        )
+        self.assertEqual(overlapping_large["window_rebuild_input_rows"], 0)
+        self.assertLessEqual(
+            overlapping_large["retained_index_events"],
+            overlapping_large["max_window_events"] * 2,
+        )
+        self.assertLessEqual(
+            overlapping_large["bounded_work_units"],
+            overlapping_small["bounded_work_units"] * 2.3,
+        )
+
+    def test_adaptive_overlapping_fast_path_matches_rebuild_after_expiry(self):
+        start = timestamp("2026-01-01T00:00:00")
+        rows = [
+            observation(
+                f"overlap-expiry-{index:04d}",
+                "WIN" if index % 5 not in {0, 1} else "LOSS",
+                start + index * 6 * 60_000,
+            )
+            for index in range(3_800)
+        ]
+        key = replay_module._observation_profile_key(rows[0])
+        lookback_ms = 15 * 86_400_000
+        tracker = AdaptiveProfileWindowReplay(key, lookback_ms=lookback_ms)
+        checkpoints = {3_599, 3_600, 3_650, 3_799}
+        for index, row in enumerate(rows):
+            evaluated_at = int(row.settled_at) + 1
+            actual = tracker.advance(row, evaluated_at)
+            if index not in checkpoints:
+                continue
+            window = [
+                event
+                for event in rows[: index + 1]
+                if evaluated_at - lookback_ms <= int(event.settled_at) < evaluated_at
+            ]
+            expected = rebuild_adaptive_profile_states(window, evaluated_at)[key]
+            with self.subTest(index=index):
+                self.assertEqual(actual, expected)
+
+        self.assertEqual(tracker.workload["window_rebuild_input_rows"], 0)
 
     def test_adaptive_window_rebuild_work_scales_with_horizon_not_total_history(self):
         def workload_for(days):

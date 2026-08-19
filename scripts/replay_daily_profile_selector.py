@@ -20,7 +20,8 @@ if str(ROOT) not in sys.path:
 
 from app.adaptive_profile_state import (
     ADAPTIVE_PROFILE_STATE_VERSION,
-    AdaptiveProfileWindowReplay,
+    AdaptiveGlobalProfileWindowReplay,
+    adaptive_replay_event_sort_key,
     evaluate_adaptive_profile_state,
 )
 from app.daily_profile_selector import (
@@ -820,22 +821,17 @@ def _build_adaptive_event_rows(
     *,
     workload: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    trackers: dict[str, AdaptiveProfileWindowReplay] = {}
+    tracker = AdaptiveGlobalProfileWindowReplay(
+        lookback_ms=ADAPTIVE_LOOKBACK_MS,
+    )
     states: dict[str, dict[str, Any]] = {}
     rows = []
-    for item in sorted(observations, key=_settlement_event_key):
+    for item in sorted(observations, key=adaptive_replay_event_sort_key):
         key = _observation_profile_key(item)
         before = states.get(key) or _adaptive_state((), key, int(item.settled_at))
         after = before
         if _is_adaptive_profile_key(key):
             evaluated_at = int(item.settled_at) + 1
-            tracker = trackers.get(key)
-            if tracker is None:
-                tracker = AdaptiveProfileWindowReplay(
-                    key,
-                    lookback_ms=ADAPTIVE_LOOKBACK_MS,
-                )
-                trackers[key] = tracker
             after = tracker.advance(item, evaluated_at)
             states[key] = after
         rows.append(
@@ -855,26 +851,22 @@ def _build_adaptive_event_rows(
             }
         )
     if workload is not None:
+        tracker_workload = tracker.workload_report()
         workload["adaptive_events"] = len(observations)
-        workload["adaptive_incremental_adds"] = sum(
-            tracker.workload["incremental_adds"]
-            for tracker in trackers.values()
+        workload["adaptive_incremental_adds"] = tracker_workload[
+            "incremental_adds"
+        ]
+        workload["adaptive_window_rebuilds"] = (
+            tracker_workload["window_rebuilds"]
+            + tracker_workload["global_identity_rebuilds"]
         )
-        workload["adaptive_window_rebuilds"] = sum(
-            tracker.workload["window_rebuilds"]
-            for tracker in trackers.values()
+        workload["adaptive_window_rebuild_input_rows"] = (
+            tracker_workload["window_rebuild_input_rows"]
+            + tracker_workload["global_identity_rebuild_input_rows"]
         )
-        workload["adaptive_window_rebuild_input_rows"] = sum(
-            tracker.workload["window_rebuild_input_rows"]
-            for tracker in trackers.values()
-        )
-        workload["adaptive_max_window_events"] = max(
-            (
-                tracker.workload["max_window_events"]
-                for tracker in trackers.values()
-            ),
-            default=0,
-        )
+        workload["adaptive_max_window_events"] = tracker_workload[
+            "max_window_events"
+        ]
     return rows
 
 
