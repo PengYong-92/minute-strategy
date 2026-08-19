@@ -3,8 +3,8 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import replace
+from contextlib import closing, redirect_stderr, redirect_stdout
+from dataclasses import fields, replace
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -12,10 +12,16 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app.daily_profile_selector import DailyProfileSelectorConfig
-from app.models import ObservationSignal
-from app.storage import SQLiteMonitorStore
+from app.models import ObservationSignal, Signal
+from app.simulator import AccountSimulator
+from app.storage import (
+    _LINKED_CONTEXT_COLUMNS,
+    _hydrate_decision_linked_payload,
+    SQLiteMonitorStore,
+)
 from scripts import replay_daily_profile_selector as replay_module
 from tests.test_storage import ENTRY_STRUCTURE_FIXTURE, structured_atomic_bundle
+from tests.test_storage_schema import _create_e0_v3_lifecycle_fixture
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -170,6 +176,9 @@ class DailyProfileReplayTest(unittest.TestCase):
             "--stake-progression-base-only-segments",
         ):
             self.assertIn(flag, help_text)
+        self.assertIn("必须与 --win-return 相等", help_text)
+        self.assertIn("当前生产兼容参数不生效", help_text)
+        self.assertIn("只接受显式空字符串", help_text)
 
     def test_cli_passes_explicit_production_settings_to_replay(self):
         args = [
@@ -274,7 +283,7 @@ class DailyProfileReplayTest(unittest.TestCase):
         legacy = observation("legacy", "LOSS", timestamp("2026-07-20T08:00:00"))
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "legacy.sqlite3"
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 connection.execute(
                     "create table observation_signals "
                     "(symbol text not null, status text not null, payload text not null)"
@@ -283,6 +292,7 @@ class DailyProfileReplayTest(unittest.TestCase):
                     "insert into observation_signals(symbol, status, payload) values (?, ?, ?)",
                     ("BTCUSDT", "SETTLED", json.dumps(legacy.to_dict())),
                 )
+                connection.commit()
             before = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
             actual = replay_module.load_replay_observations(db_path, "btcusdt")
@@ -290,6 +300,99 @@ class DailyProfileReplayTest(unittest.TestCase):
             after = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
         self.assertEqual([item.to_dict() for item in actual], [legacy.to_dict()])
+        self.assertEqual(after, before)
+
+    def test_read_only_loader_hydrates_v3_compact_lifecycle_schema(self):
+        source = observation(
+            "v3-observation",
+            "WIN",
+            1_000,
+            direction="LONG",
+            tag="v3-compact",
+            settled_at=601_000,
+        )
+        profile = "10|short_observe|v3-compact|LONG|WD-01"
+        signal_payload = source.to_dict()
+        signal_payload["profile_key"] = profile
+        context_inputs = {
+            "identity": {
+                "direction": "LONG",
+                "profile_key": profile,
+                "strategy_family": source.strategy_family,
+                "strategy_tag": source.strategy_tag,
+                "timeframe_minutes": source.timeframe_minutes,
+                "threshold_segment": source.threshold_segment,
+                "level": source.level,
+            },
+            "market": {
+                "candidate_time_ms": source.opened_at,
+                "entry_price": source.entry_price,
+            },
+            "score": {},
+            "signal": signal_payload,
+            "entry_structure": source.entry_structure_shadow,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "v3.sqlite3"
+            with closing(sqlite3.connect(db_path)) as connection:
+                _create_e0_v3_lifecycle_fixture(connection)
+                connection.execute(
+                    "update decision_contexts set input_payload = ?, direction = ?, "
+                    "profile_key = ? where decision_id = ?",
+                    (
+                        json.dumps(
+                            context_inputs,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        "LONG",
+                        profile,
+                        "v3-decision",
+                    ),
+                )
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    f"""
+                    select observation_signals.payload,
+                           observation_signals.observation_key as lifecycle_observation_key,
+                           observation_signals.status as lifecycle_status,
+                           observation_signals.result as lifecycle_result,
+                           observation_signals.opened_at as lifecycle_opened_at,
+                           observation_signals.expires_at as lifecycle_expires_at,
+                           observation_signals.settled_at as lifecycle_settled_at,
+                           null as lifecycle_exit_price,
+                           null as lifecycle_pnl,
+                           {_LINKED_CONTEXT_COLUMNS}
+                    from observation_signals
+                    left join decision_contexts
+                      on decision_contexts.symbol = observation_signals.symbol
+                     and decision_contexts.decision_id = observation_signals.decision_id
+                    where observation_signals.observation_key = 'v3-observation'
+                    """
+                ).fetchone()
+                expected_payload = _hydrate_decision_linked_payload(
+                    json.loads(row["payload"]),
+                    row,
+                )
+                accepted = {item.name for item in fields(ObservationSignal)}
+                expected = ObservationSignal(
+                    **{
+                        key: value
+                        for key, value in expected_payload.items()
+                        if key in accepted
+                    }
+                )
+                connection.commit()
+            before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+            try:
+                actual = replay_module.load_replay_observations(db_path, "BTCUSDT")
+            except Exception as error:  # noqa: BLE001 - turn loader errors into a TDD failure.
+                self.fail(f"V3 compact replay load failed: {error}")
+
+            after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        self.assertEqual([item.to_dict() for item in actual], [expected.to_dict()])
         self.assertEqual(after, before)
 
     def test_replay_is_settlement_causal_and_cutoff_safe(self):
@@ -391,6 +494,172 @@ class DailyProfileReplayTest(unittest.TestCase):
             by_key["long-second-stage"]["progression_source_order_id"],
             by_key["long-first"]["order_id"],
         )
+
+    def test_high_precision_progression_matches_account_simulator(self):
+        stake = 10.12345
+        win_return = 18.98765
+        signal = Signal(
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="B",
+            reason="high precision",
+            price=100.0,
+            open_time=0,
+        )
+        simulator = AccountSimulator(
+            stake=stake,
+            win_return=win_return,
+            enable_stake_progression=True,
+            stake_progression_max_active=1,
+            max_open_orders=2,
+        )
+        first = simulator.open_order(signal, 100.0, 0)
+        simulator.settle_expired_orders(first.expires_at, 99.0)
+        expected_second = simulator.open_order(signal, 99.0, first.expires_at)
+        rows = [
+            observation("precision-train", "WIN", timestamp("2026-07-20T01:00:00")),
+            observation("precision-first", "WIN", timestamp("2026-07-20T08:00:00")),
+            observation("precision-second", "LOSS", timestamp("2026-07-20T08:10:00")),
+        ]
+
+        report = self.replay(
+            rows,
+            stake=stake,
+            win_return=win_return,
+            stake_progression_second_stake=win_return,
+        )
+
+        actual_second = next(
+            item
+            for item in report["baseline"]["trade_rows"]
+            if item["observation_key"] == "precision-second"
+        )
+        self.assertEqual(report["execution"]["stake"], stake)
+        self.assertEqual(report["execution"]["win_return"], win_return)
+        self.assertEqual(expected_second.win_return, 35.6134)
+        self.assertEqual(actual_second["stake"], expected_second.stake)
+        self.assertEqual(actual_second["win_return"], expected_second.win_return)
+
+    def test_disabled_progression_still_uses_ledger_base_terms(self):
+        stake = 10.12345
+        win_return = 18.98765
+        signal = Signal(
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="B",
+            reason="disabled high precision",
+            price=100.0,
+            open_time=0,
+        )
+        simulator = AccountSimulator(
+            stake=stake,
+            win_return=win_return,
+            enable_stake_progression=False,
+            max_open_orders=2,
+        )
+        expected_first = simulator.open_order(signal, 100.0, 0)
+        simulator.settle_expired_orders(expected_first.expires_at, 99.0)
+        expected_second = simulator.open_order(
+            signal,
+            99.0,
+            expected_first.expires_at,
+        )
+        rows = [
+            observation("disabled-train", "WIN", timestamp("2026-07-20T01:00:00")),
+            observation("disabled-first", "WIN", timestamp("2026-07-20T08:00:00")),
+            observation("disabled-second", "LOSS", timestamp("2026-07-20T08:10:00")),
+        ]
+
+        report = self.replay(
+            rows,
+            stake=stake,
+            win_return=win_return,
+            stake_progression_enabled=False,
+            stake_progression_second_stake=win_return,
+        )
+
+        actual = {
+            item["observation_key"]: item
+            for item in report["baseline"]["trade_rows"]
+        }
+        actual_first = actual["disabled-first"]
+        actual_second = actual["disabled-second"]
+        self.assertEqual(
+            (actual_first["stake"], actual_first["win_return"], actual_first["pnl"]),
+            (expected_first.stake, expected_first.win_return, expected_first.pnl),
+        )
+        self.assertEqual(
+            (actual_second["stake"], actual_second["win_return"]),
+            (expected_second.stake, expected_second.win_return),
+        )
+        self.assertTrue(actual_first["progression_allowed"])
+        self.assertTrue(actual_second["progression_allowed"])
+        self.assertEqual(actual_first["progression_version"], "")
+        self.assertEqual(actual_second["progression_version"], "")
+
+    def test_watch_bypasses_ledger_and_keeps_original_base_terms(self):
+        stake = 10.12345
+        win_return = 18.98765
+        row = observation("watch-precision", "WIN", 1_000)
+        profile = replay_module._observation_profile_key(row)
+        watch = replay_module._adaptive_state((), profile, row.opened_at)
+        watch["status"] = "WATCH"
+        timeline = {
+            "by_profile": {profile: [(row.opened_at, watch)]},
+            "settled_times": [row.opened_at],
+        }
+        snapshot = {
+            "effective_from": 0,
+            "effective_until": row.expires_at + 1,
+            "selected_profiles": [
+                {
+                    "key": profile,
+                    "sample_size": 1,
+                    "win_rate": 1.0,
+                    "ev": 8.0,
+                }
+            ],
+        }
+        execution = self.production_execution(
+            stake=stake,
+            win_return=win_return,
+            stake_progression_second_stake=win_return,
+        ).normalized()
+        simulator = AccountSimulator(
+            stake=stake,
+            win_return=win_return,
+            enable_stake_progression=True,
+            max_open_orders=2,
+        )
+        signal = Signal(
+            direction="SHORT",
+            timeframe_minutes=10,
+            level="B",
+            reason="watch precision",
+            price=100.0,
+            open_time=0,
+        )
+        expected, _credit = simulator.open_order_with_credit(
+            signal,
+            100.0,
+            row.opened_at,
+            allow_progression=False,
+        )
+
+        result = replay_module._execute_replay(
+            [row],
+            [snapshot],
+            execution,
+            timeline,
+            apply_adaptive=True,
+            include_structure_shadow=False,
+        )
+
+        actual = result["trade_rows"][0]
+        self.assertFalse(actual["progression_allowed"])
+        self.assertEqual(actual["progression_version"], "TWO_STAGE_V1")
+        self.assertEqual(actual["stake"], expected.stake)
+        self.assertEqual(actual["win_return"], expected.win_return)
 
     def test_base_first_orders_exclude_concurrent_base_second_slot(self):
         rows = [

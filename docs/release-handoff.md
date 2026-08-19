@@ -2092,13 +2092,15 @@ python3 -m pip install -r requirements.txt
 | 金额叠加 | `TWO_STAGE_V1` |
 | 当前状态 | 本地实现完成，**未部署**、未合并`main`、未推送、未打标签、未清空订单 |
 
-`scripts/replay_daily_profile_selector.py`现在拒绝任何缺少生产执行参数的运行，不再沿用旧`max_open_orders=5`。全局并发、LONG/SHORT方向并发、同方向冷却/最小开单间隔、基础`stake`、`win_return`、金额叠加开关、级数、并行第二级上限、第二级金额及仅基础金额时段均必须显式提供。`TWO_STAGE_V1`回放进一步要求第二级`stake`严格等于`win_return`，并要求仅基础金额时段为空；非空列表会被拒绝，因为当前生产`AccountSimulator`不实施该兼容参数。
+`scripts/replay_daily_profile_selector.py`现在拒绝任何缺少生产执行参数的运行，不再沿用旧`max_open_orders=5`。全局并发、LONG/SHORT方向并发、同方向冷却/最小开单间隔、基础`stake`、`win_return`、金额叠加开关、级数、并行第二级上限、第二级金额及仅基础金额时段均必须显式提供。`TWO_STAGE_V1`回放进一步要求第二级`stake`的原始值严格等于`win_return`，并要求仅基础金额时段为空；非空列表会被拒绝，因为当前生产`AccountSimulator`不实施该兼容参数。验证后的金额原值会传入生产`TwoStageStakeProgression`，不在回放配置归一化阶段提前舍入。
+
+回放将守卫的`allow_progression`与全局`stake_progression_enabled`分开：除adaptive `WATCH`外均调用ledger `assign`，全局关闭时也由ledger返回四位量化的基础条款；只有`WATCH`令`allow_progression=false`并绕过ledger使用原始基础条款。报告中的`progression_allowed`记录该守卫值，progression版本仍由全局开关决定，与生产`selected_order_terms`语义一致。
 
 回放按`settled_at -> opened_at -> observation_key`生成结算事件时间线。每个候选只读取其开单时点已经结算的事件；每日07:50快照严格排除`settled_at >= 07:50`的数据。N12/N20在每笔结算后以`evaluated_at=settled_at+1`立即重建，并且只使用`[evaluated_at-15天, evaluated_at)`窗口内的记录，不累计窗口外历史。baseline、structure-shadow和adaptive candidate使用相同生产配置独立执行；结构 equality 报告真实逐笔比较订单ID、方向、开结算/到期时间、stake、progression字段和Webhook计数，不使用固定相等结论。
 
 ### 42.2 迁移与容量行为
 
-本分支的SQLite变更保持增量兼容：V2表、索引和列通过事务迁移增加，迁移失败整体回滚；旧订单、旧观察和旧审计继续可读，不重写、不删除、不执行固定TTL清理。Task 17使用回放专用加载器以SQLite URI `mode=ro`并启用`query_only`打开源库，不执行`SQLiteMonitorStore`初始化或任何迁移。V2记录按`app.storage`生产契约联结`decision_contexts`，水合完整decision-linked payload和生命周期列；旧`observation_signals` payload fixture仍可读取。回放只写指定JSON报告，不修改数据库，不生成生产订单，不发送真实Webhook。正式复核仍应先复制源SQLite，再对副本运行回放。
+本分支的SQLite变更保持增量兼容：V2表、索引和列通过事务迁移增加，迁移失败整体回滚；旧订单、旧观察和旧审计继续可读，不重写、不删除、不执行固定TTL清理。Task 17使用回放专用加载器以SQLite URI `mode=ro`并启用`query_only`打开源库，不执行`SQLiteMonitorStore`初始化或任何迁移。V2记录按`app.storage`生产契约联结`decision_contexts`，水合完整decision-linked payload和生命周期列；V3紧凑库即使`observation_signals`缺少后加的可空`exit_price/pnl`列，也会按现有列动态生成生命周期投影，缺列投影为`null as lifecycle_*`，并仅依据`decision_id`和完整context schema联结生产水合路径。旧`observation_signals` payload fixture仍可读取。回放只写指定JSON报告，不修改数据库，不生成生产订单，不发送真实Webhook。正式复核仍应先复制源SQLite，再对副本运行回放。
 
 单文件容量门槛保持：
 
@@ -2140,7 +2142,7 @@ python3 scripts/replay_daily_profile_selector.py \
   --output /private/tmp/adaptive-profile-release-gates.json
 ```
 
-不得直接对生产SQLite做试验性写入。命令缺少任一显式并发、冷却、金额或progression参数时必须由CLI返回错误，不得猜测生产值；`--stake-progression-second-stake`必须与`--win-return`相等，`--stake-progression-base-only-segments`必须显式传空字符串。
+不得直接对生产SQLite做试验性写入。命令缺少任一显式并发、冷却、金额或progression参数时必须由CLI返回错误，不得猜测生产值；`--stake-progression-second-stake`必须与`--win-return`原始值相等。`--stake-progression-base-only-segments`是当前生产不生效的兼容参数，回放只接受显式空字符串。
 
 ### 42.4 发布验收门槛
 
@@ -2162,4 +2164,4 @@ python3 scripts/replay_daily_profile_selector.py \
 
 ### 42.5 本地验证
 
-Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。本次规格修复同样逐项确认红灯：缺少专用V2加载器、窗口外11条WIN被错误累计、第二级金额不一致和非空仅基础金额时段均先失败后修复。`python3 -m unittest tests.test_daily_profile_replay -v`共16项通过；相关生产存储/V2加载测试共5项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0并列出全部必填生产执行参数。定向验证覆盖只读V2 structured atomic bundle与正式存储结果一致、legacy兼容、15天滚动和生产progression拒绝约束。生产SQLite的复制回放与完整测试属于后续发布检查点，未完成前不改变本节的**未部署**结论。
+Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。后续规格修复也逐项确认红灯：V3紧凑库错误落入payload-only路径、高精度金额被提前舍入、globally disabled错误绕过ledger、WATCH条款被回放层重复舍入，以及CLI未展示生产约束，均在实现前由定向测试复现。`python3 -m unittest tests.test_daily_profile_replay -v`共20项通过；完整关联模块中storage schema 33项、`AccountSimulator` 55项、stake progression 48项，共136项通过；`python3 scripts/replay_daily_profile_selector.py --help`退出码为0。覆盖范围包括只读V3/V2/legacy加载、15天滚动、生产progression拒绝约束，以及enabled/disabled/WATCH高精度金额与`AccountSimulator`一致性。生产SQLite的复制回放与完整测试属于后续发布检查点，未完成前不改变本节的**未部署**结论。

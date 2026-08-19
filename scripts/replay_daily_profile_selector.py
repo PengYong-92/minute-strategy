@@ -34,7 +34,6 @@ from app.models import ObservationSignal
 from app.stake_progression import TWO_STAGE_VERSION, TwoStageStakeProgression
 from app.storage import (
     _LINKED_CONTEXT_COLUMNS,
-    _OBSERVATION_LIFECYCLE_COLUMNS,
     _hydrate_decision_linked_payload,
 )
 
@@ -70,6 +69,19 @@ EQUALITY_FIELDS = (
     "progression_source_order_id",
     "progression_version",
     "progression_allowed",
+)
+OBSERVATION_LIFECYCLE_FIELDS = (
+    "observation_key",
+    "status",
+    "result",
+    "opened_at",
+    "expires_at",
+    "settled_at",
+    "exit_price",
+    "pnl",
+)
+REQUIRED_OBSERVATION_LIFECYCLE_FIELDS = frozenset(
+    OBSERVATION_LIFECYCLE_FIELDS[:-2]
 )
 
 
@@ -134,7 +146,7 @@ class ReplayExecutionConfig:
             amount = float(value)
             if not math.isfinite(amount) or amount <= 0:
                 raise ValueError(f"{name} must be a positive finite amount")
-            amounts[name] = round(amount, 4)
+            amounts[name] = amount
         if amounts["win_return"] <= amounts["stake"]:
             raise ValueError("win_return must exceed stake")
         if float(self.stake_progression_second_stake) != float(self.win_return):
@@ -184,6 +196,17 @@ class ReplayExecutionConfig:
 ProductionReplayConfig = ReplayExecutionConfig
 
 
+def _observation_lifecycle_select(columns: set[str]) -> str:
+    return ",\n                       ".join(
+        (
+            f"observation_signals.{field} as lifecycle_{field}"
+            if field in columns
+            else f"null as lifecycle_{field}"
+        )
+        for field in OBSERVATION_LIFECYCLE_FIELDS
+    )
+
+
 def load_replay_observations(
     db_path: str | Path,
     symbol: str,
@@ -213,17 +236,6 @@ def load_replay_observations(
             if "decision_contexts" in tables
             else set()
         )
-        lifecycle_columns = {
-            "observation_key",
-            "status",
-            "result",
-            "opened_at",
-            "expires_at",
-            "settled_at",
-            "exit_price",
-            "pnl",
-        }
-        linked_observation_columns = lifecycle_columns | {"decision_id"}
         linked_context_columns = {
             "decision_id",
             "context_version",
@@ -238,14 +250,15 @@ def load_replay_observations(
         where = "where observation_signals.symbol = ?"
         if "status" in observation_columns:
             where += " and observation_signals.status = 'SETTLED'"
+        lifecycle_select = _observation_lifecycle_select(observation_columns)
         if (
-            linked_observation_columns <= observation_columns
+            "decision_id" in observation_columns
             and linked_context_columns <= context_columns
         ):
             rows = connection.execute(
                 f"""
                 select observation_signals.payload,
-                       {_OBSERVATION_LIFECYCLE_COLUMNS},
+                       {lifecycle_select},
                        {_LINKED_CONTEXT_COLUMNS}
                 from observation_signals
                 left join decision_contexts
@@ -259,11 +272,11 @@ def load_replay_observations(
                 (symbol.upper(),),
             ).fetchall()
             hydrate_lifecycle = True
-        elif lifecycle_columns <= observation_columns:
+        elif REQUIRED_OBSERVATION_LIFECYCLE_FIELDS <= observation_columns:
             rows = connection.execute(
                 f"""
                 select observation_signals.payload,
-                       {_OBSERVATION_LIFECYCLE_COLUMNS}
+                       {lifecycle_select}
                 from observation_signals
                 {where}
                 order by observation_signals.settled_at,
@@ -878,11 +891,10 @@ def _execute_replay(
                 continue
 
             order_id = len(trades) + 1
-            progression_allowed = bool(
-                execution.stake_progression_enabled
-                and not (apply_adaptive and adaptive["status"] == "WATCH")
+            allow_progression = not (
+                apply_adaptive and adaptive["status"] == "WATCH"
             )
-            if progression_allowed:
+            if allow_progression:
                 terms, _credit = progression.assign(
                     order_id,
                     opened_at,
@@ -892,15 +904,14 @@ def _execute_replay(
                 order_win_return = terms.win_return
                 progression_step = terms.step
                 progression_source_order_id = terms.source_order_id
-                progression_version = TWO_STAGE_VERSION
             else:
                 order_stake = execution.stake
                 order_win_return = execution.win_return
                 progression_step = 1
                 progression_source_order_id = None
-                progression_version = (
-                    TWO_STAGE_VERSION if execution.stake_progression_enabled else ""
-                )
+            progression_version = (
+                TWO_STAGE_VERSION if execution.stake_progression_enabled else ""
+            )
             pnl = (
                 round(order_win_return - order_stake, 4)
                 if chosen.result == "WIN"
@@ -927,13 +938,13 @@ def _execute_replay(
                 "order_slot": "FIRST" if direction_open_count == 0 else "SECOND",
                 "order_slot_scope": "DIRECTION_V2",
                 "result": chosen.result,
-                "stake": round(float(order_stake), 4),
-                "win_return": round(float(order_win_return), 4),
+                "stake": float(order_stake),
+                "win_return": float(order_win_return),
                 "pnl": pnl,
                 "progression_step": progression_step,
                 "progression_source_order_id": progression_source_order_id,
                 "progression_version": progression_version,
-                "progression_allowed": progression_allowed,
+                "progression_allowed": allow_progression,
             }
             if include_structure_shadow:
                 trade["entry_structure_shadow"] = dict(
@@ -1392,12 +1403,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stake-progression-second-stake",
         type=float,
         required=True,
-        help="生产第二级 stake",
+        help="生产第二级 stake；必须与 --win-return 相等",
     )
     parser.add_argument(
         "--stake-progression-base-only-segments",
         required=True,
-        help="生产仅基础金额时段，逗号分隔；无时显式传空字符串",
+        help="当前生产兼容参数不生效；回放只接受显式空字符串",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--allow-partial-lookback", action="store_true")
