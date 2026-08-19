@@ -541,7 +541,48 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertNotIn("--daily-profile-stable-lookback-days", args)
         self.assertNotIn("--daily-profile-joint-failures-to-exit", args)
+        self.assertNotIn("--strategy-build-id", args)
         self.assertEqual(args[args.index("--daily-profile-degraded-runs") + 1], "2")
+
+    def test_run_script_forwards_optional_strategy_build_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            base_env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+            }
+            cases = (
+                ({"STRATEGY_BUILD_ID": "env-build"}, [], "env-build"),
+                ({"STRATEGY_BUILD_ID": "env-build"}, ["--strategy-build-id", "cli-build"], "cli-build"),
+            )
+            for environment, cli_args, expected in cases:
+                result = run(
+                    ["bash", str(ROOT / "scripts" / "run.sh"), *cli_args],
+                    cwd=ROOT,
+                    env={**base_env, **environment},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                args = log_path.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(args[args.index("--strategy-build-id") + 1], expected)
 
     def test_run_script_forwards_profile_degradation_cooldown_default_and_cli_forms(self):
         with tempfile.TemporaryDirectory() as temp_dir:

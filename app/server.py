@@ -82,11 +82,22 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         tag=_query_text(query, "tag"),
                         segment=_query_text(query, "segment"),
                         result=_query_text(query, "result"),
+                        candidate_origin=_query_text(query, "candidate_origin"),
+                        qualification_state=_query_text(query, "qualification_state"),
+                        adaptive_state=_query_text(query, "adaptive_state"),
+                        entry_structure_state=_query_text(query, "entry_structure_state"),
+                        entry_structure_bias=_query_text(query, "entry_structure_bias"),
+                        active_level_source=_query_text(query, "active_level_source"),
                     )
                 )
                 return
             if parsed.path == "/api/observation-summary":
-                self._send_json(state.observation_summary())
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    state.observation_summary(
+                        window=_query_text(query, "window") or "14d"
+                    )
+                )
                 return
             if parsed.path == "/api/order-profile":
                 self._send_json(state.order_profile_summary())

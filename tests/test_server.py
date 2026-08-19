@@ -603,6 +603,192 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(summary_payload["groups"][0]["selection_state"], "ACTIVE")
         self.assertEqual(summary_payload["groups"][0]["selection_reason"], "今日主程序已启用")
 
+    def test_adaptive_structure_and_capacity_api_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                enable_daily_profile_selector=True,
+            )
+            profile_key = "10|short_observe|generic_short_observe|SHORT|WD-22"
+            candidate = {
+                "key": profile_key,
+                "direction": "SHORT",
+                "strategy_family": "short_observe",
+                "strategy_tag": "generic_short_observe",
+                "threshold_segment": "WD-22",
+                "qualification_state": "QUALIFIED",
+                "fast_7d": {"sample_size": 24, "win_rate": 0.625, "ev": 0.8},
+                "stable_14d": {"sample_size": 40, "win_rate": 0.6, "ev": 0.7},
+            }
+            selection = {
+                "version": "DPS-20260819-0800",
+                "status": "READY",
+                "evaluated_at": 1_000,
+                "effective_from": 2_000,
+                "effective_until": 86_402_000,
+                "fast_7d": {"lookback_days": 7, "lookback_start": 10, "lookback_end": 20},
+                "stable_14d": {"lookback_days": 14, "lookback_start": 1, "lookback_end": 20},
+                "candidates": [candidate],
+                "selected_profiles": [candidate],
+            }
+            state.daily_profile_selection = selection
+            state.active_daily_profile_selection = selection
+            state.adaptive_profile_states = {
+                profile_key: {
+                    "profile_key": profile_key,
+                    "status": "ACTIVE",
+                    "reason": "N12胜7且N20 EV非负",
+                    "evaluated_at": 3_000,
+                    "n12": {"sample_size": 12, "wins": 7, "win_rate": 7 / 12, "ev": 0.8},
+                    "n20": {"sample_size": 20, "wins": 12, "win_rate": 0.6, "ev": 0.7},
+                }
+            }
+            state.selected_signal = Signal(
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="diagnostic",
+                price=100.0,
+                open_time=3_000,
+                entry_structure_shadow={
+                    "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+                    "entry_structure_mode": "SHADOW_ONLY",
+                    "entry_structure_evaluated_at": 3_000,
+                    "entry_structure_state": "RESISTANCE_REJECTION",
+                    "entry_structure_bias": "CONFIRMED",
+                    "entry_structure_reason_code": "STRUCTURE_CONFIRMED",
+                    "candidate_origin": "NATIVE_ACTIONABLE",
+                    "active_level_source": "SWING",
+                },
+            )
+            server = _serve(state)
+            try:
+                payload = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/state"
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        selection_payload = payload["daily_profile_selection"]
+        self.assertEqual(selection_payload["fast_7d"]["lookback_days"], 7)
+        self.assertEqual(selection_payload["stable_14d"]["lookback_days"], 14)
+        self.assertEqual(selection_payload["candidates"][0]["utc_segment_label"], "22:00-22:59 UTC")
+        self.assertEqual(
+            selection_payload["candidates"][0]["shanghai_segment_label"],
+            "次日06:00-06:59 Asia/Shanghai",
+        )
+        self.assertEqual(selection_payload["evaluation_time_label"], "07:50 Asia/Shanghai")
+        self.assertEqual(selection_payload["activation_time_label"], "08:00 Asia/Shanghai")
+        immediate = selection_payload["immediate_state"]["profiles"][0]
+        self.assertEqual(immediate["status"], "ACTIVE")
+        self.assertEqual(immediate["n12"]["sample_size"], 12)
+        self.assertEqual(immediate["n20"]["sample_size"], 20)
+        self.assertIn(
+            payload["storage_capacity"]["status"],
+            {"NORMAL", "WARNING", "COMPACT_ONLY", "HARD_LIMIT"},
+        )
+        self.assertEqual(
+            payload["entry_structure_shadow"]["entry_structure_bias"],
+            "CONFIRMED",
+        )
+
+    def test_observation_windows_filters_and_legacy_normalization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observation(
+                ObservationSignal(
+                    observation_key="legacy",
+                    strategy_family="short_observe",
+                    strategy_tag="legacy_short_observe",
+                    direction="SHORT",
+                    timeframe_minutes=10,
+                    level="B",
+                    reason="legacy",
+                    entry_price=100.0,
+                    opened_at=1_000,
+                    expires_at=601_000,
+                    threshold_segment="WD-22",
+                ),
+                "BTCUSDT",
+            )
+            store.save_observation(
+                ObservationSignal(
+                    observation_key="adaptive",
+                    strategy_family="short_observe",
+                    strategy_tag="adaptive_short_observe",
+                    direction="SHORT",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="adaptive",
+                    entry_price=100.0,
+                    opened_at=2_000,
+                    expires_at=602_000,
+                    threshold_segment="WD-23",
+                    context_version="DECISION_CONTEXT_V2",
+                    candidate_origin="PROFILE_PROMOTED_WAIT",
+                    adaptive_profile_state={
+                        "qualification_state": "QUALIFIED",
+                        "status": "ACTIVE",
+                    },
+                    entry_structure_shadow={
+                        "entry_structure_state": "RESISTANCE_REJECTION",
+                        "entry_structure_bias": "CONFLICT",
+                        "active_level_source": "SWING",
+                    },
+                ),
+                "BTCUSDT",
+            )
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            server = _serve(state)
+            try:
+                summaries = {
+                    window: _get_json(
+                        f"http://127.0.0.1:{server.server_port}/api/observation-summary"
+                        f"?window={window}"
+                    )
+                    for window in ("7d", "14d", "30d", "all")
+                }
+                default_summary = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/observation-summary"
+                )
+                filtered = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/observations"
+                    "?candidate_origin=PROFILE_PROMOTED_WAIT"
+                    "&qualification_state=QUALIFIED&adaptive_state=ACTIVE"
+                    "&entry_structure_state=RESISTANCE_REJECTION"
+                    "&entry_structure_bias=CONFLICT&active_level_source=SWING"
+                )
+                unfiltered = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/observations?page_size=10"
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertEqual([summaries[item]["window"] for item in summaries], ["7d", "14d", "30d", "all"])
+        self.assertEqual(default_summary["window"], "14d")
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(filtered["filters"]["candidate_origin"], "PROFILE_PROMOTED_WAIT")
+        self.assertIn("PROFILE_PROMOTED_WAIT", filtered["filter_options"]["candidate_origin"])
+        current = filtered["observations"][0]
+        self.assertEqual(current["candidate_origin"], "PROFILE_PROMOTED_WAIT")
+        self.assertEqual(current["qualification_state"], "QUALIFIED")
+        self.assertEqual(current["adaptive_state"], "ACTIVE")
+        self.assertEqual(current["entry_structure_state"], "RESISTANCE_REJECTION")
+        self.assertEqual(current["entry_structure_bias"], "CONFLICT")
+        self.assertEqual(current["active_level_source"], "SWING")
+        legacy = next(item for item in unfiltered["observations"] if item["observation_key"] == "legacy")
+        self.assertEqual(legacy["context_version"], "LEGACY")
+        self.assertEqual(legacy["candidate_origin"], "UNKNOWN")
+        self.assertEqual(legacy["qualification_state"], "UNKNOWN")
+        self.assertEqual(legacy["adaptive_state"], "UNKNOWN")
+        self.assertEqual(legacy["entry_structure_state"], "UNKNOWN")
+        self.assertEqual(legacy["entry_structure_bias"], "UNKNOWN")
+        self.assertEqual(legacy["active_level_source"], "UNKNOWN")
+
     def test_orders_api_pages_and_filters_persisted_orders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")

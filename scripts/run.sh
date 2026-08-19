@@ -5,6 +5,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+STRATEGY_BUILD_ID="${STRATEGY_BUILD_ID-}"
 HOST="${HOST:-127.0.0.1}"
 SYMBOL="${SYMBOL:-BTCUSDT}"
 PORT="${PORT:-8000}"
@@ -75,6 +76,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
 
 参数:
   --symbol SYMBOL        交易对，默认: BTCUSDT
+  --strategy-build-id ID 策略构建标识；未指定时由程序按策略源码生成
   --host HOST            监听地址，默认: 127.0.0.1
   --port PORT            页面端口，默认: 8000
   --poll-seconds N       币安轮询间隔秒数，默认: 10
@@ -177,7 +179,7 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   -h, --help             显示帮助并退出
 
 环境变量覆盖:
-  SYMBOL, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
+  SYMBOL, STRATEGY_BUILD_ID, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
   WEBHOOK_URL, WEBHOOK_TOKEN, WEBHOOK_TIMEOUT,
   WARMUP_MONTHS, WARMUP_TIMEOUT, STAKE, TRADE_SCORE_THRESHOLD, WIN_RETURN,
   MAX_OPEN_ORDERS, MAX_OPEN_LONG_ORDERS, MAX_OPEN_SHORT_ORDERS,
@@ -228,6 +230,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --symbol=*)
       SYMBOL="${1#*=}"
+      shift
+      ;;
+    --strategy-build-id)
+      require_value "$1" "${2:-}"
+      STRATEGY_BUILD_ID="$2"
+      shift 2
+      ;;
+    --strategy-build-id=*)
+      STRATEGY_BUILD_ID="${1#*=}"
       shift
       ;;
     --host)
@@ -808,6 +819,9 @@ if [ -n "$DAILY_PROFILE_STABLE_LOOKBACK_DAYS" ]; then
 fi
 if [ -n "$DAILY_PROFILE_JOINT_FAILURES_TO_EXIT" ]; then
   EXTRA_ARGS+=(--daily-profile-joint-failures-to-exit "$DAILY_PROFILE_JOINT_FAILURES_TO_EXIT")
+fi
+if [ -n "$STRATEGY_BUILD_ID" ]; then
+  EXTRA_ARGS+=(--strategy-build-id "$STRATEGY_BUILD_ID")
 fi
 
 "$PYTHON_BIN" - <<'PY'

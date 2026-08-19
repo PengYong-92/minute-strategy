@@ -5009,6 +5009,22 @@ class MonitorState:
             and latest.get("version") == active.get("version")
             and latest.get("effective_from") == active.get("effective_from")
         )
+        candidates = [
+            self._profile_api_labels(item)
+            for item in latest.get("candidates", [])
+            if isinstance(item, dict)
+        ]
+        qualifications = {str(item.get("key", "")): item for item in candidates}
+        immediate_profiles = []
+        for key, value in sorted(self.adaptive_profile_states.items()):
+            item = deepcopy(value)
+            item.setdefault("profile_key", key)
+            qualification = qualifications.get(key, {})
+            for field in ("qualification_state", "fast_7d", "stable_14d"):
+                if field in qualification:
+                    item[field] = deepcopy(qualification[field])
+            immediate_profiles.append(self._profile_api_labels(item))
+        config = self.daily_profile_selector_config
         return {
             "enabled": self.enable_daily_profile_selector,
             "status": latest.get("status", "DISABLED" if not self.enable_daily_profile_selector else "PENDING"),
@@ -5023,8 +5039,38 @@ class MonitorState:
             "pending_profiles": list(latest.get("selected_profiles", [])) if not latest_is_active else [],
             "reason": latest.get("reason", ""),
             "error": latest.get("error"),
+            "fast_7d": deepcopy(
+                latest.get(
+                    "fast_7d",
+                    {
+                        "lookback_days": config.lookback_days,
+                        "lookback_start": None,
+                        "lookback_end": None,
+                    },
+                )
+            ),
+            "stable_14d": deepcopy(
+                latest.get(
+                    "stable_14d",
+                    {
+                        "lookback_days": config.effective_stable_lookback_days,
+                        "lookback_start": None,
+                        "lookback_end": None,
+                    },
+                )
+            ),
+            "candidates": candidates,
+            "immediate_state": {"profiles": immediate_profiles},
+            "evaluation_time_label": self._shanghai_clock_label(
+                config.evaluation_hour,
+                config.evaluation_minute,
+            ),
+            "activation_time_label": self._shanghai_clock_label(
+                config.activation_hour,
+                config.activation_minute,
+            ),
             "config": {
-                **self.daily_profile_selector_config.__dict__,
+                **config.__dict__,
                 "effective_stable_lookback_days": (
                     self.daily_profile_selector_config.effective_stable_lookback_days
                 ),
@@ -5035,6 +5081,45 @@ class MonitorState:
                     self.daily_profile_selector_config.joint_failures_to_exit
                 ),
             },
+        }
+
+    @staticmethod
+    def _shanghai_clock_label(hour: int, minute: int) -> str:
+        return f"{int(hour):02d}:{int(minute):02d} Asia/Shanghai"
+
+    @staticmethod
+    def _profile_api_labels(profile: dict) -> dict:
+        item = deepcopy(profile)
+        segment = str(
+            item.get("threshold_segment")
+            or str(item.get("profile_key") or item.get("key") or "").rsplit("|", 1)[-1]
+        ).upper()
+        if len(segment) == 5 and segment[:3] in {"WD-", "WE-"} and segment[3:].isdigit():
+            utc_hour = int(segment[3:])
+            if 0 <= utc_hour <= 23:
+                shanghai_hour = (utc_hour + 8) % 24
+                next_day = utc_hour >= 16
+                item["threshold_segment"] = segment
+                item["utc_segment_label"] = f"{utc_hour:02d}:00-{utc_hour:02d}:59 UTC"
+                item["shanghai_segment_label"] = (
+                    f"{'次日' if next_day else '当日'}{shanghai_hour:02d}:00-"
+                    f"{shanghai_hour:02d}:59 Asia/Shanghai"
+                )
+                item["shanghai_segment_crosses_day"] = next_day
+        return item
+
+    def _entry_structure_status(self) -> dict:
+        if self.selected_signal and self.selected_signal.entry_structure_shadow:
+            return deepcopy(self.selected_signal.entry_structure_shadow)
+        return {
+            "entry_structure_version": "UNKNOWN",
+            "entry_structure_mode": "SHADOW_ONLY",
+            "entry_structure_evaluated_at": 0,
+            "entry_structure_state": "UNKNOWN",
+            "entry_structure_bias": "UNKNOWN",
+            "entry_structure_reason_code": "STRUCTURE_NOT_EVALUATED",
+            "candidate_origin": "UNKNOWN",
+            "active_level_source": "UNKNOWN",
         }
 
     def _trade_score_threshold_status(self) -> dict:
@@ -5435,6 +5520,8 @@ class MonitorState:
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),
+                "storage_capacity": self._sample_storage_capacity(int(self._now_ms())),
+                "entry_structure_shadow": self._entry_structure_status(),
                 "stake_progression": self._stake_progression_status(),
                 "order_policy": self._order_policy_status(),
                 "trade_score_threshold": self._trade_score_threshold_status(),
@@ -5499,9 +5586,15 @@ class MonitorState:
         tag: str = "",
         segment: str = "",
         result: str = "",
+        candidate_origin: str = "",
+        qualification_state: str = "",
+        adaptive_state: str = "",
+        entry_structure_state: str = "",
+        entry_structure_bias: str = "",
+        active_level_source: str = "",
     ) -> dict:
         if self.storage:
-            return self.storage.page_observations(
+            page_payload = self.storage.page_observations(
                 self.symbol,
                 page=page,
                 page_size=page_size,
@@ -5510,10 +5603,38 @@ class MonitorState:
                 tag=tag,
                 segment=segment,
                 result=result,
+                origin=candidate_origin,
+                qualification_state=qualification_state,
+                adaptive_state=adaptive_state,
+                entry_structure_state=entry_structure_state,
+                entry_structure_bias=entry_structure_bias,
+                active_level_source=active_level_source,
+            )
+            return self._normalize_observation_page(
+                page_payload,
+                candidate_origin=candidate_origin,
             )
         with self._lock:
             observations = list(self.observations)
-        return page_observation_list(
+        extended_filters = {
+            "candidate_origin": candidate_origin,
+            "qualification_state": qualification_state,
+            "adaptive_state": adaptive_state,
+            "entry_structure_state": entry_structure_state,
+            "entry_structure_bias": entry_structure_bias,
+            "active_level_source": active_level_source,
+        }
+        observations = [
+            item
+            for item in observations
+            if all(
+                not expected
+                or self._normalize_observation_row(item.to_dict())[field]
+                == str(expected).strip().upper()
+                for field, expected in extended_filters.items()
+            )
+        ]
+        page_payload = page_observation_list(
             observations,
             page=page,
             page_size=page_size,
@@ -5523,14 +5644,91 @@ class MonitorState:
             segment=segment,
             result=result,
         )
+        return self._normalize_observation_page(
+            page_payload,
+            candidate_origin=candidate_origin,
+        )
 
-    def observation_summary(self) -> dict:
+    @classmethod
+    def _normalize_observation_page(
+        cls,
+        payload: dict,
+        *,
+        candidate_origin: str = "",
+    ) -> dict:
+        normalized = dict(payload)
+        normalized["observations"] = [
+            cls._normalize_observation_row(item)
+            for item in payload.get("observations", [])
+        ]
+        filters = dict(payload.get("filters", {}))
+        filters["candidate_origin"] = str(
+            filters.get("candidate_origin")
+            or filters.get("origin")
+            or candidate_origin
+            or ""
+        ).strip().upper()
+        normalized["filters"] = filters
+        filter_options = dict(payload.get("filter_options", {}))
+        origins = filter_options.get("candidate_origin") or filter_options.get("origin") or []
+        filter_options["candidate_origin"] = list(origins)
+        normalized["filter_options"] = filter_options
+        return normalized
+
+    @staticmethod
+    def _normalize_observation_row(row: dict) -> dict:
+        normalized = deepcopy(row)
+        adaptive = normalized.get("adaptive_profile_state")
+        adaptive = adaptive if isinstance(adaptive, Mapping) else {}
+        structure = normalized.get("entry_structure_shadow")
+        structure = structure if isinstance(structure, Mapping) else {}
+
+        def api_value(value: object) -> str:
+            text = str(value or "").strip().upper()
+            return text or "UNKNOWN"
+
+        normalized["context_version"] = str(
+            normalized.get("context_version") or "LEGACY"
+        )
+        normalized["candidate_origin"] = api_value(normalized.get("candidate_origin"))
+        normalized["qualification_state"] = api_value(
+            adaptive.get("qualification_state")
+        )
+        normalized["adaptive_state"] = api_value(
+            adaptive.get("state") or adaptive.get("status")
+        )
+        normalized["entry_structure_state"] = api_value(
+            structure.get("entry_structure_state") or structure.get("state")
+        )
+        normalized["entry_structure_bias"] = api_value(
+            structure.get("entry_structure_bias") or structure.get("bias")
+        )
+        normalized["active_level_source"] = api_value(
+            structure.get("active_level_source")
+        )
+        return normalized
+
+    def observation_summary(self, *, window: str = "14d") -> dict:
+        normalized_window = str(window or "14d").strip().lower()
+        if normalized_window not in {"7d", "14d", "30d", "all"}:
+            normalized_window = "14d"
         if self.storage:
-            summary = self.storage.observation_summary(self.symbol)
+            summary = self.storage.observation_summary(
+                self.symbol,
+                window=normalized_window,
+            )
         else:
             with self._lock:
                 observations = list(self.observations)
+            anchor = max((item.opened_at for item in observations), default=None)
+            cutoff = None
+            if anchor is not None and normalized_window != "all":
+                cutoff = anchor - int(normalized_window[:-1]) * DAY_MS
+                observations = [item for item in observations if item.opened_at >= cutoff]
             summary = summarize_observations(observations)
+            summary.update(
+                {"window": normalized_window, "cutoff": cutoff, "anchor": anchor}
+            )
         summary["promotion_config"] = self._observation_profile_promotion_config()
         latest = self.daily_profile_selection or {}
         active_keys = {
