@@ -4,7 +4,7 @@ import json
 import math
 import sqlite3
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import closing
@@ -20,8 +20,8 @@ if str(ROOT) not in sys.path:
 
 from app.adaptive_profile_state import (
     ADAPTIVE_PROFILE_STATE_VERSION,
+    AdaptiveProfileWindowReplay,
     evaluate_adaptive_profile_state,
-    rebuild_adaptive_profile_states,
 )
 from app.daily_profile_selector import (
     SHANGHAI,
@@ -33,8 +33,8 @@ from app.daily_profile_selector import (
 from app.models import ObservationSignal
 from app.stake_progression import TWO_STAGE_VERSION, TwoStageStakeProgression
 from app.storage import (
-    _LINKED_CONTEXT_COLUMNS,
-    _hydrate_decision_linked_payload,
+    hydrate_decision_linked_payload,
+    linked_decision_context_select_columns,
 )
 
 
@@ -83,6 +83,8 @@ OBSERVATION_LIFECYCLE_FIELDS = (
 REQUIRED_OBSERVATION_LIFECYCLE_FIELDS = frozenset(
     OBSERVATION_LIFECYCLE_FIELDS[:-2]
 )
+REPORT_SCHEMA_VERSION = "CAUSAL_PROFILE_REPLAY_V2"
+ADAPTIVE_LOOKBACK_MS = 15 * 86_400_000
 
 
 @dataclass(frozen=True)
@@ -256,7 +258,7 @@ def load_replay_observations(
                 (
                     "observation_signals.payload",
                     *lifecycle_select,
-                    _LINKED_CONTEXT_COLUMNS.strip(),
+                    linked_decision_context_select_columns(),
                 )
             )
             rows = connection.execute(
@@ -302,7 +304,7 @@ def load_replay_observations(
     for row in rows:
         payload = json.loads(row["payload"])
         if hydrate_lifecycle:
-            payload = _hydrate_decision_linked_payload(payload, row)
+            payload = hydrate_decision_linked_payload(payload, row)
         observations.append(
             ObservationSignal(
                 **{key: value for key, value in payload.items() if key in accepted}
@@ -354,32 +356,39 @@ def replay_daily_profile_selection(
         ),
         key=_settlement_event_key,
     )
+    workload: dict[str, int] = {"settled_observations": len(settled)}
     snapshots = _build_schedule(
         settled,
         config,
         require_full_lookback=require_full_lookback,
+        workload=workload,
     )
-    event_rows = _build_adaptive_event_rows(settled)
+    event_rows = _build_adaptive_event_rows(settled, workload=workload)
     adaptive_timeline = _adaptive_timeline(event_rows)
+    execution_windows = _prepare_execution_windows(settled, snapshots)
+    execution_plan_rows = sum(
+        len(rows)
+        for window in execution_windows
+        for _opened_at, rows in window["groups"]
+    )
+    workload["execution_plan_rows"] = execution_plan_rows
+    workload["execution_replay_rows"] = execution_plan_rows * 3
     baseline_result = _execute_replay(
-        settled,
-        snapshots,
+        execution_windows,
         execution,
         adaptive_timeline,
         apply_adaptive=False,
         include_structure_shadow=False,
     )
     structure_result = _execute_replay(
-        settled,
-        snapshots,
+        execution_windows,
         execution,
         adaptive_timeline,
         apply_adaptive=False,
         include_structure_shadow=True,
     )
     candidate_result = _execute_replay(
-        settled,
-        snapshots,
+        execution_windows,
         execution,
         adaptive_timeline,
         apply_adaptive=True,
@@ -415,13 +424,14 @@ def replay_daily_profile_selection(
         6,
     )
     return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
         "config": _config_snapshot(config),
         "execution": execution.to_dict(),
         "data": data,
         "schedule": compact_schedule,
-        "daily_snapshots": compact_schedule,
         "schedule_stats": _schedule_stats(compact_schedule),
         "events": event_rows,
+        "workload": workload,
         "baseline": baseline,
         "candidate": candidate,
         "total": candidate["total"],
@@ -441,8 +451,11 @@ def replay_daily_profile_selection(
         "trades": candidate["total"],
         "by_profile": _group_summaries(candidate["trade_rows"], "profile_key"),
         "by_day": candidate["daily"],
-        "trade_rows": candidate["trade_rows"],
-        "leakage_violations": _count_leakage_violations(settled, snapshots),
+        "leakage_violations": _count_leakage_violations(
+            settled,
+            snapshots,
+            workload=workload,
+        ),
     }
 
 
@@ -625,7 +638,11 @@ def rank_passing_configurations(
     return sorted(
         passing,
         key=lambda item: (
-            -float(item["total"]["win_rate"]),
+            -(
+                int(item["total"]["wins"]) / int(item["total"]["orders"])
+                if int(item["total"]["orders"])
+                else 0.0
+            ),
             -int(item["total"]["orders"]),
             float(item["total"]["max_drawdown"]),
             str(item.get("name", "")),
@@ -727,6 +744,7 @@ def _build_schedule(
     config: DailyProfileSelectorConfig,
     *,
     require_full_lookback: bool,
+    workload: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     if not observations:
         return []
@@ -737,6 +755,13 @@ def _build_schedule(
     end_date = datetime.fromtimestamp(last_opened_at / 1000, tz=SHANGHAI).date()
     previous = None
     snapshots = []
+    opened_rows = sorted(
+        observations,
+        key=lambda item: (item.opened_at, *_settlement_event_key(item)),
+    )
+    opened_times = [item.opened_at for item in opened_rows]
+    selector_input_rows = 0
+    selector_max_rows = 0
     while current_date <= end_date:
         evaluated_at = int(
             datetime.combine(
@@ -759,11 +784,15 @@ def _build_schedule(
             (full_lookback or not require_full_lookback)
             and stable_window["effective_from"] <= last_opened_at
         ):
+            left = bisect_left(opened_times, stable_window["lookback_start"])
+            right = bisect_left(opened_times, stable_window["lookback_end"], left)
             known = [
                 item
-                for item in observations
+                for item in opened_rows[left:right]
                 if item.settled_at is not None and item.settled_at < evaluated_at
             ]
+            selector_input_rows += len(known)
+            selector_max_rows = max(selector_max_rows, len(known))
             snapshot = build_daily_selection(
                 known,
                 evaluated_at,
@@ -780,33 +809,34 @@ def _build_schedule(
             snapshots.append(snapshot)
             previous = snapshot
         current_date += timedelta(days=1)
+    if workload is not None:
+        workload["schedule_selector_input_rows"] = selector_input_rows
+        workload["schedule_selector_max_rows"] = selector_max_rows
     return snapshots
 
 
 def _build_adaptive_event_rows(
     observations: Sequence[ObservationSignal],
+    *,
+    workload: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    history_by_profile: dict[str, list[ObservationSignal]] = defaultdict(list)
+    trackers: dict[str, AdaptiveProfileWindowReplay] = {}
     states: dict[str, dict[str, Any]] = {}
     rows = []
-    for item in observations:
+    for item in sorted(observations, key=_settlement_event_key):
         key = _observation_profile_key(item)
         before = states.get(key) or _adaptive_state((), key, int(item.settled_at))
         after = before
         if _is_adaptive_profile_key(key):
             evaluated_at = int(item.settled_at) + 1
-            cutoff = evaluated_at - 15 * 86_400_000
-            history_by_profile[key] = [
-                event
-                for event in (*history_by_profile[key], item)
-                if event.settled_at is not None
-                and cutoff <= event.settled_at < evaluated_at
-            ]
-            rebuilt = rebuild_adaptive_profile_states(
-                history_by_profile[key],
-                evaluated_at,
-            )
-            after = rebuilt.get(key) or _adaptive_state((), key, evaluated_at)
+            tracker = trackers.get(key)
+            if tracker is None:
+                tracker = AdaptiveProfileWindowReplay(
+                    key,
+                    lookback_ms=ADAPTIVE_LOOKBACK_MS,
+                )
+                trackers[key] = tracker
+            after = tracker.advance(item, evaluated_at)
             states[key] = after
         rows.append(
             {
@@ -819,12 +849,31 @@ def _build_adaptive_event_rows(
                 "adaptive_state_before": before["status"],
                 "adaptive_state_after": after["status"],
                 "adaptive_version": str(after.get("version", "")),
-                "n12_before": before["n12"],
                 "n12_after": after["n12"],
-                "n20_before": before["n20"],
                 "n20_after": after["n20"],
                 "adaptive_evaluated_at": int(after.get("evaluated_at", 0)),
             }
+        )
+    if workload is not None:
+        workload["adaptive_events"] = len(observations)
+        workload["adaptive_incremental_adds"] = sum(
+            tracker.workload["incremental_adds"]
+            for tracker in trackers.values()
+        )
+        workload["adaptive_window_rebuilds"] = sum(
+            tracker.workload["window_rebuilds"]
+            for tracker in trackers.values()
+        )
+        workload["adaptive_window_rebuild_input_rows"] = sum(
+            tracker.workload["window_rebuild_input_rows"]
+            for tracker in trackers.values()
+        )
+        workload["adaptive_max_window_events"] = max(
+            (
+                tracker.workload["max_window_events"]
+                for tracker in trackers.values()
+            ),
+            default=0,
         )
     return rows
 
@@ -850,12 +899,70 @@ def _adaptive_timeline(
                 },
             )
         )
-    return {"by_profile": dict(by_profile), "settled_times": settled_times}
+    by_profile_rows = dict(by_profile)
+    return {
+        "by_profile": by_profile_rows,
+        "times_by_profile": {
+            key: [item[0] for item in entries]
+            for key, entries in by_profile_rows.items()
+        },
+        "settled_times": settled_times,
+    }
+
+
+def _prepare_execution_windows(
+    observations: Sequence[ObservationSignal],
+    snapshots: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    opened_rows = sorted(
+        observations,
+        key=lambda item: (item.opened_at, item.observation_key),
+    )
+    opened_times = [item.opened_at for item in opened_rows]
+    windows = []
+    for snapshot in snapshots:
+        left = bisect_left(opened_times, int(snapshot["effective_from"]))
+        right = bisect_left(
+            opened_times,
+            int(snapshot["effective_until"]),
+            left,
+        )
+        groups = []
+        position = left
+        while position < right:
+            opened_at = opened_rows[position].opened_at
+            group_end = bisect_right(opened_times, opened_at, position, right)
+            groups.append((opened_at, tuple(opened_rows[position:group_end])))
+            position = group_end
+        windows.append({"snapshot": snapshot, "groups": tuple(groups)})
+    return tuple(windows)
+
+
+@dataclass
+class _SegmentLossLedger:
+    streaks: dict[tuple[Any, str], int]
+
+    @classmethod
+    def create(cls) -> "_SegmentLossLedger":
+        return cls(streaks={})
+
+    def settle(self, order: dict[str, Any]) -> None:
+        settled_at = int(order["settled_at"])
+        day = datetime.fromtimestamp(settled_at / 1000, tz=SHANGHAI).date()
+        key = (day, str(order["threshold_segment"]))
+        self.streaks[key] = (
+            self.streaks.get(key, 0) + 1
+            if order["result"] == "LOSS"
+            else 0
+        )
+
+    def blocks(self, candidate: ObservationSignal, opened_at: int) -> bool:
+        day = datetime.fromtimestamp(opened_at / 1000, tz=SHANGHAI).date()
+        return self.streaks.get((day, candidate.threshold_segment), 0) >= 3
 
 
 def _execute_replay(
-    observations: Sequence[ObservationSignal],
-    snapshots: Sequence[dict[str, Any]],
+    execution_windows: Sequence[dict[str, Any]],
     execution: ReplayExecutionConfig,
     adaptive_timeline: dict[str, Any],
     *,
@@ -877,19 +984,16 @@ def _execute_replay(
         activated_at=0,
         second_stake=execution.stake_progression_second_stake,
     )
+    loss_ledger = _SegmentLossLedger.create()
 
-    for snapshot in snapshots:
-        grouped: dict[int, list[ObservationSignal]] = defaultdict(list)
-        for item in observations:
-            if snapshot["effective_from"] <= item.opened_at < snapshot["effective_until"]:
-                grouped[item.opened_at].append(item)
+    for window in execution_windows:
+        snapshot = window["snapshot"]
         selected_profiles = snapshot.get("selected_profiles") or []
         selected_by_key = {item["key"]: item for item in selected_profiles}
 
-        for opened_at in sorted(grouped):
-            rows = grouped[opened_at]
+        for opened_at, rows in window["groups"]:
             eligible_events += 1
-            _settle_due_orders(open_orders, opened_at, progression)
+            _settle_due_orders(open_orders, opened_at, progression, loss_ledger)
             by_key: dict[str, ObservationSignal] = {}
             for item in sorted(rows, key=lambda row: row.observation_key):
                 by_key.setdefault(_observation_profile_key(item), item)
@@ -939,7 +1043,7 @@ def _execute_replay(
             if direction_open_count >= direction_limit:
                 rejections[f"direction_capacity_{direction.lower()}"] += 1
                 continue
-            if _has_three_segment_losses(trades, chosen, opened_at):
+            if loss_ledger.blocks(chosen, opened_at):
                 rejections["three_loss_pause"] += 1
                 continue
 
@@ -1010,7 +1114,7 @@ def _execute_replay(
             last_order_opened_at[direction] = opened_at
             webhook_count += 1
 
-    _settle_due_orders(open_orders, 2**63 - 1, progression)
+    _settle_due_orders(open_orders, 2**63 - 1, progression, loss_ledger)
     return {
         "trade_rows": trades,
         "guard_rejections": rejections,
@@ -1023,6 +1127,7 @@ def _settle_due_orders(
     open_orders: list[dict[str, Any]],
     current_time: int,
     progression: TwoStageStakeProgression,
+    loss_ledger: _SegmentLossLedger,
 ) -> None:
     due = sorted(
         (
@@ -1042,6 +1147,7 @@ def _settle_due_orders(
             allow_credit=order["progression_allowed"],
             direction=order["direction"],
         )
+        loss_ledger.settle(order)
         open_orders.remove(order)
 
 
@@ -1051,7 +1157,10 @@ def _adaptive_state_before(
     opened_at: int,
 ) -> tuple[dict[str, Any], int]:
     entries = timeline["by_profile"].get(profile_key_value, [])
-    position = bisect_right([item[0] for item in entries], opened_at)
+    times = timeline.get("times_by_profile", {}).get(profile_key_value)
+    if times is None:
+        times = [item[0] for item in entries]
+    position = bisect_right(times, opened_at)
     state = (
         entries[position - 1][1]
         if position
@@ -1229,40 +1338,28 @@ def _group_summaries(
     return sorted(rows, key=lambda item: item[field])
 
 
-def _has_three_segment_losses(
-    trades: Sequence[dict[str, Any]],
-    candidate: ObservationSignal,
-    opened_at: int,
-) -> bool:
-    day = datetime.fromtimestamp(opened_at / 1000, tz=SHANGHAI).date()
-    matching = [
-        item
-        for item in trades
-        if item["settled_at"] is not None
-        and item["settled_at"] <= opened_at
-        and datetime.fromtimestamp(item["settled_at"] / 1000, tz=SHANGHAI).date() == day
-        and item["threshold_segment"] == candidate.threshold_segment
-    ]
-    consecutive = 0
-    for item in sorted(matching, key=_trade_settlement_key, reverse=True):
-        if item["result"] != "LOSS":
-            break
-        consecutive += 1
-    return consecutive >= 3
-
-
 def _count_leakage_violations(
     observations: Sequence[ObservationSignal],
     snapshots: Sequence[dict[str, Any]],
+    *,
+    workload: dict[str, int] | None = None,
 ) -> int:
+    by_key: dict[str, list[ObservationSignal]] = defaultdict(list)
+    for item in observations:
+        by_key[item.observation_key].append(item)
     violations = 0
+    checked_keys = 0
     for snapshot in snapshots:
+        sample_keys = set(snapshot.get("sample_keys") or [])
+        checked_keys += len(sample_keys)
         if any(
             item.settled_at is None or item.settled_at >= snapshot["lookback_end"]
-            for item in observations
-            if item.observation_key in set(snapshot.get("sample_keys") or [])
+            for key in sample_keys
+            for item in by_key.get(key, ())
         ):
             violations += 1
+    if workload is not None:
+        workload["leakage_sample_keys_checked"] = checked_keys
     return violations
 
 
@@ -1323,8 +1420,16 @@ def _empty_sample_summary() -> dict[str, Any]:
     }
 
 
-def _settlement_event_key(item: ObservationSignal) -> tuple[int, int, str]:
-    return int(item.settled_at or 0), int(item.opened_at), str(item.observation_key)
+def _settlement_event_key(item: ObservationSignal) -> tuple:
+    return (
+        int(item.settled_at or 0),
+        int(item.opened_at),
+        str(item.observation_key),
+        str(item.decision_id),
+        int(item.expires_at),
+        str(item.result),
+        float(item.pnl).hex(),
+    )
 
 
 def _trade_settlement_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
@@ -1382,6 +1487,23 @@ def _split_csv(value: str) -> tuple[str, ...]:
     return tuple(item.strip().upper() for item in str(value).split(",") if item.strip())
 
 
+def _finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
+    return parsed
+
+
+def _unit_interval_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="严格因果回放每日与自适应观察画像")
     parser.add_argument("--db-path", type=Path, required=True)
@@ -1393,8 +1515,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="稳定画像回看天数；未指定时取 14 与快速窗口天数的较大值",
     )
     parser.add_argument("--min-samples", type=int, default=20)
-    parser.add_argument("--min-win-rate", type=float, default=0.60)
-    parser.add_argument("--min-ev", type=float, default=0.0)
+    parser.add_argument("--min-win-rate", type=_unit_interval_float, default=0.60)
+    parser.add_argument("--min-ev", type=_finite_float, default=0.0)
     parser.add_argument(
         "--degraded-runs-to-exit",
         type=int,
@@ -1421,12 +1543,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--min-order-gap-minutes",
-        type=float,
+        type=_finite_float,
         required=True,
         help="生产同方向冷却/最小开单间隔（分钟）",
     )
-    parser.add_argument("--stake", type=float, required=True, help="生产基础 stake")
-    parser.add_argument("--win-return", type=float, required=True, help="生产基础赢单返还")
+    parser.add_argument("--stake", type=_finite_float, required=True, help="生产基础 stake")
+    parser.add_argument("--win-return", type=_finite_float, required=True, help="生产基础赢单返还")
     progression = parser.add_mutually_exclusive_group(required=True)
     progression.add_argument(
         "--stake-progression",
@@ -1454,7 +1576,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stake-progression-second-stake",
-        type=float,
+        type=_finite_float,
         required=True,
         help="生产第二级 stake；必须与 --win-return 相等",
     )
@@ -1471,19 +1593,19 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    config = DailyProfileSelectorConfig(
-        lookback_days=args.lookback_days,
-        stable_lookback_days=args.stable_lookback_days,
-        min_samples=args.min_samples,
-        min_win_rate=args.min_win_rate,
-        min_ev=args.min_ev,
-        exit_win_rate=args.min_win_rate,
-        exit_ev=args.min_ev,
-        degraded_runs_to_exit=args.degraded_runs_to_exit,
-        joint_failures_to_exit=args.joint_failures_to_exit,
-        max_active_profiles=0,
-    ).normalized()
     try:
+        config = DailyProfileSelectorConfig(
+            lookback_days=args.lookback_days,
+            stable_lookback_days=args.stable_lookback_days,
+            min_samples=args.min_samples,
+            min_win_rate=args.min_win_rate,
+            min_ev=args.min_ev,
+            exit_win_rate=args.min_win_rate,
+            exit_ev=args.min_ev,
+            degraded_runs_to_exit=args.degraded_runs_to_exit,
+            joint_failures_to_exit=args.joint_failures_to_exit,
+            max_active_profiles=0,
+        ).normalized()
         execution = ReplayExecutionConfig(
             max_open_orders=args.max_open_orders,
             max_open_long_orders=args.max_open_long_orders,
@@ -1499,7 +1621,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.stake_progression_base_only_segments
             ),
         ).normalized()
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, OverflowError) as error:
         parser.error(str(error))
     result = replay_daily_profile_selection(
         load_replay_observations(args.db_path, args.symbol),
@@ -1507,12 +1629,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution=execution,
         require_full_lookback=not args.allow_partial_lookback,
     )
-    payload = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(payload + "\n", encoding="utf-8")
+        with args.output.open("w", encoding="utf-8") as output:
+            json.dump(
+                result,
+                output,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            output.write("\n")
     else:
-        print(payload)
+        json.dump(
+            result,
+            sys.stdout,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        sys.stdout.write("\n")
     return 0
 
 

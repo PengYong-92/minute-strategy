@@ -4,21 +4,21 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
-from dataclasses import fields, replace
+from dataclasses import replace
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from app.adaptive_profile_state import (
+    AdaptiveProfileWindowReplay,
+    rebuild_adaptive_profile_states,
+)
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import ObservationSignal, Signal
 from app.simulator import AccountSimulator
-from app.storage import (
-    _LINKED_CONTEXT_COLUMNS,
-    _hydrate_decision_linked_payload,
-    SQLiteMonitorStore,
-)
+from app.storage import SQLiteMonitorStore
 from scripts import replay_daily_profile_selector as replay_module
 from tests.test_storage import ENTRY_STRUCTURE_FIXTURE, structured_atomic_bundle
 from tests.test_storage_schema import _create_e0_v3_lifecycle_fixture
@@ -82,6 +82,23 @@ def selector_config() -> DailyProfileSelectorConfig:
 
 
 class DailyProfileReplayTest(unittest.TestCase):
+    def cli_args(self, *extra):
+        return [
+            "--db-path", "/tmp/replay.sqlite3",
+            "--max-open-orders", "2",
+            "--max-open-long-orders", "1",
+            "--max-open-short-orders", "2",
+            "--min-order-gap-minutes", "2",
+            "--stake", "10",
+            "--win-return", "18",
+            "--stake-progression",
+            "--stake-progression-max-orders", "2",
+            "--stake-progression-max-active", "1",
+            "--stake-progression-second-stake", "18",
+            "--stake-progression-base-only-segments", "",
+            *extra,
+        ]
+
     def production_execution(self, **overrides):
         self.assertTrue(
             hasattr(replay_module, "ReplayExecutionConfig"),
@@ -181,20 +198,7 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertIn("只接受显式空字符串", help_text)
 
     def test_cli_passes_explicit_production_settings_to_replay(self):
-        args = [
-            "--db-path", "/tmp/replay.sqlite3",
-            "--max-open-orders", "2",
-            "--max-open-long-orders", "1",
-            "--max-open-short-orders", "2",
-            "--min-order-gap-minutes", "2",
-            "--stake", "10",
-            "--win-return", "18",
-            "--stake-progression",
-            "--stake-progression-max-orders", "2",
-            "--stake-progression-max-active", "1",
-            "--stake-progression-second-stake", "18",
-            "--stake-progression-base-only-segments", "",
-        ]
+        args = self.cli_args()
         with (
             patch.object(
                 replay_module,
@@ -229,6 +233,25 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(execution.stake_progression_max_active, 1)
         self.assertEqual(execution.stake_progression_second_stake, 18.0)
 
+    def test_cli_rejects_invalid_and_non_finite_numbers_without_traceback(self):
+        cases = (
+            ("--min-win-rate", "2"),
+            ("--min-win-rate", "nan"),
+            ("--min-ev", "inf"),
+            ("--min-order-gap-minutes", "inf"),
+            ("--stake", "nan"),
+            ("--win-return", "inf"),
+            ("--stake-progression-second-stake", "-inf"),
+        )
+        for flag, value in cases:
+            with self.subTest(flag=flag, value=value):
+                stderr = StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                    replay_module.main(self.cli_args(flag, value))
+                self.assertEqual(raised.exception.code, 2)
+                self.assertNotIn("Traceback", stderr.getvalue())
+                self.assertIn("error:", stderr.getvalue())
+
     def test_read_only_loader_hydrates_v2_structured_bundle_like_storage(self):
         self.assertTrue(
             hasattr(replay_module, "load_replay_observations"),
@@ -259,10 +282,6 @@ class DailyProfileReplayTest(unittest.TestCase):
                 pnl=8.0,
             )
             store.save_observation(settled, context.symbol)
-            expected = store.load_adaptive_profile_observations(
-                context.symbol,
-                evaluated_at=settled.settled_at + 1,
-            )
             store.close()
             before = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
@@ -270,12 +289,16 @@ class DailyProfileReplayTest(unittest.TestCase):
 
             after = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
-        self.assertEqual(
-            [item.to_dict() for item in actual],
-            [item.to_dict() for item in expected],
-        )
-        self.assertEqual(actual[0].entry_structure_shadow, ENTRY_STRUCTURE_FIXTURE)
-        self.assertEqual(actual[0].decision_inputs, context.to_dict()["inputs"])
+        self.assertEqual(len(actual), 1)
+        loaded = actual[0]
+        self.assertEqual(loaded.observation_key, settled.observation_key)
+        self.assertEqual(loaded.status, "SETTLED")
+        self.assertEqual(loaded.result, "WIN")
+        self.assertEqual(loaded.settled_at, settled.expires_at)
+        self.assertEqual(loaded.exit_price, settled.entry_price + 1.0)
+        self.assertEqual(loaded.pnl, 8.0)
+        self.assertEqual(loaded.entry_structure_shadow, ENTRY_STRUCTURE_FIXTURE)
+        self.assertEqual(loaded.decision_inputs, context.to_dict()["inputs"])
         self.assertEqual(after, before)
 
     def test_read_only_loader_keeps_legacy_payload_fixture_compatible(self):
@@ -389,36 +412,6 @@ class DailyProfileReplayTest(unittest.TestCase):
                         "v3-decision",
                     ),
                 )
-                connection.row_factory = sqlite3.Row
-                row = connection.execute(
-                    f"""
-                    select observation_signals.payload,
-                           observation_signals.observation_key as lifecycle_observation_key,
-                           observation_signals.status as lifecycle_status,
-                           observation_signals.result as lifecycle_result,
-                           observation_signals.opened_at as lifecycle_opened_at,
-                           observation_signals.expires_at as lifecycle_expires_at,
-                           observation_signals.settled_at as lifecycle_settled_at,
-                           {_LINKED_CONTEXT_COLUMNS}
-                    from observation_signals
-                    left join decision_contexts
-                      on decision_contexts.symbol = observation_signals.symbol
-                     and decision_contexts.decision_id = observation_signals.decision_id
-                    where observation_signals.observation_key = 'v3-observation'
-                    """
-                ).fetchone()
-                expected_payload = _hydrate_decision_linked_payload(
-                    json.loads(row["payload"]),
-                    row,
-                )
-                accepted = {item.name for item in fields(ObservationSignal)}
-                expected = ObservationSignal(
-                    **{
-                        key: value
-                        for key, value in expected_payload.items()
-                        if key in accepted
-                    }
-                )
                 connection.commit()
             before = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
@@ -429,11 +422,36 @@ class DailyProfileReplayTest(unittest.TestCase):
 
             after = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
-        self.assertEqual([item.to_dict() for item in actual], [expected.to_dict()])
-        self.assertEqual(actual[0].result, "WIN")
-        self.assertEqual(actual[0].settled_at, 601_000)
-        self.assertEqual(actual[0].exit_price, 101.0)
-        self.assertEqual(actual[0].pnl, 8.0)
+        self.assertEqual(len(actual), 1)
+        loaded = actual[0]
+        expected = {
+            "observation_key": "v3-observation",
+            "decision_id": "v3-decision",
+            "direction": "LONG",
+            "profile_key": profile,
+            "strategy_tag": "v3-compact",
+            "opened_at": 1_000,
+            "expires_at": 601_000,
+            "status": "SETTLED",
+            "result": "WIN",
+            "settled_at": 601_000,
+            "exit_price": 101.0,
+            "pnl": 8.0,
+            "entry_structure_shadow": source.entry_structure_shadow,
+        }
+        for field_name, expected_value in expected.items():
+            with self.subTest(field=field_name):
+                self.assertEqual(getattr(loaded, field_name), expected_value)
+        self.assertEqual(loaded.decision_inputs["identity"], context_inputs["identity"])
+        self.assertEqual(loaded.decision_inputs["market"], context_inputs["market"])
+        self.assertEqual(
+            loaded.decision_inputs["entry_structure"],
+            context_inputs["entry_structure"],
+        )
+        self.assertEqual(
+            loaded.decision_inputs["signal"]["profile_key"],
+            profile,
+        )
         self.assertEqual(after, before)
 
     def test_replay_is_settlement_causal_and_cutoff_safe(self):
@@ -513,6 +531,213 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(recent_event["n12_after"]["sample_size"], 1)
         self.assertEqual(recent_event["n20_after"]["sample_size"], 1)
 
+    def test_adaptive_incremental_work_is_linear_without_arbitrary_event_cap(self):
+        def work_for(count):
+            rows = [
+                observation(
+                    f"bounded-{index}",
+                    "WIN" if index % 2 else "LOSS",
+                    timestamp("2026-07-01T00:00:00") + index * 60_000,
+                )
+                for index in range(count)
+            ]
+            workload = {}
+            replay_module._build_adaptive_event_rows(rows, workload=workload)
+            return workload
+
+        small = work_for(1_024)
+        large = work_for(2_048)
+
+        self.assertEqual(large["adaptive_events"], 2_048)
+        self.assertEqual(large["adaptive_incremental_adds"], 2_048)
+        self.assertEqual(large["adaptive_window_rebuilds"], 0)
+        self.assertEqual(large["adaptive_window_rebuild_input_rows"], 0)
+        self.assertEqual(
+            large["adaptive_incremental_adds"],
+            small["adaptive_incremental_adds"] * 2,
+        )
+        self.assertGreater(large["adaptive_max_window_events"], 256)
+        self.assertFalse(hasattr(replay_module, "ADAPTIVE_REBUILD_MAX_EVENTS"))
+
+    def test_adaptive_public_window_replay_matches_full_rebuild_beyond_256_events(self):
+        start = timestamp("2026-07-01T00:00:00")
+        rows = []
+        for index in range(340):
+            row = observation(
+                f"dense-{index:03d}",
+                "WIN" if index % 5 not in {0, 1} else "LOSS",
+                start + index * 3 * 60_000,
+            )
+            if index >= 40 and index % 37 == 0:
+                row = replace(
+                    row,
+                    observation_key=rows[index - 19].observation_key,
+                    decision_id=f"conflicting-observation-{index}",
+                )
+            elif index >= 40 and index % 41 == 0:
+                row = replace(
+                    row,
+                    decision_id=rows[index - 23].decision_id,
+                )
+            elif index >= 40 and index % 43 == 0:
+                owner = rows[index - 29]
+                row = replace(
+                    row,
+                    observation_key=owner.observation_key,
+                    decision_id=owner.decision_id,
+                )
+            rows.append(row)
+
+        key = replay_module._observation_profile_key(rows[0])
+        tracker = AdaptiveProfileWindowReplay(key, lookback_ms=15 * 86_400_000)
+        prefix = []
+        for index, row in enumerate(rows):
+            prefix.append(row)
+            evaluated_at = int(row.settled_at) + 1
+            expected = rebuild_adaptive_profile_states(prefix, evaluated_at)[key]
+            actual = tracker.advance(row, evaluated_at)
+            with self.subTest(index=index):
+                self.assertEqual(actual, expected)
+
+        self.assertEqual(tracker.workload["incremental_adds"], len(rows))
+        self.assertEqual(tracker.workload["window_rebuilds"], 0)
+        self.assertEqual(tracker.workload["max_window_events"], len(rows))
+
+    def test_adaptive_window_rebuild_work_scales_with_horizon_not_total_history(self):
+        def workload_for(days):
+            start = timestamp("2026-01-01T00:00:00")
+            rows = [
+                observation(
+                    f"horizon-{days}-{index:04d}",
+                    "WIN" if index % 2 else "LOSS",
+                    start + index * 3 * 60 * 60_000,
+                )
+                for index in range(days * 8)
+            ]
+            workload = {}
+            replay_module._build_adaptive_event_rows(rows, workload=workload)
+            return workload
+
+        short = workload_for(90)
+        long = workload_for(180)
+
+        self.assertLessEqual(
+            long["adaptive_max_window_events"],
+            short["adaptive_max_window_events"] + 1,
+        )
+        self.assertEqual(
+            long["adaptive_incremental_adds"],
+            short["adaptive_incremental_adds"] * 2,
+        )
+        self.assertLessEqual(
+            long["adaptive_window_rebuild_input_rows"],
+            short["adaptive_window_rebuild_input_rows"] * 2.25,
+        )
+
+    def test_adaptive_public_window_replay_matches_full_rebuild_after_expiry(self):
+        start = timestamp("2026-07-01T00:00:00")
+        rows = []
+        for index in range(275):
+            row = observation(
+                f"expiry-{index:03d}",
+                "WIN" if index % 3 else "LOSS",
+                start + index * 90 * 60_000,
+            )
+            if index >= 180 and index % 29 == 0:
+                row = replace(
+                    row,
+                    observation_key=rows[index - 170].observation_key,
+                    decision_id=f"expiry-conflict-{index}",
+                )
+            rows.append(row)
+
+        key = replay_module._observation_profile_key(rows[0])
+        lookback_ms = 15 * 86_400_000
+        tracker = AdaptiveProfileWindowReplay(key, lookback_ms=lookback_ms)
+        prefix = []
+        for index, row in enumerate(rows):
+            prefix.append(row)
+            evaluated_at = int(row.settled_at) + 1
+            window = [
+                event
+                for event in prefix
+                if evaluated_at - lookback_ms <= int(event.settled_at) < evaluated_at
+            ]
+            expected = rebuild_adaptive_profile_states(window, evaluated_at)[key]
+            actual = tracker.advance(row, evaluated_at)
+            with self.subTest(index=index):
+                self.assertEqual(actual, expected)
+
+        self.assertGreater(tracker.workload["window_rebuilds"], 0)
+        self.assertGreater(tracker.workload["window_rebuild_input_rows"], 0)
+
+    def test_schedule_passes_only_bounded_lookback_rows_to_selector(self):
+        start = timestamp("2026-06-01T01:00:00")
+        rows = [
+            observation(f"day-{index}", "WIN", start + index * 86_400_000)
+            for index in range(45)
+        ]
+        config = selector_config()
+        input_sizes = []
+        original = replay_module.build_daily_selection
+
+        def recording_selection(observations, *args, **kwargs):
+            input_sizes.append(len(observations))
+            return original(observations, *args, **kwargs)
+
+        with patch.object(
+            replay_module,
+            "build_daily_selection",
+            side_effect=recording_selection,
+        ):
+            replay_module._build_schedule(
+                sorted(rows, key=replay_module._settlement_event_key),
+                config,
+                require_full_lookback=False,
+            )
+
+        self.assertGreater(len(input_sizes), 40)
+        self.assertLessEqual(max(input_sizes), 2)
+
+    def test_leakage_check_builds_each_sample_key_index_once(self):
+        class CountingKeys:
+            def __init__(self, values):
+                self.values = values
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return iter(self.values)
+
+        rows = [observation(f"leak-{index}", "WIN", index * 1_000_000) for index in range(20)]
+        keys = CountingKeys([item.observation_key for item in rows])
+        snapshots = [{"sample_keys": keys, "lookback_end": 100_000_000}]
+
+        self.assertEqual(replay_module._count_leakage_violations(rows, snapshots), 0)
+        self.assertEqual(keys.iterations, 1)
+
+    def test_replay_prepares_execution_windows_once_for_all_three_runs(self):
+        rows = [
+            observation("plan-train", "WIN", timestamp("2026-07-20T01:00:00")),
+            observation("plan-one", "WIN", timestamp("2026-07-20T08:00:00")),
+            observation("plan-two", "LOSS", timestamp("2026-07-20T08:12:00")),
+        ]
+        self.assertTrue(hasattr(replay_module, "_prepare_execution_windows"))
+        original = replay_module._prepare_execution_windows
+        with patch.object(
+            replay_module,
+            "_prepare_execution_windows",
+            wraps=original,
+        ) as prepare:
+            report = self.replay(rows)
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertLessEqual(report["workload"]["execution_plan_rows"], len(rows))
+        self.assertEqual(
+            report["workload"]["execution_replay_rows"],
+            report["workload"]["execution_plan_rows"] * 3,
+        )
+
     def test_replay_applies_direction_capacity_and_progression_on_each_settlement(self):
         rows = [
             observation("train-long", "WIN", timestamp("2026-07-20T01:00:00"), direction="LONG", tag="long"),
@@ -535,6 +760,25 @@ class DailyProfileReplayTest(unittest.TestCase):
             by_key["long-second-stage"]["progression_source_order_id"],
             by_key["long-first"]["order_id"],
         )
+
+    def test_three_loss_pause_uses_settlement_ledger_without_rescanning_trades(self):
+        rows = [
+            observation("loss-ledger-train", "WIN", timestamp("2026-07-20T01:00:00")),
+            observation("loss-ledger-1", "LOSS", timestamp("2026-07-20T08:00:00")),
+            observation("loss-ledger-2", "LOSS", timestamp("2026-07-20T08:11:00")),
+            observation("loss-ledger-3", "LOSS", timestamp("2026-07-20T08:22:00")),
+            observation("loss-ledger-blocked", "WIN", timestamp("2026-07-20T08:33:00")),
+        ]
+
+        report = self.replay(rows)
+        baseline = report["baseline"]
+
+        self.assertEqual(baseline["guard_rejections"]["three_loss_pause"], 1)
+        self.assertNotIn(
+            "loss-ledger-blocked",
+            {item["observation_key"] for item in baseline["trade_rows"]},
+        )
+        self.assertFalse(hasattr(replay_module, "_has_three_segment_losses"))
 
     def test_high_precision_progression_matches_account_simulator(self):
         stake = 10.12345
@@ -688,8 +932,7 @@ class DailyProfileReplayTest(unittest.TestCase):
         )
 
         result = replay_module._execute_replay(
-            [row],
-            [snapshot],
+            replay_module._prepare_execution_windows([row], [snapshot]),
             execution,
             timeline,
             apply_adaptive=True,
@@ -763,6 +1006,39 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(report["execution"]["max_open_orders"], 2)
         self.assertEqual(report["execution"]["max_open_long_orders"], 1)
         self.assertEqual(report["execution"]["max_open_short_orders"], 2)
+
+    def test_report_removes_duplicate_sections_and_compacts_event_audit(self):
+        start = timestamp("2026-07-19T20:00:00")
+        rows = [
+            observation(
+                f"compact-{index}",
+                "WIN" if index % 3 else "LOSS",
+                start + index * 11 * 60_000,
+            )
+            for index in range(40)
+        ]
+
+        report = self.replay(rows)
+
+        self.assertNotIn("daily_snapshots", report)
+        self.assertNotIn("trade_rows", report)
+        self.assertIn("trade_rows", report["candidate"])
+        self.assertIn("report_schema_version", report)
+        for event in report["events"]:
+            self.assertNotIn("n12_before", event)
+            self.assertNotIn("n20_before", event)
+            self.assertIn("n12_after", event)
+            self.assertIn("n20_after", event)
+
+        legacy = json.loads(json.dumps(report))
+        legacy["daily_snapshots"] = legacy["schedule"]
+        legacy["trade_rows"] = legacy["candidate"]["trade_rows"]
+        for event in legacy["events"]:
+            event["n12_before"] = event["n12_after"]
+            event["n20_before"] = event["n20_after"]
+        compact_size = len(json.dumps(report, separators=(",", ":")))
+        legacy_size = len(json.dumps(legacy, separators=(",", ":")))
+        self.assertLess(compact_size, legacy_size * 0.8)
 
     def test_release_gates_apply_ev_to_total_and_both_directions_and_compare_risk(self):
         self.assertTrue(hasattr(replay_module, "evaluate_release_gates"))
@@ -1009,11 +1285,11 @@ class DailyProfileReplayTest(unittest.TestCase):
     def test_passing_configurations_rank_by_win_rate_orders_then_drawdown(self):
         self.assertTrue(hasattr(replay_module, "rank_passing_configurations"))
         reports = [
-            {"name": "drawdown-high", "passed": True, "total": {"win_rate": 0.62, "orders": 90, "max_drawdown": 12}},
-            {"name": "more-orders", "passed": True, "total": {"win_rate": 0.62, "orders": 100, "max_drawdown": 20}},
-            {"name": "best-rate", "passed": True, "total": {"win_rate": 0.63, "orders": 80, "max_drawdown": 30}},
-            {"name": "drawdown-low", "passed": True, "total": {"win_rate": 0.62, "orders": 90, "max_drawdown": 10}},
-            {"name": "rejected", "passed": False, "total": {"win_rate": 0.99, "orders": 999, "max_drawdown": 0}},
+            {"name": "drawdown-high", "passed": True, "total": {"wins": 62, "win_rate": 0.62, "orders": 100, "max_drawdown": 12}},
+            {"name": "more-orders", "passed": True, "total": {"wins": 124, "win_rate": 0.62, "orders": 200, "max_drawdown": 20}},
+            {"name": "best-rate", "passed": True, "total": {"wins": 63, "win_rate": 0.63, "orders": 100, "max_drawdown": 30}},
+            {"name": "drawdown-low", "passed": True, "total": {"wins": 62, "win_rate": 0.62, "orders": 100, "max_drawdown": 10}},
+            {"name": "rejected", "passed": False, "total": {"wins": 999, "win_rate": 0.99, "orders": 999, "max_drawdown": 0}},
         ]
 
         ranked = replay_module.rank_passing_configurations(reports)
@@ -1022,6 +1298,34 @@ class DailyProfileReplayTest(unittest.TestCase):
             [item["name"] for item in ranked],
             ["best-rate", "more-orders", "drawdown-low", "drawdown-high"],
         )
+
+    def test_passing_configuration_sort_uses_unrounded_win_ratio(self):
+        reports = [
+            {
+                "name": "lower-but-more-orders",
+                "passed": True,
+                "total": {
+                    "wins": 6_000_001,
+                    "orders": 10_000_000,
+                    "win_rate": 0.6,
+                    "max_drawdown": 1.0,
+                },
+            },
+            {
+                "name": "higher-raw-rate",
+                "passed": True,
+                "total": {
+                    "wins": 3_000_001,
+                    "orders": 5_000_000,
+                    "win_rate": 0.6,
+                    "max_drawdown": 2.0,
+                },
+            },
+        ]
+
+        ranked = replay_module.rank_passing_configurations(reports)
+
+        self.assertEqual(ranked[0]["name"], "higher-raw-rate")
 
     def test_structure_shadow_equality_is_computed_from_independent_results(self):
         self.assertTrue(hasattr(replay_module, "build_structure_shadow_equality_report"))

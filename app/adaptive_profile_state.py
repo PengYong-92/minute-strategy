@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import re
 from bisect import bisect_left
+from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -363,6 +365,106 @@ class _IncrementalCanonicalSelection:
         return bool(removed or selected)
 
 
+class AdaptiveProfileWindowReplay:
+    """Replay causally ordered events over an exact settlement-time window."""
+
+    def __init__(
+        self,
+        profile_key: str,
+        *,
+        lookback_ms: int,
+        config: AdaptiveProfileStateConfig | None = None,
+    ) -> None:
+        _validate_profile_key(profile_key)
+        if type(lookback_ms) is not int or lookback_ms <= 0:
+            raise ValueError("lookback_ms must be a positive integer")
+        self.profile_key = profile_key
+        self.lookback_ms = lookback_ms
+        self.config = _resolve_config(config)
+        self._events: deque[ObservationSignal] = deque()
+        self._bindings = _IdentityBindings()
+        self._replay = _ProfileReplay(selection=_IncrementalCanonicalSelection())
+        self._state: dict | None = None
+        self._last_event_key: tuple | None = None
+        self.workload = {
+            "incremental_adds": 0,
+            "window_rebuilds": 0,
+            "window_rebuild_input_rows": 0,
+            "max_window_events": 0,
+        }
+
+    def advance(
+        self,
+        event: ObservationSignal,
+        evaluated_at: int,
+    ) -> dict:
+        cutoff = _validated_evaluated_at(evaluated_at)
+        prepared = _prepare_event(event, cutoff)
+        if prepared is None or prepared[0] != self.profile_key:
+            raise ValueError("event is not eligible for this adaptive profile window")
+        event_key = _prepared_event_sort_key(prepared)
+        if self._last_event_key is not None and event_key < self._last_event_key:
+            raise ValueError("events must advance in causal settlement order")
+
+        window_start = cutoff - self.lookback_ms
+        removed = False
+        while self._events and int(self._events[0].settled_at) < window_start:
+            self._events.popleft()
+            removed = True
+        if removed:
+            self._rebuild_window(cutoff)
+
+        self._events.append(event)
+        self._apply_prepared(prepared)
+        self._last_event_key = event_key
+        self.workload["incremental_adds"] += 1
+        self.workload["max_window_events"] = max(
+            self.workload["max_window_events"],
+            len(self._events),
+        )
+        if self._state is None:
+            self._state = evaluate_adaptive_profile_state(
+                (),
+                self.profile_key,
+                cutoff,
+                config=self.config,
+            )
+        state = dict(self._state)
+        state["evaluated_at"] = cutoff
+        self._state = state
+        return deepcopy(state)
+
+    def _rebuild_window(self, evaluated_at: int) -> None:
+        self.workload["window_rebuilds"] += 1
+        self.workload["window_rebuild_input_rows"] += len(self._events)
+        self._bindings = _IdentityBindings()
+        self._replay = _ProfileReplay(selection=_IncrementalCanonicalSelection())
+        self._state = None
+        prepared_events = []
+        for event in self._events:
+            prepared = _prepare_event(event, evaluated_at)
+            if prepared is not None:
+                prepared_events.append(prepared)
+        for prepared in sorted(prepared_events, key=_prepared_event_sort_key):
+            self._apply_prepared(prepared)
+
+    def _apply_prepared(
+        self,
+        prepared: tuple[str, ObservationSignal],
+    ) -> None:
+        key, event = prepared
+        if not self._bindings.accept(key, event):
+            return
+        state = _advance_profile_replay(
+            self._replay,
+            key,
+            event,
+            self.config,
+        )
+        if state is not None:
+            self._state = state
+
+
 def evaluate_adaptive_profile_state(
     observations: Sequence[ObservationSignal],
     profile_key: str,
@@ -518,6 +620,27 @@ def _causally_bound_prepared_events(
     return accepted
 
 
+def _advance_profile_replay(
+    replay: _ProfileReplay,
+    key: str,
+    event: ObservationSignal,
+    config: AdaptiveProfileStateConfig,
+) -> dict | None:
+    update = replay.selection.add(event)
+    if not update.changed:
+        return None
+    samples = replay.selection.latest_selected_events(config.full_window_samples)
+    state = classify_profile_state(
+        samples,
+        key,
+        int(event.settled_at) + 1,
+        previous=replay.previous_status,
+        config=config,
+    )
+    replay.previous_status = state["status"]
+    return state
+
+
 def rebuild_adaptive_profile_states(
     observations: Sequence[ObservationSignal],
     evaluated_at: int,
@@ -543,22 +666,9 @@ def rebuild_adaptive_profile_states(
             )
             profiles[key] = replay
 
-        update = replay.selection.add(event)
-        if not update.changed:
-            continue
-        samples = replay.selection.latest_selected_events(
-            resolved.full_window_samples
-        )
-
-        event_cutoff = int(event.settled_at) + 1
-        states[key] = classify_profile_state(
-            samples,
-            key,
-            event_cutoff,
-            previous=replay.previous_status,
-            config=resolved,
-        )
-        replay.previous_status = states[key]["status"]
+        state = _advance_profile_replay(replay, key, event, resolved)
+        if state is not None:
+            states[key] = state
 
     for state in states.values():
         state["evaluated_at"] = cutoff

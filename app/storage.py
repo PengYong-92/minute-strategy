@@ -132,6 +132,11 @@ decision_contexts.input_payload as linked_input_payload,
 decision_contexts.outcome_payload as linked_outcome_payload
 """
 
+
+def linked_decision_context_select_columns() -> str:
+    """Return the stable SELECT projection used to hydrate linked decisions."""
+    return _LINKED_CONTEXT_COLUMNS.strip()
+
 _ORDER_LIFECYCLE_COLUMNS = """
 orders.order_id as lifecycle_order_id,
 orders.status as lifecycle_status,
@@ -505,6 +510,20 @@ def _hydrate_decision_linked_payload(
     if apply_lifecycle_authority:
         return _apply_lifecycle_row_authority(payload, row, has_context=True)
     return payload
+
+
+def hydrate_decision_linked_payload(
+    payload: dict[str, Any],
+    row: Mapping[str, Any],
+    *,
+    apply_lifecycle_authority: bool = True,
+) -> dict[str, Any]:
+    """Hydrate a persisted model payload through the public storage contract."""
+    return _hydrate_decision_linked_payload(
+        payload,
+        row,
+        apply_lifecycle_authority=apply_lifecycle_authority,
+    )
 
 
 def _canonical_storage_projection(
