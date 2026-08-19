@@ -69,8 +69,8 @@ WARMUP_CURRENT_MONTH_DAILY="${WARMUP_CURRENT_MONTH_DAILY:-1}"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run.sh [SYMBOL] [PORT]
-       scripts/run.sh [options]
+用法: scripts/run.sh [SYMBOL] [PORT]
+      scripts/run.sh [参数]
 
 启动币安事件合约量价监控程序。
 

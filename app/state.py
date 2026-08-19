@@ -5497,6 +5497,7 @@ class MonitorState:
             return
 
     def snapshot(self) -> dict:
+        storage_capacity = self._sample_storage_capacity(int(self._now_ms()))
         with self._lock:
             latest = self.klines[-1] if self.klines else None
             orders = list(reversed(self.simulator.orders[-100:]))
@@ -5520,7 +5521,7 @@ class MonitorState:
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),
-                "storage_capacity": self._sample_storage_capacity(int(self._now_ms())),
+                "storage_capacity": storage_capacity,
                 "entry_structure_shadow": self._entry_structure_status(),
                 "stake_progression": self._stake_progression_status(),
                 "order_policy": self._order_policy_status(),
@@ -5624,14 +5625,25 @@ class MonitorState:
             "entry_structure_bias": entry_structure_bias,
             "active_level_source": active_level_source,
         }
+        normalized_filters = {
+            field: str(value or "").strip().upper()
+            for field, value in extended_filters.items()
+        }
+        normalized_observations = [
+            (item, self._normalize_observation_row(item.to_dict()))
+            for item in observations
+        ]
+        diagnostic_filter_options = {
+            field: sorted({row[field] for _, row in normalized_observations})
+            for field in extended_filters
+        }
         observations = [
             item
-            for item in observations
+            for item, row in normalized_observations
             if all(
                 not expected
-                or self._normalize_observation_row(item.to_dict())[field]
-                == str(expected).strip().upper()
-                for field, expected in extended_filters.items()
+                or row[field] == expected
+                for field, expected in normalized_filters.items()
             )
         ]
         page_payload = page_observation_list(
@@ -5644,6 +5656,8 @@ class MonitorState:
             segment=segment,
             result=result,
         )
+        page_payload["filters"].update(normalized_filters)
+        page_payload["filter_options"].update(diagnostic_filter_options)
         return self._normalize_observation_page(
             page_payload,
             candidate_origin=candidate_origin,

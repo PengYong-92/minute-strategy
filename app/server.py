@@ -27,6 +27,15 @@ DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS = ""
 DEFAULT_LIVE_SHORT_SEGMENTS = "WD-02,WD-23"
 
 
+class _ChineseHelpFormatter(argparse.HelpFormatter):
+    def _format_usage(self, *args, **kwargs) -> str:
+        return super()._format_usage(*args, **kwargs).replace(
+            "usage: ",
+            "用法: ",
+            1,
+        )
+
+
 def start_market_data(
     state: MonitorState,
     client: BinanceKlineClient,
@@ -265,7 +274,13 @@ def _strategy_build_id(value: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="币安事件合约量价监控程序")
+    parser = argparse.ArgumentParser(
+        description="币安事件合约量价监控程序",
+        add_help=False,
+        formatter_class=_ChineseHelpFormatter,
+    )
+    parser._optionals.title = "参数"
+    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
     parser.add_argument("--symbol", default=os.getenv("SYMBOL", "BTCUSDT"), help="交易对，默认: BTCUSDT")
     parser.add_argument(
         "--strategy-build-id",

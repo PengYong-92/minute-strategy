@@ -22,6 +22,53 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_snapshot_capacity_sampling_does_not_hold_realtime_state_lock(self):
+        state = MonitorState(symbol="BTCUSDT")
+        capacity_started = threading.Event()
+        release_capacity = threading.Event()
+        mutation_done = threading.Event()
+        result = {}
+        errors = []
+
+        def blocking_capacity(_sampled_at_ms):
+            capacity_started.set()
+            release_capacity.wait(timeout=2)
+            return {"status": "IN_MEMORY"}
+
+        def take_snapshot():
+            try:
+                result["snapshot"] = state.snapshot()
+            except Exception as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        def update_realtime_state():
+            try:
+                state.reset_symbol("ETHUSDT")
+                state.update_realtime_price(123.0, 2_000, 2_000)
+                mutation_done.set()
+            except Exception as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        with patch.object(state, "_sample_storage_capacity", side_effect=blocking_capacity):
+            snapshot_thread = threading.Thread(target=take_snapshot)
+            snapshot_thread.start()
+            self.assertTrue(capacity_started.wait(timeout=1))
+            mutation_thread = threading.Thread(target=update_realtime_state)
+            mutation_thread.start()
+            try:
+                self.assertTrue(
+                    mutation_done.wait(timeout=0.2),
+                    "容量采样阻塞时不应占用实时状态锁",
+                )
+            finally:
+                release_capacity.set()
+                snapshot_thread.join(timeout=2)
+                mutation_thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(result["snapshot"]["symbol"], "ETHUSDT")
+        self.assertEqual(state.price_snapshot()["latest_price"], 123.0)
+
     def test_main_injects_versioned_strategy_build_id_from_cli_or_environment(self):
         cases = (
             ({}, [], server_module.DEFAULT_STRATEGY_BUILD_ID),
@@ -103,6 +150,28 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--strategy-build-id", stdout.getvalue())
         self.assertIn("策略构建标识", stdout.getvalue())
+
+    def test_server_help_has_no_english_argparse_labels(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        help_text = stdout.getvalue()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("用法:", help_text)
+        self.assertIn("参数:", help_text)
+        for english_label in (
+            "usage",
+            "options",
+            "show this help message",
+            "missing value",
+        ):
+            self.assertNotIn(english_label, help_text.lower())
 
     def test_daily_profile_startup_defaults_and_explicit_precedence(self):
         cases = (
@@ -788,6 +857,68 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(legacy["entry_structure_state"], "UNKNOWN")
         self.assertEqual(legacy["entry_structure_bias"], "UNKNOWN")
         self.assertEqual(legacy["active_level_source"], "UNKNOWN")
+
+    def test_in_memory_observation_diagnostic_filter_options_include_unknown(self):
+        state = MonitorState(symbol="BTCUSDT")
+        state.observations = [
+            ObservationSignal(
+                observation_key="legacy-memory",
+                strategy_family="short_observe",
+                strategy_tag="legacy",
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="B",
+                reason="legacy",
+                entry_price=100.0,
+                opened_at=1_000,
+                expires_at=601_000,
+            ),
+            ObservationSignal(
+                observation_key="current-memory",
+                strategy_family="short_observe",
+                strategy_tag="current",
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="current",
+                entry_price=100.0,
+                opened_at=2_000,
+                expires_at=602_000,
+                candidate_origin="NATIVE_ACTIONABLE",
+                adaptive_profile_state={
+                    "qualification_state": "QUALIFIED",
+                    "status": "ACTIVE",
+                },
+                entry_structure_shadow={
+                    "entry_structure_state": "BREAKOUT_CONFIRMED",
+                    "entry_structure_bias": "CONFIRMED",
+                    "active_level_source": "SWING",
+                },
+            ),
+        ]
+
+        payload = state.page_observations(
+            candidate_origin="UNKNOWN",
+            qualification_state="UNKNOWN",
+            adaptive_state="UNKNOWN",
+            entry_structure_state="UNKNOWN",
+            entry_structure_bias="UNKNOWN",
+            active_level_source="UNKNOWN",
+        )
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["observations"][0]["observation_key"], "legacy-memory")
+        expected = {
+            "candidate_origin": {"NATIVE_ACTIONABLE", "UNKNOWN"},
+            "qualification_state": {"QUALIFIED", "UNKNOWN"},
+            "adaptive_state": {"ACTIVE", "UNKNOWN"},
+            "entry_structure_state": {"BREAKOUT_CONFIRMED", "UNKNOWN"},
+            "entry_structure_bias": {"CONFIRMED", "UNKNOWN"},
+            "active_level_source": {"SWING", "UNKNOWN"},
+        }
+        for name, values in expected.items():
+            self.assertEqual(set(payload["filter_options"][name]), values)
+            self.assertEqual(payload["filters"][name], "UNKNOWN")
 
     def test_orders_api_pages_and_filters_persisted_orders(self):
         with tempfile.TemporaryDirectory() as temp_dir:

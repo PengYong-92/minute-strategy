@@ -355,6 +355,27 @@ process.stdout.write(JSON.stringify({
         self.assertIn("每天北京时间", result.stdout)
         self.assertIn("观察画像", result.stdout)
 
+    def test_run_script_help_has_no_english_argument_labels(self):
+        result = run(
+            ["bash", str(ROOT / "scripts" / "run.sh"), "--help"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("用法:", result.stdout)
+        self.assertIn("参数:", result.stdout)
+        for english_label in (
+            "usage",
+            "options",
+            "show this help message",
+            "missing value",
+        ):
+            self.assertNotIn(english_label, result.stdout.lower())
+
     def test_run_script_handles_empty_extra_args_on_macos_bash(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
