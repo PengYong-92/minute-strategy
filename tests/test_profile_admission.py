@@ -55,6 +55,10 @@ class ProfileAdmissionTest(unittest.TestCase):
             ProfileAdmissionPolicy(fast_n20_ev_min=-0.0).policy_hash,
             ProfileAdmissionPolicy(fast_n20_ev_min=0.0).policy_hash,
         )
+        self.assertEqual(
+            ProfileAdmissionPolicy(resident_daily_win_rate_floor=-0.0).policy_hash,
+            ProfileAdmissionPolicy(resident_daily_win_rate_floor=0.0).policy_hash,
+        )
 
         policies = policy_grid()
         self.assertEqual(len(policies), 32)

@@ -101,7 +101,11 @@ class ProfileAdmissionPolicy:
             floor = float(self.resident_daily_win_rate_floor)
             if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
                 raise ValueError("resident_daily_win_rate_floor must be between 0 and 1")
-            object.__setattr__(self, "resident_daily_win_rate_floor", floor)
+            object.__setattr__(
+                self,
+                "resident_daily_win_rate_floor",
+                0.0 if floor == 0.0 else floor,
+            )
         fast_n20_ev_min = float(self.fast_n20_ev_min)
         object.__setattr__(
             self,
