@@ -479,7 +479,11 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--daily-profile-activation-time", result.stdout)
         self.assertIn("--profile-degradation-cooldown-minutes", result.stdout)
         self.assertIn("--enable-profile-admission", result.stdout)
-        self.assertIn("--profile-admission-resident-n12-max-wins", result.stdout)
+        self.assertNotIn("--profile-admission-resident-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-resident-long-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-resident-short-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-resident-long-win-rate-floor", result.stdout)
+        self.assertIn("--profile-admission-resident-short-win-rate-floor", result.stdout)
         self.assertIn("--profile-admission-fast-directions", result.stdout)
         self.assertIn("--profile-admission-fast-n12-min-wins", result.stdout)
         self.assertIn("--profile-admission-fast-n12-max-wins", result.stdout)
@@ -781,7 +785,10 @@ process.stdout.write(JSON.stringify({
                     "bash",
                     str(ROOT / "scripts" / "run.sh"),
                     "--enable-profile-admission",
-                    "--profile-admission-resident-n12-max-wins", "7",
+                    "--profile-admission-resident-long-n12-max-wins", "6",
+                    "--profile-admission-resident-short-n12-max-wins", "8",
+                    "--profile-admission-resident-long-win-rate-floor", "0.60",
+                    "--profile-admission-resident-short-win-rate-floor", "0.65",
                     "--profile-admission-fast-directions", "SHORT",
                     "--profile-admission-fast-n12-min-wins", "6",
                     "--profile-admission-fast-n12-max-wins", "7",
@@ -798,9 +805,22 @@ process.stdout.write(JSON.stringify({
 
         self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
         self.assertNotIn("--enable-profile-admission", default_args)
+        self.assertNotIn("--profile-admission-resident-n12-max-wins", default_args)
         self.assertEqual(
-            default_args[default_args.index("--profile-admission-resident-n12-max-wins") + 1],
-            "8",
+            default_args[default_args.index("--profile-admission-resident-long-n12-max-wins") + 1],
+            "7",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-short-n12-max-wins") + 1],
+            "9",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-long-win-rate-floor") + 1],
+            "off",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-short-win-rate-floor") + 1],
+            "0.625",
         )
         self.assertEqual(
             default_args[default_args.index("--profile-admission-fast-directions") + 1],
@@ -809,7 +829,10 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr + enabled_result.stdout)
         self.assertIn("--enable-profile-admission", enabled_args)
         expected = {
-            "--profile-admission-resident-n12-max-wins": "7",
+            "--profile-admission-resident-long-n12-max-wins": "6",
+            "--profile-admission-resident-short-n12-max-wins": "8",
+            "--profile-admission-resident-long-win-rate-floor": "0.60",
+            "--profile-admission-resident-short-win-rate-floor": "0.65",
             "--profile-admission-fast-directions": "SHORT",
             "--profile-admission-fast-n12-min-wins": "6",
             "--profile-admission-fast-n12-max-wins": "7",
@@ -817,6 +840,23 @@ process.stdout.write(JSON.stringify({
         }
         for option, value in expected.items():
             self.assertEqual(enabled_args[enabled_args.index(option) + 1], value)
+
+    def test_run_script_rejects_deprecated_shared_profile_admission_environment(self):
+        result = run(
+            ["bash", str(ROOT / "scripts" / "run.sh")],
+            cwd=ROOT,
+            env={
+                "PATH": os.environ["PATH"],
+                "PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS": "8",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS", result.stderr)
 
     def test_run_script_forwards_profile_degradation_cooldown_default_and_cli_forms(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -7231,6 +7231,7 @@ class MonitorStateTest(unittest.TestCase):
         frozen = order.adaptive_profile_state["admission"]
         self.assertEqual(frozen["decision"]["policy_hash"], policy.policy_hash)
         self.assertEqual(frozen["decision"]["channel"], "FAST")
+        self.assertEqual(frozen["context"]["candidate_ordinal"], 1)
         self.assertFalse(order.daily_profile_selected)
         runtime = json.loads(state._decision_runtime_config().canonical_payload)
         self.assertEqual(runtime["profiles"]["admission"]["policy_hash"], policy.policy_hash)
@@ -7276,9 +7277,108 @@ class MonitorStateTest(unittest.TestCase):
         )
 
         self.assertTrue(required)
-        self.assertIs(selected, primary)
         self.assertFalse(selected.daily_profile_selected)
         self.assertNotIn("admission", selected.adaptive_profile_state)
+        candidate_audit = selected.adaptive_profile_state["admission_candidates"]
+        self.assertEqual(len(candidate_audit), 1)
+        self.assertEqual(
+            candidate_audit[0]["decision"]["code"],
+            "FAST_DIRECTION_BLOCKED",
+        )
+
+        decision = state._maybe_open_order(
+            selected,
+            latest_kline(current_time),
+            daily_profile_required=required,
+        )
+
+        self.assertEqual(decision, "FAST_PRIMARY_BLOCKED")
+        self.assertEqual(state.simulator.orders, [])
+        frozen_candidates = state.selected_signal.decision_inputs["admission"][
+            "profile_admission_candidates"
+        ]
+        self.assertEqual(
+            frozen_candidates[0]["decision"]["code"],
+            "FAST_DIRECTION_BLOCKED",
+        )
+
+    def test_profile_admission_fast_keeps_the_original_score_threshold(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state(
+            "ACTIVE",
+            current_time,
+            profile_admission_policy=candidate_policy(),
+        )
+        self.addCleanup(state.close)
+        fast_key = "10|short_observe|fast_short|SHORT|WD-08"
+        state.active_daily_profile_selection["selected_profiles"] = []
+        state.adaptive_profile_states = {
+            fast_key: adaptive_profile_snapshot(
+                "ACTIVE", current_time - 1, profile_key=fast_key
+            )
+        }
+        primary = Signal("WAIT", 10, "B", "无主方向", 100.0, current_time)
+        observation = Signal(
+            "WAIT", 10, "A", "评分不足的SHORT快速候选", 100.0, current_time,
+            score=-70.0, threshold=79.0, threshold_segment="WD-08",
+            strategy_family="short_observe", strategy_tag="fast_short",
+            observe_direction="SHORT", observe_only=True,
+        )
+
+        selected, required = state._select_daily_profile_signal(
+            primary, [observation], current_time
+        )
+        decision = state._maybe_open_order(
+            selected,
+            latest_kline(current_time),
+            daily_profile_required=required,
+        )
+
+        self.assertEqual(selected.threshold, 79.0)
+        self.assertEqual(decision, "BELOW_THRESHOLD")
+        self.assertEqual(state.simulator.orders, [])
+
+    def test_profile_admission_all_rejected_wait_persists_candidate_audit(self):
+        current_time = 1_800_000_000_000
+        state = adaptive_admission_state(
+            "ACTIVE",
+            current_time,
+            profile_admission_policy=candidate_policy(),
+        )
+        self.addCleanup(state.close)
+        state.active_daily_profile_selection["selected_profiles"] = []
+        long_key = "10|drop_reclaim|blocked_long|LONG|WD-08"
+        state.adaptive_profile_states = {
+            long_key: adaptive_profile_snapshot(
+                "ACTIVE", current_time - 1, profile_key=long_key
+            )
+        }
+        primary = Signal("WAIT", 10, "B", "无主方向", 100.0, current_time)
+        observation = Signal(
+            "WAIT", 10, "B", "未入选LONG观察", 100.0, current_time,
+            score=84.0, threshold=79.0, threshold_segment="WD-08",
+            strategy_family="drop_reclaim", strategy_tag="blocked_long",
+            observe_direction="LONG", observe_only=True,
+        )
+
+        selected, required = state._select_daily_profile_signal(
+            primary, [observation], current_time
+        )
+        decision = state._maybe_open_order(
+            selected,
+            latest_kline(current_time),
+            daily_profile_required=required,
+        )
+
+        self.assertEqual(decision, "SESSION_BLOCKED")
+        self.assertEqual(state.simulator.orders, [])
+        frozen_candidates = state.selected_signal.decision_inputs["admission"][
+            "profile_admission_candidates"
+        ]
+        self.assertEqual(
+            frozen_candidates[0]["decision"]["code"],
+            "FAST_DIRECTION_BLOCKED",
+        )
 
     def test_profile_admission_overheated_resident_falls_through_to_next_resident(self):
         current_time = 1_800_000_000_000
@@ -7330,6 +7430,13 @@ class MonitorStateTest(unittest.TestCase):
             selected.adaptive_profile_state["admission"]["decision"]["channel"],
             "RESIDENT",
         )
+        candidate_audit = selected.adaptive_profile_state["admission_candidates"]
+        self.assertEqual(
+            [item["decision"]["code"] for item in candidate_audit],
+            ["RESIDENT_N12_OVERHEATED", "RESIDENT_ADMITTED"],
+        )
+        self.assertEqual(candidate_audit[0]["context"]["n12_wins"], 9)
+        self.assertEqual(candidate_audit[1]["context"]["profile_key"], next_key)
 
     def test_profile_admission_fast_never_consumes_progression_and_rechecks_current_state(self):
         current_time = 1_800_000_000_000

@@ -220,6 +220,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _strict_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} 必须为布尔值，实际为 {value!r}")
+
+
 def _env_float(name: str, default: float | None) -> float | None:
     value = os.getenv(name)
     if value is None or value == "":
@@ -262,6 +274,18 @@ def _profile_admission_directions(value: str) -> tuple[str, ...]:
             "画像准入策略快速方向只能使用 LONG、SHORT，且不能为空"
         )
     return directions
+
+
+def _profile_admission_optional_rate(value: str) -> float | None:
+    normalized = str(value).strip().lower()
+    if normalized in {"", "off", "none", "关闭"}:
+        return None
+    try:
+        return float(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "画像准入胜率下限必须是 0 到 1 的数字或 off"
+        ) from exc
 
 
 def _clock_value(value: str) -> tuple[int, int]:
@@ -549,20 +573,50 @@ def main() -> None:
         default=os.getenv("LIVE_SHORT_SEGMENTS", DEFAULT_LIVE_SHORT_SEGMENTS),
         help=f"允许实际开 SHORT 的时段，逗号分隔；默认: {DEFAULT_LIVE_SHORT_SEGMENTS}",
     )
+    deprecated_admission_env = "PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS"
+    if deprecated_admission_env in os.environ:
+        parser.error(
+            f"{deprecated_admission_env} 已废弃；请分别配置 LONG/SHORT N12 上限"
+        )
+    try:
+        profile_admission_enabled = _strict_env_bool(
+            "PROFILE_ADMISSION_ENABLE",
+            False,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     parser.add_argument(
         "--enable-profile-admission",
         action="store_true",
-        default=_env_bool("PROFILE_ADMISSION_ENABLE", False),
+        default=profile_admission_enabled,
         help=(
             "显式启用冻结画像准入候选；默认关闭并使用兼容基准。"
             "前向稳定性尚未证明，release_allowed 始终为 false"
         ),
     )
     parser.add_argument(
-        "--profile-admission-resident-n12-max-wins",
+        "--profile-admission-resident-long-n12-max-wins",
         type=int,
-        default=int(os.getenv("PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS", "8")),
-        help="常驻画像 N12 最大胜数，候选默认: 8",
+        default=int(os.getenv("PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS", "7")),
+        help="LONG 常驻画像 N12 最大胜数，候选默认: 7",
+    )
+    parser.add_argument(
+        "--profile-admission-resident-short-n12-max-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS", "9")),
+        help="SHORT 常驻画像 N12 最大胜数，候选默认: 9",
+    )
+    parser.add_argument(
+        "--profile-admission-resident-long-win-rate-floor",
+        type=_profile_admission_optional_rate,
+        default=os.getenv("PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR", "off"),
+        help="LONG 常驻画像当日胜率下限，off 关闭，候选默认: off",
+    )
+    parser.add_argument(
+        "--profile-admission-resident-short-win-rate-floor",
+        type=_profile_admission_optional_rate,
+        default=os.getenv("PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR", "0.625"),
+        help="SHORT 常驻画像当日胜率下限，off 关闭，候选默认: 0.625",
     )
     parser.add_argument(
         "--profile-admission-fast-directions",
@@ -676,7 +730,19 @@ def main() -> None:
     try:
         candidate_admission_policy = ProfileAdmissionPolicy(
             resident_allowed_states=("ACTIVE", "WATCH"),
-            resident_n12_max_wins=args.profile_admission_resident_n12_max_wins,
+            resident_n12_max_wins=12,
+            resident_long_n12_max_wins=(
+                args.profile_admission_resident_long_n12_max_wins
+            ),
+            resident_short_n12_max_wins=(
+                args.profile_admission_resident_short_n12_max_wins
+            ),
+            resident_long_daily_win_rate_floor=(
+                args.profile_admission_resident_long_win_rate_floor
+            ),
+            resident_short_daily_win_rate_floor=(
+                args.profile_admission_resident_short_win_rate_floor
+            ),
             fast_enabled=True,
             fast_directions=args.profile_admission_fast_directions,
             fast_allowed_states=("ACTIVE",),

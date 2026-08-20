@@ -34,7 +34,7 @@ def context(**overrides) -> ProfileAdmissionContext:
         "n20_sample_size": 20,
         "n20_ev": 1.0,
         "candidate_origin": "OBSERVATION",
-        "candidate_ordinal": 0,
+        "candidate_ordinal": 1,
     }
     values.update(overrides)
     return ProfileAdmissionContext(**values)
@@ -60,6 +60,10 @@ class ProfileAdmissionTest(unittest.TestCase):
             ProfileAdmissionPolicy(resident_daily_win_rate_floor=-0.0).policy_hash,
             ProfileAdmissionPolicy(resident_daily_win_rate_floor=0.0).policy_hash,
         )
+        self.assertEqual(
+            ProfileAdmissionPolicy(resident_short_daily_win_rate_floor=-0.0).policy_hash,
+            ProfileAdmissionPolicy(resident_short_daily_win_rate_floor=0.0).policy_hash,
+        )
 
         policies = policy_grid()
         self.assertEqual(len(policies), 32)
@@ -73,6 +77,12 @@ class ProfileAdmissionTest(unittest.TestCase):
             ProfileAdmissionPolicy(fast_n12_min_wins=9, fast_n12_max_wins=8)
         with self.assertRaisesRegex(ValueError, "resident_daily_win_rate_floor"):
             ProfileAdmissionPolicy(resident_daily_win_rate_floor=1.1)
+        with self.assertRaisesRegex(ValueError, "resident_long_n12_max_wins"):
+            ProfileAdmissionPolicy(resident_long_n12_max_wins=13)
+        with self.assertRaisesRegex(ValueError, "resident_n12_max_wins"):
+            ProfileAdmissionPolicy(resident_n12_max_wins=None)
+        with self.assertRaisesRegex(ValueError, "resident_short_daily_win_rate_floor"):
+            ProfileAdmissionPolicy(resident_short_daily_win_rate_floor=True)
         with self.assertRaisesRegex(ValueError, "fast_enabled"):
             ProfileAdmissionPolicy(fast_enabled=1)
         with self.assertRaisesRegex(ValueError, "fast_n20_ev_min"):
@@ -83,8 +93,11 @@ class ProfileAdmissionTest(unittest.TestCase):
     def test_candidate_policy_is_the_automatic_search_candidate(self):
         policy = candidate_policy()
         self.assertEqual(policy.version, PROFILE_ADMISSION_VERSION)
-        self.assertEqual(policy.resident_n12_max_wins, 8)
+        self.assertEqual(policy.resident_long_n12_max_wins, 7)
+        self.assertEqual(policy.resident_short_n12_max_wins, 9)
         self.assertIsNone(policy.resident_daily_win_rate_floor)
+        self.assertIsNone(policy.resident_long_daily_win_rate_floor)
+        self.assertEqual(policy.resident_short_daily_win_rate_floor, 0.625)
         self.assertTrue(policy.fast_enabled)
         self.assertEqual(policy.fast_directions, ("SHORT",))
         self.assertEqual((policy.fast_n12_min_wins, policy.fast_n12_max_wins), (7, 8))
@@ -96,20 +109,24 @@ class ProfileAdmissionTest(unittest.TestCase):
                 '"fast_allowed_states":["ACTIVE"],"fast_directions":["SHORT"],'
                 '"fast_enabled":false,"fast_n12_max_wins":8,"fast_n12_min_wins":7,'
                 '"fast_n20_ev_min":0.0,"resident_allowed_states":["ACTIVE","WARMUP","WATCH"],'
-                '"resident_daily_win_rate_floor":null,"resident_n12_max_wins":12,'
+                '"resident_daily_win_rate_floor":null,"resident_long_daily_win_rate_floor":null,'
+                '"resident_long_n12_max_wins":null,"resident_n12_max_wins":12,'
+                '"resident_short_daily_win_rate_floor":null,"resident_short_n12_max_wins":null,'
                 '"version":"PROFILE_ADMISSION_V1","watch_allow_first_order":true,'
                 '"watch_allow_progression":false,"watch_allow_second_order":false}',
-                "dbcec12bd41a3d2b476d138474164763d2ade17de50052c5c94aaf2382a63b43",
+                "f9ddeaa9ecf86a236ea23e405048de8d605eb03a1a0dab4715ff4294c26d5c67",
             ),
             "candidate": (
                 '{"fast_allow_progression":false,"fast_allow_second_order":false,'
                 '"fast_allowed_states":["ACTIVE"],"fast_directions":["SHORT"],'
                 '"fast_enabled":true,"fast_n12_max_wins":8,"fast_n12_min_wins":7,'
                 '"fast_n20_ev_min":0.0,"resident_allowed_states":["ACTIVE","WATCH"],'
-                '"resident_daily_win_rate_floor":null,"resident_n12_max_wins":8,'
+                '"resident_daily_win_rate_floor":null,"resident_long_daily_win_rate_floor":null,'
+                '"resident_long_n12_max_wins":7,"resident_n12_max_wins":12,'
+                '"resident_short_daily_win_rate_floor":0.625,"resident_short_n12_max_wins":9,'
                 '"version":"PROFILE_ADMISSION_V1","watch_allow_first_order":true,'
                 '"watch_allow_progression":false,"watch_allow_second_order":false}',
-                "ba30cd239416d56dec7499ff66a230027488861b654ed9c93cc7a2abff4bc8fa",
+                "8ac0366d26a6f6e7cd0e69f887d73b6eeb8f7d548bc664caabc28f0ec66072bc",
             ),
         }
         for name, policy in (
@@ -177,9 +194,20 @@ class ProfileAdmissionTest(unittest.TestCase):
                 self.assertFalse(decision.allowed)
                 self.assertEqual(decision.channel, "NONE")
 
-        overheated = evaluate_profile_admission(context(n12_wins=9), policy)
+        overheated = evaluate_profile_admission(context(n12_wins=10), policy)
         self.assertFalse(overheated.allowed)
         self.assertEqual(overheated.code, "RESIDENT_N12_OVERHEATED")
+
+        long_overheated = evaluate_profile_admission(
+            context(
+                profile_key="10|long|rebound|LONG|WD-08",
+                direction="LONG",
+                n12_wins=8,
+            ),
+            policy,
+        )
+        self.assertFalse(long_overheated.allowed)
+        self.assertEqual(long_overheated.code, "RESIDENT_N12_OVERHEATED")
 
         unqualified = evaluate_profile_admission(
             context(qualification_state="NOT_QUALIFIED"),
@@ -245,6 +273,13 @@ class ProfileAdmissionTest(unittest.TestCase):
         self.assertFalse(warmup.allowed)
         self.assertEqual(warmup.code, "FAST_STATE_BLOCKED")
 
+        primary = evaluate_profile_admission(
+            context(daily_selected=False, daily_rank=None, candidate_ordinal=0),
+            policy,
+        )
+        self.assertFalse(primary.allowed)
+        self.assertEqual(primary.code, "FAST_PRIMARY_BLOCKED")
+
         with self.assertRaisesRegex(ValueError, "fast_allowed_states"):
             replace(policy, fast_allowed_states=("ACTIVE", "WARMUP"))
         with self.assertRaisesRegex(ValueError, "FAST"):
@@ -259,6 +294,17 @@ class ProfileAdmissionTest(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "DAILY_PROFILE_NOT_SELECTED")
+
+        baseline_primary = evaluate_profile_admission(
+            context(
+                daily_selected=False,
+                daily_rank=None,
+                candidate_ordinal=0,
+            ),
+            ProfileAdmissionPolicy(),
+        )
+        self.assertFalse(baseline_primary.allowed)
+        self.assertEqual(baseline_primary.code, "DAILY_PROFILE_NOT_SELECTED")
 
         baseline_warmup = evaluate_profile_admission(
             context(
@@ -279,7 +325,7 @@ class ProfileAdmissionTest(unittest.TestCase):
             profile_key="10|short_observe|generic_short_observe|SHORT|WD-01",
             daily_selected=False,
             daily_rank=None,
-            candidate_ordinal=0,
+            candidate_ordinal=1,
         )
         second_resident = context(
             profile_key="10|long|rebound|LONG|WD-03",

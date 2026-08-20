@@ -102,6 +102,16 @@ PROFILE_SEARCH_ACCEPTANCE = {
     "orders_per_day_max": 55.0,
     "positive_oos_windows_min": 2,
 }
+PROFILE_SEARCH_COMPARISON_METRICS = (
+    "orders",
+    "wins",
+    "losses",
+    "win_rate",
+    "pnl",
+    "ev",
+    "max_drawdown",
+    "max_loss_streak",
+)
 
 
 @dataclass(frozen=True)
@@ -667,6 +677,7 @@ def evaluate_profile_admission_search_gates(
     candidate: dict[str, Any],
     *,
     active_oos_days: float,
+    full_day_metrics: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     thresholds = dict(PROFILE_SEARCH_ACCEPTANCE)
     gates: dict[str, dict[str, Any]] = {}
@@ -735,11 +746,19 @@ def evaluate_profile_admission_search_gates(
         )
         minimum(f"{direction.lower()}_ev", direction_ev, thresholds["ev_min"])
 
-    orders_per_day = (
-        total_orders / float(active_oos_days)
-        if float(active_oos_days) > 0.0
-        else 0.0
-    )
+    if full_day_metrics is not None:
+        orders_per_day = (
+            sum(int(item["orders"]) for item in full_day_metrics)
+            / len(full_day_metrics)
+            if full_day_metrics
+            else 0.0
+        )
+    else:
+        orders_per_day = (
+            total_orders / float(active_oos_days)
+            if float(active_oos_days) > 0.0
+            else 0.0
+        )
     range_gate(
         "orders_per_day",
         orders_per_day,
@@ -824,6 +843,43 @@ def rank_profile_admission_configurations(
     )
 
 
+def _profile_admission_baseline_comparison(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    def compare(
+        baseline_summary: dict[str, Any],
+        candidate_summary: dict[str, Any],
+    ) -> dict[str, dict[str, float | int]]:
+        baseline_metrics = {
+            metric: baseline_summary[metric]
+            for metric in PROFILE_SEARCH_COMPARISON_METRICS
+        }
+        candidate_metrics = {
+            metric: candidate_summary[metric]
+            for metric in PROFILE_SEARCH_COMPARISON_METRICS
+        }
+        return {
+            "baseline": baseline_metrics,
+            "candidate": candidate_metrics,
+            "delta": {
+                metric: candidate_metrics[metric] - baseline_metrics[metric]
+                for metric in PROFILE_SEARCH_COMPARISON_METRICS
+            },
+        }
+
+    return {
+        "total": compare(baseline["total"], candidate["total"]),
+        "by_direction": {
+            direction: compare(
+                baseline["by_direction"][direction],
+                candidate["by_direction"][direction],
+            )
+            for direction in ("LONG", "SHORT")
+        },
+    }
+
+
 def search_profile_admission_policies(
     execution_windows: Sequence[dict[str, Any]],
     execution: ReplayExecutionConfig,
@@ -851,10 +907,16 @@ def search_profile_admission_policies(
         )
         report = _execution_report(execution_result, oos_start, oos_end)
         reports_by_hash[policy.policy_hash] = report
+        full_day_metrics = _full_oos_day_metrics(
+            report["trade_rows"],
+            oos_start,
+            oos_end,
+        )
         gate_report = evaluate_profile_admission_search_gates(
             baseline,
             report,
             active_oos_days=active_oos_days,
+            full_day_metrics=full_day_metrics,
         )
         configurations.append(
             {
@@ -867,11 +929,7 @@ def search_profile_admission_policies(
                 "total": report["total"],
                 "by_direction": report["by_direction"],
                 "daily": report["daily"],
-                "full_day_metrics": _full_oos_day_metrics(
-                    report["trade_rows"],
-                    oos_start,
-                    oos_end,
-                ),
+                "full_day_metrics": full_day_metrics,
                 "oos_windows": report["oos_windows"],
                 "orders_per_day": round(gate_report["orders_per_day_raw"], 6),
                 "orders_per_day_raw": gate_report["orders_per_day_raw"],
@@ -914,6 +972,10 @@ def search_profile_admission_policies(
         "configurations": configurations,
         "ranking": [item["policy_hash"] for item in ranked],
         "best_candidate": best,
+        "baseline_comparison": _profile_admission_baseline_comparison(
+            baseline,
+            best,
+        ),
         "aggregate_gates_passed": aggregate_gates_passed,
         "stability": stability,
         "stability_proven": stability_proven,
@@ -1504,13 +1566,13 @@ def _execute_replay(
         for opened_at, rows in window["groups"]:
             eligible_events += 1
             _settle_due_orders(open_orders, opened_at, progression, loss_ledger)
-            by_key: dict[str, ObservationSignal] = {}
-            for item in sorted(rows, key=lambda row: row.observation_key):
-                by_key.setdefault(_observation_profile_key(item), item)
             admission = None
             adaptive = None
             evaluated_through = 0
             if admission_policy is None:
+                by_key: dict[str, ObservationSignal] = {}
+                for item in sorted(rows, key=lambda row: row.observation_key):
+                    by_key.setdefault(_observation_profile_key(item), item)
                 chosen = next(
                     (
                         by_key[item["key"]]
@@ -1520,8 +1582,13 @@ def _execute_replay(
                     None,
                 )
             else:
-                contexts, adaptive_by_key, evaluated_by_key = _admission_contexts(
-                    by_key,
+                (
+                    contexts,
+                    candidate_by_ordinal,
+                    adaptive_by_ordinal,
+                    evaluated_by_ordinal,
+                ) = _admission_contexts(
+                    rows,
                     selected_profiles,
                     candidate_by_key,
                     adaptive_timeline,
@@ -1532,10 +1599,15 @@ def _execute_replay(
                     decision = evaluate_profile_admission(context, admission_policy)
                     admission_codes[decision.code] += 1
                 admission = select_admitted_candidate(contexts, admission_policy)
-                chosen = by_key.get(admission.context.profile_key) if admission else None
+                chosen = (
+                    candidate_by_ordinal[admission.context.candidate_ordinal]
+                    if admission is not None
+                    else None
+                )
                 if admission is not None:
-                    adaptive = adaptive_by_key[admission.context.profile_key]
-                    evaluated_through = evaluated_by_key[admission.context.profile_key]
+                    ordinal = admission.context.candidate_ordinal
+                    adaptive = adaptive_by_ordinal[ordinal]
+                    evaluated_through = evaluated_by_ordinal[ordinal]
             if chosen is None:
                 rejections["profile_not_selected"] += 1
                 continue
@@ -1681,7 +1753,7 @@ def _execute_replay(
 
 
 def _admission_contexts(
-    by_key: dict[str, ObservationSignal],
+    rows: Sequence[ObservationSignal],
     selected_profiles: Sequence[dict[str, Any]],
     candidate_by_key: dict[str, dict[str, Any]],
     adaptive_timeline: dict[str, Any],
@@ -1689,8 +1761,9 @@ def _admission_contexts(
     opened_at: int,
 ) -> tuple[
     tuple[ProfileAdmissionContext, ...],
-    dict[str, dict[str, Any]],
-    dict[str, int],
+    dict[int, ObservationSignal],
+    dict[int, dict[str, Any]],
+    dict[int, int],
 ]:
     selected_ranks = {
         item["key"]: rank
@@ -1700,19 +1773,58 @@ def _admission_contexts(
         direction: sum(1 for order in open_orders if order["direction"] == direction)
         for direction in ("LONG", "SHORT")
     }
-    adaptive_by_key: dict[str, dict[str, Any]] = {}
-    evaluated_by_key: dict[str, int] = {}
+    candidate_by_ordinal: dict[int, ObservationSignal] = {}
+    adaptive_by_ordinal: dict[int, dict[str, Any]] = {}
+    evaluated_by_ordinal: dict[int, int] = {}
     contexts = []
-    for ordinal, profile_key_value in enumerate(sorted(by_key)):
-        item = by_key[profile_key_value]
+    ordered_rows = sorted(
+        rows,
+        key=lambda item: (
+            item.observation_key,
+            item.candidate_origin,
+            item.decision_id,
+        ),
+    )
+    used_ordinals: set[int] = set()
+    fallback_ordinal = 1
+    for item in ordered_rows:
+        identity = (
+            item.decision_inputs.get("identity")
+            if isinstance(item.decision_inputs, dict)
+            else None
+        )
+        candidate_identity = (
+            identity.get("candidate_identity", identity)
+            if isinstance(identity, dict)
+            else None
+        )
+        frozen_ordinal = (
+            candidate_identity.get("candidate_ordinal")
+            if isinstance(candidate_identity, dict)
+            else None
+        )
+        if (
+            type(frozen_ordinal) is int
+            and frozen_ordinal >= 0
+            and frozen_ordinal not in used_ordinals
+        ):
+            ordinal = frozen_ordinal
+        else:
+            while fallback_ordinal in used_ordinals:
+                fallback_ordinal += 1
+            ordinal = fallback_ordinal
+            fallback_ordinal += 1
+        used_ordinals.add(ordinal)
+        profile_key_value = _observation_profile_key(item)
         profile = candidate_by_key.get(profile_key_value) or {}
         adaptive, evaluated_through = _adaptive_state_before(
             adaptive_timeline,
             profile_key_value,
             opened_at,
         )
-        adaptive_by_key[profile_key_value] = adaptive
-        evaluated_by_key[profile_key_value] = evaluated_through
+        candidate_by_ordinal[ordinal] = item
+        adaptive_by_ordinal[ordinal] = adaptive
+        evaluated_by_ordinal[ordinal] = evaluated_through
         direction = str(item.direction).upper()
         n12 = adaptive.get("n12") or _empty_sample_summary()
         n20 = adaptive.get("n20") or _empty_sample_summary()
@@ -1755,7 +1867,12 @@ def _admission_contexts(
                 candidate_ordinal=ordinal,
             )
         )
-    return tuple(contexts), adaptive_by_key, evaluated_by_key
+    return (
+        tuple(contexts),
+        candidate_by_ordinal,
+        adaptive_by_ordinal,
+        evaluated_by_ordinal,
+    )
 
 
 def _settle_due_orders(

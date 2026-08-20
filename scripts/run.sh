@@ -48,7 +48,14 @@ OBSERVATION_PROFILE_MIN_EV="${OBSERVATION_PROFILE_MIN_EV:-4}"
 OBSERVATION_PROFILE_MIN_EDGE="${OBSERVATION_PROFILE_MIN_EDGE:-10}"
 LIVE_SHORT_SEGMENTS="${LIVE_SHORT_SEGMENTS:-WD-02,WD-23}"
 PROFILE_ADMISSION_ENABLE="${PROFILE_ADMISSION_ENABLE:-0}"
-PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS="${PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS:-8}"
+if [ "${PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS+x}" = "x" ]; then
+  echo "PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS 已废弃；请分别配置 LONG/SHORT N12 上限" >&2
+  exit 2
+fi
+PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS="${PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS:-7}"
+PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS="${PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS:-9}"
+PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR="${PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR:-off}"
+PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR="${PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR:-0.625}"
 PROFILE_ADMISSION_FAST_DIRECTIONS="${PROFILE_ADMISSION_FAST_DIRECTIONS:-SHORT}"
 PROFILE_ADMISSION_FAST_N12_MIN_WINS="${PROFILE_ADMISSION_FAST_N12_MIN_WINS:-7}"
 PROFILE_ADMISSION_FAST_N12_MAX_WINS="${PROFILE_ADMISSION_FAST_N12_MAX_WINS:-8}"
@@ -150,8 +157,14 @@ usage() {
   --enable-profile-admission
                          显式启用冻结画像准入候选；默认关闭并使用兼容基准
                          前向稳定性尚未证明，release_allowed 固定为 false
-  --profile-admission-resident-n12-max-wins N
-                         常驻画像 N12 最大胜数，候选默认: 8
+  --profile-admission-resident-long-n12-max-wins N
+                         LONG 常驻画像 N12 最大胜数，候选默认: 7
+  --profile-admission-resident-short-n12-max-wins N
+                         SHORT 常驻画像 N12 最大胜数，候选默认: 9
+  --profile-admission-resident-long-win-rate-floor N|off
+                         LONG 常驻画像当日胜率下限，候选默认: off
+  --profile-admission-resident-short-win-rate-floor N|off
+                         SHORT 常驻画像当日胜率下限，候选默认: 0.625
   --profile-admission-fast-directions LIST
                          快速通道允许方向，逗号分隔，候选默认: SHORT
   --profile-admission-fast-n12-min-wins N
@@ -213,7 +226,11 @@ usage() {
   OBSERVATION_PROFILE_PROMOTION, OBSERVATION_PROFILE_LOOKBACK_DAYS,
   OBSERVATION_PROFILE_MIN_SAMPLES, OBSERVATION_PROFILE_MIN_WIN_RATE,
   OBSERVATION_PROFILE_MIN_EV, OBSERVATION_PROFILE_MIN_EDGE, LIVE_SHORT_SEGMENTS,
-  PROFILE_ADMISSION_ENABLE, PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS,
+  PROFILE_ADMISSION_ENABLE,
+  PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS,
+  PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS,
+  PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR,
+  PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR,
   PROFILE_ADMISSION_FAST_DIRECTIONS, PROFILE_ADMISSION_FAST_N12_MIN_WINS,
   PROFILE_ADMISSION_FAST_N12_MAX_WINS, PROFILE_ADMISSION_FAST_N20_EV_MIN,
   DAILY_PROFILE_SELECTOR, DAILY_PROFILE_LOOKBACK_DAYS,
@@ -595,13 +612,40 @@ while [ "$#" -gt 0 ]; do
       PROFILE_ADMISSION_ENABLE="1"
       shift
       ;;
-    --profile-admission-resident-n12-max-wins)
+    --profile-admission-resident-long-n12-max-wins)
       require_value "$1" "${2:-}"
-      PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS="$2"
+      PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS="$2"
       shift 2
       ;;
-    --profile-admission-resident-n12-max-wins=*)
-      PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS="${1#*=}"
+    --profile-admission-resident-long-n12-max-wins=*)
+      PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-resident-short-n12-max-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-short-n12-max-wins=*)
+      PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-resident-long-win-rate-floor)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-long-win-rate-floor=*)
+      PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR="${1#*=}"
+      shift
+      ;;
+    --profile-admission-resident-short-win-rate-floor)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-short-win-rate-floor=*)
+      PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR="${1#*=}"
       shift
       ;;
     --profile-admission-fast-directions)
@@ -884,6 +928,12 @@ case "$PROFILE_ADMISSION_ENABLE" in
   1|true|TRUE|yes|YES|y|Y|on|ON)
     EXTRA_ARGS+=(--enable-profile-admission)
     ;;
+  0|false|FALSE|no|NO|n|N|off|OFF)
+    ;;
+  *)
+    echo "PROFILE_ADMISSION_ENABLE 必须为布尔值，实际为: $PROFILE_ADMISSION_ENABLE" >&2
+    exit 2
+    ;;
 esac
 case "$WARMUP_CURRENT_MONTH_DAILY" in
   0|false|FALSE|no|NO|n|N|off|OFF)
@@ -945,7 +995,10 @@ exec "$PYTHON_BIN" -m app.server \
   --observation-profile-min-ev "$OBSERVATION_PROFILE_MIN_EV" \
   --observation-profile-min-edge "$OBSERVATION_PROFILE_MIN_EDGE" \
   --live-short-segments "$LIVE_SHORT_SEGMENTS" \
-  --profile-admission-resident-n12-max-wins "$PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS" \
+  --profile-admission-resident-long-n12-max-wins "$PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS" \
+  --profile-admission-resident-short-n12-max-wins "$PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS" \
+  --profile-admission-resident-long-win-rate-floor "$PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR" \
+  --profile-admission-resident-short-win-rate-floor "$PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR" \
   --profile-admission-fast-directions "$PROFILE_ADMISSION_FAST_DIRECTIONS" \
   --profile-admission-fast-n12-min-wins "$PROFILE_ADMISSION_FAST_N12_MIN_WINS" \
   --profile-admission-fast-n12-max-wins "$PROFILE_ADMISSION_FAST_N12_MAX_WINS" \

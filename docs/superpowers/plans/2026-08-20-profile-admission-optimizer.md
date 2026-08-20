@@ -25,17 +25,17 @@
 - Create: `app/profile_admission.py`
 - Create: `tests/test_profile_admission.py`
 
-- [ ] **Step 1: Write failing policy validation and canonical hash tests**
+- [x] **Step 1: Write failing policy validation and canonical hash tests**
 
 Add tests which import `ProfileAdmissionPolicy`, `ProfileAdmissionContext`, `evaluate_profile_admission`, `candidate_policy`, and `policy_grid`. Assert that equivalent set ordering produces the same hash, non-finite EV and inverted N12 bounds fail, and `policy_grid()` returns 32 unique hashes in deterministic order.
 
-- [ ] **Step 2: Run the new tests and confirm RED**
+- [x] **Step 2: Run the new tests and confirm RED**
 
 Run: `python3 -m unittest tests.test_profile_admission -v`
 
 Expected: FAIL with `ModuleNotFoundError: No module named 'app.profile_admission'`.
 
-- [ ] **Step 3: Implement immutable policy and context types**
+- [x] **Step 3: Implement immutable policy and context types**
 
 Implement:
 
@@ -82,15 +82,15 @@ class ProfileAdmissionContext:
 
 Expose canonical `to_dict()`, JSON, hash, baseline policy, current candidate policy and deterministic 32-policy grid.
 
-- [ ] **Step 4: Add failing admission matrix and ranking tests**
+- [x] **Step 4: Add failing admission matrix and ranking tests**
 
 Cover resident ACTIVE/WATCH/PAUSED/WARMUP, resident N12 overheat, unselected SHORT ACTIVE fast admission, LONG fast rejection, second-slot rejection, and deterministic `RESIDENT` before `FAST` ranking.
 
-- [ ] **Step 5: Implement pure admission and ranking**
+- [x] **Step 5: Implement pure admission and ranking**
 
 Return a frozen `ProfileAdmissionDecision` containing `allowed`, `channel`, `code`, `allow_second_order`, `allow_progression`, `policy_version`, `policy_hash`, and `rank_key`. Codes must distinguish daily missing, state blocked, resident overheated, fast direction/state/N12/N20 rejection, WATCH second slot and admitted RESIDENT/FAST.
 
-- [ ] **Step 6: Run focused tests and commit**
+- [x] **Step 6: Run focused tests and commit**
 
 Run: `python3 -m unittest tests.test_profile_admission -v`
 
@@ -105,29 +105,29 @@ Commit: `feat: add shared profile admission policy`
 - Modify: `scripts/replay_daily_profile_selector.py`
 - Modify: `tests/test_daily_profile_replay.py`
 
-- [ ] **Step 1: Write failing replay tests for shared selection**
+- [x] **Step 1: Write failing replay tests for shared selection**
 
 Add fixtures where a blocked first resident falls through to the next resident, where no resident exists and a SHORT ACTIVE fast candidate is selected, and where LONG/WARMUP/PAUSED candidates remain rejected. Assert the selected observation key, admission channel/code, and progression prohibition.
 
-- [ ] **Step 2: Verify RED against the current daily-only selector**
+- [x] **Step 2: Verify RED against the current daily-only selector**
 
 Run: `python3 -m unittest tests.test_daily_profile_replay.DailyProfileReplayTest.test_replay_fast_lane_uses_shared_admission tests.test_daily_profile_replay.DailyProfileReplayTest.test_blocked_resident_falls_through -v`
 
 Expected: FAIL because `_execute_replay` only chooses the first daily-selected profile.
 
-- [ ] **Step 3: Preserve full adaptive before-state inputs**
+- [x] **Step 3: Preserve full adaptive before-state inputs**
 
 Add `transition` to compact adaptive event rows and timeline snapshots. Build every execution candidate's `ProfileAdmissionContext` from the latest strictly earlier settlement snapshot; never use the current event's result or after-state.
 
-- [ ] **Step 4: Replace replay-only admission branches**
+- [x] **Step 4: Replace replay-only admission branches**
 
 Change `_execute_replay(..., admission_policy=...)` to evaluate all candidates in each opened-time group through `select_admitted_candidate`. Preserve existing concurrency, cooldown, three-loss ledger and `TwoStageStakeProgression`; use the decision's `allow_progression` and record policy hash/channel/code on each trade.
 
-- [ ] **Step 5: Write failing automatic-search and precision tests**
+- [x] **Step 5: Write failing automatic-search and precision tests**
 
 Assert exactly32 configurations, hard constraints without rounded values, deterministic ranking, no release policy when none passes, and distinct `aggregate_gates_passed`, `stability_proven`, `release_allowed` fields. Add a fixture where aggregate metrics pass but the seven-day forward requirement is absent; expected release remains blocked.
 
-- [ ] **Step 6: Implement search report**
+- [x] **Step 6: Implement search report**
 
 Expose `search_profile_admission_policies(...)` which reuses one causal schedule/timeline/execution plan, evaluates each policy independently, calculates active OOS duration, orders/day, full-day metrics and three chronological windows, then ranks by:
 
@@ -143,7 +143,7 @@ policy_hash asc
 
 The CLI report must include all32 summaries, best candidate, exact failed gates, equivalence scope and stability status. Keep the baseline and structure equality executions unchanged.
 
-- [ ] **Step 7: Run replay tests and commit**
+- [x] **Step 7: Run replay tests and commit**
 
 Run: `python3 -m unittest tests.test_daily_profile_replay tests.test_adaptive_profile_state -v`
 
@@ -161,29 +161,29 @@ Commit: `feat: add causal profile admission search`
 - Modify: `tests/test_server.py`
 - Modify: `tests/test_packaging.py`
 
-- [ ] **Step 1: Write failing runtime candidate-selection tests**
+- [x] **Step 1: Write failing runtime candidate-selection tests**
 
 Add state tests proving: a non-selected SHORT observation with ACTIVE N12 7-8 becomes an actionable FAST candidate; non-selected LONG remains observation-only; resident N12 above the configured maximum falls through; FAST/WATCH never consumes progression; the frozen decision context contains policy version/hash/channel/code.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `python3 -m unittest tests.test_state -k profile_admission -v`
 
 Expected: FAIL because `_select_daily_profile_signal` only scans selected profiles and `_maybe_open_order_locked` blocks every unselected profile.
 
-- [ ] **Step 3: Inject policy and share candidate selection**
+- [x] **Step 3: Inject policy and share candidate selection**
 
 Add `profile_admission_policy: ProfileAdmissionPolicy | None` to `MonitorState`; default to baseline compatibility. Rewrite `_select_daily_profile_signal` to build contexts for all primary/observation candidates and call the shared selector. Attach the selected decision under `adaptive_profile_state["admission"]`; `_maybe_open_order_locked` trusts only a recomputed matching policy hash and permits FAST without setting `daily_profile_selected=True`.
 
-- [ ] **Step 4: Freeze audit values and failure behavior**
+- [x] **Step 4: Freeze audit values and failure behavior**
 
 Include policy data in runtime config snapshots and decision traces. Invalid/missing/unknown policy input must fail startup or explicitly use baseline policy; it must never silently enable FAST. Keep entry structure `SHADOW_ONLY`.
 
-- [ ] **Step 5: Add Chinese CLI/startup parameters**
+- [x] **Step 5: Add Chinese CLI/startup parameters**
 
-Add explicit server/run.sh options for admission enablement, resident N12 maximum, FAST directions, N12 range and N20 EV minimum. Defaults on this feature branch represent the current candidate (`8`, SHORT, `7-8`, `0`) but startup state reports `release_allowed=false` until forward stability is proven.
+Add explicit server/run.sh options for admission enablement, LONG/SHORT resident N12 maxima and daily win-rate floors, FAST directions, N12 range and N20 EV minimum. Defaults on this feature branch represent the current candidate (LONG `7`, SHORT `9`, SHORT daily floor `0.625`, FAST SHORT `7-8`, EV `0`) but startup state reports `release_allowed=false` until forward stability is proven.
 
-- [ ] **Step 6: Run runtime and packaging regressions and commit**
+- [x] **Step 6: Run runtime and packaging regressions and commit**
 
 Run: `python3 -m unittest tests.test_state tests.test_server tests.test_packaging -v`
 
@@ -201,25 +201,25 @@ Commit: `feat: apply frozen profile admission policy`
 - Modify: `docs/release-handoff.md`
 - Verify: all implementation and test files
 
-- [ ] **Step 1: Run copied-database search**
+- [x] **Step 1: Run copied-database search**
 
 Run the existing explicit production command against `/private/tmp/monitor-replay.sqlite3`, adding the automatic profile admission search output path `/private/tmp/profile-admission-optimizer-report.json`. Record source SHA-256 before and after.
 
 Expected: 4997 settled observations, zero leakage, unchanged SQLite hash, exactly32 evaluated policies and a deterministic best candidate.
 
-- [ ] **Step 2: Verify target and stability separately**
+- [x] **Step 2: Verify target and stability separately**
 
 Confirm the report's raw counts, LONG/SHORT metrics, orders/day, EV, PnL, drawdown, daily distribution and OOS windows. Do not mark release allowed unless both aggregate and seven-full-day forward gates pass.
 
-- [ ] **Step 3: Update the single handoff**
+- [x] **Step 3: Update the single handoff**
 
 Append one section to `docs/release-handoff.md` with policy hash, search grid, baseline/candidate metrics, failed stability evidence, exact replay command, explicit equivalence scope and `未部署` status.
 
-- [ ] **Step 4: Request independent code review**
+- [x] **Step 4: Request independent code review**
 
 Review the diff from `840076a` through HEAD for P1/P2 correctness, production/replay drift, future leakage, candidate ordering, progression credit, report precision and configuration safety. Resolve findings and rerun affected tests.
 
-- [ ] **Step 5: Run final verification**
+- [x] **Step 5: Run final verification**
 
 Run:
 

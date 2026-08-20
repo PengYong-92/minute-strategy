@@ -31,7 +31,10 @@ class OrdersApiTest(unittest.TestCase):
                 {},
                 [
                     "--enable-profile-admission",
-                    "--profile-admission-resident-n12-max-wins", "8",
+                    "--profile-admission-resident-long-n12-max-wins", "7",
+                    "--profile-admission-resident-short-n12-max-wins", "9",
+                    "--profile-admission-resident-long-win-rate-floor", "off",
+                    "--profile-admission-resident-short-win-rate-floor", "0.625",
                     "--profile-admission-fast-directions", "SHORT",
                     "--profile-admission-fast-n12-min-wins", "7",
                     "--profile-admission-fast-n12-max-wins", "8",
@@ -90,6 +93,14 @@ class OrdersApiTest(unittest.TestCase):
                 "--enable-profile-admission",
                 "--profile-admission-fast-n20-ev-min", "nan",
             ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-resident-long-n12-max-wins", "13",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-resident-short-win-rate-floor", "1.1",
+            ],
         )
         for cli_args in invalid_args:
             with self.subTest(cli_args=cli_args):
@@ -106,6 +117,40 @@ class OrdersApiTest(unittest.TestCase):
                 self.assertFalse(monitor_state.called)
                 self.assertIn("画像准入策略", stderr.getvalue())
 
+    def test_profile_admission_invalid_environment_switch_fails_startup(self):
+        stderr = StringIO()
+        with (
+            patch.dict(os.environ, {"PROFILE_ADMISSION_ENABLE": "tru"}, clear=True),
+            patch.object(sys, "argv", ["app.server"]),
+            redirect_stderr(stderr),
+            patch("app.server.MonitorState") as monitor_state,
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertFalse(monitor_state.called)
+        self.assertIn("PROFILE_ADMISSION_ENABLE", stderr.getvalue())
+
+    def test_profile_admission_deprecated_shared_environment_fails_startup(self):
+        stderr = StringIO()
+        with (
+            patch.dict(
+                os.environ,
+                {"PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS": "8"},
+                clear=True,
+            ),
+            patch.object(sys, "argv", ["app.server"]),
+            redirect_stderr(stderr),
+            patch("app.server.MonitorState") as monitor_state,
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertFalse(monitor_state.called)
+        self.assertIn("PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS", stderr.getvalue())
+
     def test_profile_admission_help_is_explicitly_chinese_and_marks_release_blocked(self):
         stdout = StringIO()
         with (
@@ -119,7 +164,11 @@ class OrdersApiTest(unittest.TestCase):
         help_text = stdout.getvalue()
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--enable-profile-admission", help_text)
-        self.assertIn("--profile-admission-resident-n12-max-wins", help_text)
+        self.assertNotIn("--profile-admission-resident-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-resident-long-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-resident-short-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-resident-long-win-rate-floor", help_text)
+        self.assertIn("--profile-admission-resident-short-win-rate-floor", help_text)
         self.assertIn("--profile-admission-fast-directions", help_text)
         self.assertIn("--profile-admission-fast-n12-min-wins", help_text)
         self.assertIn("--profile-admission-fast-n12-max-wins", help_text)

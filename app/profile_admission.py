@@ -28,7 +28,11 @@ class ProfileAdmissionPolicy:
     version: str = PROFILE_ADMISSION_VERSION
     resident_allowed_states: tuple[str, ...] = ("ACTIVE", "WATCH")
     resident_n12_max_wins: int = 12
+    resident_long_n12_max_wins: int | None = None
+    resident_short_n12_max_wins: int | None = None
     resident_daily_win_rate_floor: float | None = None
+    resident_long_daily_win_rate_floor: float | None = None
+    resident_short_daily_win_rate_floor: float | None = None
     fast_enabled: bool = False
     fast_directions: tuple[str, ...] = ("SHORT",)
     fast_allowed_states: tuple[str, ...] = ("ACTIVE",)
@@ -91,8 +95,20 @@ class ProfileAdmissionPolicy:
             raise ValueError("FAST must not allow second orders or progression")
         if self.watch_allow_second_order or self.watch_allow_progression:
             raise ValueError("WATCH must not allow second orders or progression")
-        if type(self.resident_n12_max_wins) is not int or not 0 <= self.resident_n12_max_wins <= 12:
+        if (
+            type(self.resident_n12_max_wins) is not int
+            or not 0 <= self.resident_n12_max_wins <= 12
+        ):
             raise ValueError("resident_n12_max_wins must be between 0 and 12")
+        for name in (
+            "resident_long_n12_max_wins",
+            "resident_short_n12_max_wins",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not int or not 0 <= value <= 12
+            ):
+                raise ValueError(f"{name} must be between 0 and 12")
         if (
             type(self.fast_n12_min_wins) is not int
             or type(self.fast_n12_max_wins) is not int
@@ -103,15 +119,22 @@ class ProfileAdmissionPolicy:
             float(self.fast_n20_ev_min)
         ):
             raise ValueError("fast_n20_ev_min must be finite")
-        if self.resident_daily_win_rate_floor is not None:
-            if isinstance(self.resident_daily_win_rate_floor, bool):
-                raise ValueError("resident_daily_win_rate_floor must be between 0 and 1")
-            floor = float(self.resident_daily_win_rate_floor)
+        for name in (
+            "resident_daily_win_rate_floor",
+            "resident_long_daily_win_rate_floor",
+            "resident_short_daily_win_rate_floor",
+        ):
+            raw_floor = getattr(self, name)
+            if raw_floor is None:
+                continue
+            if isinstance(raw_floor, bool):
+                raise ValueError(f"{name} must be between 0 and 1")
+            floor = float(raw_floor)
             if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
-                raise ValueError("resident_daily_win_rate_floor must be between 0 and 1")
+                raise ValueError(f"{name} must be between 0 and 1")
             object.__setattr__(
                 self,
-                "resident_daily_win_rate_floor",
+                name,
                 0.0 if floor == 0.0 else floor,
             )
         fast_n20_ev_min = float(self.fast_n20_ev_min)
@@ -157,7 +180,32 @@ class ProfileAdmissionPolicy:
 
     @property
     def complexity(self) -> int:
-        return int(self.fast_enabled) + int(self.resident_daily_win_rate_floor is not None)
+        return sum(
+            (
+                int(self.fast_enabled),
+                int(self.resident_daily_win_rate_floor is not None),
+                int(self.resident_long_n12_max_wins is not None),
+                int(self.resident_short_n12_max_wins is not None),
+                int(self.resident_long_daily_win_rate_floor is not None),
+                int(self.resident_short_daily_win_rate_floor is not None),
+            )
+        )
+
+    def resident_n12_limit(self, direction: str) -> int:
+        override = (
+            self.resident_long_n12_max_wins
+            if str(direction).upper() == "LONG"
+            else self.resident_short_n12_max_wins
+        )
+        return self.resident_n12_max_wins if override is None else override
+
+    def resident_win_rate_floor(self, direction: str) -> float | None:
+        override = (
+            self.resident_long_daily_win_rate_floor
+            if str(direction).upper() == "LONG"
+            else self.resident_short_daily_win_rate_floor
+        )
+        return self.resident_daily_win_rate_floor if override is None else override
 
 
 @dataclass(frozen=True)
@@ -301,8 +349,12 @@ def baseline_policy() -> ProfileAdmissionPolicy:
 def candidate_policy() -> ProfileAdmissionPolicy:
     return ProfileAdmissionPolicy(
         resident_allowed_states=("ACTIVE", "WATCH"),
-        resident_n12_max_wins=8,
+        resident_n12_max_wins=12,
+        resident_long_n12_max_wins=7,
+        resident_short_n12_max_wins=9,
         resident_daily_win_rate_floor=None,
+        resident_long_daily_win_rate_floor=None,
+        resident_short_daily_win_rate_floor=0.625,
         fast_enabled=True,
         fast_directions=("SHORT",),
         fast_allowed_states=("ACTIVE",),
@@ -316,8 +368,12 @@ def policy_grid() -> tuple[ProfileAdmissionPolicy, ...]:
     return tuple(
         ProfileAdmissionPolicy(
             resident_allowed_states=("ACTIVE", "WATCH"),
-            resident_n12_max_wins=resident_max,
-            resident_daily_win_rate_floor=daily_floor,
+            resident_n12_max_wins=12,
+            resident_long_n12_max_wins=long_max,
+            resident_short_n12_max_wins=short_max,
+            resident_daily_win_rate_floor=None,
+            resident_long_daily_win_rate_floor=long_floor,
+            resident_short_daily_win_rate_floor=short_floor,
             fast_enabled=True,
             fast_directions=("SHORT",),
             fast_allowed_states=("ACTIVE",),
@@ -325,8 +381,10 @@ def policy_grid() -> tuple[ProfileAdmissionPolicy, ...]:
             fast_n12_max_wins=fast_max,
             fast_n20_ev_min=0.0,
         )
-        for resident_max in (7, 8, 9, 12)
-        for daily_floor in (None, 0.55, 0.60, 0.65)
+        for long_max in (7, 8)
+        for short_max in (8, 9)
+        for long_floor in (None, 0.60)
+        for short_floor in (None, 0.625)
         for fast_max in (7, 8)
     )
 
@@ -394,7 +452,7 @@ def evaluate_profile_admission(
                 channel="NONE",
                 code="RESIDENT_STATE_BLOCKED",
             )
-        if context.n12_wins > policy.resident_n12_max_wins:
+        if context.n12_wins > policy.resident_n12_limit(context.direction):
             return _decision(
                 context,
                 policy,
@@ -402,10 +460,8 @@ def evaluate_profile_admission(
                 channel="NONE",
                 code="RESIDENT_N12_OVERHEATED",
             )
-        if (
-            policy.resident_daily_win_rate_floor is not None
-            and context.daily_win_rate < policy.resident_daily_win_rate_floor
-        ):
+        resident_floor = policy.resident_win_rate_floor(context.direction)
+        if resident_floor is not None and context.daily_win_rate < resident_floor:
             return _decision(
                 context,
                 policy,
@@ -456,6 +512,14 @@ def evaluate_profile_admission(
             allowed=False,
             channel="NONE",
             code="DAILY_PROFILE_NOT_SELECTED",
+        )
+    if context.candidate_ordinal <= 0:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_PRIMARY_BLOCKED",
         )
     if context.direction != "SHORT" or context.direction not in policy.fast_directions:
         return _decision(

@@ -1790,6 +1790,9 @@ class MonitorState:
         )
         admission = {
             **deepcopy(run.admission_snapshot),
+            "profile_admission_candidates": deepcopy(
+                adaptive.get("admission_candidates", [])
+            ),
             "guards": deepcopy(audit_context),
             "guard_results": {
                 stage: deepcopy(
@@ -2532,12 +2535,14 @@ class MonitorState:
         candidate_origin = self._formal_candidate_origin(signal)
         if signal.candidate_origin != candidate_origin:
             signal = replace(signal, candidate_origin=candidate_origin)
-        if daily_profile_required:
+        candidate_ordinal = self._profile_admission_candidate_ordinal(signal)
+        if daily_profile_required and self._signal_direction(signal) in {"LONG", "SHORT"}:
             signal, admission_context, admission_decision = (
                 self._recompute_profile_admission(
                     signal,
                     current_time=latest.close_time,
                     candidate_origin=candidate_origin,
+                    candidate_ordinal=candidate_ordinal,
                 )
             )
         signal = self._attach_entry_structure_snapshot(
@@ -2550,7 +2555,7 @@ class MonitorState:
             signal,
             latest,
             candidate_origin=candidate_origin,
-            candidate_ordinal=0,
+            candidate_ordinal=candidate_ordinal,
         )
         reused_decision = self._reuse_committed_decision(signal, latest, run)
         if reused_decision is not None:
@@ -3700,6 +3705,11 @@ class MonitorState:
                 ),
             }
         )
+        previous_adaptive = signal.adaptive_profile_state
+        if isinstance(previous_adaptive, dict):
+            for key in ("admission", "admission_candidates"):
+                if key in previous_adaptive:
+                    state[key] = deepcopy(previous_adaptive[key])
         return replace(signal, adaptive_profile_state=state)
 
     def _profile_admission_status(self) -> dict[str, object]:
@@ -3834,6 +3844,14 @@ class MonitorState:
             decision,
         )
 
+    @staticmethod
+    def _profile_admission_candidate_ordinal(signal: Signal) -> int:
+        adaptive = signal.adaptive_profile_state
+        admission = adaptive.get("admission") if isinstance(adaptive, dict) else None
+        context = admission.get("context") if isinstance(admission, dict) else None
+        value = context.get("candidate_ordinal") if isinstance(context, dict) else 0
+        return value if type(value) is int and value >= 0 else 0
+
     def _select_daily_profile_signal(
         self,
         primary_signal: Signal,
@@ -3901,6 +3919,13 @@ class MonitorState:
             eligible_contexts,
             self.profile_admission_policy,
         )
+        candidate_admissions = [
+            self._profile_admission_payload(
+                context,
+                evaluate_profile_admission(context, self.profile_admission_policy),
+            )
+            for context in eligible_contexts
+        ]
         if selected is not None:
             signal, _context = prepared[selected.context.candidate_ordinal]
             selected_profile = next(
@@ -3935,16 +3960,11 @@ class MonitorState:
                 selected.context,
                 selected.decision,
             )
-            effective_threshold = (
-                min(signal.threshold, abs(signal.score))
-                if selected.decision.channel == "FAST"
-                else signal.threshold
-            )
+            adaptive["admission_candidates"] = candidate_admissions
             return (
                 replace(
                     signal,
                     reason=reason,
-                    threshold=effective_threshold,
                     calculated_threshold=calculated_threshold,
                     session_allowed=True,
                     session_sample_size=int(selected_profile.get("sample_size", 0) or 0),
@@ -3955,7 +3975,9 @@ class MonitorState:
                 ),
                 True,
             )
-        return primary_signal, True
+        adaptive = deepcopy(primary_signal.adaptive_profile_state)
+        adaptive["admission_candidates"] = candidate_admissions
+        return replace(primary_signal, adaptive_profile_state=adaptive), True
 
     @staticmethod
     def _without_dynamic_threshold_block(signal: Signal) -> str:
