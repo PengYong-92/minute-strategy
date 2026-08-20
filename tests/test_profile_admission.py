@@ -74,6 +74,8 @@ class ProfileAdmissionTest(unittest.TestCase):
             ProfileAdmissionPolicy(resident_daily_win_rate_floor=1.1)
         with self.assertRaisesRegex(ValueError, "fast_enabled"):
             ProfileAdmissionPolicy(fast_enabled=1)
+        with self.assertRaisesRegex(ValueError, "fast_n20_ev_min"):
+            ProfileAdmissionPolicy(fast_n20_ev_min=True)
         with self.assertRaisesRegex(ValueError, "fast_directions"):
             ProfileAdmissionPolicy(fast_directions=("SIDEWAYS",))
 

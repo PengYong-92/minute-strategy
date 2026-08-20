@@ -95,9 +95,13 @@ class ProfileAdmissionPolicy:
             or not 0 <= self.fast_n12_min_wins <= self.fast_n12_max_wins <= 12
         ):
             raise ValueError("fast_n12 bounds must satisfy 0 <= min <= max <= 12")
-        if not math.isfinite(float(self.fast_n20_ev_min)):
+        if isinstance(self.fast_n20_ev_min, bool) or not math.isfinite(
+            float(self.fast_n20_ev_min)
+        ):
             raise ValueError("fast_n20_ev_min must be finite")
         if self.resident_daily_win_rate_floor is not None:
+            if isinstance(self.resident_daily_win_rate_floor, bool):
+                raise ValueError("resident_daily_win_rate_floor must be between 0 and 1")
             floor = float(self.resident_daily_win_rate_floor)
             if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
                 raise ValueError("resident_daily_win_rate_floor must be between 0 and 1")
@@ -186,6 +190,8 @@ class ProfileAdmissionContext:
             raise ValueError("daily_selected must be a boolean")
         if self.daily_rank is not None and (type(self.daily_rank) is not int or self.daily_rank <= 0):
             raise ValueError("daily_rank must be a positive integer")
+        if isinstance(self.daily_win_rate, bool):
+            raise ValueError("daily_win_rate must be between 0 and 1")
         daily_win_rate = float(self.daily_win_rate)
         if not math.isfinite(daily_win_rate) or not 0.0 <= daily_win_rate <= 1.0:
             raise ValueError("daily_win_rate must be between 0 and 1")
@@ -202,6 +208,8 @@ class ProfileAdmissionContext:
             raise ValueError("n12_wins must fit n12_sample_size <= 12")
         if self.n20_sample_size > 20:
             raise ValueError("n20_sample_size must not exceed 20")
+        if isinstance(self.n20_ev, bool):
+            raise ValueError("n20_ev must be finite")
         n20_ev = float(self.n20_ev)
         if not math.isfinite(n20_ev):
             raise ValueError("n20_ev must be finite")
