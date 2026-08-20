@@ -22,7 +22,7 @@ def context(**overrides) -> ProfileAdmissionContext:
         "direction": "SHORT",
         "order_slot": "FIRST",
         "daily_selected": True,
-        "qualification_state": "SELECTED",
+        "qualification_state": "QUALIFIED",
         "daily_rank": 1,
         "daily_win_rate": 0.66,
         "adaptive_state": "ACTIVE",
@@ -43,14 +43,18 @@ class ProfileAdmissionTest(unittest.TestCase):
     def test_policy_hash_is_canonical_and_grid_is_unique(self):
         first = ProfileAdmissionPolicy(
             resident_allowed_states=("WATCH", "ACTIVE"),
-            fast_directions=("SHORT", "LONG"),
+            fast_directions=("SHORT", "SHORT"),
         )
         second = ProfileAdmissionPolicy(
             resident_allowed_states=("ACTIVE", "WATCH"),
-            fast_directions=("LONG", "SHORT"),
+            fast_directions=("SHORT",),
         )
         self.assertEqual(first.policy_hash, second.policy_hash)
         self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(
+            ProfileAdmissionPolicy(fast_n20_ev_min=-0.0).policy_hash,
+            ProfileAdmissionPolicy(fast_n20_ev_min=0.0).policy_hash,
+        )
 
         policies = policy_grid()
         self.assertEqual(len(policies), 32)
@@ -64,6 +68,10 @@ class ProfileAdmissionTest(unittest.TestCase):
             ProfileAdmissionPolicy(fast_n12_min_wins=9, fast_n12_max_wins=8)
         with self.assertRaisesRegex(ValueError, "resident_daily_win_rate_floor"):
             ProfileAdmissionPolicy(resident_daily_win_rate_floor=1.1)
+        with self.assertRaisesRegex(ValueError, "fast_enabled"):
+            ProfileAdmissionPolicy(fast_enabled=1)
+        with self.assertRaisesRegex(ValueError, "fast_directions"):
+            ProfileAdmissionPolicy(fast_directions=("SIDEWAYS",))
 
     def test_candidate_policy_is_the_automatic_search_candidate(self):
         policy = candidate_policy()
@@ -111,6 +119,13 @@ class ProfileAdmissionTest(unittest.TestCase):
         self.assertFalse(overheated.allowed)
         self.assertEqual(overheated.code, "RESIDENT_N12_OVERHEATED")
 
+        unqualified = evaluate_profile_admission(
+            context(qualification_state="NOT_QUALIFIED"),
+            policy,
+        )
+        self.assertFalse(unqualified.allowed)
+        self.assertEqual(unqualified.code, "RESIDENT_QUALIFICATION_BLOCKED")
+
     def test_fast_lane_only_admits_first_short_active_in_range(self):
         policy = candidate_policy()
         fast = evaluate_profile_admission(
@@ -149,6 +164,13 @@ class ProfileAdmissionTest(unittest.TestCase):
                 self.assertFalse(decision.allowed)
                 self.assertEqual(decision.code, code)
 
+        with self.assertRaisesRegex(ValueError, "fast_allowed_states"):
+            replace(policy, fast_allowed_states=("ACTIVE", "WARMUP"))
+        with self.assertRaisesRegex(ValueError, "FAST"):
+            replace(policy, fast_allow_second_order=True)
+        with self.assertRaisesRegex(ValueError, "WATCH"):
+            replace(policy, watch_allow_progression=True)
+
     def test_baseline_without_fast_rejects_unselected_profile(self):
         decision = evaluate_profile_admission(
             context(daily_selected=False, daily_rank=None),
@@ -175,7 +197,7 @@ class ProfileAdmissionTest(unittest.TestCase):
             second_resident,
             profile_key="10|long|rebound|LONG|WD-02",
             daily_rank=1,
-            candidate_ordinal=1,
+            candidate_ordinal=99,
         )
         ranked = rank_admitted_candidates(
             (fast, second_resident, first_resident),

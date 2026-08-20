@@ -10,6 +10,8 @@ from typing import Sequence
 PROFILE_ADMISSION_VERSION = "PROFILE_ADMISSION_V1"
 _ADAPTIVE_STATES = {"WARMUP", "ACTIVE", "WATCH", "PAUSED"}
 _ORDER_SLOTS = {"FIRST", "SECOND"}
+_DIRECTIONS = {"LONG", "SHORT"}
+_RESIDENT_QUALIFICATIONS = {"QUALIFIED", "QUALIFICATION_WATCH"}
 
 
 def _normalized_values(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
@@ -67,6 +69,24 @@ class ProfileAdmissionPolicy:
             raise ValueError(f"unknown resident states: {sorted(unknown_resident)}")
         if unknown_fast:
             raise ValueError(f"unknown fast states: {sorted(unknown_fast)}")
+        if set(self.fast_directions) - {"SHORT"}:
+            raise ValueError("fast_directions only supports SHORT")
+        if set(self.fast_allowed_states) - {"ACTIVE"}:
+            raise ValueError("fast_allowed_states only supports ACTIVE")
+        for name in (
+            "fast_enabled",
+            "fast_allow_second_order",
+            "fast_allow_progression",
+            "watch_allow_first_order",
+            "watch_allow_second_order",
+            "watch_allow_progression",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        if self.fast_allow_second_order or self.fast_allow_progression:
+            raise ValueError("FAST must not allow second orders or progression")
+        if self.watch_allow_second_order or self.watch_allow_progression:
+            raise ValueError("WATCH must not allow second orders or progression")
         if type(self.resident_n12_max_wins) is not int or not 0 <= self.resident_n12_max_wins <= 12:
             raise ValueError("resident_n12_max_wins must be between 0 and 12")
         if (
@@ -82,7 +102,12 @@ class ProfileAdmissionPolicy:
             if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
                 raise ValueError("resident_daily_win_rate_floor must be between 0 and 1")
             object.__setattr__(self, "resident_daily_win_rate_floor", floor)
-        object.__setattr__(self, "fast_n20_ev_min", float(self.fast_n20_ev_min))
+        fast_n20_ev_min = float(self.fast_n20_ev_min)
+        object.__setattr__(
+            self,
+            "fast_n20_ev_min",
+            0.0 if fast_n20_ev_min == 0.0 else fast_n20_ev_min,
+        )
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -135,18 +160,36 @@ class ProfileAdmissionContext:
         object.__setattr__(self, "direction", str(self.direction).upper())
         object.__setattr__(self, "order_slot", str(self.order_slot).upper())
         object.__setattr__(self, "adaptive_state", str(self.adaptive_state).upper())
+        object.__setattr__(
+            self,
+            "qualification_state",
+            str(self.qualification_state).upper(),
+        )
+        object.__setattr__(
+            self,
+            "candidate_origin",
+            str(self.candidate_origin).upper(),
+        )
         if not self.profile_key:
             raise ValueError("profile_key must not be empty")
         if self.order_slot not in _ORDER_SLOTS:
             raise ValueError(f"unknown order_slot: {self.order_slot}")
+        if self.direction not in _DIRECTIONS:
+            raise ValueError(f"unknown direction: {self.direction}")
         if self.adaptive_state not in _ADAPTIVE_STATES:
             raise ValueError(f"unknown adaptive_state: {self.adaptive_state}")
+        if type(self.daily_selected) is not bool:
+            raise ValueError("daily_selected must be a boolean")
         if self.daily_rank is not None and (type(self.daily_rank) is not int or self.daily_rank <= 0):
             raise ValueError("daily_rank must be a positive integer")
         daily_win_rate = float(self.daily_win_rate)
         if not math.isfinite(daily_win_rate) or not 0.0 <= daily_win_rate <= 1.0:
             raise ValueError("daily_win_rate must be between 0 and 1")
-        object.__setattr__(self, "daily_win_rate", daily_win_rate)
+        object.__setattr__(
+            self,
+            "daily_win_rate",
+            0.0 if daily_win_rate == 0.0 else daily_win_rate,
+        )
         for name in ("n12_sample_size", "n12_wins", "n20_sample_size"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
@@ -158,7 +201,7 @@ class ProfileAdmissionContext:
         n20_ev = float(self.n20_ev)
         if not math.isfinite(n20_ev):
             raise ValueError("n20_ev must be finite")
-        object.__setattr__(self, "n20_ev", n20_ev)
+        object.__setattr__(self, "n20_ev", 0.0 if n20_ev == 0.0 else n20_ev)
         if type(self.adaptive_evaluated_at) is not int or self.adaptive_evaluated_at < 0:
             raise ValueError("adaptive_evaluated_at must be a non-negative integer")
         if type(self.candidate_ordinal) is not int or self.candidate_ordinal < 0:
@@ -236,9 +279,9 @@ def _rank_key(context: ProfileAdmissionContext, channel: str) -> tuple:
     return (
         0 if channel == "RESIDENT" else 1,
         context.daily_rank if context.daily_rank is not None else 1_000_000,
-        context.candidate_ordinal,
         context.profile_key,
         context.candidate_origin,
+        context.candidate_ordinal,
     )
 
 
@@ -279,6 +322,14 @@ def evaluate_profile_admission(
         )
 
     if context.daily_selected:
+        if context.qualification_state not in _RESIDENT_QUALIFICATIONS:
+            return _decision(
+                context,
+                policy,
+                allowed=False,
+                channel="NONE",
+                code="RESIDENT_QUALIFICATION_BLOCKED",
+            )
         if state not in policy.resident_allowed_states:
             return _decision(
                 context,
@@ -329,8 +380,8 @@ def evaluate_profile_admission(
                 allowed=True,
                 channel="RESIDENT",
                 code="RESIDENT_WATCH_ADMITTED",
-                allow_second_order=policy.watch_allow_second_order,
-                allow_progression=policy.watch_allow_progression,
+                allow_second_order=False,
+                allow_progression=False,
             )
         return _decision(
             context,
@@ -350,7 +401,7 @@ def evaluate_profile_admission(
             channel="NONE",
             code="DAILY_PROFILE_NOT_SELECTED",
         )
-    if context.direction not in policy.fast_directions:
+    if context.direction != "SHORT" or context.direction not in policy.fast_directions:
         return _decision(
             context,
             policy,
@@ -358,7 +409,7 @@ def evaluate_profile_admission(
             channel="NONE",
             code="FAST_DIRECTION_BLOCKED",
         )
-    if state not in policy.fast_allowed_states:
+    if state in {"WARMUP", "WATCH"} or state not in policy.fast_allowed_states:
         return _decision(
             context,
             policy,
@@ -382,7 +433,7 @@ def evaluate_profile_admission(
             channel="NONE",
             code="FAST_N20_EV_BLOCKED",
         )
-    if context.order_slot == "SECOND" and not policy.fast_allow_second_order:
+    if context.order_slot == "SECOND":
         return _decision(
             context,
             policy,
@@ -396,8 +447,8 @@ def evaluate_profile_admission(
         allowed=True,
         channel="FAST",
         code="FAST_ADMITTED",
-        allow_second_order=policy.fast_allow_second_order,
-        allow_progression=policy.fast_allow_progression,
+        allow_second_order=False,
+        allow_progression=False,
     )
 
 
