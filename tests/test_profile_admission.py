@@ -133,6 +133,8 @@ class ProfileAdmissionTest(unittest.TestCase):
             context(n12_sample_size=12, n12_wins=7, n20_sample_size=11)
         with self.assertRaisesRegex(ValueError, "mature"):
             context(adaptive_state="ACTIVE", n12_sample_size=11, n12_wins=7)
+        with self.assertRaisesRegex(ValueError, "adaptive_transition"):
+            context(adaptive_transition=["WATCH", "ACTIVE"])
 
     def test_resident_matrix_and_overheat(self):
         policy = candidate_policy()

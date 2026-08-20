@@ -183,6 +183,13 @@ class ProfileAdmissionContext:
         object.__setattr__(self, "direction", str(self.direction).upper())
         object.__setattr__(self, "order_slot", str(self.order_slot).upper())
         object.__setattr__(self, "adaptive_state", str(self.adaptive_state).upper())
+        if type(self.adaptive_transition) is not str:
+            raise ValueError("adaptive_transition must be a string")
+        object.__setattr__(
+            self,
+            "adaptive_transition",
+            self.adaptive_transition.strip().upper(),
+        )
         object.__setattr__(
             self,
             "qualification_state",
