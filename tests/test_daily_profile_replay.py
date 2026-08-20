@@ -20,6 +20,7 @@ from app.adaptive_profile_state import (
 )
 from app.daily_profile_selector import DailyProfileSelectorConfig
 from app.models import ObservationSignal, Signal
+from app.profile_admission import candidate_policy
 from app.simulator import AccountSimulator
 from app.storage import SQLiteMonitorStore
 from scripts import replay_daily_profile_selector as replay_module
@@ -130,6 +131,167 @@ class DailyProfileReplayTest(unittest.TestCase):
             execution=self.production_execution(**execution_overrides),
             require_full_lookback=False,
         )
+
+    def adaptive_timeline(self, states):
+        by_profile = {}
+        settled_times = []
+        for profile, settled_at, status, n12_wins, n20_ev in states:
+            n12_sample_size = 11 if status == "WARMUP" else 12
+            state = replay_module._adaptive_state((), profile, settled_at + 1)
+            state.update(
+                {
+                    "status": status,
+                    "transition": f"TEST->{status}",
+                    "evaluated_at": settled_at + 1,
+                    "n12": {
+                        "sample_size": n12_sample_size,
+                        "wins": n12_wins,
+                        "losses": n12_sample_size - n12_wins,
+                        "win_rate": n12_wins / n12_sample_size,
+                        "pnl": 1.0,
+                        "ev": 1.0 / n12_sample_size,
+                    },
+                    "n20": {
+                        "sample_size": 20,
+                        "wins": 12,
+                        "losses": 8,
+                        "win_rate": 0.6,
+                        "pnl": n20_ev * 20,
+                        "ev": n20_ev,
+                    },
+                }
+            )
+            by_profile.setdefault(profile, []).append((settled_at, state))
+            settled_times.append(settled_at)
+        return {
+            "by_profile": by_profile,
+            "times_by_profile": {
+                profile: [item[0] for item in entries]
+                for profile, entries in by_profile.items()
+            },
+            "settled_times": sorted(settled_times),
+        }
+
+    def test_replay_fast_lane_uses_shared_admission(self):
+        opened_at = timestamp("2026-07-20T08:00:00")
+        fast = observation("fast-active", "WIN", opened_at, tag="fast-active")
+        fast_second = observation(
+            "fast-second",
+            "WIN",
+            opened_at + 2 * 60_000,
+            tag="fast-active",
+        )
+        long_active = observation(
+            "long-active",
+            "WIN",
+            opened_at,
+            direction="LONG",
+            tag="long-active",
+        )
+        warmup = observation("short-warmup", "WIN", opened_at, tag="short-warmup")
+        paused = observation("short-paused", "WIN", opened_at, tag="short-paused")
+        rows = [fast, long_active, warmup, paused, fast_second]
+        profiles = {
+            item.observation_key: replay_module._observation_profile_key(item)
+            for item in rows
+        }
+        snapshot = {
+            "effective_from": opened_at,
+            "effective_until": opened_at + 20 * 60_000,
+            "selected_profiles": [],
+            "candidates": [
+                {
+                    "key": profile,
+                    "sample_size": 20,
+                    "win_rate": 0.6,
+                    "ev": 1.0,
+                    "selection_state": "RANKED_OUT",
+                }
+                for profile in sorted(set(profiles.values()))
+            ],
+        }
+        timeline = self.adaptive_timeline(
+            [
+                (profiles["fast-active"], opened_at - 1, "ACTIVE", 7, 1.0),
+                (profiles["long-active"], opened_at - 1, "ACTIVE", 7, 1.0),
+                (profiles["short-warmup"], opened_at - 1, "WARMUP", 7, 1.0),
+                (profiles["short-paused"], opened_at - 1, "PAUSED", 7, 1.0),
+            ]
+        )
+
+        result = replay_module._execute_replay(
+            replay_module._prepare_execution_windows(rows, [snapshot]),
+            self.production_execution().normalized(),
+            timeline,
+            apply_adaptive=True,
+            include_structure_shadow=False,
+            admission_policy=candidate_policy(),
+        )
+
+        self.assertEqual(
+            [item["observation_key"] for item in result["trade_rows"]],
+            ["fast-active"],
+        )
+        trade = result["trade_rows"][0]
+        self.assertEqual(trade["admission_channel"], "FAST")
+        self.assertEqual(trade["admission_code"], "FAST_ADMITTED")
+        self.assertFalse(trade["progression_allowed"])
+        self.assertEqual(result["admission_codes"]["FAST_DIRECTION_BLOCKED"], 1)
+        self.assertEqual(result["admission_codes"]["FAST_STATE_BLOCKED"], 1)
+        self.assertEqual(result["admission_codes"]["ADAPTIVE_PAUSED"], 1)
+        self.assertEqual(result["admission_codes"]["FAST_SECOND_ORDER_BLOCKED"], 1)
+
+    def test_blocked_resident_falls_through(self):
+        opened_at = timestamp("2026-07-20T08:00:00")
+        blocked = observation("resident-blocked", "LOSS", opened_at, tag="resident-blocked")
+        fallback = observation("resident-fallback", "WIN", opened_at, tag="resident-fallback")
+        rows = [blocked, fallback]
+        blocked_profile = replay_module._observation_profile_key(blocked)
+        fallback_profile = replay_module._observation_profile_key(fallback)
+        snapshot = {
+            "effective_from": opened_at,
+            "effective_until": opened_at + 20 * 60_000,
+            "selected_profiles": [
+                {
+                    "key": blocked_profile,
+                    "sample_size": 20,
+                    "win_rate": 0.7,
+                    "ev": 1.0,
+                    "qualification_state": "QUALIFIED",
+                    "selection_state": "SELECTED",
+                },
+                {
+                    "key": fallback_profile,
+                    "sample_size": 20,
+                    "win_rate": 0.6,
+                    "ev": 1.0,
+                    "qualification_state": "QUALIFIED",
+                    "selection_state": "SELECTED",
+                },
+            ],
+            "candidates": [],
+        }
+        timeline = self.adaptive_timeline(
+            [
+                (blocked_profile, opened_at - 1, "ACTIVE", 9, 1.0),
+                (fallback_profile, opened_at - 1, "ACTIVE", 7, 1.0),
+            ]
+        )
+
+        result = replay_module._execute_replay(
+            replay_module._prepare_execution_windows(rows, [snapshot]),
+            self.production_execution().normalized(),
+            timeline,
+            apply_adaptive=True,
+            include_structure_shadow=False,
+            admission_policy=candidate_policy(),
+        )
+
+        self.assertTrue(result["trade_rows"], result)
+        self.assertEqual(result["trade_rows"][0]["observation_key"], "resident-fallback")
+        self.assertEqual(result["trade_rows"][0]["admission_channel"], "RESIDENT")
+        self.assertEqual(result["trade_rows"][0]["admission_code"], "RESIDENT_ADMITTED")
+        self.assertEqual(result["admission_codes"]["RESIDENT_N12_OVERHEATED"], 1)
 
     def test_replay_rejects_omitted_production_execution_settings(self):
         with self.assertRaisesRegex(ValueError, "explicit production execution settings"):
@@ -460,14 +622,18 @@ class DailyProfileReplayTest(unittest.TestCase):
     def test_replay_is_settlement_causal_and_cutoff_safe(self):
         start = timestamp("2026-07-19T22:00:00")
         rows = [
-            observation(f"adaptive-{index:02d}", "WIN", start + index * 11 * 60_000)
+            observation(
+                f"adaptive-{index:02d}",
+                "WIN" if index in {0, 1, 3, 5, 7, 9, 11} else "LOSS",
+                start + index * 11 * 60_000,
+            )
             for index in range(12)
         ]
         rows.extend(
             [
                 observation(
                     "settled-after-0750",
-                    "LOSS",
+                    "WIN",
                     timestamp("2026-07-20T07:30:00"),
                     settled_at=timestamp("2026-07-20T07:51:00"),
                 ),
@@ -489,6 +655,7 @@ class DailyProfileReplayTest(unittest.TestCase):
         twelfth = next(item for item in report["events"] if item["observation_key"] == "adaptive-11")
         self.assertEqual(twelfth["adaptive_state_before"], "WARMUP")
         self.assertEqual(twelfth["adaptive_state_after"], "ACTIVE")
+        self.assertEqual(twelfth["adaptive_transition_after"], "WARMUP->ACTIVE")
         self.assertEqual(twelfth["n12_after"]["sample_size"], 12)
 
         snapshot = next(
@@ -503,6 +670,23 @@ class DailyProfileReplayTest(unittest.TestCase):
         )
         self.assertEqual(candidate["adaptive_state_before"], "ACTIVE")
         self.assertLessEqual(candidate["adaptive_evaluated_through"], candidate["opened_at"])
+
+    def test_adaptive_snapshot_excludes_settlement_at_opened_at(self):
+        opened_at = timestamp("2026-07-20T08:00:00")
+        row = observation("same-time", "WIN", opened_at)
+        profile = replay_module._observation_profile_key(row)
+        timeline = self.adaptive_timeline(
+            [(profile, opened_at, "ACTIVE", 7, 1.0)]
+        )
+
+        state, evaluated_through = replay_module._adaptive_state_before(
+            timeline,
+            profile,
+            opened_at,
+        )
+
+        self.assertEqual(state["status"], "WARMUP")
+        self.assertEqual(evaluated_through, 0)
 
     def test_adaptive_event_rows_use_only_the_trailing_fifteen_days(self):
         old_start = timestamp("2026-07-01T00:00:00")
@@ -1744,8 +1928,8 @@ class DailyProfileReplayTest(unittest.TestCase):
         watch = replay_module._adaptive_state((), profile, row.opened_at)
         watch["status"] = "WATCH"
         timeline = {
-            "by_profile": {profile: [(row.opened_at, watch)]},
-            "settled_times": [row.opened_at],
+            "by_profile": {profile: [(row.opened_at - 1, watch)]},
+            "settled_times": [row.opened_at - 1],
         }
         snapshot = {
             "effective_from": 0,
@@ -1844,6 +2028,11 @@ class DailyProfileReplayTest(unittest.TestCase):
             "acceptance",
             "passing_configuration_ranking",
             "structure_shadow_equality",
+            "profile_admission_search",
+            "aggregate_gates_passed",
+            "stability_proven",
+            "release_allowed",
+            "equivalence_scope",
         }
         self.assertTrue(required.issubset(report))
         for name in ("baseline", "candidate"):
@@ -1860,6 +2049,15 @@ class DailyProfileReplayTest(unittest.TestCase):
         self.assertEqual(report["execution"]["max_open_orders"], 2)
         self.assertEqual(report["execution"]["max_open_long_orders"], 1)
         self.assertEqual(report["execution"]["max_open_short_orders"], 2)
+        self.assertEqual(report["profile_admission_search"]["evaluated_count"], 32)
+        self.assertEqual(
+            report["aggregate_gates_passed"],
+            report["profile_admission_search"]["aggregate_gates_passed"],
+        )
+        self.assertEqual(
+            report["equivalence_scope"]["scope"],
+            "PROFILE_ADMISSION_LAYER_ONLY",
+        )
 
     def test_report_removes_duplicate_sections_and_compacts_event_audit(self):
         start = timestamp("2026-07-19T20:00:00")
@@ -1884,13 +2082,15 @@ class DailyProfileReplayTest(unittest.TestCase):
             self.assertIn("n12_after", event)
             self.assertIn("n20_after", event)
 
-        legacy = json.loads(json.dumps(report))
+        compact = json.loads(json.dumps(report))
+        compact.pop("profile_admission_search")
+        legacy = json.loads(json.dumps(compact))
         legacy["daily_snapshots"] = legacy["schedule"]
         legacy["trade_rows"] = legacy["candidate"]["trade_rows"]
         for event in legacy["events"]:
             event["n12_before"] = event["n12_after"]
             event["n20_before"] = event["n20_after"]
-        compact_size = len(json.dumps(report, separators=(",", ":")))
+        compact_size = len(json.dumps(compact, separators=(",", ":")))
         legacy_size = len(json.dumps(legacy, separators=(",", ":")))
         self.assertLess(compact_size, legacy_size * 0.8)
 
@@ -2135,6 +2335,302 @@ class DailyProfileReplayTest(unittest.TestCase):
                     result["gates"][gate_name]["actual"], displayed_threshold
                 )
                 self.assertFalse(result["gates"][gate_name]["passed"])
+
+    def test_profile_admission_search_evaluates_fixed_grid_and_blocks_unproven_release(self):
+        start_at = timestamp("2026-07-20T08:00:00")
+        end_at = start_at + 86_400_000
+        rows = [
+            observation(
+                f"search-{index:02d}",
+                "LOSS" if index % 3 == 2 else "WIN",
+                start_at + index * 12 * 60_000,
+                direction="LONG" if index % 2 == 0 else "SHORT",
+                tag="search-long" if index % 2 == 0 else "search-short",
+            )
+            for index in range(50)
+        ]
+        profiles = {
+            replay_module._observation_profile_key(item)
+            for item in rows
+        }
+        selected_profiles = [
+            {
+                "key": profile,
+                "sample_size": 20,
+                "win_rate": 0.7,
+                "ev": 1.0,
+                "qualification_state": "QUALIFIED",
+                "selection_state": "SELECTED",
+            }
+            for profile in sorted(profiles)
+        ]
+        snapshot = {
+            "effective_from": start_at,
+            "effective_until": end_at,
+            "selected_profiles": selected_profiles,
+            "candidates": selected_profiles,
+        }
+        timeline = self.adaptive_timeline(
+            [
+                (profile, start_at - 1, "ACTIVE", 7, 1.0)
+                for profile in sorted(profiles)
+            ]
+        )
+        windows = replay_module._prepare_execution_windows(rows, [snapshot])
+        execution = self.production_execution().normalized()
+        baseline = replay_module._execution_report(
+            replay_module._execute_replay(
+                windows,
+                execution,
+                timeline,
+                apply_adaptive=False,
+                include_structure_shadow=False,
+            ),
+            start_at,
+            end_at,
+        )
+
+        first = replay_module.search_profile_admission_policies(
+            windows,
+            execution,
+            timeline,
+            baseline,
+            start_at,
+            end_at,
+        )
+        second = replay_module.search_profile_admission_policies(
+            windows,
+            execution,
+            timeline,
+            baseline,
+            start_at,
+            end_at,
+        )
+
+        self.assertEqual(first["grid_size"], 32)
+        self.assertEqual(first["evaluated_count"], 32)
+        self.assertEqual(len(first["configurations"]), 32)
+        self.assertTrue(
+            all(
+                len(item["full_day_metrics"]) == 1
+                for item in first["configurations"]
+            )
+        )
+        self.assertEqual(
+            [item["policy_hash"] for item in first["configurations"]],
+            [item["policy_hash"] for item in second["configurations"]],
+        )
+        self.assertTrue(
+            first["aggregate_gates_passed"],
+            first["best_candidate"]["failed_gates"],
+        )
+        self.assertFalse(first["stability_proven"])
+        self.assertFalse(first["release_allowed"])
+        self.assertIsNone(first["release_policy"])
+        self.assertLess(first["stability"]["complete_forward_days"], 7)
+        self.assertEqual(
+            first["equivalence_scope"]["scope"],
+            "PROFILE_ADMISSION_LAYER_ONLY",
+        )
+
+    def test_forward_stability_requires_seven_days_of_actual_performance(self):
+        start_at = timestamp("2026-07-20T08:00:00")
+
+        def forward_trades(good_days):
+            trades = []
+            for day in range(7):
+                wins = 35 if day < good_days else 25
+                for index in range(50):
+                    won = index < wins
+                    trades.append(
+                        {
+                            "observation_key": f"forward-{day}-{index}",
+                            "direction": "LONG" if index % 2 == 0 else "SHORT",
+                            "opened_at": start_at + day * 86_400_000 + index * 60_000,
+                            "settled_at": start_at + day * 86_400_000 + (index + 10) * 60_000,
+                            "result": "WIN" if won else "LOSS",
+                            "pnl": 8.0 if won else -10.0,
+                        }
+                    )
+            return trades
+
+        failed = replay_module._forward_stability_report(
+            {"policy_hash": "frozen", "trade_rows": forward_trades(3)},
+            frozen_policy_hash="frozen",
+            forward_start_at=start_at,
+            oos_end=start_at + 7 * 86_400_000,
+        )
+
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["complete_forward_days"], 7)
+        self.assertFalse(failed["gates"]["qualifying_win_rate_days"]["passed"])
+        self.assertFalse(failed["gates"]["positive_ev_days"]["passed"])
+        self.assertFalse(failed["gates"]["combined_win_rate"]["passed"])
+        self.assertTrue(failed["gates"]["orders_per_day"]["passed"])
+
+        passed = replay_module._forward_stability_report(
+            {"policy_hash": "frozen", "trade_rows": forward_trades(7)},
+            frozen_policy_hash="frozen",
+            forward_start_at=start_at,
+            oos_end=start_at + 7 * 86_400_000,
+        )
+        self.assertTrue(passed["passed"])
+
+    def test_profile_admission_search_has_no_release_policy_when_aggregate_gates_fail(self):
+        execution = self.production_execution().normalized()
+        start_at = timestamp("2026-07-20T08:00:00")
+        end_at = start_at + 86_400_000
+        baseline_result = replay_module._execute_replay(
+            (),
+            execution,
+            {"by_profile": {}, "times_by_profile": {}, "settled_times": []},
+            apply_adaptive=False,
+            include_structure_shadow=False,
+        )
+        baseline = replay_module._execution_report(
+            baseline_result,
+            start_at,
+            end_at,
+        )
+
+        report = replay_module.search_profile_admission_policies(
+            (),
+            execution,
+            {"by_profile": {}, "times_by_profile": {}, "settled_times": []},
+            baseline,
+            start_at,
+            end_at,
+        )
+
+        self.assertFalse(report["aggregate_gates_passed"])
+        self.assertFalse(report["release_allowed"])
+        self.assertIsNone(report["release_policy"])
+        self.assertTrue(report["best_candidate"]["failed_gates"])
+
+    def test_profile_admission_search_gates_use_unrounded_values(self):
+        total_orders = 5_000
+        long_orders = 2_509
+        long_wins = 1_394
+        short_orders = total_orders - long_orders
+        short_wins = 3_000 - long_wins
+
+        def summary(orders, wins, pnl):
+            return {
+                "orders": orders,
+                "wins": wins,
+                "losses": orders - wins,
+                "win_rate": round(wins / orders, 6),
+                "pnl": round(pnl, 4),
+                "ev": round(pnl / orders, 4),
+                "max_drawdown": 1.0,
+                "max_loss_streak": 1,
+            }
+
+        baseline = {
+            "total": summary(total_orders, 3_000, 100.0),
+            "by_direction": {
+                "LONG": summary(long_orders, long_wins, 50.0),
+                "SHORT": summary(short_orders, short_wins, 50.0),
+            },
+            "trade_rows": [
+                {"direction": "LONG", "result": "LOSS", "pnl": -1.0},
+                {"direction": "LONG", "result": "WIN", "pnl": 1.0},
+            ],
+        }
+        candidate = {
+            "total": summary(total_orders, 3_000, -0.000001),
+            "by_direction": {
+                "LONG": summary(long_orders, long_wins, 1.0),
+                "SHORT": summary(short_orders, short_wins, 1.0),
+            },
+            "oos_windows": [
+                {"orders": 1, "wins": 1, "pnl": 1.0},
+                {"orders": 1, "wins": 1, "pnl": 1.0},
+                {"orders": 1, "wins": 0, "pnl": -1.0},
+            ],
+            "trade_rows": [
+                {
+                    "direction": "LONG",
+                    "result": "LOSS",
+                    "pnl": -1.0000001,
+                },
+                {
+                    "direction": "LONG",
+                    "result": "WIN",
+                    "pnl": 1.00000009,
+                },
+            ],
+        }
+        active_days = total_orders / 44.9999996
+
+        result = replay_module.evaluate_profile_admission_search_gates(
+            baseline,
+            candidate,
+            active_oos_days=active_days,
+        )
+
+        self.assertEqual(result["gates"]["long_win_rate"]["actual"], 0.5556)
+        self.assertFalse(result["gates"]["long_win_rate"]["passed"])
+        self.assertEqual(result["gates"]["orders_per_day"]["actual"], 45.0)
+        self.assertFalse(result["gates"]["orders_per_day"]["passed"])
+        self.assertEqual(result["gates"]["total_ev"]["actual"], -0.0)
+        self.assertFalse(result["gates"]["total_ev"]["passed"])
+        self.assertEqual(
+            result["gates"]["maximum_drawdown_not_worse"]["actual"],
+            1.0,
+        )
+        self.assertFalse(
+            result["gates"]["maximum_drawdown_not_worse"]["passed"]
+        )
+
+    def test_profile_admission_search_ranking_is_deterministic_lexicographic(self):
+        def row(
+            name,
+            passed,
+            window_rate,
+            orders_per_day,
+            drawdown,
+            streak,
+            complexity,
+            policy_hash,
+            raw_drawdown=None,
+        ):
+            return {
+                "name": name,
+                "aggregate_gates_passed": passed,
+                "minimum_window_win_rate_raw": window_rate,
+                "orders_per_day_raw": orders_per_day,
+                "total": {
+                    "max_drawdown": drawdown,
+                    "max_loss_streak": streak,
+                },
+                "policy_complexity": complexity,
+                "policy_hash": policy_hash,
+                "maximum_drawdown_raw": (
+                    drawdown if raw_drawdown is None else raw_drawdown
+                ),
+            }
+
+        configurations = [
+            row("failed", False, 0.99, 50.0, 0.0, 0, 0, "0"),
+            row("farther", True, 0.60, 48.0, 1.0, 1, 1, "2"),
+            row("nearer", True, 0.60, 49.0, 2.0, 2, 2, "3", 2.0000002),
+            row("best-window", True, 0.61, 45.0, 9.0, 9, 9, "4"),
+            row("raw-drawdown", True, 0.60, 49.0, 2.0, 2, 2, "f", 2.0000001),
+        ]
+
+        ranked = replay_module.rank_profile_admission_configurations(configurations)
+
+        self.assertEqual(
+            [item["name"] for item in ranked],
+            ["best-window", "raw-drawdown", "nearer", "farther", "failed"],
+        )
+        self.assertEqual(
+            ranked,
+            replay_module.rank_profile_admission_configurations(
+                list(reversed(configurations))
+            ),
+        )
 
     def test_passing_configurations_rank_by_win_rate_orders_then_drawdown(self):
         self.assertTrue(hasattr(replay_module, "rank_passing_configurations"))

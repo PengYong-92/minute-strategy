@@ -32,6 +32,13 @@ from app.daily_profile_selector import (
     selection_window,
 )
 from app.models import ObservationSignal
+from app.profile_admission import (
+    ProfileAdmissionContext,
+    ProfileAdmissionPolicy,
+    evaluate_profile_admission,
+    policy_grid,
+    select_admitted_candidate,
+)
 from app.stake_progression import TWO_STAGE_VERSION, TwoStageStakeProgression
 from app.storage import (
     hydrate_decision_linked_payload,
@@ -86,6 +93,15 @@ REQUIRED_OBSERVATION_LIFECYCLE_FIELDS = frozenset(
 )
 REPORT_SCHEMA_VERSION = "CAUSAL_PROFILE_REPLAY_V2"
 ADAPTIVE_LOOKBACK_MS = 15 * 86_400_000
+DAY_MS = 86_400_000
+PROFILE_SEARCH_ACCEPTANCE = {
+    "total_win_rate_min": 0.60,
+    "direction_win_rate_min": 0.5556,
+    "ev_min": 0.0,
+    "orders_per_day_min": 45.0,
+    "orders_per_day_max": 55.0,
+    "positive_oos_windows_min": 2,
+}
 
 
 @dataclass(frozen=True)
@@ -399,6 +415,17 @@ def replay_daily_profile_selection(
     oos_start, oos_end = _oos_bounds(settled, snapshots)
     baseline = _execution_report(baseline_result, oos_start, oos_end)
     candidate = _execution_report(candidate_result, oos_start, oos_end)
+    profile_admission_search = search_profile_admission_policies(
+        execution_windows,
+        execution,
+        adaptive_timeline,
+        baseline,
+        oos_start,
+        oos_end,
+    )
+    workload["profile_admission_search_replay_rows"] = execution_plan_rows * len(
+        policy_grid()
+    )
     acceptance = evaluate_release_gates(baseline, candidate)
     equality = build_structure_shadow_equality_report(
         baseline_result["trade_rows"],
@@ -446,6 +473,13 @@ def replay_daily_profile_selection(
         "oos_windows": candidate["oos_windows"],
         "acceptance": acceptance,
         "passing_configuration_ranking": ranking,
+        "profile_admission_search": profile_admission_search,
+        "aggregate_gates_passed": profile_admission_search[
+            "aggregate_gates_passed"
+        ],
+        "stability_proven": profile_admission_search["stability_proven"],
+        "release_allowed": profile_admission_search["release_allowed"],
+        "equivalence_scope": profile_admission_search["equivalence_scope"],
         "structure_shadow_equality": equality,
         "eligible_events": candidate_result["eligible_events"],
         "rejections": candidate["guard_rejections"],
@@ -626,6 +660,446 @@ def evaluate_release_gates(
         "gates": gates,
         "passed": all(item["passed"] for item in gates.values()),
     }
+
+
+def evaluate_profile_admission_search_gates(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    active_oos_days: float,
+) -> dict[str, Any]:
+    thresholds = dict(PROFILE_SEARCH_ACCEPTANCE)
+    gates: dict[str, dict[str, Any]] = {}
+    candidate_trades = candidate.get("trade_rows")
+
+    def raw_win_rate(summary: dict[str, Any]) -> float:
+        orders = int(summary["orders"])
+        return int(summary["wins"]) / orders if orders else 0.0
+
+    def raw_pnl(
+        summary: dict[str, Any],
+        trades: Sequence[dict[str, Any]] | None,
+    ) -> float:
+        if trades is not None:
+            return math.fsum(float(item["pnl"]) for item in trades)
+        return float(summary["pnl"])
+
+    def minimum(name: str, actual: float, threshold: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "minimum": float(threshold),
+            "passed": float(actual) >= float(threshold),
+        }
+
+    def range_gate(name: str, actual: float, lower: float, upper: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "minimum": float(lower),
+            "maximum": float(upper),
+            "passed": float(lower) <= float(actual) <= float(upper),
+        }
+
+    def not_worse(name: str, actual: float, baseline_value: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "baseline": round(float(baseline_value), 6),
+            "passed": float(actual) <= float(baseline_value),
+        }
+
+    total = candidate["total"]
+    by_direction = candidate["by_direction"]
+    minimum("total_win_rate", raw_win_rate(total), thresholds["total_win_rate_min"])
+    for direction in ("LONG", "SHORT"):
+        minimum(
+            f"{direction.lower()}_win_rate",
+            raw_win_rate(by_direction[direction]),
+            thresholds["direction_win_rate_min"],
+        )
+
+    direction_trades = {
+        direction: (
+            [item for item in candidate_trades if item["direction"] == direction]
+            if candidate_trades is not None
+            else None
+        )
+        for direction in ("LONG", "SHORT")
+    }
+    total_orders = int(total["orders"])
+    total_ev = raw_pnl(total, candidate_trades) / total_orders if total_orders else 0.0
+    minimum("total_ev", total_ev, thresholds["ev_min"])
+    for direction in ("LONG", "SHORT"):
+        summary = by_direction[direction]
+        orders = int(summary["orders"])
+        direction_ev = (
+            raw_pnl(summary, direction_trades[direction]) / orders if orders else 0.0
+        )
+        minimum(f"{direction.lower()}_ev", direction_ev, thresholds["ev_min"])
+
+    orders_per_day = (
+        total_orders / float(active_oos_days)
+        if float(active_oos_days) > 0.0
+        else 0.0
+    )
+    range_gate(
+        "orders_per_day",
+        orders_per_day,
+        thresholds["orders_per_day_min"],
+        thresholds["orders_per_day_max"],
+    )
+
+    positive_windows = 0
+    window_win_rates = []
+    for window in candidate["oos_windows"]:
+        if candidate_trades is not None and "start_at" in window and "end_at" in window:
+            trades = [
+                item
+                for item in candidate_trades
+                if int(window["start_at"])
+                <= int(item["opened_at"])
+                < int(window["end_at"])
+            ]
+            window_pnl = math.fsum(float(item["pnl"]) for item in trades)
+            window_orders = len(trades)
+            window_wins = sum(1 for item in trades if item["result"] == "WIN")
+        else:
+            window_pnl = float(window["pnl"])
+            window_orders = int(window["orders"])
+            window_wins = int(window["wins"])
+        positive_windows += int(window_pnl > 0.0)
+        window_win_rates.append(window_wins / window_orders if window_orders else 0.0)
+    minimum(
+        "positive_oos_windows",
+        positive_windows,
+        thresholds["positive_oos_windows_min"],
+    )
+    candidate_drawdown, candidate_loss_streak = _raw_risk_metrics(
+        candidate_trades,
+        total,
+    )
+    baseline_drawdown, baseline_loss_streak = _raw_risk_metrics(
+        baseline.get("trade_rows"),
+        baseline["total"],
+    )
+    not_worse(
+        "maximum_drawdown_not_worse",
+        candidate_drawdown,
+        baseline_drawdown,
+    )
+    not_worse(
+        "longest_loss_streak_not_worse",
+        candidate_loss_streak,
+        baseline_loss_streak,
+    )
+    failed_gates = [name for name, gate in gates.items() if not gate["passed"]]
+    return {
+        "thresholds": thresholds,
+        "gates": gates,
+        "passed": not failed_gates,
+        "failed_gates": failed_gates,
+        "orders_per_day_raw": orders_per_day,
+        "minimum_window_win_rate_raw": min(window_win_rates, default=0.0),
+        "maximum_drawdown_raw": candidate_drawdown,
+    }
+
+
+def rank_profile_admission_configurations(
+    configurations: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        (dict(item) for item in configurations),
+        key=lambda item: (
+            -int(bool(item["aggregate_gates_passed"])),
+            -float(item["minimum_window_win_rate_raw"]),
+            abs(float(item["orders_per_day_raw"]) - 50.0),
+            float(
+                item.get(
+                    "maximum_drawdown_raw",
+                    item["total"]["max_drawdown"],
+                )
+            ),
+            int(item["total"]["max_loss_streak"]),
+            int(item["policy_complexity"]),
+            str(item["policy_hash"]),
+        ),
+    )
+
+
+def search_profile_admission_policies(
+    execution_windows: Sequence[dict[str, Any]],
+    execution: ReplayExecutionConfig,
+    adaptive_timeline: dict[str, Any],
+    baseline: dict[str, Any],
+    oos_start: int,
+    oos_end: int,
+    *,
+    frozen_policy_hash: str | None = None,
+    forward_start_at: int | None = None,
+) -> dict[str, Any]:
+    policies = policy_grid()
+    active_oos_ms = max(0, int(oos_end) - int(oos_start))
+    active_oos_days = active_oos_ms / DAY_MS
+    configurations = []
+    reports_by_hash: dict[str, dict[str, Any]] = {}
+    for policy in policies:
+        execution_result = _execute_replay(
+            execution_windows,
+            execution,
+            adaptive_timeline,
+            apply_adaptive=True,
+            include_structure_shadow=False,
+            admission_policy=policy,
+        )
+        report = _execution_report(execution_result, oos_start, oos_end)
+        reports_by_hash[policy.policy_hash] = report
+        gate_report = evaluate_profile_admission_search_gates(
+            baseline,
+            report,
+            active_oos_days=active_oos_days,
+        )
+        configurations.append(
+            {
+                "policy": policy.to_dict(),
+                "policy_hash": policy.policy_hash,
+                "policy_complexity": policy.complexity,
+                "aggregate_gates_passed": gate_report["passed"],
+                "failed_gates": gate_report["failed_gates"],
+                "gates": gate_report["gates"],
+                "total": report["total"],
+                "by_direction": report["by_direction"],
+                "daily": report["daily"],
+                "full_day_metrics": _full_oos_day_metrics(
+                    report["trade_rows"],
+                    oos_start,
+                    oos_end,
+                ),
+                "oos_windows": report["oos_windows"],
+                "orders_per_day": round(gate_report["orders_per_day_raw"], 6),
+                "orders_per_day_raw": gate_report["orders_per_day_raw"],
+                "minimum_window_win_rate": round(
+                    gate_report["minimum_window_win_rate_raw"],
+                    6,
+                ),
+                "minimum_window_win_rate_raw": gate_report[
+                    "minimum_window_win_rate_raw"
+                ],
+                "maximum_drawdown_raw": gate_report["maximum_drawdown_raw"],
+                "admission_codes": report["admission_codes"],
+            }
+        )
+
+    ranked = rank_profile_admission_configurations(configurations)
+    rank_by_hash = {
+        item["policy_hash"]: rank for rank, item in enumerate(ranked, start=1)
+    }
+    for rank, item in enumerate(ranked, start=1):
+        item["rank"] = rank
+    for item in configurations:
+        item["rank"] = rank_by_hash[item["policy_hash"]]
+    best = ranked[0]
+    stability = _forward_stability_report(
+        best,
+        trade_rows=reports_by_hash[best["policy_hash"]]["trade_rows"],
+        frozen_policy_hash=frozen_policy_hash,
+        forward_start_at=forward_start_at,
+        oos_end=oos_end,
+    )
+    aggregate_gates_passed = bool(best["aggregate_gates_passed"])
+    stability_proven = bool(stability["passed"])
+    release_allowed = aggregate_gates_passed and stability_proven
+    return {
+        "grid_size": len(policies),
+        "evaluated_count": len(configurations),
+        "active_oos_ms": active_oos_ms,
+        "active_oos_days": round(active_oos_days, 6),
+        "configurations": configurations,
+        "ranking": [item["policy_hash"] for item in ranked],
+        "best_candidate": best,
+        "aggregate_gates_passed": aggregate_gates_passed,
+        "stability": stability,
+        "stability_proven": stability_proven,
+        "release_allowed": release_allowed,
+        "release_policy": best["policy"] if release_allowed else None,
+        "equivalence_scope": {
+            "scope": "PROFILE_ADMISSION_LAYER_ONLY",
+            "includes": [
+                "shared_profile_admission_policy",
+                "candidate_ranking",
+                "replay_execution_guards",
+            ],
+            "excludes": ["runtime_guards_not_modeled_by_this_replay"],
+        },
+    }
+
+
+def _forward_stability_report(
+    candidate: dict[str, Any],
+    *,
+    trade_rows: Sequence[dict[str, Any]] | None = None,
+    frozen_policy_hash: str | None,
+    forward_start_at: int | None,
+    oos_end: int,
+) -> dict[str, Any]:
+    frozen = bool(
+        frozen_policy_hash
+        and frozen_policy_hash == candidate["policy_hash"]
+        and forward_start_at is not None
+    )
+    complete_days = int(
+        max(0, int(oos_end) - int(forward_start_at)) // DAY_MS
+        if frozen and forward_start_at is not None
+        else 0
+    )
+    evaluated_days = min(7, complete_days)
+    rows = list(
+        trade_rows
+        if trade_rows is not None
+        else candidate.get("trade_rows") or []
+    )
+    daily = []
+    forward_rows = []
+    if frozen and forward_start_at is not None:
+        for day in range(evaluated_days):
+            lower = int(forward_start_at) + day * DAY_MS
+            upper = lower + DAY_MS
+            day_rows = [
+                item
+                for item in rows
+                if lower <= int(item["opened_at"]) < upper
+            ]
+            wins = sum(1 for item in day_rows if item["result"] == "WIN")
+            pnl = math.fsum(float(item["pnl"]) for item in day_rows)
+            orders = len(day_rows)
+            forward_rows.extend(day_rows)
+            daily.append(
+                {
+                    "day": day + 1,
+                    "start_at": lower,
+                    "end_at": upper,
+                    "orders": orders,
+                    "wins": wins,
+                    "losses": orders - wins,
+                    "win_rate": round(wins / orders, 6) if orders else 0.0,
+                    "pnl": round(pnl, 4),
+                    "ev": round(pnl / orders, 4) if orders else 0.0,
+                }
+            )
+    qualifying_win_rate_days = sum(
+        1
+        for item in daily
+        if item["orders"] > 0
+        and int(item["wins"]) / int(item["orders"]) >= 0.5556
+    )
+    positive_ev_days = (
+        sum(
+            1
+            for day in range(evaluated_days)
+            if math.fsum(
+                float(item["pnl"])
+                for item in forward_rows
+                if int(forward_start_at) + day * DAY_MS
+                <= int(item["opened_at"])
+                < int(forward_start_at) + (day + 1) * DAY_MS
+            )
+            > 0.0
+        )
+        if forward_start_at is not None
+        else 0
+    )
+    combined_orders = len(forward_rows)
+    combined_wins = sum(1 for item in forward_rows if item["result"] == "WIN")
+    combined_win_rate = combined_wins / combined_orders if combined_orders else 0.0
+    orders_per_day = combined_orders / evaluated_days if evaluated_days else 0.0
+    gates = {
+        "policy_frozen": {"actual": frozen, "required": True, "passed": frozen},
+        "complete_forward_days": {
+            "actual": complete_days,
+            "minimum": 7,
+            "passed": complete_days >= 7,
+        },
+        "qualifying_win_rate_days": {
+            "actual": qualifying_win_rate_days,
+            "minimum": 5,
+            "daily_win_rate_minimum": 0.5556,
+            "passed": qualifying_win_rate_days >= 5,
+        },
+        "positive_ev_days": {
+            "actual": positive_ev_days,
+            "minimum": 5,
+            "daily_ev_strictly_positive": True,
+            "passed": positive_ev_days >= 5,
+        },
+        "combined_win_rate": {
+            "actual": round(combined_win_rate, 6),
+            "minimum": 0.60,
+            "passed": combined_win_rate >= 0.60,
+        },
+        "orders_per_day": {
+            "actual": round(orders_per_day, 6),
+            "minimum": 45.0,
+            "maximum": 55.0,
+            "passed": 45.0 <= orders_per_day <= 55.0,
+        },
+    }
+    return {
+        "complete_forward_days": complete_days,
+        "evaluated_forward_days": evaluated_days,
+        "daily": daily,
+        "combined_orders": combined_orders,
+        "combined_wins": combined_wins,
+        "gates": gates,
+        "failed_gates": [name for name, gate in gates.items() if not gate["passed"]],
+        "passed": all(gate["passed"] for gate in gates.values()),
+    }
+
+
+def _raw_risk_metrics(
+    trades: Sequence[dict[str, Any]] | None,
+    summary: dict[str, Any],
+) -> tuple[float, int]:
+    if trades is None:
+        return float(summary["max_drawdown"]), int(summary["max_loss_streak"])
+    equity = 0.0
+    peak = 0.0
+    maximum_drawdown = 0.0
+    loss_streak = 0
+    maximum_loss_streak = 0
+    for item in sorted(trades, key=_trade_settlement_key):
+        equity += float(item["pnl"])
+        peak = max(peak, equity)
+        maximum_drawdown = max(maximum_drawdown, peak - equity)
+        if item["result"] == "LOSS":
+            loss_streak += 1
+            maximum_loss_streak = max(maximum_loss_streak, loss_streak)
+        else:
+            loss_streak = 0
+    return maximum_drawdown, maximum_loss_streak
+
+
+def _full_oos_day_metrics(
+    trades: Sequence[dict[str, Any]],
+    oos_start: int,
+    oos_end: int,
+) -> list[dict[str, Any]]:
+    complete_days = max(0, int(oos_end) - int(oos_start)) // DAY_MS
+    metrics = []
+    for day in range(complete_days):
+        lower = int(oos_start) + day * DAY_MS
+        upper = lower + DAY_MS
+        metrics.append(
+            {
+                "day": day + 1,
+                "start_at": lower,
+                "end_at": upper,
+                **summarize_trades(
+                    [
+                        item
+                        for item in trades
+                        if lower <= int(item["opened_at"]) < upper
+                    ]
+                ),
+            }
+        )
+    return metrics
 
 
 def rank_passing_configurations(
@@ -844,6 +1318,7 @@ def _build_adaptive_event_rows(
                 "result": item.result,
                 "adaptive_state_before": before["status"],
                 "adaptive_state_after": after["status"],
+                "adaptive_transition_after": str(after.get("transition", "")),
                 "adaptive_version": str(after.get("version", "")),
                 "n12_after": after["n12"],
                 "n20_after": after["n20"],
@@ -920,6 +1395,7 @@ def _adaptive_timeline(
                 {
                     "version": row["adaptive_version"],
                     "status": row["adaptive_state_after"],
+                    "transition": row["adaptive_transition_after"],
                     "profile_key": row["profile_key"],
                     "evaluated_at": row["adaptive_evaluated_at"],
                     "n12": row["n12_after"],
@@ -996,10 +1472,12 @@ def _execute_replay(
     *,
     apply_adaptive: bool,
     include_structure_shadow: bool,
+    admission_policy: ProfileAdmissionPolicy | None = None,
 ) -> dict[str, Any]:
     trades: list[dict[str, Any]] = []
     open_orders: list[dict[str, Any]] = []
     rejections = {name: 0 for name in GUARD_REJECTIONS}
+    admission_codes: dict[str, int] = defaultdict(int)
     eligible_events = 0
     webhook_count = 0
     last_order_opened_at: dict[str, int | None] = {"LONG": None, "SHORT": None}
@@ -1018,6 +1496,10 @@ def _execute_replay(
         snapshot = window["snapshot"]
         selected_profiles = snapshot.get("selected_profiles") or []
         selected_by_key = {item["key"]: item for item in selected_profiles}
+        candidate_by_key = {
+            item["key"]: item for item in snapshot.get("candidates") or []
+        }
+        candidate_by_key.update(selected_by_key)
 
         for opened_at, rows in window["groups"]:
             eligible_events += 1
@@ -1025,29 +1507,63 @@ def _execute_replay(
             by_key: dict[str, ObservationSignal] = {}
             for item in sorted(rows, key=lambda row: row.observation_key):
                 by_key.setdefault(_observation_profile_key(item), item)
-            chosen = next(
-                (by_key[item["key"]] for item in selected_profiles if item["key"] in by_key),
-                None,
-            )
+            admission = None
+            adaptive = None
+            evaluated_through = 0
+            if admission_policy is None:
+                chosen = next(
+                    (
+                        by_key[item["key"]]
+                        for item in selected_profiles
+                        if item["key"] in by_key
+                    ),
+                    None,
+                )
+            else:
+                contexts, adaptive_by_key, evaluated_by_key = _admission_contexts(
+                    by_key,
+                    selected_profiles,
+                    candidate_by_key,
+                    adaptive_timeline,
+                    open_orders,
+                    opened_at,
+                )
+                for context in contexts:
+                    decision = evaluate_profile_admission(context, admission_policy)
+                    admission_codes[decision.code] += 1
+                admission = select_admitted_candidate(contexts, admission_policy)
+                chosen = by_key.get(admission.context.profile_key) if admission else None
+                if admission is not None:
+                    adaptive = adaptive_by_key[admission.context.profile_key]
+                    evaluated_through = evaluated_by_key[admission.context.profile_key]
             if chosen is None:
                 rejections["profile_not_selected"] += 1
                 continue
 
             direction = str(chosen.direction).upper()
-            profile = selected_by_key[_observation_profile_key(chosen)]
-            adaptive, evaluated_through = _adaptive_state_before(
-                adaptive_timeline,
-                profile["key"],
-                opened_at,
-            )
+            chosen_profile_key = _observation_profile_key(chosen)
+            profile = candidate_by_key.get(chosen_profile_key) or {
+                "key": chosen_profile_key,
+                "sample_size": 0,
+                "win_rate": 0.0,
+                "ev": 0.0,
+                "selection_state": "NOT_SELECTED",
+            }
+            if adaptive is None:
+                adaptive, evaluated_through = _adaptive_state_before(
+                    adaptive_timeline,
+                    profile["key"],
+                    opened_at,
+                )
             direction_open_count = sum(
                 1 for order in open_orders if order["direction"] == direction
             )
-            if apply_adaptive and adaptive["status"] == "PAUSED":
+            if admission_policy is None and apply_adaptive and adaptive["status"] == "PAUSED":
                 rejections["adaptive_profile_paused"] += 1
                 continue
             if (
-                apply_adaptive
+                admission_policy is None
+                and apply_adaptive
                 and adaptive["status"] == "WATCH"
                 and direction_open_count >= 1
             ):
@@ -1076,8 +1592,10 @@ def _execute_replay(
                 continue
 
             order_id = len(trades) + 1
-            allow_progression = not (
-                apply_adaptive and adaptive["status"] == "WATCH"
+            allow_progression = (
+                admission.decision.allow_progression
+                if admission is not None
+                else not (apply_adaptive and adaptive["status"] == "WATCH")
             )
             if allow_progression:
                 terms, _credit = progression.assign(
@@ -1117,6 +1635,7 @@ def _execute_replay(
                 "training_win_rate": profile["win_rate"],
                 "training_ev": profile["ev"],
                 "adaptive_state_before": adaptive["status"],
+                "adaptive_transition_before": str(adaptive.get("transition", "")),
                 "adaptive_n12_before": adaptive["n12"],
                 "adaptive_n20_before": adaptive["n20"],
                 "adaptive_evaluated_through": evaluated_through,
@@ -1131,6 +1650,15 @@ def _execute_replay(
                 "progression_version": progression_version,
                 "progression_allowed": allow_progression,
             }
+            if admission is not None:
+                trade.update(
+                    {
+                        "admission_policy_version": admission.decision.policy_version,
+                        "admission_policy_hash": admission.decision.policy_hash,
+                        "admission_channel": admission.decision.channel,
+                        "admission_code": admission.decision.code,
+                    }
+                )
             if include_structure_shadow:
                 trade["entry_structure_shadow"] = dict(
                     chosen.entry_structure_shadow
@@ -1146,9 +1674,88 @@ def _execute_replay(
     return {
         "trade_rows": trades,
         "guard_rejections": rejections,
+        "admission_codes": dict(sorted(admission_codes.items())),
         "eligible_events": eligible_events,
         "webhook_count": webhook_count,
     }
+
+
+def _admission_contexts(
+    by_key: dict[str, ObservationSignal],
+    selected_profiles: Sequence[dict[str, Any]],
+    candidate_by_key: dict[str, dict[str, Any]],
+    adaptive_timeline: dict[str, Any],
+    open_orders: Sequence[dict[str, Any]],
+    opened_at: int,
+) -> tuple[
+    tuple[ProfileAdmissionContext, ...],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+]:
+    selected_ranks = {
+        item["key"]: rank
+        for rank, item in enumerate(selected_profiles, start=1)
+    }
+    direction_open_counts = {
+        direction: sum(1 for order in open_orders if order["direction"] == direction)
+        for direction in ("LONG", "SHORT")
+    }
+    adaptive_by_key: dict[str, dict[str, Any]] = {}
+    evaluated_by_key: dict[str, int] = {}
+    contexts = []
+    for ordinal, profile_key_value in enumerate(sorted(by_key)):
+        item = by_key[profile_key_value]
+        profile = candidate_by_key.get(profile_key_value) or {}
+        adaptive, evaluated_through = _adaptive_state_before(
+            adaptive_timeline,
+            profile_key_value,
+            opened_at,
+        )
+        adaptive_by_key[profile_key_value] = adaptive
+        evaluated_by_key[profile_key_value] = evaluated_through
+        direction = str(item.direction).upper()
+        n12 = adaptive.get("n12") or _empty_sample_summary()
+        n20 = adaptive.get("n20") or _empty_sample_summary()
+        daily_sample_size = int(profile.get("sample_size", 0))
+        daily_win_rate = (
+            int(profile["wins"]) / daily_sample_size
+            if daily_sample_size > 0 and profile.get("wins") is not None
+            else float(profile.get("win_rate", 0.0))
+        )
+        contexts.append(
+            ProfileAdmissionContext(
+                profile_key=profile_key_value,
+                direction=direction,
+                order_slot=(
+                    "FIRST"
+                    if direction_open_counts.get(direction, 0) == 0
+                    else "SECOND"
+                ),
+                daily_selected=profile_key_value in selected_ranks,
+                qualification_state=str(
+                    profile.get(
+                        "qualification_state",
+                        (
+                            "QUALIFIED"
+                            if profile_key_value in selected_ranks
+                            else "NOT_QUALIFIED"
+                        ),
+                    )
+                ),
+                daily_rank=selected_ranks.get(profile_key_value),
+                daily_win_rate=daily_win_rate,
+                adaptive_state=str(adaptive["status"]),
+                adaptive_transition=str(adaptive.get("transition", "")),
+                adaptive_evaluated_at=int(adaptive.get("evaluated_at", 0)),
+                n12_sample_size=int(n12.get("sample_size", 0)),
+                n12_wins=int(n12.get("wins", 0)),
+                n20_sample_size=int(n20.get("sample_size", 0)),
+                n20_ev=float(n20.get("ev", 0.0)),
+                candidate_origin=str(item.candidate_origin or "REPLAY_OBSERVATION"),
+                candidate_ordinal=ordinal,
+            )
+        )
+    return tuple(contexts), adaptive_by_key, evaluated_by_key
 
 
 def _settle_due_orders(
@@ -1188,14 +1795,14 @@ def _adaptive_state_before(
     times = timeline.get("times_by_profile", {}).get(profile_key_value)
     if times is None:
         times = [item[0] for item in entries]
-    position = bisect_right(times, opened_at)
+    position = bisect_left(times, opened_at)
     state = (
         entries[position - 1][1]
         if position
-        else _adaptive_state((), profile_key_value, opened_at + 1)
+        else _adaptive_state((), profile_key_value, opened_at)
     )
     settled_times = timeline["settled_times"]
-    global_position = bisect_right(settled_times, opened_at)
+    global_position = bisect_left(settled_times, opened_at)
     evaluated_through = settled_times[global_position - 1] if global_position else 0
     return state, evaluated_through
 
@@ -1209,6 +1816,7 @@ def _adaptive_state(
         return {
             "version": ADAPTIVE_PROFILE_STATE_VERSION,
             "status": "WARMUP",
+            "transition": "NONE->WARMUP",
             "profile_key": key,
             "evaluated_at": evaluated_at,
             "n12": _empty_sample_summary(),
@@ -1244,6 +1852,7 @@ def _execution_report(
         "daily_best": daily_best,
         "daily_worst": daily_worst,
         "guard_rejections": dict(execution_result["guard_rejections"]),
+        "admission_codes": dict(execution_result.get("admission_codes") or {}),
         "oos_windows": _oos_windows(trades, oos_start, oos_end),
         "webhook_count": execution_result["webhook_count"],
         "eligible_events": execution_result["eligible_events"],
@@ -1320,6 +1929,7 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                     "win_rate",
                     "pnl",
                     "ev",
+                    "qualification_state",
                     "selection_state",
                 )
             }
