@@ -8,6 +8,7 @@ from app.profile_admission import (
     PROFILE_ADMISSION_VERSION,
     ProfileAdmissionContext,
     ProfileAdmissionPolicy,
+    baseline_policy,
     candidate_policy,
     evaluate_profile_admission,
     policy_grid,
@@ -88,6 +89,51 @@ class ProfileAdmissionTest(unittest.TestCase):
         self.assertEqual(policy.fast_directions, ("SHORT",))
         self.assertEqual((policy.fast_n12_min_wins, policy.fast_n12_max_wins), (7, 8))
 
+    def test_v1_baseline_and_candidate_have_golden_payloads_and_hashes(self):
+        expected = {
+            "baseline": (
+                '{"fast_allow_progression":false,"fast_allow_second_order":false,'
+                '"fast_allowed_states":["ACTIVE"],"fast_directions":["SHORT"],'
+                '"fast_enabled":false,"fast_n12_max_wins":8,"fast_n12_min_wins":7,'
+                '"fast_n20_ev_min":0.0,"resident_allowed_states":["ACTIVE","WARMUP","WATCH"],'
+                '"resident_daily_win_rate_floor":null,"resident_n12_max_wins":12,'
+                '"version":"PROFILE_ADMISSION_V1","watch_allow_first_order":true,'
+                '"watch_allow_progression":false,"watch_allow_second_order":false}',
+                "dbcec12bd41a3d2b476d138474164763d2ade17de50052c5c94aaf2382a63b43",
+            ),
+            "candidate": (
+                '{"fast_allow_progression":false,"fast_allow_second_order":false,'
+                '"fast_allowed_states":["ACTIVE"],"fast_directions":["SHORT"],'
+                '"fast_enabled":true,"fast_n12_max_wins":8,"fast_n12_min_wins":7,'
+                '"fast_n20_ev_min":0.0,"resident_allowed_states":["ACTIVE","WATCH"],'
+                '"resident_daily_win_rate_floor":null,"resident_n12_max_wins":8,'
+                '"version":"PROFILE_ADMISSION_V1","watch_allow_first_order":true,'
+                '"watch_allow_progression":false,"watch_allow_second_order":false}',
+                "ba30cd239416d56dec7499ff66a230027488861b654ed9c93cc7a2abff4bc8fa",
+            ),
+        }
+        for name, policy in (
+            ("baseline", baseline_policy()),
+            ("candidate", candidate_policy()),
+        ):
+            with self.subTest(name=name):
+                payload, policy_hash = expected[name]
+                self.assertEqual(policy.to_json(), payload)
+                self.assertEqual(policy.policy_hash, policy_hash)
+
+    def test_context_rejects_profile_direction_mismatch_and_impossible_windows(self):
+        with self.assertRaisesRegex(ValueError, "profile_key direction"):
+            context(
+                profile_key="10|long|rebound|LONG|WD-08",
+                direction="SHORT",
+            )
+        with self.assertRaisesRegex(ValueError, "profile_key"):
+            context(profile_key=["not", "a", "key"])
+        with self.assertRaisesRegex(ValueError, "n20_sample_size"):
+            context(n12_sample_size=12, n12_wins=7, n20_sample_size=11)
+        with self.assertRaisesRegex(ValueError, "mature"):
+            context(adaptive_state="ACTIVE", n12_sample_size=11, n12_wins=7)
+
     def test_resident_matrix_and_overheat(self):
         policy = candidate_policy()
         active = evaluate_profile_admission(context(), policy)
@@ -117,7 +163,15 @@ class ProfileAdmissionTest(unittest.TestCase):
 
         for state in ("PAUSED", "WARMUP"):
             with self.subTest(state=state):
-                decision = evaluate_profile_admission(context(adaptive_state=state), policy)
+                overrides = {"adaptive_state": state}
+                if state == "WARMUP":
+                    overrides.update(
+                        n12_sample_size=0,
+                        n12_wins=0,
+                        n20_sample_size=0,
+                        n20_ev=0.0,
+                    )
+                decision = evaluate_profile_admission(context(**overrides), policy)
                 self.assertFalse(decision.allowed)
                 self.assertEqual(decision.channel, "NONE")
 
@@ -147,7 +201,6 @@ class ProfileAdmissionTest(unittest.TestCase):
         cases = (
             ("LONG", "ACTIVE", 7, 1.0, "FIRST", "FAST_DIRECTION_BLOCKED"),
             ("SHORT", "WATCH", 7, 1.0, "FIRST", "FAST_STATE_BLOCKED"),
-            ("SHORT", "WARMUP", 7, 1.0, "FIRST", "FAST_STATE_BLOCKED"),
             ("SHORT", "PAUSED", 7, 1.0, "FIRST", "ADAPTIVE_PAUSED"),
             ("SHORT", "ACTIVE", 6, 1.0, "FIRST", "FAST_N12_BLOCKED"),
             ("SHORT", "ACTIVE", 7, -0.01, "FIRST", "FAST_N20_EV_BLOCKED"),
@@ -157,6 +210,11 @@ class ProfileAdmissionTest(unittest.TestCase):
             with self.subTest(code=code):
                 decision = evaluate_profile_admission(
                     context(
+                        profile_key=(
+                            "10|long_observe|generic_long_observe|LONG|WD-08"
+                            if direction == "LONG"
+                            else "10|short_observe|generic_short_observe|SHORT|WD-08"
+                        ),
                         daily_selected=False,
                         daily_rank=None,
                         direction=direction,
@@ -170,6 +228,21 @@ class ProfileAdmissionTest(unittest.TestCase):
                 self.assertFalse(decision.allowed)
                 self.assertEqual(decision.code, code)
 
+        warmup = evaluate_profile_admission(
+            context(
+                daily_selected=False,
+                daily_rank=None,
+                adaptive_state="WARMUP",
+                n12_sample_size=0,
+                n12_wins=0,
+                n20_sample_size=0,
+                n20_ev=0.0,
+            ),
+            policy,
+        )
+        self.assertFalse(warmup.allowed)
+        self.assertEqual(warmup.code, "FAST_STATE_BLOCKED")
+
         with self.assertRaisesRegex(ValueError, "fast_allowed_states"):
             replace(policy, fast_allowed_states=("ACTIVE", "WARMUP"))
         with self.assertRaisesRegex(ValueError, "FAST"):
@@ -177,13 +250,26 @@ class ProfileAdmissionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "WATCH"):
             replace(policy, watch_allow_progression=True)
 
-    def test_baseline_without_fast_rejects_unselected_profile(self):
+    def test_default_without_fast_rejects_unselected_profile(self):
         decision = evaluate_profile_admission(
             context(daily_selected=False, daily_rank=None),
             ProfileAdmissionPolicy(),
         )
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "DAILY_PROFILE_NOT_SELECTED")
+
+        baseline_warmup = evaluate_profile_admission(
+            context(
+                adaptive_state="WARMUP",
+                n12_sample_size=0,
+                n12_wins=0,
+                n20_sample_size=0,
+                n20_ev=0.0,
+            ),
+            baseline_policy(),
+        )
+        self.assertTrue(baseline_warmup.allowed)
+        self.assertEqual(baseline_warmup.channel, "RESIDENT")
 
     def test_ranking_is_resident_then_fast_and_deterministic(self):
         policy = candidate_policy()

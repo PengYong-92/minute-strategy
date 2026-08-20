@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import asdict, dataclass, field, fields
 from typing import Sequence
 
 
@@ -12,6 +13,7 @@ _ADAPTIVE_STATES = {"WARMUP", "ACTIVE", "WATCH", "PAUSED"}
 _ORDER_SLOTS = {"FIRST", "SECOND"}
 _DIRECTIONS = {"LONG", "SHORT"}
 _RESIDENT_QUALIFICATIONS = {"QUALIFIED", "QUALIFICATION_WATCH"}
+_PROFILE_SEGMENT = re.compile(r"(?:WD|WE)-(?:0[0-9]|1[0-9]|2[0-3])\Z")
 
 
 def _normalized_values(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
@@ -38,6 +40,8 @@ class ProfileAdmissionPolicy:
     watch_allow_first_order: bool = True
     watch_allow_second_order: bool = False
     watch_allow_progression: bool = False
+    _canonical_json: str = field(init=False, repr=False, compare=False)
+    _policy_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.version != PROFILE_ADMISSION_VERSION:
@@ -116,9 +120,26 @@ class ProfileAdmissionPolicy:
             "fast_n20_ev_min",
             0.0 if fast_n20_ev_min == 0.0 else fast_n20_ev_min,
         )
+        canonical_json = json.dumps(
+            self.to_dict(),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        object.__setattr__(self, "_canonical_json", canonical_json)
+        object.__setattr__(
+            self,
+            "_policy_hash",
+            hashlib.sha256(canonical_json.encode("ascii")).hexdigest(),
+        )
 
     def to_dict(self) -> dict:
-        payload = asdict(self)
+        payload = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if item.init
+        }
         for name in (
             "resident_allowed_states",
             "fast_directions",
@@ -128,17 +149,11 @@ class ProfileAdmissionPolicy:
         return payload
 
     def to_json(self) -> str:
-        return json.dumps(
-            self.to_dict(),
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        return self._canonical_json
 
     @property
     def policy_hash(self) -> str:
-        return hashlib.sha256(self.to_json().encode("ascii")).hexdigest()
+        return self._policy_hash
 
     @property
     def complexity(self) -> int:
@@ -178,12 +193,24 @@ class ProfileAdmissionContext:
             "candidate_origin",
             str(self.candidate_origin).upper(),
         )
-        if not self.profile_key:
-            raise ValueError("profile_key must not be empty")
+        if type(self.profile_key) is not str:
+            raise ValueError("profile_key must be a canonical string")
+        profile_parts = self.profile_key.split("|")
+        if (
+            len(profile_parts) != 5
+            or profile_parts[0] != "10"
+            or not profile_parts[1]
+            or not profile_parts[2]
+            or profile_parts[3] not in _DIRECTIONS
+            or _PROFILE_SEGMENT.fullmatch(profile_parts[4]) is None
+        ):
+            raise ValueError("profile_key must be a canonical 10-minute profile key")
         if self.order_slot not in _ORDER_SLOTS:
             raise ValueError(f"unknown order_slot: {self.order_slot}")
         if self.direction not in _DIRECTIONS:
             raise ValueError(f"unknown direction: {self.direction}")
+        if profile_parts[3] != self.direction:
+            raise ValueError("profile_key direction must equal context direction")
         if self.adaptive_state not in _ADAPTIVE_STATES:
             raise ValueError(f"unknown adaptive_state: {self.adaptive_state}")
         if type(self.daily_selected) is not bool:
@@ -208,11 +235,21 @@ class ProfileAdmissionContext:
             raise ValueError("n12_wins must fit n12_sample_size <= 12")
         if self.n20_sample_size > 20:
             raise ValueError("n20_sample_size must not exceed 20")
+        if self.n20_sample_size < self.n12_sample_size:
+            raise ValueError("n20_sample_size must include the N12 samples")
+        if self.adaptive_state == "WARMUP" and self.n12_sample_size >= 12:
+            raise ValueError("WARMUP must not contain a mature N12 window")
+        if self.adaptive_state != "WARMUP" and self.n12_sample_size != 12:
+            raise ValueError(f"{self.adaptive_state} requires a mature N12 window")
+        if self.adaptive_state == "PAUSED" and self.n20_sample_size != 20:
+            raise ValueError("PAUSED requires a complete N20 window")
         if isinstance(self.n20_ev, bool):
             raise ValueError("n20_ev must be finite")
         n20_ev = float(self.n20_ev)
         if not math.isfinite(n20_ev):
             raise ValueError("n20_ev must be finite")
+        if self.n20_sample_size == 0 and n20_ev != 0.0:
+            raise ValueError("n20_ev must be zero without N20 samples")
         object.__setattr__(self, "n20_ev", 0.0 if n20_ev == 0.0 else n20_ev)
         if type(self.adaptive_evaluated_at) is not int or self.adaptive_evaluated_at < 0:
             raise ValueError("adaptive_evaluated_at must be a non-negative integer")
