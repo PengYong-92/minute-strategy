@@ -478,6 +478,13 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--daily-profile-evaluation-time", result.stdout)
         self.assertIn("--daily-profile-activation-time", result.stdout)
         self.assertIn("--profile-degradation-cooldown-minutes", result.stdout)
+        self.assertIn("--enable-profile-admission", result.stdout)
+        self.assertIn("--profile-admission-resident-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-fast-directions", result.stdout)
+        self.assertIn("--profile-admission-fast-n12-min-wins", result.stdout)
+        self.assertIn("--profile-admission-fast-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-fast-n20-ev-min", result.stdout)
+        self.assertIn("前向稳定性尚未证明", result.stdout)
         self.assertIn("--no-websocket", result.stdout)
         self.assertIn(
             "完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60",
@@ -736,6 +743,81 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertEqual(args[args.index("--strategy-build-id") + 1], expected)
 
+    def test_run_script_profile_admission_candidate_is_inert_until_explicitly_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            base_env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+            }
+
+            default_result = run(
+                ["bash", str(ROOT / "scripts" / "run.sh")],
+                cwd=ROOT,
+                env=base_env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            default_args = log_path.read_text(encoding="utf-8").splitlines()
+            enabled_result = run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "run.sh"),
+                    "--enable-profile-admission",
+                    "--profile-admission-resident-n12-max-wins", "7",
+                    "--profile-admission-fast-directions", "SHORT",
+                    "--profile-admission-fast-n12-min-wins", "6",
+                    "--profile-admission-fast-n12-max-wins", "7",
+                    "--profile-admission-fast-n20-ev-min", "0.25",
+                ],
+                cwd=ROOT,
+                env=base_env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            enabled_args = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
+        self.assertNotIn("--enable-profile-admission", default_args)
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-n12-max-wins") + 1],
+            "8",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-fast-directions") + 1],
+            "SHORT",
+        )
+        self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr + enabled_result.stdout)
+        self.assertIn("--enable-profile-admission", enabled_args)
+        expected = {
+            "--profile-admission-resident-n12-max-wins": "7",
+            "--profile-admission-fast-directions": "SHORT",
+            "--profile-admission-fast-n12-min-wins": "6",
+            "--profile-admission-fast-n12-max-wins": "7",
+            "--profile-admission-fast-n20-ev-min": "0.25",
+        }
+        for option, value in expected.items():
+            self.assertEqual(enabled_args[enabled_args.index(option) + 1], value)
+
     def test_run_script_forwards_profile_degradation_cooldown_default_and_cli_forms(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -910,6 +992,7 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(any(name.endswith("/app/history.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/storage.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/daily_profile_selector.py") for name in names))
+                self.assertTrue(any(name.endswith("/app/profile_admission.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/session_profiles.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/webhook.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/static/index.html") for name in names))

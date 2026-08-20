@@ -16,12 +16,116 @@ from unittest.mock import patch
 import app.server as server_module
 from app.history import WarmupReport
 from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
+from app.profile_admission import baseline_policy, candidate_policy
 from app.server import apply_warmup, make_handler
 from app.state import MonitorState
 from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_profile_admission_startup_requires_explicit_enable_and_freezes_candidate(self):
+        cases = (
+            ({}, [], baseline_policy()),
+            ({"PROFILE_ADMISSION_ENABLE": "1"}, [], candidate_policy()),
+            (
+                {},
+                [
+                    "--enable-profile-admission",
+                    "--profile-admission-resident-n12-max-wins", "8",
+                    "--profile-admission-fast-directions", "SHORT",
+                    "--profile-admission-fast-n12-min-wins", "7",
+                    "--profile-admission-fast-n12-max-wins", "8",
+                    "--profile-admission-fast-n20-ev-min", "0",
+                ],
+                candidate_policy(),
+            ),
+        )
+        for environment, cli_args, expected in cases:
+            with self.subTest(environment=environment, cli_args=cli_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *cli_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch(
+                        "app.server.start_market_data",
+                        return_value=SimpleNamespace(stop=lambda: None),
+                    ),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                policy = monitor_state.call_args.kwargs["profile_admission_policy"]
+                self.assertEqual(policy.to_dict(), expected.to_dict())
+                self.assertEqual(policy.policy_hash, expected.policy_hash)
+
+    def test_profile_admission_invalid_enabled_candidate_fails_startup(self):
+        invalid_args = (
+            [
+                "--enable-profile-admission",
+                "--profile-admission-fast-n12-min-wins", "9",
+                "--profile-admission-fast-n12-max-wins", "8",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-fast-directions", "SHORT,SIDEWAYS",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-fast-n20-ev-min", "nan",
+            ],
+        )
+        for cli_args in invalid_args:
+            with self.subTest(cli_args=cli_args):
+                stderr = StringIO()
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch.object(sys, "argv", ["app.server", *cli_args]),
+                    redirect_stderr(stderr),
+                    patch("app.server.MonitorState") as monitor_state,
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    server_module.main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(monitor_state.called)
+                self.assertIn("画像准入策略", stderr.getvalue())
+
+    def test_profile_admission_help_is_explicitly_chinese_and_marks_release_blocked(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        help_text = stdout.getvalue()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--enable-profile-admission", help_text)
+        self.assertIn("--profile-admission-resident-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-fast-directions", help_text)
+        self.assertIn("--profile-admission-fast-n12-min-wins", help_text)
+        self.assertIn("--profile-admission-fast-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-fast-n20-ev-min", help_text)
+        self.assertIn("前向稳定性尚未证明", help_text)
+
     def test_snapshot_capacity_sampling_does_not_hold_realtime_state_lock(self):
         state = MonitorState(symbol="BTCUSDT")
         capacity_started = threading.Event()

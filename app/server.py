@@ -14,6 +14,7 @@ from app.history import WarmupConfig, WarmupReport, warmup_history
 from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.profile_health_guard import ProfileHealthGuardConfig
+from app.profile_admission import ProfileAdmissionPolicy, baseline_policy
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState, strategy_source_build_id
 from app.time_period_guard import TimePeriodGuardConfig
@@ -252,6 +253,15 @@ def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip().upper() for item in value.split(",") if item.strip()]
+
+
+def _profile_admission_directions(value: str) -> tuple[str, ...]:
+    directions = tuple(_split_csv(value))
+    if not directions or set(directions) - {"LONG", "SHORT"}:
+        raise argparse.ArgumentTypeError(
+            "画像准入策略快速方向只能使用 LONG、SHORT，且不能为空"
+        )
+    return directions
 
 
 def _clock_value(value: str) -> tuple[int, int]:
@@ -540,6 +550,45 @@ def main() -> None:
         help=f"允许实际开 SHORT 的时段，逗号分隔；默认: {DEFAULT_LIVE_SHORT_SEGMENTS}",
     )
     parser.add_argument(
+        "--enable-profile-admission",
+        action="store_true",
+        default=_env_bool("PROFILE_ADMISSION_ENABLE", False),
+        help=(
+            "显式启用冻结画像准入候选；默认关闭并使用兼容基准。"
+            "前向稳定性尚未证明，release_allowed 始终为 false"
+        ),
+    )
+    parser.add_argument(
+        "--profile-admission-resident-n12-max-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS", "8")),
+        help="常驻画像 N12 最大胜数，候选默认: 8",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-directions",
+        type=_profile_admission_directions,
+        default=os.getenv("PROFILE_ADMISSION_FAST_DIRECTIONS", "SHORT"),
+        help="快速通道允许方向，逗号分隔，候选默认: SHORT",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-n12-min-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_FAST_N12_MIN_WINS", "7")),
+        help="快速通道 N12 最小胜数，候选默认: 7",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-n12-max-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_FAST_N12_MAX_WINS", "8")),
+        help="快速通道 N12 最大胜数，候选默认: 8",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-n20-ev-min",
+        type=float,
+        default=float(os.getenv("PROFILE_ADMISSION_FAST_N20_EV_MIN", "0")),
+        help="快速通道 N20 最低 EV，候选默认: 0",
+    )
+    parser.add_argument(
         "--no-daily-profile-selector",
         action="store_true",
         default=not _env_bool("DAILY_PROFILE_SELECTOR", True),
@@ -624,6 +673,24 @@ def main() -> None:
         help="每天北京时间画像生效时间，格式 HH:MM，默认: 08:00",
     )
     args = parser.parse_args()
+    try:
+        candidate_admission_policy = ProfileAdmissionPolicy(
+            resident_allowed_states=("ACTIVE", "WATCH"),
+            resident_n12_max_wins=args.profile_admission_resident_n12_max_wins,
+            fast_enabled=True,
+            fast_directions=args.profile_admission_fast_directions,
+            fast_allowed_states=("ACTIVE",),
+            fast_n12_min_wins=args.profile_admission_fast_n12_min_wins,
+            fast_n12_max_wins=args.profile_admission_fast_n12_max_wins,
+            fast_n20_ev_min=args.profile_admission_fast_n20_ev_min,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(f"画像准入策略参数无效：{exc}")
+    profile_admission_policy = (
+        candidate_admission_policy
+        if args.enable_profile_admission
+        else baseline_policy()
+    )
     win_return = args.win_return if args.win_return is not None else round(args.stake * 1.8, 4)
 
     webhook = None
@@ -678,6 +745,7 @@ def main() -> None:
         observation_profile_min_edge=args.observation_profile_min_edge,
         live_short_segments=_split_csv(args.live_short_segments),
         enable_daily_profile_selector=not args.no_daily_profile_selector,
+        profile_admission_policy=profile_admission_policy,
         daily_profile_selector_config=DailyProfileSelectorConfig(
             lookback_days=args.daily_profile_lookback_days,
             stable_lookback_days=args.daily_profile_stable_lookback_days,

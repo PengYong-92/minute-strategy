@@ -63,6 +63,14 @@ from app.profile_health_guard import (
     ProfileHealthGuardDecision,
     evaluate_profile_health_guard,
 )
+from app.profile_admission import (
+    ProfileAdmissionContext,
+    ProfileAdmissionDecision,
+    ProfileAdmissionPolicy,
+    baseline_policy,
+    evaluate_profile_admission,
+    select_admitted_candidate,
+)
 from app.quality_score import attach_shadow_quality_score
 from app.result_sequence_guard import (
     ResultSequenceGuardConfig,
@@ -195,6 +203,7 @@ class MonitorState:
         profile_degradation_guard_config: ProfileDegradationGuardConfig | None = None,
         time_period_guard_config: TimePeriodGuardConfig | None = None,
         profile_health_guard_config: ProfileHealthGuardConfig | None = None,
+        profile_admission_policy: ProfileAdmissionPolicy | None = None,
         strategy_build_id: str = DEFAULT_STRATEGY_BUILD_ID,
     ):
         self.symbol = symbol.upper()
@@ -251,6 +260,9 @@ class MonitorState:
             if str(item).strip()
         }
         self.enable_daily_profile_selector = bool(enable_daily_profile_selector)
+        self.profile_admission_policy = profile_admission_policy or baseline_policy()
+        if not isinstance(self.profile_admission_policy, ProfileAdmissionPolicy):
+            raise TypeError("profile_admission_policy must be ProfileAdmissionPolicy")
         if trade_score_threshold is not None and not 0.0 <= float(trade_score_threshold) <= 95.0:
             raise ValueError("trade_score_threshold must be between 0 and 95")
         self.trade_score_threshold = (
@@ -1317,6 +1329,7 @@ class MonitorState:
                     "observation_min_ev": self.observation_profile_min_ev,
                     "observation_min_edge": self.observation_profile_min_edge,
                     "live_short_segments": sorted(self.live_short_segments),
+                    "admission": self._profile_admission_status(),
                 },
                 "trade_score_threshold": self.trade_score_threshold,
                 "module_versions": {
@@ -2474,6 +2487,8 @@ class MonitorState:
         self._profile_source_cached = False
         self._cached_profile_source = None
         self.risk_pause = ""
+        admission_context: ProfileAdmissionContext | None = None
+        admission_decision: ProfileAdmissionDecision | None = None
         self.profile_guard_audit = self._empty_profile_guard_audit()
         if not self.enable_profile_guard:
             self._update_profile_summary_audit(
@@ -2517,6 +2532,14 @@ class MonitorState:
         candidate_origin = self._formal_candidate_origin(signal)
         if signal.candidate_origin != candidate_origin:
             signal = replace(signal, candidate_origin=candidate_origin)
+        if daily_profile_required:
+            signal, admission_context, admission_decision = (
+                self._recompute_profile_admission(
+                    signal,
+                    current_time=latest.close_time,
+                    candidate_origin=candidate_origin,
+                )
+            )
         signal = self._attach_entry_structure_snapshot(
             signal,
             latest,
@@ -2623,12 +2646,10 @@ class MonitorState:
         qualification_state = str(
             signal.adaptive_profile_state.get("qualification_state", "")
         )
-        daily_profile_qualified = qualification_state in {
-            "QUALIFIED",
-            "QUALIFICATION_WATCH",
-        }
-        if daily_profile_required and (
-            not signal.daily_profile_selected or not daily_profile_qualified
+        if (
+            daily_profile_required
+            and admission_decision is not None
+            and admission_decision.code == "DAILY_PROFILE_NOT_SELECTED"
         ):
             run.trace(
                 "DAILY_PROFILE",
@@ -2640,6 +2661,10 @@ class MonitorState:
                     "profile_key": signal.profile_key,
                     "version": signal.daily_profile_version,
                     "qualification_state": qualification_state,
+                    "admission": self._profile_admission_payload(
+                        admission_context,
+                        admission_decision,
+                    ),
                 },
             )
             return self._block_order(
@@ -2660,13 +2685,21 @@ class MonitorState:
                 "profile_key": signal.profile_key,
                 "version": signal.daily_profile_version,
                 "qualification_state": qualification_state,
+                "admission": (
+                    self._profile_admission_payload(
+                        admission_context,
+                        admission_decision,
+                    )
+                    if admission_context is not None and admission_decision is not None
+                    else None
+                ),
             },
         )
 
         adaptive = signal.adaptive_profile_state
         adaptive_status = str(
-            adaptive.get("status", "WARMUP")
-            if daily_profile_required and signal.daily_profile_selected
+            admission_context.adaptive_state
+            if daily_profile_required and admission_context is not None
             else "NOT_APPLICABLE"
         )
         adaptive_values = {
@@ -2678,34 +2711,48 @@ class MonitorState:
             "n20": deepcopy(adaptive.get("n20", {})),
             "order_slot": signal.order_slot,
             "order_slot_scope": signal.order_slot_scope,
+            "admission": (
+                self._profile_admission_payload(
+                    admission_context,
+                    admission_decision,
+                )
+                if admission_context is not None and admission_decision is not None
+                else None
+            ),
         }
-        if adaptive_status == "PAUSED":
+        if (
+            admission_decision is not None
+            and signal.order_slot == "SECOND"
+            and not admission_decision.allow_second_order
+        ):
+            block_code = self._profile_admission_runtime_code(admission_decision.code)
             run.trace(
                 "ADAPTIVE_PROFILE",
                 "BLOCK",
-                "ADAPTIVE_PROFILE_PAUSED",
+                block_code,
                 adaptive_values,
             )
             return self._block_order(
                 signal,
                 latest,
-                "ADAPTIVE_PROFILE_PAUSED",
-                "当前完整画像即时状态为 PAUSED，仅继续记录独立观察",
+                block_code,
+                "当前画像准入决定禁止同方向第二席位",
                 should_observe=True,
                 run=run,
             )
-        if adaptive_status == "WATCH" and signal.order_slot == "SECOND":
+        if admission_decision is not None and not admission_decision.allowed:
+            block_code = self._profile_admission_runtime_code(admission_decision.code)
             run.trace(
                 "ADAPTIVE_PROFILE",
                 "BLOCK",
-                "ADAPTIVE_PROFILE_SECOND_BLOCKED",
+                block_code,
                 adaptive_values,
             )
             return self._block_order(
                 signal,
                 latest,
-                "ADAPTIVE_PROFILE_SECOND_BLOCKED",
-                "当前完整画像即时状态为 WATCH，禁止同方向第二席位",
+                block_code,
+                f"当前画像准入被阻止：{admission_decision.code}",
                 should_observe=True,
                 run=run,
             )
@@ -2713,8 +2760,8 @@ class MonitorState:
             "ADAPTIVE_PROFILE",
             "PASS",
             (
-                f"ADAPTIVE_PROFILE_{adaptive_status}"
-                if adaptive_status != "NOT_APPLICABLE"
+                admission_decision.code
+                if admission_decision is not None
                 else "ADAPTIVE_PROFILE_NOT_APPLICABLE"
             ),
             adaptive_values,
@@ -2775,6 +2822,10 @@ class MonitorState:
         if (
             signal.direction == "SHORT"
             and not signal.daily_profile_selected
+            and not (
+                admission_decision is not None
+                and admission_decision.channel == "FAST"
+            )
             and signal.threshold_segment.upper() not in self.live_short_segments
         ):
             run.trace(
@@ -2786,6 +2837,9 @@ class MonitorState:
                     "segment": signal.threshold_segment,
                     "daily_profile_selected": signal.daily_profile_selected,
                     "live_short_segments": sorted(self.live_short_segments),
+                    "admission_channel": (
+                        admission_decision.channel if admission_decision else "NONE"
+                    ),
                 },
             )
             return self._block_order(
@@ -2804,6 +2858,9 @@ class MonitorState:
                 "direction": signal.direction,
                 "segment": signal.threshold_segment,
                 "daily_profile_selected": signal.daily_profile_selected,
+                "admission_channel": (
+                    admission_decision.channel if admission_decision else "NONE"
+                ),
             },
         )
         if signal.direction == "SHORT" and signal.observe_only:
@@ -3048,7 +3105,11 @@ class MonitorState:
                 batch_decision.allow_progression
                 and profile_decision.allow_progression
                 and health_decision.allow_progression
-                and adaptive_status != "WATCH"
+                and (
+                    admission_decision.allow_progression
+                    if admission_decision is not None
+                    else True
+                )
             ),
             run=run,
         )
@@ -3641,6 +3702,138 @@ class MonitorState:
         )
         return replace(signal, adaptive_profile_state=state)
 
+    def _profile_admission_status(self) -> dict[str, object]:
+        return {
+            "enabled": self.profile_admission_policy.fast_enabled,
+            "policy": self.profile_admission_policy.to_dict(),
+            "policy_hash": self.profile_admission_policy.policy_hash,
+            "policy_version": self.profile_admission_policy.version,
+            "stability_proven": False,
+            "release_allowed": False,
+            "release_status": "BLOCKED",
+            "release_reason": "前向稳定性尚未证明，当前策略仅用于冻结审计",
+        }
+
+    @staticmethod
+    def _profile_admission_payload(
+        context: ProfileAdmissionContext,
+        decision: ProfileAdmissionDecision,
+    ) -> dict[str, object]:
+        return {
+            "context": context.to_dict(),
+            "decision": decision.to_dict(),
+            "stability_proven": False,
+            "release_allowed": False,
+        }
+
+    @staticmethod
+    def _profile_admission_runtime_code(code: str) -> str:
+        return {
+            "ADAPTIVE_PAUSED": "ADAPTIVE_PROFILE_PAUSED",
+            "WATCH_SECOND_ORDER_BLOCKED": "ADAPTIVE_PROFILE_SECOND_BLOCKED",
+        }.get(code, code)
+
+    def _profile_admission_context(
+        self,
+        signal: Signal,
+        *,
+        current_time: int,
+        candidate_origin: str,
+        candidate_ordinal: int,
+    ) -> ProfileAdmissionContext:
+        direction = self._signal_direction(signal)
+        key = daily_profile_key(
+            signal.timeframe_minutes,
+            signal.strategy_family,
+            signal.strategy_tag,
+            direction,
+            signal.threshold_segment,
+        )
+        selected_profiles = (self.active_daily_profile_selection or {}).get(
+            "selected_profiles",
+            [],
+        )
+        selected_profile = next(
+            (
+                (rank, item)
+                for rank, item in enumerate(selected_profiles, start=1)
+                if isinstance(item, dict) and str(item.get("key", "")) == key
+            ),
+            None,
+        )
+        daily_rank, qualification = selected_profile or (None, {})
+        qualification_state = str(
+            qualification.get("qualification_state") or (
+                "QUALIFIED" if selected_profile is not None else "NOT_QUALIFIED"
+            )
+        )
+        daily_selected = bool(
+            signal.daily_profile_selected
+            and selected_profile is not None
+            and qualification_state in {"QUALIFIED", "QUALIFICATION_WATCH"}
+        )
+        adaptive = signal.adaptive_profile_state
+        if not isinstance(adaptive, dict) or str(adaptive.get("profile_key", "")) != key:
+            adaptive = deepcopy(self.adaptive_profile_states.get(key))
+            if adaptive is None:
+                adaptive = evaluate_adaptive_profile_state((), key, int(current_time))
+        n12 = adaptive.get("n12", {}) if isinstance(adaptive.get("n12"), dict) else {}
+        n20 = adaptive.get("n20", {}) if isinstance(adaptive.get("n20"), dict) else {}
+        open_order_count = sum(
+            1
+            for order in self.simulator.orders
+            if order.status == "OPEN"
+            and str(order.direction or "").upper() == direction
+        )
+        return ProfileAdmissionContext(
+            profile_key=key,
+            direction=direction,
+            order_slot="SECOND" if open_order_count > 0 else "FIRST",
+            daily_selected=daily_selected,
+            qualification_state=qualification_state,
+            daily_rank=daily_rank,
+            daily_win_rate=float(qualification.get("win_rate", 0.0) or 0.0),
+            adaptive_state=str(adaptive.get("status", "WARMUP") or "WARMUP"),
+            adaptive_transition=str(adaptive.get("transition", "") or ""),
+            adaptive_evaluated_at=int(adaptive.get("evaluated_at", 0) or 0),
+            n12_sample_size=int(n12.get("sample_size", 0) or 0),
+            n12_wins=int(n12.get("wins", 0) or 0),
+            n20_sample_size=int(n20.get("sample_size", 0) or 0),
+            n20_ev=float(n20.get("ev", 0.0) or 0.0),
+            candidate_origin=candidate_origin,
+            candidate_ordinal=candidate_ordinal,
+        )
+
+    def _recompute_profile_admission(
+        self,
+        signal: Signal,
+        *,
+        current_time: int,
+        candidate_origin: str,
+        candidate_ordinal: int = 0,
+    ) -> tuple[Signal, ProfileAdmissionContext, ProfileAdmissionDecision]:
+        context = self._profile_admission_context(
+            signal,
+            current_time=current_time,
+            candidate_origin=candidate_origin,
+            candidate_ordinal=candidate_ordinal,
+        )
+        decision = evaluate_profile_admission(context, self.profile_admission_policy)
+        adaptive = deepcopy(signal.adaptive_profile_state)
+        adaptive["admission"] = self._profile_admission_payload(context, decision)
+        return (
+            replace(
+                signal,
+                profile_key=context.profile_key,
+                daily_profile_selected=context.daily_selected,
+                order_slot=context.order_slot,
+                order_slot_scope="DIRECTION_V2",
+                adaptive_profile_state=adaptive,
+            ),
+            context,
+            decision,
+        )
+
     def _select_daily_profile_signal(
         self,
         primary_signal: Signal,
@@ -3653,65 +3846,115 @@ class MonitorState:
         if not snapshot or snapshot.get("status") not in {"READY", "FALLBACK"}:
             return primary_signal, False
 
-        candidates: list[tuple[Signal, str, str]] = [
-            (
-                primary_signal,
-                (primary_signal.observe_direction or primary_signal.direction).upper(),
-                self._origin_before_profile_promotion(primary_signal),
+        raw_candidates = [primary_signal, *observation_candidates]
+        prepared: dict[int, tuple[Signal, ProfileAdmissionContext]] = {}
+        eligible_contexts: list[ProfileAdmissionContext] = []
+        for candidate_ordinal, signal in enumerate(raw_candidates):
+            direction = (signal.observe_direction or signal.direction).upper()
+            if direction not in {"LONG", "SHORT"}:
+                continue
+            candidate_origin = self._origin_before_profile_promotion(signal)
+            key = daily_profile_key(
+                signal.timeframe_minutes,
+                signal.strategy_family,
+                signal.strategy_tag,
+                direction,
+                signal.threshold_segment,
             )
-        ]
-        candidates.extend(
-            (
+            candidate = replace(
                 signal,
-                (signal.observe_direction or signal.direction).upper(),
-                self._origin_before_profile_promotion(signal),
+                direction=direction,
+                observe_direction=direction,
+                profile_key=key,
+                daily_profile_selected=any(
+                    isinstance(item, dict)
+                    and str(item.get("key", "")) == key
+                    and str(item.get("qualification_state") or "QUALIFIED")
+                    in {"QUALIFIED", "QUALIFICATION_WATCH"}
+                    for item in snapshot.get("selected_profiles", [])
+                ),
+                daily_profile_version=str(snapshot.get("version", "")),
+                candidate_origin=candidate_origin,
             )
-            for signal in observation_candidates
+            candidate = self._attach_adaptive_profile_state(
+                candidate,
+                current_time=current_time,
+                daily_profile_required=True,
+            )
+            context = self._profile_admission_context(
+                candidate,
+                current_time=current_time,
+                candidate_origin=candidate_origin,
+                candidate_ordinal=candidate_ordinal,
+            )
+            candidate = replace(
+                candidate,
+                daily_profile_selected=context.daily_selected,
+                order_slot=context.order_slot,
+                order_slot_scope="DIRECTION_V2",
+            )
+            prepared[candidate_ordinal] = (candidate, context)
+            if context.daily_selected or candidate_ordinal > 0:
+                eligible_contexts.append(context)
+
+        selected = select_admitted_candidate(
+            eligible_contexts,
+            self.profile_admission_policy,
         )
-        for selected_profile in snapshot.get("selected_profiles", []):
-            selected_key = str(selected_profile.get("key", ""))
-            for signal, direction, candidate_origin in candidates:
-                if direction not in {"LONG", "SHORT"}:
-                    continue
-                key = daily_profile_key(
-                    signal.timeframe_minutes,
-                    signal.strategy_family,
-                    signal.strategy_tag,
-                    direction,
-                    signal.threshold_segment,
+        if selected is not None:
+            signal, _context = prepared[selected.context.candidate_ordinal]
+            selected_profile = next(
+                (
+                    item
+                    for item in snapshot.get("selected_profiles", [])
+                    if isinstance(item, dict)
+                    and str(item.get("key", "")) == selected.context.profile_key
+                ),
+                {},
+            )
+            calculated_threshold = (
+                signal.calculated_threshold
+                if signal.calculated_threshold > 0
+                else signal.threshold
+            )
+            if selected.decision.channel == "RESIDENT":
+                reason = (
+                    f"{self._without_dynamic_threshold_block(signal)}；"
+                    f"每日画像启用 {snapshot.get('version', '')} "
+                    f"N{selected_profile.get('sample_size', 0)} "
+                    f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
+                    f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
                 )
-                if key != selected_key:
-                    continue
-                calculated_threshold = (
-                    signal.calculated_threshold
-                    if signal.calculated_threshold > 0
-                    else signal.threshold
+            else:
+                reason = (
+                    f"{self._without_dynamic_threshold_block(signal)}；"
+                    f"画像快速通道 {selected.decision.code}"
                 )
-                return (
-                    replace(
-                        signal,
-                        direction=direction,
-                        reason=(
-                            f"{self._without_dynamic_threshold_block(signal)}；"
-                            f"每日画像启用 {snapshot.get('version', '')} "
-                            f"N{selected_profile.get('sample_size', 0)} "
-                            f"胜率{float(selected_profile.get('win_rate', 0.0)):.2%} "
-                            f"EV{float(selected_profile.get('ev', 0.0)):.2f}U"
-                        ),
-                        calculated_threshold=calculated_threshold,
-                        session_allowed=True,
-                        session_sample_size=int(selected_profile.get("sample_size", 0)),
-                        session_win_rate=float(selected_profile.get("win_rate", 0.0)),
-                        session_ev=float(selected_profile.get("ev", 0.0)),
-                        observe_direction=direction,
-                        observe_only=False,
-                        profile_key=key,
-                        daily_profile_selected=True,
-                        daily_profile_version=str(snapshot.get("version", "")),
-                        candidate_origin=candidate_origin,
-                    ),
-                    True,
-                )
+            adaptive = deepcopy(signal.adaptive_profile_state)
+            adaptive["admission"] = self._profile_admission_payload(
+                selected.context,
+                selected.decision,
+            )
+            effective_threshold = (
+                min(signal.threshold, abs(signal.score))
+                if selected.decision.channel == "FAST"
+                else signal.threshold
+            )
+            return (
+                replace(
+                    signal,
+                    reason=reason,
+                    threshold=effective_threshold,
+                    calculated_threshold=calculated_threshold,
+                    session_allowed=True,
+                    session_sample_size=int(selected_profile.get("sample_size", 0) or 0),
+                    session_win_rate=float(selected_profile.get("win_rate", 0.0) or 0.0),
+                    session_ev=float(selected_profile.get("ev", 0.0) or 0.0),
+                    observe_only=False,
+                    adaptive_profile_state=adaptive,
+                ),
+                True,
+            )
         return primary_signal, True
 
     @staticmethod
@@ -5521,6 +5764,7 @@ class MonitorState:
                 "profile_guard": self._profile_guard_config(),
                 "observation_profile_promotion": self._observation_profile_promotion_config(),
                 "daily_profile_selection": self._daily_profile_selector_status(),
+                "profile_admission": self._profile_admission_status(),
                 "storage_capacity": storage_capacity,
                 "entry_structure_shadow": self._entry_structure_status(),
                 "stake_progression": self._stake_progression_status(),

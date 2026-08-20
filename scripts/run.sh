@@ -47,6 +47,12 @@ OBSERVATION_PROFILE_MIN_WIN_RATE="${OBSERVATION_PROFILE_MIN_WIN_RATE:-0.72}"
 OBSERVATION_PROFILE_MIN_EV="${OBSERVATION_PROFILE_MIN_EV:-4}"
 OBSERVATION_PROFILE_MIN_EDGE="${OBSERVATION_PROFILE_MIN_EDGE:-10}"
 LIVE_SHORT_SEGMENTS="${LIVE_SHORT_SEGMENTS:-WD-02,WD-23}"
+PROFILE_ADMISSION_ENABLE="${PROFILE_ADMISSION_ENABLE:-0}"
+PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS="${PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS:-8}"
+PROFILE_ADMISSION_FAST_DIRECTIONS="${PROFILE_ADMISSION_FAST_DIRECTIONS:-SHORT}"
+PROFILE_ADMISSION_FAST_N12_MIN_WINS="${PROFILE_ADMISSION_FAST_N12_MIN_WINS:-7}"
+PROFILE_ADMISSION_FAST_N12_MAX_WINS="${PROFILE_ADMISSION_FAST_N12_MAX_WINS:-8}"
+PROFILE_ADMISSION_FAST_N20_EV_MIN="${PROFILE_ADMISSION_FAST_N20_EV_MIN:-0}"
 DAILY_PROFILE_SELECTOR="${DAILY_PROFILE_SELECTOR:-1}"
 DAILY_PROFILE_LOOKBACK_DAYS="${DAILY_PROFILE_LOOKBACK_DAYS:-7}"
 DAILY_PROFILE_STABLE_LOOKBACK_DAYS="${DAILY_PROFILE_STABLE_LOOKBACK_DAYS-}"
@@ -141,6 +147,19 @@ usage() {
                          观察画像动态放行最低评分边际，默认: 10
   --live-short-segments LIST
                          允许实际开 SHORT 的时段，逗号分隔，默认: WD-02,WD-23
+  --enable-profile-admission
+                         显式启用冻结画像准入候选；默认关闭并使用兼容基准
+                         前向稳定性尚未证明，release_allowed 固定为 false
+  --profile-admission-resident-n12-max-wins N
+                         常驻画像 N12 最大胜数，候选默认: 8
+  --profile-admission-fast-directions LIST
+                         快速通道允许方向，逗号分隔，候选默认: SHORT
+  --profile-admission-fast-n12-min-wins N
+                         快速通道 N12 最小胜数，候选默认: 7
+  --profile-admission-fast-n12-max-wins N
+                         快速通道 N12 最大胜数，候选默认: 8
+  --profile-admission-fast-n20-ev-min N
+                         快速通道 N20 最低 EV，候选默认: 0
   --no-daily-profile-selector
                          关闭每日观察画像策略选择器，回退到静态主策略
   --daily-profile-lookback-days N
@@ -194,6 +213,9 @@ usage() {
   OBSERVATION_PROFILE_PROMOTION, OBSERVATION_PROFILE_LOOKBACK_DAYS,
   OBSERVATION_PROFILE_MIN_SAMPLES, OBSERVATION_PROFILE_MIN_WIN_RATE,
   OBSERVATION_PROFILE_MIN_EV, OBSERVATION_PROFILE_MIN_EDGE, LIVE_SHORT_SEGMENTS,
+  PROFILE_ADMISSION_ENABLE, PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS,
+  PROFILE_ADMISSION_FAST_DIRECTIONS, PROFILE_ADMISSION_FAST_N12_MIN_WINS,
+  PROFILE_ADMISSION_FAST_N12_MAX_WINS, PROFILE_ADMISSION_FAST_N20_EV_MIN,
   DAILY_PROFILE_SELECTOR, DAILY_PROFILE_LOOKBACK_DAYS,
   DAILY_PROFILE_STABLE_LOOKBACK_DAYS,
   DAILY_PROFILE_MIN_SAMPLES, DAILY_PROFILE_WEEKEND_MIN_SAMPLES,
@@ -569,6 +591,55 @@ while [ "$#" -gt 0 ]; do
       LIVE_SHORT_SEGMENTS="${1#*=}"
       shift
       ;;
+    --enable-profile-admission)
+      PROFILE_ADMISSION_ENABLE="1"
+      shift
+      ;;
+    --profile-admission-resident-n12-max-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-n12-max-wins=*)
+      PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-directions)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_DIRECTIONS="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-directions=*)
+      PROFILE_ADMISSION_FAST_DIRECTIONS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-n12-min-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_N12_MIN_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-n12-min-wins=*)
+      PROFILE_ADMISSION_FAST_N12_MIN_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-n12-max-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_N12_MAX_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-n12-max-wins=*)
+      PROFILE_ADMISSION_FAST_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-n20-ev-min)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_N20_EV_MIN="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-n20-ev-min=*)
+      PROFILE_ADMISSION_FAST_N20_EV_MIN="${1#*=}"
+      shift
+      ;;
     --no-daily-profile-selector)
       DAILY_PROFILE_SELECTOR="0"
       shift
@@ -809,6 +880,11 @@ case "$DAILY_PROFILE_SELECTOR" in
     EXTRA_ARGS+=(--no-daily-profile-selector)
     ;;
 esac
+case "$PROFILE_ADMISSION_ENABLE" in
+  1|true|TRUE|yes|YES|y|Y|on|ON)
+    EXTRA_ARGS+=(--enable-profile-admission)
+    ;;
+esac
 case "$WARMUP_CURRENT_MONTH_DAILY" in
   0|false|FALSE|no|NO|n|N|off|OFF)
     EXTRA_ARGS+=(--no-current-month-daily)
@@ -869,6 +945,11 @@ exec "$PYTHON_BIN" -m app.server \
   --observation-profile-min-ev "$OBSERVATION_PROFILE_MIN_EV" \
   --observation-profile-min-edge "$OBSERVATION_PROFILE_MIN_EDGE" \
   --live-short-segments "$LIVE_SHORT_SEGMENTS" \
+  --profile-admission-resident-n12-max-wins "$PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS" \
+  --profile-admission-fast-directions "$PROFILE_ADMISSION_FAST_DIRECTIONS" \
+  --profile-admission-fast-n12-min-wins "$PROFILE_ADMISSION_FAST_N12_MIN_WINS" \
+  --profile-admission-fast-n12-max-wins "$PROFILE_ADMISSION_FAST_N12_MAX_WINS" \
+  --profile-admission-fast-n20-ev-min "$PROFILE_ADMISSION_FAST_N20_EV_MIN" \
   --daily-profile-lookback-days "$DAILY_PROFILE_LOOKBACK_DAYS" \
   --daily-profile-min-samples "$DAILY_PROFILE_MIN_SAMPLES" \
   --daily-profile-weekend-min-samples "$DAILY_PROFILE_WEEKEND_MIN_SAMPLES" \
