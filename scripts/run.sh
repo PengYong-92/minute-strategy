@@ -13,6 +13,10 @@ POLL_SECONDS="${POLL_SECONDS:-10}"
 KLINE_LIMIT="${KLINE_LIMIT:-300}"
 DATA_DIR="${DATA_DIR:-$ROOT_DIR/data}"
 DB_PATH="${DB_PATH:-$ROOT_DIR/data/monitor.sqlite3}"
+SHADOW_OPTIMIZER="${SHADOW_OPTIMIZER:-0}"
+SHADOW_DB_PATH="${SHADOW_DB_PATH:-$ROOT_DIR/data/monitor.shadow.sqlite3}"
+SHADOW_QUEUE_SIZE="${SHADOW_QUEUE_SIZE:-120}"
+SHADOW_MAX_CHALLENGERS="${SHADOW_MAX_CHALLENGERS:-7}"
 WEBHOOK_URL="${WEBHOOK_URL:-https://event.easy-tx.com/api/signals/ingest}"
 WEBHOOK_TOKEN="${WEBHOOK_TOKEN:-}"
 WEBHOOK_TIMEOUT="${WEBHOOK_TIMEOUT:-5}"
@@ -96,6 +100,13 @@ usage() {
   --limit N              每次拉取的 1分钟K线数量，默认: 300
   --data-dir DIR         本地 Binance Vision 缓存目录，默认: ./data
   --db-path PATH         SQLite 持久化路径，默认: ./data/monitor.sqlite3
+  --enable-shadow-optimizer
+                         启用独立进程持续影子参数优化，默认关闭
+  --no-shadow-optimizer  关闭持续影子参数优化
+  --shadow-db-path PATH  影子参数独立SQLite路径，默认: ./data/monitor.shadow.sqlite3
+  --shadow-queue-size N  影子分钟事件有界队列长度，默认: 120
+  --shadow-max-challengers N
+                         并行影子候选数量，范围1到7，默认: 7
   --webhook-url URL      外部信号 webhook 地址，默认: event.easy-tx 导入接口
   --webhook-token TOKEN  外部信号 importToken
   --webhook-timeout N    Webhook 超时秒数，默认: 5
@@ -212,6 +223,7 @@ usage() {
 
 环境变量覆盖:
   SYMBOL, STRATEGY_BUILD_ID, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
+  SHADOW_OPTIMIZER, SHADOW_DB_PATH, SHADOW_QUEUE_SIZE, SHADOW_MAX_CHALLENGERS,
   WEBHOOK_URL, WEBHOOK_TOKEN, WEBHOOK_TIMEOUT,
   WARMUP_MONTHS, WARMUP_TIMEOUT, STAKE, TRADE_SCORE_THRESHOLD, WIN_RETURN,
   MAX_OPEN_ORDERS, MAX_OPEN_LONG_ORDERS, MAX_OPEN_SHORT_ORDERS,
@@ -332,6 +344,41 @@ while [ "$#" -gt 0 ]; do
       ;;
     --db-path=*)
       DB_PATH="${1#*=}"
+      shift
+      ;;
+    --enable-shadow-optimizer)
+      SHADOW_OPTIMIZER="1"
+      shift
+      ;;
+    --no-shadow-optimizer)
+      SHADOW_OPTIMIZER="0"
+      shift
+      ;;
+    --shadow-db-path)
+      require_value "$1" "${2:-}"
+      SHADOW_DB_PATH="$2"
+      shift 2
+      ;;
+    --shadow-db-path=*)
+      SHADOW_DB_PATH="${1#*=}"
+      shift
+      ;;
+    --shadow-queue-size)
+      require_value "$1" "${2:-}"
+      SHADOW_QUEUE_SIZE="$2"
+      shift 2
+      ;;
+    --shadow-queue-size=*)
+      SHADOW_QUEUE_SIZE="${1#*=}"
+      shift
+      ;;
+    --shadow-max-challengers)
+      require_value "$1" "${2:-}"
+      SHADOW_MAX_CHALLENGERS="$2"
+      shift 2
+      ;;
+    --shadow-max-challengers=*)
+      SHADOW_MAX_CHALLENGERS="${1#*=}"
       shift
       ;;
     --webhook-url)
@@ -935,6 +982,18 @@ case "$PROFILE_ADMISSION_ENABLE" in
     exit 2
     ;;
 esac
+case "$SHADOW_OPTIMIZER" in
+  1|true|TRUE|yes|YES|y|Y|on|ON)
+    EXTRA_ARGS+=(--enable-shadow-optimizer)
+    ;;
+  0|false|FALSE|no|NO|n|N|off|OFF)
+    EXTRA_ARGS+=(--no-shadow-optimizer)
+    ;;
+  *)
+    echo "SHADOW_OPTIMIZER 必须为布尔值，实际为: $SHADOW_OPTIMIZER" >&2
+    exit 2
+    ;;
+esac
 case "$WARMUP_CURRENT_MONTH_DAILY" in
   0|false|FALSE|no|NO|n|N|off|OFF)
     EXTRA_ARGS+=(--no-current-month-daily)
@@ -968,6 +1027,9 @@ exec "$PYTHON_BIN" -m app.server \
   --limit "$KLINE_LIMIT" \
   --data-dir "$DATA_DIR" \
   --db-path "$DB_PATH" \
+  --shadow-db-path "$SHADOW_DB_PATH" \
+  --shadow-queue-size "$SHADOW_QUEUE_SIZE" \
+  --shadow-max-challengers "$SHADOW_MAX_CHALLENGERS" \
   --webhook-url "$WEBHOOK_URL" \
   --webhook-token "$WEBHOOK_TOKEN" \
   --webhook-timeout "$WEBHOOK_TIMEOUT" \

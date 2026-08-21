@@ -80,6 +80,7 @@ from app.result_sequence_guard import (
 from app.rolling_edge import RollingEdgeConfig, RollingEdgeSnapshot, rolling_edge_snapshot, should_degrade
 from app.simulator import AccountSimulator, SettlementEvent
 from app.stake_progression import TWO_STAGE_VERSION
+from app.stake_progression import StakeProgressionCredit
 from app.storage import (
     DecisionAudit,
     SQLiteMonitorStore,
@@ -380,6 +381,12 @@ class MonitorState:
         self._last_order_opened_at = self._latest_order_opened_at_by_direction(
             restored_orders
         )
+        self._shadow_event_gap_count = 0
+        self._shadow_last_gap = ""
+        self._shadow_status_provider = None
+        self._shadow_policy_audit_sink = None
+        self._pending_shadow_policy_change: dict[str, object] | None = None
+        self._last_shadow_policy_change: dict[str, object] | None = None
         self._lock = threading.RLock()
 
     def capture_symbol_context(self) -> tuple[str, int]:
@@ -428,6 +435,435 @@ class MonitorState:
                 return None
             return self.klines[-1].open_time
 
+    def shadow_market_context(
+        self,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> dict[str, object] | None:
+        with self._lock:
+            if not self._matches_symbol_context(expected_context):
+                return None
+            return deepcopy(self.fear_greed.to_dict()) if self.fear_greed else None
+
+    def shadow_runtime_seed(self) -> dict[str, object]:
+        with self._lock:
+            constructor = {
+                "max_open_orders": self.order_policy.max_open_orders,
+                "max_open_long_orders": self.order_policy.max_open_long_orders,
+                "max_open_short_orders": self.order_policy.max_open_short_orders,
+                "min_order_gap_ms": self.order_policy.min_order_gap_ms,
+                "max_klines": self.max_klines,
+                "rolling_edge_config": deepcopy(self.rolling_edge_config),
+                "enable_rolling_edge_guard": self.enable_rolling_edge_guard,
+                "result_sequence_guard_config": deepcopy(
+                    self.result_sequence_guard_config
+                ),
+                "stake": self.stake,
+                "win_return": self.win_return,
+                "enable_stake_progression": self.enable_stake_progression,
+                "stake_progression_max_orders": self.stake_progression_max_orders,
+                "stake_progression_base_only_segments": tuple(
+                    self.stake_progression_base_only_segments
+                ),
+                "stake_progression_max_active": self.stake_progression_max_active,
+                "enable_profile_guard": self.enable_profile_guard,
+                "profile_guard_min_history": self.profile_guard_min_history,
+                "profile_guard_min_group_size": self.profile_guard_min_group_size,
+                "enable_observation_profile_promotion": (
+                    self.enable_observation_profile_promotion
+                ),
+                "observation_profile_lookback_days": (
+                    self.observation_profile_lookback_days
+                ),
+                "observation_profile_min_samples": (
+                    self.observation_profile_min_samples
+                ),
+                "observation_profile_min_win_rate": (
+                    self.observation_profile_min_win_rate
+                ),
+                "observation_profile_min_ev": self.observation_profile_min_ev,
+                "observation_profile_min_edge": self.observation_profile_min_edge,
+                "live_short_segments": tuple(sorted(self.live_short_segments)),
+                "enable_daily_profile_selector": self.enable_daily_profile_selector,
+                "daily_profile_selector_config": deepcopy(
+                    self.daily_profile_selector_config
+                ),
+                "trade_score_threshold": self.trade_score_threshold,
+                "enable_wave_guard": self.enable_wave_guard,
+                "wave_batch_guard_config": deepcopy(self.wave_batch_guard_config),
+                "profile_degradation_guard_config": deepcopy(
+                    self.profile_degradation_guard_config
+                ),
+                "time_period_guard_config": deepcopy(
+                    self.time_period_guard_config
+                ),
+                "profile_health_guard_config": deepcopy(
+                    self.profile_health_guard_config
+                ),
+                "strategy_build_id": self.strategy_build_id,
+            }
+            return {
+                "symbol": self.symbol,
+                "context": (self.symbol, self._symbol_generation),
+                "constructor": constructor,
+                "klines": tuple(self.klines),
+                "observations": tuple(deepcopy(self.observations)),
+                "daily_profile_selection": deepcopy(self.daily_profile_selection),
+                "fear_greed": (
+                    deepcopy(self.fear_greed.to_dict()) if self.fear_greed else None
+                ),
+                "profile_admission_policy": self.profile_admission_policy.to_dict(),
+                "runtime_config": self._decision_runtime_config().to_dict(),
+            }
+
+    def seed_shadow_history(
+        self,
+        observations: Sequence[ObservationSignal],
+        daily_profile_selection: dict | None,
+        *,
+        evaluated_at: int,
+    ) -> None:
+        if self.storage is not None:
+            raise RuntimeError("shadow history can only seed a non-persistent state")
+        with self._lock:
+            restored = list(deepcopy(observations))
+            self.observations = restored
+            self._adaptive_profile_observations = list(deepcopy(restored))
+            self.adaptive_profile_states = {}
+            self._rebuild_all_adaptive_profile_states(int(evaluated_at))
+            self._direction_pulse_history = list(deepcopy(restored))
+            self.direction_pulse_shadow = empty_direction_pulse_shadow(
+                current_time=int(evaluated_at)
+            )
+            self._refresh_direction_pulse_shadow(
+                int(evaluated_at),
+                report_error=False,
+            )
+            self.daily_profile_selection = deepcopy(daily_profile_selection)
+            self.active_daily_profile_selection = None
+
+    def restore_shadow_execution_state(
+        self,
+        *,
+        orders: Sequence,
+        observations: Sequence[ObservationSignal],
+        credits: Sequence[StakeProgressionCredit],
+        wave_snapshot: WaveSnapshot,
+        wave_evaluated_at: int,
+        daily_profile_selection: dict | None,
+        active_daily_profile_selection: dict | None,
+        last_order_opened_at: Mapping[str, int | None] | None,
+        opened_signal_keys: Sequence[Sequence[object]],
+        evaluated_at: int,
+    ) -> None:
+        if self.storage is not None:
+            raise RuntimeError("shadow execution can only restore a non-persistent state")
+        with self._lock:
+            restored_orders = list(deepcopy(orders))
+            restored_credits = list(deepcopy(credits))
+            active_second_order_ids = {
+                order.id
+                for order in restored_orders
+                if order.status == "OPEN"
+                and order.stake_progression_step == 2
+                and order.stake_progression_version == TWO_STAGE_VERSION
+            }
+            self.simulator = AccountSimulator(
+                stake=self.stake,
+                win_return=self.win_return,
+                orders=restored_orders,
+                enable_stake_progression=self.enable_stake_progression,
+                stake_progression_max_orders=2,
+                stake_progression_base_only_segments=(
+                    self.stake_progression_base_only_segments
+                ),
+                stake_progression_max_active=self.stake_progression_max_active,
+                max_open_orders=self.order_policy.max_open_orders,
+                stake_progression_activated_at=0,
+                stake_progression_credits=restored_credits,
+                active_second_order_ids=active_second_order_ids,
+            )
+            restored_observations = list(deepcopy(observations))
+            self.observations = restored_observations
+            self._adaptive_profile_observations = list(
+                deepcopy(restored_observations)
+            )
+            self.adaptive_profile_states = {}
+            self._rebuild_all_adaptive_profile_states(int(evaluated_at))
+            self._direction_pulse_history = list(deepcopy(restored_observations))
+            self.direction_pulse_shadow = empty_direction_pulse_shadow(
+                current_time=int(evaluated_at)
+            )
+            self._refresh_direction_pulse_shadow(
+                int(evaluated_at),
+                report_error=False,
+            )
+            self.wave_state = deepcopy(wave_snapshot)
+            self._wave_evaluated_at = int(wave_evaluated_at)
+            self._wave_runtime_bootstrap_required = False
+            self._wave_bootstrap_cancel_pending = False
+            self.daily_profile_selection = deepcopy(daily_profile_selection)
+            self.active_daily_profile_selection = deepcopy(
+                active_daily_profile_selection
+            )
+            self._last_order_opened_at = (
+                {
+                    direction: (
+                        None if value is None else int(value)
+                    )
+                    for direction, value in last_order_opened_at.items()
+                }
+                if isinstance(last_order_opened_at, Mapping)
+                else self._latest_order_opened_at_by_direction(restored_orders)
+            )
+            self._opened_signal_keys = {
+                (int(item[0]), int(item[1]), str(item[2]))
+                for item in opened_signal_keys
+                if len(item) == 3
+            }
+            self._pending_settlement_events = []
+
+    def apply_profile_admission_policy(
+        self,
+        policy: ProfileAdmissionPolicy,
+        *,
+        expected_policy_hash: str | None = None,
+    ) -> bool:
+        if not isinstance(policy, ProfileAdmissionPolicy):
+            raise TypeError("policy must be ProfileAdmissionPolicy")
+        with self._lock:
+            if (
+                expected_policy_hash is not None
+                and self.profile_admission_policy.policy_hash
+                != str(expected_policy_hash)
+            ):
+                return False
+            self.profile_admission_policy = policy
+            self._decision_runtime_config_cache = None
+            return True
+
+    def request_shadow_policy_change(
+        self,
+        request: Mapping[str, object],
+    ) -> dict[str, object]:
+        policy_payload = request.get("policy")
+        if not isinstance(policy_payload, Mapping):
+            raise ValueError("shadow policy request requires policy")
+        policy = ProfileAdmissionPolicy(**deepcopy(dict(policy_payload)))
+        expected_hash = str(request.get("expected_policy_hash") or "")
+        effective_at_ms = int(request.get("effective_at_ms") or self._now_ms())
+        request_symbol = str(request.get("symbol") or "").strip().upper()
+        request_generation = request.get("generation")
+        normalized = {
+            "request_id": str(request.get("request_id") or ""),
+            "type": str(request.get("type") or "PROMOTION_REQUEST"),
+            "experiment_id": str(request.get("experiment_id") or ""),
+            "from_arm_id": str(request.get("from_arm_id") or ""),
+            "to_arm_id": str(request.get("to_arm_id") or ""),
+            "parameter_hash": str(request.get("parameter_hash") or ""),
+            "symbol": request_symbol,
+            "generation": request_generation,
+            "policy": policy,
+            "expected_policy_hash": expected_hash,
+            "requested_at_ms": effective_at_ms,
+            "deadline_at_ms": effective_at_ms + 10 * 60_000,
+        }
+        with self._lock:
+            if (
+                not request_symbol
+                or type(request_generation) is not int
+                or (request_symbol, request_generation)
+                != (self.symbol, self._symbol_generation)
+            ):
+                result = {
+                    "status": "REJECTED_CONTEXT",
+                    "request_id": normalized["request_id"],
+                    "requested_context": [request_symbol, request_generation],
+                    "current_context": [self.symbol, self._symbol_generation],
+                }
+                self._last_shadow_policy_change = result
+                return deepcopy(result)
+            if expected_hash and self.profile_admission_policy.policy_hash != expected_hash:
+                result = {
+                    "status": "REJECTED_STALE_CHAMPION",
+                    "request_id": normalized["request_id"],
+                    "expected_policy_hash": expected_hash,
+                    "current_policy_hash": self.profile_admission_policy.policy_hash,
+                }
+                self._last_shadow_policy_change = result
+                return deepcopy(result)
+            self._pending_shadow_policy_change = normalized
+            return self._apply_pending_shadow_policy_change_locked(effective_at_ms)
+
+    def apply_pending_shadow_policy_change(
+        self,
+        current_time_ms: int,
+    ) -> dict[str, object]:
+        with self._lock:
+            return self._apply_pending_shadow_policy_change_locked(
+                int(current_time_ms)
+            )
+
+    def _apply_pending_shadow_policy_change_locked(
+        self,
+        current_time_ms: int,
+    ) -> dict[str, object]:
+        pending = self._pending_shadow_policy_change
+        if pending is None:
+            return deepcopy(
+                self._last_shadow_policy_change
+                or {"status": "NO_PENDING_CHANGE"}
+            )
+        if (pending["symbol"], pending["generation"]) != (
+            self.symbol,
+            self._symbol_generation,
+        ):
+            result = {
+                "status": "REJECTED_CONTEXT",
+                "request_id": pending["request_id"],
+                "requested_context": [pending["symbol"], pending["generation"]],
+                "current_context": [self.symbol, self._symbol_generation],
+            }
+            self._pending_shadow_policy_change = None
+            self._last_shadow_policy_change = deepcopy(result)
+            return result
+        open_orders = sum(
+            order.status == "OPEN" for order in self.simulator.orders
+        )
+        deadline = int(pending["deadline_at_ms"])
+        if open_orders and int(current_time_ms) < deadline:
+            return {
+                "status": "WAITING_OPEN_ORDERS",
+                "request_id": pending["request_id"],
+                "open_orders": open_orders,
+                "deadline_at_ms": deadline,
+            }
+        expected_hash = str(pending["expected_policy_hash"])
+        if expected_hash and self.profile_admission_policy.policy_hash != expected_hash:
+            result = {
+                "status": "REJECTED_STALE_CHAMPION",
+                "request_id": pending["request_id"],
+                "expected_policy_hash": expected_hash,
+                "current_policy_hash": self.profile_admission_policy.policy_hash,
+            }
+        else:
+            policy = pending["policy"]
+            self.profile_admission_policy = policy
+            self._decision_runtime_config_cache = None
+            result = {
+                "status": (
+                    "APPLIED_AT_DEADLINE" if open_orders else "APPLIED"
+                ),
+                "request_id": pending["request_id"],
+                "policy_hash": policy.policy_hash,
+                "applied_at_ms": int(current_time_ms),
+            }
+            self._notify_shadow_policy_audit_locked(pending, result)
+        self._pending_shadow_policy_change = None
+        self._last_shadow_policy_change = deepcopy(result)
+        return deepcopy(result)
+
+    def attach_shadow_status_provider(self, provider) -> None:
+        with self._lock:
+            self._shadow_status_provider = provider
+
+    def attach_shadow_policy_audit_sink(self, sink) -> None:
+        with self._lock:
+            self._shadow_policy_audit_sink = sink
+
+    def _notify_shadow_policy_audit_locked(
+        self,
+        request: Mapping[str, object],
+        result: Mapping[str, object],
+    ) -> None:
+        sink = self._shadow_policy_audit_sink
+        if sink is None:
+            return
+        audit_request = {
+            **deepcopy(dict(request)),
+            "policy": request["policy"].to_dict(),
+        }
+        audit_result = deepcopy(dict(result))
+
+        def persist() -> None:
+            try:
+                sink(audit_request, audit_result)
+            except Exception as exc:  # noqa: BLE001 - 审计写入不得影响正式开单线程。
+                self.record_shadow_event_gap(
+                    f"formal policy receipt failed: {type(exc).__name__}: {exc}"
+                )
+
+        threading.Thread(
+            target=persist,
+            name="shadow-formal-policy-receipt",
+            daemon=True,
+        ).start()
+
+    def record_shadow_event_gap(
+        self,
+        message: str,
+        *,
+        expected_context: tuple[str, int] | None = None,
+    ) -> bool:
+        with self._lock:
+            if not self._matches_symbol_context(expected_context):
+                return False
+            self._shadow_event_gap_count += 1
+            self._shadow_last_gap = str(message)
+            return True
+
+    def shadow_optimizer_status(self) -> dict[str, object]:
+        with self._lock:
+            provider = self._shadow_status_provider
+            gap_count = self._shadow_event_gap_count
+            last_gap = self._shadow_last_gap
+            pending_change = self._pending_shadow_policy_change
+            last_change = self._last_shadow_policy_change
+        status = provider.status() if provider is not None else {"status": "DISABLED"}
+        return {
+            **deepcopy(status),
+            "gap_count": gap_count,
+            "last_gap": last_gap,
+            "formal_policy_change": (
+                {
+                    "status": "WAITING_OPEN_ORDERS",
+                    "request_id": pending_change["request_id"],
+                    "deadline_at_ms": pending_change["deadline_at_ms"],
+                }
+                if pending_change is not None
+                else deepcopy(last_change)
+            ),
+        }
+
+    def shadow_experiment_summary(self) -> dict[str, object]:
+        with self._lock:
+            provider = self._shadow_status_provider
+        reader = getattr(provider, "experiment_summary", None)
+        if not callable(reader):
+            return {"status": "DISABLED", "experiment": None}
+        return reader()
+
+    def page_shadow_orders(
+        self,
+        *,
+        arm_id: str,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, object]:
+        with self._lock:
+            provider = self._shadow_status_provider
+        reader = getattr(provider, "page_orders", None)
+        if not callable(reader):
+            return {
+                "arm_id": str(arm_id),
+                "page": 1,
+                "page_size": min(100, max(1, int(page_size))),
+                "total": 0,
+                "total_pages": 1,
+                "orders": [],
+            }
+        return reader(arm_id=arm_id, page=page, page_size=page_size)
+
     def price_snapshot(self) -> dict:
         with self._lock:
             latest = self.klines[-1] if self.klines else None
@@ -456,6 +892,7 @@ class MonitorState:
         klines: Sequence[Kline],
         *,
         expected_context: tuple[str, int] | None = None,
+        _shadow_analysis_frame: Mapping[str, object] | None = None,
     ) -> bool:
         if not klines:
             return False
@@ -495,16 +932,38 @@ class MonitorState:
         if self._wave_runtime_bootstrap_required and bootstrap_ready:
             wave_state = self._bootstrap_wave_anchor(wave_state, wave_evaluated_at)
         fear_greed = self._fear_greed_context()
-        new_signals = [
-            analyze_volume_price(merged_klines, timeframe_minutes=minutes, fear_greed=fear_greed)
-            for minutes in LIVE_TRADE_TIMEFRAMES
-        ]
-        observation_signals = [
-            signal
-            for minutes in LIVE_TRADE_TIMEFRAMES
-            for signal in analyze_observation_signals(merged_klines, timeframe_minutes=minutes, fear_greed=fear_greed)
-        ]
-        selected_signal = choose_trade_signal(merged_klines, fear_greed=fear_greed)
+        if _shadow_analysis_frame is None:
+            new_signals = [
+                analyze_volume_price(
+                    merged_klines,
+                    timeframe_minutes=minutes,
+                    fear_greed=fear_greed,
+                )
+                for minutes in LIVE_TRADE_TIMEFRAMES
+            ]
+            observation_signals = [
+                signal
+                for minutes in LIVE_TRADE_TIMEFRAMES
+                for signal in analyze_observation_signals(
+                    merged_klines,
+                    timeframe_minutes=minutes,
+                    fear_greed=fear_greed,
+                )
+            ]
+            selected_signal = choose_trade_signal(
+                merged_klines,
+                fear_greed=fear_greed,
+            )
+        else:
+            if int(_shadow_analysis_frame.get("latest_close_time") or -1) != int(
+                latest.close_time
+            ):
+                raise ValueError("shadow analysis frame does not match latest kline")
+            new_signals = deepcopy(list(_shadow_analysis_frame["new_signals"]))
+            observation_signals = deepcopy(
+                list(_shadow_analysis_frame["observation_signals"])
+            )
+            selected_signal = deepcopy(_shadow_analysis_frame["selected_signal"])
 
         with self._lock:
             if not self._matches_symbol_context(operation_context):
@@ -542,6 +1001,8 @@ class MonitorState:
                 if not self._flush_pending_settlement_events():
                     return False
             self._settle_observations(latest.close_time, latest.close, merged_klines)
+
+            self._apply_pending_shadow_policy_change_locked(latest.close_time)
 
             self._refresh_daily_profile_selection(latest.close_time)
             new_signals = [
@@ -707,6 +1168,12 @@ class MonitorState:
 
     def reset_symbol(self, symbol: str) -> None:
         with self._lock:
+            if self._pending_shadow_policy_change is not None:
+                self._last_shadow_policy_change = {
+                    "status": "CANCELLED_SYMBOL_CHANGE",
+                    "request_id": self._pending_shadow_policy_change["request_id"],
+                }
+                self._pending_shadow_policy_change = None
             self._symbol_generation += 1
             self.symbol = symbol.upper()
             self.last_error = None
@@ -5763,6 +6230,7 @@ class MonitorState:
 
     def snapshot(self) -> dict:
         storage_capacity = self._sample_storage_capacity(int(self._now_ms()))
+        shadow_optimizer = self.shadow_optimizer_status()
         with self._lock:
             latest = self.klines[-1] if self.klines else None
             orders = list(reversed(self.simulator.orders[-100:]))
@@ -5788,6 +6256,7 @@ class MonitorState:
                 "daily_profile_selection": self._daily_profile_selector_status(),
                 "profile_admission": self._profile_admission_status(),
                 "storage_capacity": storage_capacity,
+                "shadow_optimizer": shadow_optimizer,
                 "entry_structure_shadow": self._entry_structure_status(),
                 "stake_progression": self._stake_progression_status(),
                 "order_policy": self._order_policy_status(),

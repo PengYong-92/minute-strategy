@@ -66,7 +66,100 @@ class RecordingState:
         self.errors.append(message)
 
 
+class RecordingShadowPublisher:
+    def __init__(self, state, *, result=True, error=None):
+        self.state = state
+        self.result = result
+        self.error = error
+        self.batches = []
+
+    def try_publish(self, *, context, klines, fear_greed):
+        if self.error is not None:
+            raise self.error
+        self.batches.append(
+            {
+                "context": context,
+                "klines": tuple(klines),
+                "fear_greed": fear_greed,
+                "formal_batch_count": len(self.state.closed_batches),
+            }
+        )
+        return self.result
+
+
 class MarketDataCoordinatorTest(unittest.TestCase):
+    def test_successful_formal_update_publishes_shadow_batch_after_commit(self):
+        state = RecordingState()
+        state.shadow_market_context = lambda **_kwargs: {"value": 42, "trend": "flat"}
+        publisher = RecordingShadowPublisher(state)
+        coordinator = MarketDataCoordinator(
+            state,
+            rest_client=None,
+            rest_limit=10,
+            shadow_publisher=publisher,
+        )
+        event = stream_event(0, 101.0)
+
+        coordinator._process_klines(state.context, [event.kline])
+
+        self.assertEqual(len(publisher.batches), 1)
+        self.assertEqual(publisher.batches[0]["context"], state.context)
+        self.assertEqual(publisher.batches[0]["klines"], (event.kline,))
+        self.assertEqual(publisher.batches[0]["fear_greed"], {"value": 42, "trend": "flat"})
+        self.assertEqual(publisher.batches[0]["formal_batch_count"], 1)
+        self.assertEqual(coordinator._cursor[state.context], event.kline.open_time)
+
+    def test_failed_formal_update_does_not_publish_shadow_batch(self):
+        state = RecordingState()
+        state.update_from_klines = lambda *_args, **_kwargs: False
+        publisher = RecordingShadowPublisher(state)
+        coordinator = MarketDataCoordinator(
+            state,
+            rest_client=None,
+            rest_limit=10,
+            shadow_publisher=publisher,
+        )
+
+        coordinator._process_klines(state.context, [stream_event(0, 101.0).kline])
+
+        self.assertEqual(publisher.batches, [])
+        self.assertIsNone(coordinator._cursor[state.context])
+
+    def test_shadow_publish_failure_does_not_retry_or_rollback_formal_batch(self):
+        state = RecordingState()
+        publisher = RecordingShadowPublisher(state, error=RuntimeError("shadow unavailable"))
+        coordinator = MarketDataCoordinator(
+            state,
+            rest_client=None,
+            rest_limit=10,
+            shadow_publisher=publisher,
+        )
+        event = stream_event(0, 101.0)
+
+        coordinator._process_klines(state.context, [event.kline])
+
+        self.assertEqual(len(state.closed_batches), 1)
+        self.assertEqual(coordinator._cursor[state.context], event.kline.open_time)
+        self.assertFalse(coordinator._retry_required.is_set())
+        self.assertIn("shadow event publish failed", state.errors[-1])
+
+    def test_full_shadow_queue_marks_gap_without_retrying_formal_batch(self):
+        state = RecordingState()
+        publisher = RecordingShadowPublisher(state, result=False)
+        coordinator = MarketDataCoordinator(
+            state,
+            rest_client=None,
+            rest_limit=10,
+            shadow_publisher=publisher,
+        )
+        event = stream_event(0, 101.0)
+
+        coordinator._process_klines(state.context, [event.kline])
+
+        self.assertEqual(coordinator._cursor[state.context], event.kline.open_time)
+        self.assertFalse(coordinator._retry_required.is_set())
+        self.assertIn("shadow event queue full", state.errors[-1])
+
     def test_open_kline_only_updates_realtime_price(self):
         state = RecordingState()
         coordinator = MarketDataCoordinator(state, rest_client=None, rest_limit=10)

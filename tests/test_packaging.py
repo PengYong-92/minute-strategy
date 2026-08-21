@@ -50,6 +50,7 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("wave-batch-guard-status", index_html)
         self.assertIn("profile-degradation-guard-status", index_html)
         self.assertIn("direction-pulse-shadow-status", index_html)
+        self.assertIn("shadow-optimizer-status", index_html)
         self.assertIn("fmtWaveState", app_js)
         self.assertIn("fmtWaveBatchGuard", app_js)
         self.assertIn("fmtProfileDegradationGuard", app_js)
@@ -746,6 +747,50 @@ process.stdout.write(JSON.stringify({
                 args = log_path.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertEqual(args[args.index("--strategy-build-id") + 1], expected)
+
+    def test_run_script_forwards_shadow_optimizer_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+                "SHADOW_OPTIMIZER": "1",
+                "SHADOW_DB_PATH": "/tmp/custom-shadow.sqlite3",
+                "SHADOW_QUEUE_SIZE": "12",
+                "SHADOW_MAX_CHALLENGERS": "5",
+            }
+
+            result = run(
+                ["bash", str(ROOT / "scripts" / "run.sh")],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            args = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("--enable-shadow-optimizer", args)
+        self.assertEqual(args[args.index("--shadow-db-path") + 1], "/tmp/custom-shadow.sqlite3")
+        self.assertEqual(args[args.index("--shadow-queue-size") + 1], "12")
+        self.assertEqual(args[args.index("--shadow-max-challengers") + 1], "5")
 
     def test_run_script_profile_admission_candidate_is_inert_until_explicitly_enabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:

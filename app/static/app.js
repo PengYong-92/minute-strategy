@@ -87,6 +87,17 @@ function formatAdaptiveProfile(profile) {
   return parts.length ? parts.join(" · ") : DASH;
 }
 
+function fmtShadowOptimizer(shadow) {
+  if (!shadow || shadow.status === "DISABLED") return "已关闭";
+  if (shadow.status === "FAILED") return `异常 · ${shadow.error || `退出码${shadow.exit_code ?? DASH}`}`;
+  const sample = Number(shadow.settled_orders || 0);
+  const days = Number(shadow.complete_days || 0);
+  const winRate = Number(shadow.win_rate || 0) * 100;
+  const arms = Number(shadow.active_arms ?? shadow.arms ?? 0);
+  const capacity = shadow.capacity_status || "UNKNOWN";
+  return `${shadow.status || "UNKNOWN"} · ${arms}组 · ${days}日/${sample}单 · 胜率${winRate.toFixed(2)}% · ${capacity}`;
+}
+
 function formatEntryStructure(structure) {
   if (!structure || typeof structure !== "object" || !Object.keys(structure).length) return DASH;
   const values = [
@@ -599,6 +610,7 @@ const summaryFields = {
   "wave-batch-guard-status": (state) => fmtWaveBatchGuard(state.wave_batch_guard),
   "profile-degradation-guard-status": (state) => fmtProfileDegradationGuard(state.profile_degradation_guard),
   "direction-pulse-shadow-status": (state) => fmtDirectionPulseShadow(state.direction_pulse_shadow),
+  "shadow-optimizer-status": (state) => fmtShadowOptimizer(state.shadow_optimizer),
   "result-sequence-guard-status": (state) => fmtResultSequenceGuard(state.result_sequence_guard),
   "webhook-status": (state) => fmtWebhook(state.webhook),
   "order-decision": (state) => state.order_decision || DASH,

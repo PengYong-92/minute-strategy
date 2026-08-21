@@ -16,6 +16,7 @@ from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.profile_health_guard import ProfileHealthGuardConfig
 from app.profile_admission import ProfileAdmissionPolicy, baseline_policy
 from app.result_sequence_guard import ResultSequenceGuardConfig
+from app.shadow_supervisor import ShadowSupervisor
 from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState, strategy_source_build_id
 from app.time_period_guard import TimePeriodGuardConfig
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
@@ -44,6 +45,7 @@ def start_market_data(
     poll_seconds: int,
     limit: int,
     enable_websocket: bool,
+    shadow_publisher=None,
 ) -> MarketDataCoordinator:
     coordinator = MarketDataCoordinator(
         state,
@@ -51,6 +53,7 @@ def start_market_data(
         poll_seconds=poll_seconds,
         rest_limit=limit,
         enable_websocket=enable_websocket,
+        shadow_publisher=shadow_publisher,
     )
     coordinator.start()
     return coordinator
@@ -67,6 +70,22 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                 return
             if parsed.path == "/api/price":
                 self._send_json(state.price_snapshot())
+                return
+            if parsed.path == "/api/shadow":
+                self._send_json(state.shadow_optimizer_status())
+                return
+            if parsed.path == "/api/shadow/experiment":
+                self._send_json(state.shadow_experiment_summary())
+                return
+            if parsed.path == "/api/shadow/orders":
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    state.page_shadow_orders(
+                        arm_id=_query_text(query, "arm_id"),
+                        page=_query_int(query, "page", 1),
+                        page_size=_query_int(query, "page_size", 20),
+                    )
+                )
                 return
             if parsed.path == "/api/orders":
                 query = parse_qs(parsed.query)
@@ -354,6 +373,42 @@ def main() -> None:
         "--db-path",
         default=os.getenv("DB_PATH", str(PROJECT_ROOT / "data" / "monitor.sqlite3")),
         help="SQLite 持久化路径，默认: ./data/monitor.sqlite3",
+    )
+    shadow_switch = parser.add_mutually_exclusive_group()
+    shadow_switch.add_argument(
+        "--enable-shadow-optimizer",
+        dest="enable_shadow_optimizer",
+        action="store_true",
+        default=_env_bool("SHADOW_OPTIMIZER", False),
+        help="启用独立进程持续影子参数优化，默认: 关闭",
+    )
+    shadow_switch.add_argument(
+        "--no-shadow-optimizer",
+        dest="enable_shadow_optimizer",
+        action="store_false",
+        help="关闭持续影子参数优化",
+    )
+    parser.add_argument(
+        "--shadow-db-path",
+        default=os.getenv(
+            "SHADOW_DB_PATH",
+            str(PROJECT_ROOT / "data" / "monitor.shadow.sqlite3"),
+        ),
+        help="影子参数独立 SQLite 路径，默认: ./data/monitor.shadow.sqlite3",
+    )
+    parser.add_argument(
+        "--shadow-queue-size",
+        type=int,
+        default=int(os.getenv("SHADOW_QUEUE_SIZE", "120")),
+        help="影子分钟事件有界队列长度，默认: 120",
+    )
+    parser.add_argument(
+        "--shadow-max-challengers",
+        type=int,
+        choices=range(1, 8),
+        default=int(os.getenv("SHADOW_MAX_CHALLENGERS", "7")),
+        metavar="1-7",
+        help="并行影子候选数量，范围1到7，默认: 7",
     )
     parser.add_argument(
         "--webhook-url",
@@ -847,6 +902,30 @@ def main() -> None:
             f"missing={len(report.missing_files)}"
         )
 
+    shadow_optimizer = None
+    if args.enable_shadow_optimizer:
+        shadow_optimizer = ShadowSupervisor(
+            seed_supplier=state.shadow_runtime_seed,
+            database_path=args.shadow_db_path,
+            queue_size=args.shadow_queue_size,
+            max_challengers=args.shadow_max_challengers,
+            lifecycle_handler=state.request_shadow_policy_change,
+        )
+        state.attach_shadow_status_provider(shadow_optimizer)
+        state.attach_shadow_policy_audit_sink(
+            shadow_optimizer.record_formal_policy_receipt
+        )
+        try:
+            restored_request = shadow_optimizer.restored_policy_request()
+            if restored_request is not None:
+                state.request_shadow_policy_change(restored_request)
+            shadow_optimizer.start()
+        except Exception as exc:  # noqa: BLE001 - 影子启动失败不得阻断正式服务。
+            recorder = getattr(state, "record_shadow_event_gap", None)
+            if callable(recorder):
+                recorder(f"shadow optimizer startup failed: {exc}")
+            shadow_optimizer.stop()
+
     client = BinanceKlineClient()
     market_data = start_market_data(
         state,
@@ -854,6 +933,7 @@ def main() -> None:
         poll_seconds=args.poll_seconds,
         limit=args.limit,
         enable_websocket=not args.no_websocket,
+        shadow_publisher=shadow_optimizer,
     )
 
     def warmup_loader(target_state: MonitorState) -> None:
@@ -893,6 +973,8 @@ def main() -> None:
     finally:
         server.server_close()
         market_data.stop()
+        if shadow_optimizer is not None:
+            shadow_optimizer.stop()
         closer = getattr(state, "close", None)
         if closer is not None:
             closer()

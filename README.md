@@ -22,6 +22,7 @@
 - 按方向结算序列守卫默认启用：LONG与SHORT分别按连续已结算亏损触发方向冷却，不改变信号方向。
 - 北京时间12:00-18:00固定时段守卫保留为可选模块，但默认关闭，不再按固定时段暂停真实开单。
 - 模拟订单和观察单都按各自到期分钟对应的 K 线结算；轮询中断后不会借用恢复时的更晚价格。重启时恢复8天缓冲，再按固定截止点精确截取7天观察窗口，不受页面500条展示上限影响。
+- 可选启用独立进程持续影子优化：一个当前画像准入 Champion 与最多7个 Challenger 同时消费正式提交后的闭合分钟事件，使用独立 SQLite 记录参数、判断、订单、日统计、晋级和回退；默认关闭，不改变当前正式开单。
 
 ## 文档
 
@@ -62,6 +63,7 @@ bash scripts/run.sh --symbol BTCUSDT --host 0.0.0.0 --port 8000 --poll-seconds 1
 bash scripts/run.sh --no-warmup
 bash scripts/run.sh --no-websocket
 bash scripts/run.sh --db-path data/monitor.sqlite3
+bash scripts/run.sh --enable-shadow-optimizer --shadow-db-path data/monitor.shadow.sqlite3
 bash scripts/run.sh --max-open-orders 2 --max-open-long-orders 1 --max-open-short-orders 2 --min-order-gap-minutes 2
 PROFILE_DEGRADATION_COOLDOWN_MINUTES=60 bash scripts/run.sh
 RESULT_SEQUENCE_GUARD=1 bash scripts/run.sh --result-sequence-loss-streak 3 --result-sequence-cooldown-minutes 20 --result-sequence-scope DIRECTION
@@ -104,6 +106,18 @@ bash scripts/run.sh \
 
 北京时间段影子守卫默认关闭，真实开单不再受固定 `12:00-18:00` 时段限制。仅在显式设置 `TIME_PERIOD_GUARD=1` 时恢复旧的时段影子拦截；`--no-time-period-guard` 可强制关闭。
 
+持续影子优化默认关闭。使用下面命令显式启用：
+
+```bash
+bash scripts/run.sh \
+  --enable-shadow-optimizer \
+  --shadow-db-path data/monitor.shadow.sqlite3 \
+  --shadow-queue-size 120 \
+  --shadow-max-challengers 7
+```
+
+影子运行使用独立CPU进程和独立数据库。正式订单、正式SQLite事务和Webhook成功路径不等待影子计算；队列缺口只冻结对应影子前向样本。每天北京时间07:50评估，08:00提出切换请求；至少需要7个完整无缺口前向日和300笔已结影子订单，并同时满足总胜率、方向胜率、日稳定性、订单量、回撤和连亏门槛。正式在途订单存在时最多等待10分钟再只切换后续新订单使用的画像准入策略；正式应用并保存不可变回执后，影子侧才确认Champion变化。失败版本按连续8亏、50/100笔胜率或共同样本回撤规则自动回退。影子库主文件页上限为5GiB，4.5GiB后停止普通明细；30天旧决策先转为日级分析汇总再压缩。
+
 运行要求：
 
 - Python `3.10+`
@@ -120,6 +134,7 @@ bash scripts/run.sh \
 - 持久化模拟订单，重启后会恢复未结/已结订单和累计统计。
 - 持久化每轮选择信号与开单决策，方便复盘为什么开单或为什么被过滤。
 - 切换币种时按 `symbol` 隔离订单和信号审计记录。
+- 可选影子数据库默认路径为 `data/monitor.shadow.sqlite3`，与正式库完全分离；`/api/shadow`、`/api/shadow/experiment` 和 `/api/shadow/orders` 提供只读状态及分页明细。
 
 指定数据库路径：
 

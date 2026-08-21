@@ -23,6 +23,82 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_shadow_optimizer_requires_explicit_enable_and_is_wired_to_market_data(self):
+        fake_server = SimpleNamespace(
+            serve_forever=lambda: None,
+            server_close=lambda: None,
+        )
+        fake_state = SimpleNamespace(
+            symbol="BTCUSDT",
+            shadow_runtime_seed=lambda: {"context": ("BTCUSDT", 0)},
+            request_shadow_policy_change=lambda request: {"status": "APPLIED"},
+            attach_shadow_status_provider=lambda provider: setattr(
+                fake_state,
+                "shadow_provider",
+                provider,
+            ),
+            attach_shadow_policy_audit_sink=lambda sink: setattr(
+                fake_state,
+                "shadow_audit_sink",
+                sink,
+            ),
+            close=lambda: None,
+        )
+        fake_shadow = SimpleNamespace(
+            restored_policy_request=lambda: None,
+            record_formal_policy_receipt=lambda request, result: None,
+            start=lambda: setattr(fake_shadow, "started", True),
+            stop=lambda: setattr(fake_shadow, "stopped", True),
+        )
+        fake_market = SimpleNamespace(stop=lambda: None)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "app.server",
+                    "--no-warmup",
+                    "--no-persistence",
+                    "--no-webhook",
+                    "--enable-shadow-optimizer",
+                    "--shadow-max-challengers",
+                    "5",
+                ],
+            ),
+            patch("app.server.MonitorState", return_value=fake_state),
+            patch("app.server.ShadowSupervisor", return_value=fake_shadow) as shadow_type,
+            patch("app.server.start_market_data", return_value=fake_market) as market,
+            patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+        ):
+            server_module.main()
+
+        self.assertTrue(fake_shadow.started)
+        self.assertTrue(fake_shadow.stopped)
+        self.assertIs(fake_state.shadow_provider, fake_shadow)
+        self.assertIs(
+            fake_state.shadow_audit_sink,
+            fake_shadow.record_formal_policy_receipt,
+        )
+        self.assertEqual(shadow_type.call_args.kwargs["max_challengers"], 5)
+        self.assertIs(
+            market.call_args.kwargs["shadow_publisher"],
+            fake_shadow,
+        )
+
+    def test_shadow_status_api_is_read_only_and_lightweight(self):
+        payload = {"status": "RUNNING", "arms": 8, "settled_orders": 320}
+        state = SimpleNamespace(shadow_optimizer_status=lambda: payload)
+        handler = make_handler(state)
+        instance = object.__new__(handler)
+        instance.path = "/api/shadow"
+        captured = []
+        instance._send_json = captured.append
+
+        instance.do_GET()
+
+        self.assertEqual(captured, [payload])
+
     def test_profile_admission_startup_requires_explicit_enable_and_freezes_candidate(self):
         cases = (
             ({}, [], baseline_policy()),
@@ -641,6 +717,29 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(captured, [payload])
         self.assertNotIn("orders", captured[0])
         self.assertNotIn("stats", captured[0])
+
+    def test_shadow_detail_apis_delegate_to_paged_read_model(self):
+        state = SimpleNamespace(
+            shadow_experiment_summary=lambda: {"experiment_id": "exp-1"},
+            page_shadow_orders=lambda **kwargs: {"orders": [], **kwargs},
+        )
+        handler = make_handler(state)
+        experiment = object.__new__(handler)
+        experiment.path = "/api/shadow/experiment"
+        experiment_payload = []
+        experiment._send_json = experiment_payload.append
+        orders = object.__new__(handler)
+        orders.path = "/api/shadow/orders?arm_id=arm-1&page=2&page_size=50"
+        order_payload = []
+        orders._send_json = order_payload.append
+
+        experiment.do_GET()
+        orders.do_GET()
+
+        self.assertEqual(experiment_payload, [{"experiment_id": "exp-1"}])
+        self.assertEqual(order_payload[0]["arm_id"], "arm-1")
+        self.assertEqual(order_payload[0]["page"], 2)
+        self.assertEqual(order_payload[0]["page_size"], 50)
 
     def test_concurrent_symbol_switches_serialize_warmup_and_keep_responses_isolated(self):
         class SwitchingState:
