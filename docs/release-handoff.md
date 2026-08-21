@@ -1,6 +1,6 @@
 # minute-strategy 发布交接文档
 
-## 当前未发布候选：画像准入自动优化（2026-08-20）
+## 当前画像准入自动优化基线（2026-08-20）
 
 本轮不由人工挑参数。固定目标按字典序执行：聚合硬门槛全部通过；最差时间窗口胜率最高；日均单量最接近50；随后比较最大回撤、最长连亏和参数复杂度。订单目标为完整交易日日均45至55笔，胜率和跨窗口稳定性优先于精确凑满50笔。
 
@@ -30,7 +30,7 @@
 
 实现已修正以下等价性问题：FAST不再降低评分阈值；冻结主信号序号`0`在回放中不会被重分配并误入FAST；每个参与排序的候选保留准入审计；全部候选拒绝后的无方向WAIT不会中断处理；回放不再按画像键合并同一时点的不同来源；搜索报告提供相对基准的总计及LONG/SHORT差异；服务端和中文启动脚本使用LONG/SHORT独立参数，画像开关拼写错误、参数非法或继续使用废弃共享N12变量时启动失败。
 
-聚合门槛为true，但冻结策略后的7个完整前向日尚不存在，`stability_proven=false`、`release_allowed=false`。当前状态为：**代码完成，未部署、未推送、未创建tag、未合并main、未清空订单**。后续无需人工重选参数；保持该策略哈希不变累计7个完整前向交易日，再由同一程序自动判断至少5天胜率不低于55.56%、至少5天EV为正、合计胜率不低于60%且日均45至55单。
+聚合门槛为true，但冻结策略后的7个完整前向日尚不存在，`stability_proven=false`、`release_allowed=false`。实现已合并并发布到`main`，持续影子优化器只记录、比较和提出生命周期请求，不绕过正式发布门槛。后续无需人工重选参数；保持同一策略哈希累计7个完整前向交易日，再由同一程序自动判断至少5天胜率不低于55.56%、至少5天EV为正、合计胜率不低于60%且日均45至55单。
 
 ## 1. 文档目的
 
@@ -44,32 +44,32 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `6474dd81b005ca8c1d011a739bca71335f26b1e6`（方向脉冲影子与结算即更新） |
-| 固化标签 | `v2026.08.16-direction-pulse-shadow` |
-| 当前生产提交 | `6474dd81b005ca8c1d011a739bca71335f26b1e6` |
-| 当前生产事实 | 第41节 |
-| 本地未部署功能 | `feature/adaptive-resident-profiles` 的自适应常驻画像、价格结构影子、V2审计/容量治理及严格因果发布门槛，见第42节 |
-| 下一开发检查点 | 当前候选未通过第42节发布硬门槛；硬门槛全部通过前不得发布 |
+| 当前功能基线 | `59f0544aa2140e7d198f05ed1c19c25a90bdc890`（自适应画像、持续影子优化、WAL与观察结算精度修复） |
+| 固化标签 | `v2026.08.16-direction-pulse-shadow`（历史功能标签；本次修复未创建新标签） |
+| 当前生产提交 | `59f0544aa2140e7d198f05ed1c19c25a90bdc890` |
+| 当前生产事实 | 第47节 |
+| 本地未部署功能 | 无；运行代码与`origin/main`均包含`59f0544` |
+| 下一开发检查点 | 修复影子实验重复`RUNNING`生命周期标记，并继续监控2GiB实例容量；正式策略晋升仍必须满足第42节硬门槛 |
 
-第2至41节是历史发布、本地开发或生产事实快照；生产现状以第41节为准。第42节只记录当前功能分支的本地实现和发布前门槛，不代表生产已经切换。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 和 `feature/websocket-low-latency` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
+第2至46节是历史发布、本地开发或生产事实快照；生产现状以第47节为准。生产运行代码来自`main`，`feature/1m-wave-direction-guard`、`feature/websocket-low-latency`和`feature/adaptive-resident-profiles`保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
 
 ## 2. 发布身份
 
 | 项目 | 当前值 |
 |---|---|
 | 仓库 | `PengYong-92/minute-strategy` |
-| 生产代码分支 | `feature/1m-wave-direction-guard` |
-| 生产提交 | `75a3745cb53c39637e82663c9de1a065b8d3307e` |
-| 提交摘要 | `fix: clarify overridden threshold reasons` |
-| 生产发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-75a3745-20260807-114208` |
+| 生产代码分支 | `main` |
+| 生产提交 | `59f0544aa2140e7d198f05ed1c19c25a90bdc890` |
+| 提交摘要 | `fix: preserve frozen observation precision` |
+| 生产发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-59f0544-20260821-2145-20260821-213445` |
 | 当前软链 | `/opt/victory-event-monitor/current` |
 | systemd 服务 | `victory-event-monitor` |
 | 内部监听 | `127.0.0.1:18080` |
 | 公网域名 | `https://victory.easy-tx.com` |
 | SQLite | `/opt/victory-event-monitor/shared/data/monitor.sqlite3` |
-| 发布前版本 | `bc5fa35`，目录 `event-contract-monitor-bc5fa35-20260807-113613` |
+| 发布前版本 | `58b4164`，目录 `event-contract-monitor-58b4164-20260821-1830` |
 
-重要：截至本文记录时，`origin/main` 仍停留在 `78c8eee`，生产功能分支为 `feature/1m-wave-direction-guard`。生产版本尚未合并到 `main`，不得从 `main` 直接重新部署，否则会回退波段守卫、运行态加固和可配置阈值。
+重要：当前工作树、`main`、`origin/main`和生产代码均包含`59f0544`功能基线。重新部署必须使用该提交或其后继提交生成的最小包，不能从历史功能分支直接覆盖生产。
 
 ## 3. 本次代码提交链
 
@@ -2406,3 +2406,38 @@ https=200
 ```
 
 跨约5分钟采样确认`updated_at_ms`从`1787309100639`推进到`1787309401680`，最新1分钟K线推进到`1787309399999`，期间没有再次出现`database is locked`、`STORAGE_ERROR`或影子缺口。发布后正式订单仍为0，但当前原因已经恢复为正常策略判断`DAILY_PROFILE_NOT_SELECTED`，页面提示“当前信号未进入今日启用画像，仅记录观察”；这表示存储故障已解除，不代表当前K线满足开单条件。后续判断开单量时必须以发布后的完整运行窗口为边界，不能把15:49前后的故障停机时间计入策略筛选效果。
+
+## 47. 2026-08-21观察结算精度修复与受控发布
+
+### 47.1 故障根因与代码边界
+
+线上报错为`settlement conflicts with frozen observation data: persisted edge does not match decision context`。观察对象创建时把`abs(score)-threshold`四舍五入到4位，而V2冻结决策上下文保留Python原始浮点值，例如`14.400000000000006`；结算事务比较不可变字段时因此拒绝写入。`save_observations`使用同一事务批量提交，单条冲突会让该批到期观察全部恢复为`OPEN`。
+
+提交`59f0544aa2140e7d198f05ed1c19c25a90bdc890`不放宽存储一致性校验，只在两个观察入口把内存对象的`edge`绑定到已经冻结的`decision_context.inputs.score.edge`。研究观察在创建观察和冻结上下文前先完成一次质量评分，防止观察对象与上下文分别从不同Signal快照派生。正式订单观察和研究观察均新增浮点精度回归测试；未修改画像、评分公式、阈值、方向、开单门禁、滚单、Webhook、预热或数据库结构。
+
+最终本地验证为`python3 -m unittest discover -s tests -v`共1149项通过；`compileall`、`bash -n scripts/run.sh`、启动帮助、`git diff --check`和最小包离线导入均通过。`main`与`origin/main`均包含`59f0544`。
+
+### 47.2 发布与资源保护
+
+| 项目 | 本次值 |
+|---|---|
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-59f0544-20260821-2145-20260821-213445` |
+| 发布包SHA-256 | `0ca99fc45a9c062e806ce17d3e794c2256a43ff4572b41c56d62c4d109dee506` |
+| 发布前目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-58b4164-20260821-1830` |
+| 正式影子配置 | `SHADOW_OPTIMIZER=1`、队列120、3个Challenger（共4个arm） |
+| 服务内存保护 | `MemoryHigh=950M`、`MemoryMax=1200M` |
+| 数据处理 | 未备份、未清空、未覆盖任何正式订单、观察、审计或影子实验数据 |
+
+首次按原7个Challenger启动后，cgroup峰值约951MiB、整机可用内存降至357MiB，`/api/state`出现3秒超时。为避免2GiB实例再次失联，服务被正常停止并新增`95-resource-safety.conf`：Challenger降为3，同时保留服务及其影子子进程的cgroup内存上限。该调整只减少并行参数实验臂，不改变正式开单策略。最终影子状态为`RUNNING`、4个arm、`failed_arms={}`、`gap_count=0`。
+
+### 47.3 生产结算验证
+
+发布前正式库有14条`OPEN`观察。强制重启清除了旧进程内错误的四舍五入对象，13条带V2冻结上下文的到期记录在新版本启动后一次性正常结算，计数从`OPEN=14/SETTLED=9902`变为`OPEN=2/SETTLED=9915`。本次发布后新生成的`1787319360000|10|LONG|drop_reclaim_live_guarded`随后于`1787320019999`正常结算为`WIN/+8U`，`SETTLED`增至9916，证明新记录的创建、冻结、恢复和生产写入链路均不再触发精度冲突。
+
+最终采样：服务`active`、`NRestarts=0`、预热`READY/161280`、`last_error=null`、内部API HTTP 200约0.82秒；日志中无`conflict`、`database is locked`、`Traceback`、`OOM`或进程被杀记录。未修改Nginx、SSL和Webhook开关。
+
+### 47.4 已确认待处理项
+
+1. 正式库仍有1条2026年7月旧格式`OPEN`观察，没有V2冻结上下文且已超出当前实时精确到期K线回放范围；不得直接篡改结果，后续应提供可审计的历史到期K线修复工具。
+2. 影子库存在多个历史实验仍标记为`RUNNING`。恢复只选择最新实验，因此当前不会重复执行旧实验，但生命周期创建分支应保证所有被替代实验原子标记为`SUPERSEDED_*`，避免状态歧义和无效磁盘保留。
+3. 实例无Swap，最终可用内存仍只有约340MiB。当前cgroup限制可保护整机，但需持续监控`MemoryCurrent/MemoryPeak`、API延迟、`NRestarts`和影子缺口；扩展Challenger前必须先降低主进程启动常驻内存或升级实例。
