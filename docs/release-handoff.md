@@ -34,7 +34,7 @@
 
 ## 1. 文档目的
 
-本文汇总 `minute-strategy` 截至2026-08-20的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
+本文汇总 `minute-strategy` 截至2026-08-21的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
 
 `docs/release-handoff.md` 是项目唯一的发布交接文档。后续发布只更新或追加本文，不再创建带日期、提交号或版本号的交接文档副本。
 
@@ -2245,3 +2245,63 @@ bash scripts/run.sh \
 ```
 
 当前状态：**本地实现，未部署、未推送、未合并main、未创建标签、未清空订单**。已完成真实`spawn`子进程冒烟，证明完整影子运行时可启动、接收闭合分钟事件并推进独立SQLite游标。独立代码审查发现的生命周期提前提交、旧请求跨币种/代次生效、停机种子领先冻结、REST批次逐分钟偏差、重复分析计算和空间压缩丢失长期统计均已按上述边界修复。最终全量`python3 -m unittest discover -s tests`共1138项通过；`python3 -m compileall -q app scripts tests`、`node --check app/static/app.js`、`bash -n scripts/run.sh`和`git diff --check`全部通过。
+
+## 44. 2026-08-21生产发布与资源降级
+
+### 44.1 仓库与发布包
+
+| 项目 | 发布值 |
+|---|---|
+| 功能分支提交 | `093516a`，已推送`feature/adaptive-resident-profiles` |
+| `main`合并提交 | `a81f7a8` |
+| 最小包修复提交/生产提交 | `0799dec`，已推送`main` |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-0799dec-20260821-102550` |
+| 发布前目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-6474dd8-20260816-143053` |
+| 发布包 | `event-contract-monitor-0799dec-20260821-102550.tar.gz` |
+| 发布包大小 | `335131`字节 |
+| SHA-256 | `af9d1abbdde99fe059728df8adbebc54e12ebffe74436d06f3b62cf7b54d8d00` |
+| 最终服务边界 | `2026-08-21 11:10:21 CST` |
+
+发布前检查发现旧`package.sh`会把测试、文档和工作树根目录的忽略SQLite一起打包。`0799dec`改为运行白名单并增加回归断言。最终包共75个条目，根目录只包含`.gitignore`、`README.md`、`requirements.txt`、`app/`和`scripts/`，不包含`data/`、SQLite、测试或文档；本地和服务器SHA-256一致，服务器解压后Python编译与`app.server`、`app.shadow_optimizer`、`app.shadow_storage`导入通过。
+
+### 44.2 模拟订单清理
+
+按要求未创建数据库备份。服务停止后在一个SQLite事务中清理模拟订单及其金额运行态：
+
+| 表 | 清理前 | 清理后 |
+|---|---:|---:|
+| `orders` | 665 | 0 |
+| `order_entry_snapshots` | 665 | 0 |
+| `stake_progression_credits` | 264 | 0 |
+| `stake_progression_runtime` | 1 | 0 |
+
+清理时保留9829条`observation_signals`和23条`daily_profile_selections`。最终验收时观察已因新行情正常增加到9833条；正式库已原地迁移至`PRAGMA user_version=5`，新决策上下文正常写入。订单接口返回`total=0`、空列表，累计PnL和胜率均从新基线重新统计。
+
+### 44.3 影子优化资源降级
+
+首次按7个Challenger、队列120启用持续影子优化后，2核2GiB实例在使用161280根正式预热种子创建隔离运行时时发生严重内存/调度争抢：首次`/api/state`成功后，HTTP和SSH均在banner或上游阶段超时。通过阿里云轻量应用服务器控制台确认目标实例ID`7ed4e3e5a981486b9f483e2bca029e6d`与公网IP`149.129.222.173`一致，实例停止并重新启动后恢复调度。
+
+最终systemd覆盖明确设置`SHADOW_OPTIMIZER=0`，正式代码和只读影子接口保留，但不启动影子子进程。最终主进程PID为1372，`ps --ppid 1372`无子进程；`/api/shadow`返回`DISABLED`。在实现按arm惰性预热、限制预热种子长度或把影子进程迁移到独立计算节点前，不得在该2GiB生产实例直接恢复7组并发影子运行。
+
+### 44.4 最终验收
+
+```text
+current=/opt/victory-event-monitor/releases/event-contract-monitor-0799dec-20260821-102550
+service=active/running
+NRestarts=0
+warmup.status=READY
+warmup.loaded_klines=161280
+warmup.missing_files=0
+warmup.errors=[]
+orders=0
+open_orders=0
+last_error=null
+webhook.enabled=false
+shadow_optimizer.status=DISABLED
+database.user_version=5
+journal warnings since 11:10:21=0
+https=200
+ssl_verify_result=0
+```
+
+仓库合并后全量1138项测试通过，Python、JavaScript、Shell与差异检查通过；最小包专项17项测试通过。未修改Nginx和SSL，旧发布目录保留。
