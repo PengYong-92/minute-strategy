@@ -2305,3 +2305,62 @@ ssl_verify_result=0
 ```
 
 仓库合并后全量1138项测试通过，Python、JavaScript、Shell与差异检查通过；最小包专项17项测试通过。未修改Nginx和SSL，旧发布目录保留。
+
+## 45. 2026-08-21影子优化器资源修复与正式启用
+
+### 45.1 问题结论与修复边界
+
+44节发布时影子优化器最终被设置为`SHADOW_OPTIMIZER=0`，因此当时线上只产生正式订单和观察画像，不会积累独立参数实验数据，不能实现持续优化目标。根因不是影子策略本身，而是启动种子在2GiB实例上的资源模型：正式状态的14万根K线和带完整决策载荷的观察记录被8个实验臂重复深拷贝，首个事件还会把全部预热观察误当作实验样本写入各臂SQLite。
+
+提交`66ea0ba`将影子K线严格限制为当前分析器所需的`43200 + 10 = 43210`根；正式状态仍保留14万根，正式SQLite中的完整指标、决策输入和审计记录不删减。影子启动观察仅保留画像、结算和身份绑定所需字段，单个arm内部三份历史索引共享同一组已隔离对象；8个arm之间仍保持独立深拷贝。预热观察不再写成实验样本，影子新生成的观察仍保存完整分析参数。
+
+提交`8420f54`补齐恢复隔离：重启时只从正式种子补充实验`effective_from`之前的预热历史，实验开始后的观察只从该arm自己的持久化记录恢复；同键以arm记录为准，实验期`OPEN`记录可继续更新为`SETTLED`。零checkpoint但种子已推进的实验标记为`SUPERSEDED_SEED_ADVANCE`；只有部分arm完成checkpoint的实验标记为`SUPERSEDED_INCOMPLETE_CHECKPOINT`并整组重建，禁止不同覆盖区间的arm继续比较。
+
+### 45.2 仓库、测试与发布
+
+| 项目 | 本次值 |
+|---|---|
+| 资源修复提交 | `66ea0ba` |
+| 恢复隔离/生产提交 | `8420f545985323aabc695ab1d9971f4b4a1da561` |
+| GitHub | `main`已推送到`8420f54` |
+| 生产目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-8420f54-20260821-122411` |
+| 发布包SHA-256 | `9511c3126ff699960c7f54228ed2b06f205cbc54e5c11880dad2d2d3d4f82064` |
+| 影子配置 | `SHADOW_OPTIMIZER=1`、队列120、7个Challenger |
+| 影子SQLite | `/opt/victory-event-monitor/shared/data/monitor.shadow.sqlite3` |
+
+新增回归覆盖预热不落库、预热历史跨重启保留、实验期OPEN生命周期继续持久化、正式实验期记录不得注入arm、零checkpoint种子推进和部分arm checkpoint中断。最终全量`python3 -m unittest discover -s tests`共1146项通过；最终76项影子定向测试、Python编译、JavaScript语法、Shell语法和`git diff --check`均通过。独立代码审查最终确认无发布阻塞。
+
+按要求未创建数据库备份。服务停止后在单个SQLite事务中清理正式模拟状态：`orders 1 -> 0`、`order_entry_snapshots 1 -> 0`、`stake_progression_credits 0 -> 0`、`stake_progression_runtime 1 -> 0`；观察画像、决策上下文、审计历史和影子SQLite均保留。未修改Nginx和SSL。
+
+### 45.3 生产验证证据
+
+2026-08-21 12:24:27 CST完成启动，约10秒后本地API恢复。最终状态如下：
+
+```text
+current=/opt/victory-event-monitor/releases/event-contract-monitor-8420f54-20260821-122411
+service=active
+NRestarts=0
+formal_orders=0
+warmup.status=READY
+warmup.loaded_klines=161280
+warmup.missing_files=[]
+warmup.errors=[]
+last_error=null
+webhook.enabled=false
+https=200
+ssl_verify_result=0
+shadow.status=RUNNING
+shadow.experiment_id=shadow-profile-8566cea0de96b481f3c2d013
+shadow.arms=8
+shadow.active_arms=8
+shadow.failed_arms={}
+shadow.gap_count=0
+shadow.seed.source_klines=140000
+shadow.seed.klines=43210
+shadow.seed.source_observations=4264
+shadow.seed.observations=4264
+```
+
+跨分钟采样确认`last_event_id`从`9d742828...`推进到`407751257...`。当前实验SQLite已有8个事件游标、72条分钟决策、8份运行态和440条新影子观察；旧实验`shadow-profile-8986b25832f52376a1b86210`被正确标记为`SUPERSEDED_INCOMPLETE_CHECKPOINT`，证明本次恢复保护在真实旧状态上生效。影子库采样大小约122MiB，容量状态为`NORMAL`。
+
+稳定运行约7分钟后的进程RSS为：正式主进程449420KiB、影子子进程176588KiB、resource tracker 9984KiB；整机内存1613MiB中已用1103MiB、可用509MiB、无Swap。systemd自发布边界后的root级warning日志为0。该资源余量明显低于旧实现造成的失联状态，但仍应以后续日常`capacity_status`、`failed_arms`、`gap_count`、`NRestarts`和系统可用内存作为持续运行判据。
