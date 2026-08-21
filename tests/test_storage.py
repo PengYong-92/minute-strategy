@@ -1736,6 +1736,76 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(restored["evaluated_at"], 24_000_000)
         self.assertEqual(restored["snapshot"], snapshot)
 
+    def test_dashboard_reader_does_not_block_wave_runtime_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            snapshot = WaveSnapshot(
+                state="UP_LEG",
+                raw_state="UP_LEG",
+                window=8,
+                efficiency=0.9,
+                direction_ratio=0.85,
+                atr_strength=1.7,
+                range_position=0.92,
+                confirmations=2,
+                confirmed_at=960_000,
+                allowed_directions=("LONG",),
+            )
+            store.save_wave_runtime("BTCUSDT", snapshot, evaluated_at=24_000_000)
+
+            reader = sqlite3.connect(db_path)
+            reader.execute("begin")
+            reader.execute(
+                "select payload from wave_runtime where symbol = 'BTCUSDT'"
+            ).fetchone()
+            self.assertEqual(
+                reader.execute("pragma journal_mode").fetchone()[0],
+                "wal",
+            )
+            started = threading.Event()
+            completed = threading.Event()
+            errors: list[BaseException] = []
+
+            def persist_next_wave() -> None:
+                started.set()
+                try:
+                    store.save_wave_runtime(
+                        "BTCUSDT",
+                        snapshot,
+                        evaluated_at=24_060_000,
+                    )
+                except BaseException as exc:  # noqa: BLE001 - surfaced below.
+                    errors.append(exc)
+                finally:
+                    completed.set()
+
+            writer = threading.Thread(target=persist_next_wave)
+            writer.start()
+            committed_evaluated_at = None
+            try:
+                self.assertTrue(started.wait(timeout=1.0))
+                completed_while_reader_open = completed.wait(timeout=0.5)
+                if completed_while_reader_open:
+                    with closing(sqlite3.connect(db_path)) as verifier:
+                        committed_evaluated_at = verifier.execute(
+                            "select evaluated_at from wave_runtime "
+                            "where symbol = 'BTCUSDT'"
+                        ).fetchone()[0]
+            finally:
+                reader.rollback()
+                reader.close()
+                writer.join(timeout=6.0)
+                store.close()
+
+        self.assertTrue(
+            completed_while_reader_open,
+            "dashboard read transaction blocked the strategy runtime write",
+        )
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(committed_evaluated_at, 24_060_000)
+
     def test_persists_and_restores_simulated_orders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "monitor.sqlite3"

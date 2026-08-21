@@ -1532,6 +1532,7 @@ class SQLiteMonitorStore:
             self._profile_summary_lock
         )
         self.profile_worker_thread_prefix = f"profile-summary-{id(self):x}"
+        self._enable_concurrent_access()
         self._profile_summary_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=self.profile_worker_thread_prefix,
@@ -1540,6 +1541,19 @@ class SQLiteMonitorStore:
         self._profile_summary_close_state = "OPEN"
         self._profile_summary_shutdown_in_progress = False
         self._init_schema()
+
+    def _enable_concurrent_access(self) -> None:
+        connection = sqlite3.connect(self.path, timeout=5.0)
+        try:
+            connection.execute("pragma busy_timeout = 5000")
+            journal_mode = connection.execute(
+                "pragma journal_mode = wal"
+            ).fetchone()
+            if not journal_mode or str(journal_mode[0]).lower() != "wal":
+                raise sqlite3.OperationalError("failed to enable SQLite WAL mode")
+            connection.execute("pragma synchronous = normal")
+        finally:
+            connection.close()
 
     def _maintain_profile_summary_after_commit(
         self,
@@ -5373,8 +5387,13 @@ class SQLiteMonitorStore:
 
     @contextmanager
     def _connect(self, *, timeout: float = 5.0) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=max(0.0, float(timeout)))
+        normalized_timeout = max(0.0, float(timeout))
+        connection = sqlite3.connect(self.path, timeout=normalized_timeout)
         try:
+            connection.execute(
+                f"pragma busy_timeout = {int(normalized_timeout * 1000)}"
+            )
+            connection.execute("pragma synchronous = normal")
             configure_max_page_count(connection)
             connection.row_factory = sqlite3.Row
             yield connection
