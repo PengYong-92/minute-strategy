@@ -289,6 +289,157 @@ class ShadowOptimizerTest(unittest.TestCase):
             self.assertEqual(rows["experiment-open-observation"]["status"], "SETTLED")
             self.assertIsNotNone(rows["experiment-open-observation"]["settled_at"])
 
+    def test_restart_does_not_inject_formal_post_effective_observation_into_arms(self):
+        optimizer = self._optimizer(created_at_ms=1_000)
+        first = event(20)
+        self._process_actionable(optimizer, first)
+        experiment_id = optimizer.experiment_id
+        arm_ids = optimizer.arm_ids
+        optimizer.close()
+        formal_only = ObservationSignal(
+            observation_key="formal-only-after-effective-from",
+            strategy_family="long_observe",
+            strategy_tag="formal-only",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="must not enter shadow arms",
+            entry_price=100.0,
+            opened_at=first.kline.open_time,
+            expires_at=event(30).kline.close_time,
+            threshold_segment="WD-00",
+        )
+
+        restarted = ShadowOptimizer(
+            seed={
+                **self.seed,
+                "klines": (*self.seed["klines"], first.kline),
+                "observations": (formal_only,),
+            },
+            store=ShadowSQLiteStore(self.path),
+            max_challengers=2,
+            created_at_ms=9_999,
+        )
+        self.addCleanup(restarted.close)
+
+        self.assertEqual(restarted.experiment_id, experiment_id)
+        for arm_id in arm_ids:
+            keys = {
+                item.observation_key
+                for item in restarted.runtime(arm_id).state(arm_id).observations
+            }
+            self.assertNotIn("formal-only-after-effective-from", keys)
+
+        self._process_actionable(restarted, event(21))
+        store = ShadowSQLiteStore(self.path)
+        for arm_id in arm_ids:
+            stored_keys = {
+                row["observation_key"]
+                for row in store.load_recovery_state(arm_id)["observations"]
+            }
+            self.assertNotIn("formal-only-after-effective-from", stored_keys)
+
+    def test_restart_supersedes_zero_checkpoint_experiment_when_seed_advanced(self):
+        optimizer = self._optimizer(created_at_ms=1_000)
+        abandoned_experiment_id = optimizer.experiment_id
+        optimizer.close()
+        first = event(20)
+        formal_only = ObservationSignal(
+            observation_key="formal-only-before-first-checkpoint",
+            strategy_family="long_observe",
+            strategy_tag="formal-only",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="new experiment warmup",
+            entry_price=100.0,
+            opened_at=first.kline.close_time,
+            expires_at=event(30).kline.close_time,
+            threshold_segment="WD-00",
+        )
+
+        restarted = ShadowOptimizer(
+            seed={
+                **self.seed,
+                "klines": (*self.seed["klines"], first.kline),
+                "observations": (formal_only,),
+            },
+            store=ShadowSQLiteStore(self.path),
+            max_challengers=2,
+            created_at_ms=9_999,
+        )
+        self.addCleanup(restarted.close)
+
+        self.assertNotEqual(restarted.experiment_id, abandoned_experiment_id)
+        abandoned = ShadowSQLiteStore(self.path).load_experiment(
+            abandoned_experiment_id
+        )
+        self.assertEqual(abandoned["status"], "SUPERSEDED_SEED_ADVANCE")
+        for arm_id in restarted.arm_ids:
+            keys = {
+                item.observation_key
+                for item in restarted.runtime(arm_id).state(arm_id).observations
+            }
+            self.assertIn("formal-only-before-first-checkpoint", keys)
+
+        self._process_actionable(restarted, event(21))
+        store = ShadowSQLiteStore(self.path)
+        for arm_id in restarted.arm_ids:
+            stored_keys = {
+                row["observation_key"]
+                for row in store.load_recovery_state(arm_id)["observations"]
+            }
+            self.assertNotIn("formal-only-before-first-checkpoint", stored_keys)
+
+    def test_restart_supersedes_partially_checkpointed_experiment(self):
+        optimizer = self._optimizer(created_at_ms=1_000)
+        abandoned_experiment_id = optimizer.experiment_id
+        first = event(20)
+        checkpointed_arm = optimizer.arm_ids[0]
+        self.assertTrue(optimizer.runtime(checkpointed_arm).process(first))
+        optimizer._persist_event(checkpointed_arm, first)
+        optimizer.close()
+        formal_only = ObservationSignal(
+            observation_key="formal-only-partial-checkpoint",
+            strategy_family="long_observe",
+            strategy_tag="formal-only",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="new experiment warmup",
+            entry_price=100.0,
+            opened_at=first.kline.close_time,
+            expires_at=event(30).kline.close_time,
+            threshold_segment="WD-00",
+        )
+
+        restarted = ShadowOptimizer(
+            seed={
+                **self.seed,
+                "klines": (*self.seed["klines"], first.kline),
+                "observations": (formal_only,),
+            },
+            store=ShadowSQLiteStore(self.path),
+            max_challengers=2,
+            created_at_ms=9_999,
+        )
+        self.addCleanup(restarted.close)
+
+        self.assertNotEqual(restarted.experiment_id, abandoned_experiment_id)
+        abandoned = ShadowSQLiteStore(self.path).load_experiment(
+            abandoned_experiment_id
+        )
+        self.assertEqual(
+            abandoned["status"],
+            "SUPERSEDED_INCOMPLETE_CHECKPOINT",
+        )
+        for arm_id in restarted.arm_ids:
+            keys = {
+                item.observation_key
+                for item in restarted.runtime(arm_id).state(arm_id).observations
+            }
+            self.assertIn("formal-only-partial-checkpoint", keys)
+
     def test_duplicate_is_idempotent_and_gap_freezes_each_arm_with_audit(self):
         optimizer = self._optimizer()
         first = event(20)

@@ -161,17 +161,42 @@ class ShadowOptimizer:
             if existing is not None
             else {"cursor_count": 0, "minimum_closed_at_ms": None}
         )
+        existing_effective_from = (
+            min(
+                int(item["effective_from_ms"])
+                for item in existing.get("arms", ())
+            )
+            if existing is not None and existing.get("arms")
+            else None
+        )
+        cursor_count = int(cursor_bounds["cursor_count"] or 0)
+        expected_cursor_count = len(existing.get("arms", ())) if existing else 0
+        incomplete_checkpoint = bool(
+            existing is not None
+            and 0 < cursor_count < expected_cursor_count
+        )
         seed_ahead = bool(
             latest_seed_close is not None
-            and int(cursor_bounds["cursor_count"] or 0) > 0
-            and cursor_bounds["minimum_closed_at_ms"] is not None
-            and latest_seed_close > int(cursor_bounds["minimum_closed_at_ms"])
+            and (
+                (
+                    cursor_count > 0
+                    and cursor_bounds["minimum_closed_at_ms"] is not None
+                    and latest_seed_close
+                    > int(cursor_bounds["minimum_closed_at_ms"])
+                )
+                or (
+                    cursor_count == 0
+                    and existing_effective_from is not None
+                    and latest_seed_close >= existing_effective_from
+                )
+            )
         )
         reusable = bool(
             existing
             and int(existing["generation"]) == self.generation
             and {item["parameter_hash"] for item in existing["arms"]}
             == expected_hashes
+            and not incomplete_checkpoint
             and not seed_ahead
         )
         if reusable:
@@ -185,7 +210,13 @@ class ShadowOptimizer:
             ]
             self._champion_arm_id = str(existing["champion_arm_id"])
         else:
-            if existing is not None and seed_ahead:
+            if existing is not None and incomplete_checkpoint:
+                self.store.mark_experiment_status(
+                    str(existing["experiment_id"]),
+                    status="SUPERSEDED_INCOMPLETE_CHECKPOINT",
+                    completed_at_ms=self.created_at_ms,
+                )
+            elif existing is not None and seed_ahead:
                 self.store.mark_experiment_status(
                     str(existing["experiment_id"]),
                     status="SUPERSEDED_SEED_ADVANCE",
@@ -274,6 +305,7 @@ class ShadowOptimizer:
                         self.seed,
                         arm_id=arm_id,
                         policy=definition.policy,
+                        effective_from_ms=self._effective_from_by_arm[arm_id],
                         runtime_state=runtime_state,
                         orders=[self._restore_order(row) for row in recovery["orders"]],
                         observations=[

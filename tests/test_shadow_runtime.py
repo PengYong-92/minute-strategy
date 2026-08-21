@@ -240,6 +240,7 @@ class ShadowRuntimeTest(unittest.TestCase):
             restored_seed,
             arm_id="champion",
             policy=baseline_policy(),
+            effective_from_ms=self.seed["klines"][-1].close_time + 1,
             runtime_state=compact,
             orders=[item.to_dict() for item in self.runtime.orders("champion")],
             observations=[

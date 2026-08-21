@@ -292,6 +292,7 @@ class ShadowRuntime:
         *,
         arm_id: str,
         policy: ProfileAdmissionPolicy,
+        effective_from_ms: int,
         runtime_state: Mapping[str, object],
         orders: list[Mapping[str, object]],
         observations: list[Mapping[str, object]],
@@ -307,6 +308,8 @@ class ShadowRuntime:
         arm_state = runtime_state.get("arm")
         if not isinstance(arm_state, Mapping):
             raise ValueError("persisted runtime requires arm state")
+        if type(effective_from_ms) is not int or effective_from_ms < 0:
+            raise ValueError("effective_from_ms must be a non-negative integer")
         merged_observations: dict[str, dict[str, object]] = {}
         for item in seed.get("observations") or ():
             payload = (
@@ -315,7 +318,7 @@ class ShadowRuntime:
                 else deepcopy(dict(item))
             )
             key = str(payload.get("observation_key", ""))
-            if key:
+            if key and int(payload.get("opened_at", 0) or 0) < effective_from_ms:
                 merged_observations[key] = payload
         for item in observations:
             payload = deepcopy(dict(item))
