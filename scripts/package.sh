@@ -85,6 +85,13 @@ if not include_reports:
     excluded_dirs.add("reports")
 
 excluded_suffixes = {".pyc", ".pyo", ".log"}
+runtime_roots = (
+    ".gitignore",
+    "README.md",
+    "requirements.txt",
+    "app",
+    "scripts",
+)
 
 
 def should_include(path: Path) -> bool:
@@ -102,16 +109,24 @@ def should_include(path: Path) -> bool:
 def copy_tree(target_root: Path) -> None:
     package_root = target_root / package_name
     package_root.mkdir(parents=True)
-    for source in root.rglob("*"):
-        if not should_include(source):
+    selected_roots = list(runtime_roots)
+    if include_reports:
+        selected_roots.append("reports")
+    for selected in selected_roots:
+        source_root = root / selected
+        if not source_root.exists():
             continue
-        relative = source.relative_to(root)
-        target = package_root / relative
-        if source.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        sources = (source_root,) if source_root.is_file() else source_root.rglob("*")
+        for source in sources:
+            if not should_include(source):
+                continue
+            relative = source.relative_to(root)
+            target = package_root / relative
+            if source.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     for script in (package_root / "scripts").glob("*.sh"):
         mode = script.stat().st_mode
         script.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

@@ -1087,6 +1087,9 @@ process.stdout.write(JSON.stringify({
                 self.assertFalse(any("/.venv/" in name for name in names))
                 self.assertFalse(any("/data/" in name for name in names))
                 self.assertFalse(any("/__pycache__/" in name for name in names))
+                self.assertFalse(any("/tests/" in name for name in names))
+                self.assertFalse(any("/docs/" in name for name in names))
+                self.assertFalse(any(name.endswith(".sqlite3") for name in names))
 
             with tempfile.TemporaryDirectory() as extract_dir:
                 with tarfile.open(tarballs[0], "r:gz") as archive:
