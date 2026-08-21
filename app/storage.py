@@ -9,7 +9,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from pathlib import Path
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 from app.decision_context import (
@@ -3173,6 +3173,76 @@ class SQLiteMonitorStore:
             observations.append(ObservationSignal(**clean_payload))
         return observations
 
+    @staticmethod
+    def _compact_runtime_observation(
+        observation: ObservationSignal,
+    ) -> ObservationSignal:
+        return ObservationSignal(
+            observation_key=observation.observation_key,
+            strategy_family=observation.strategy_family,
+            strategy_tag=observation.strategy_tag,
+            direction=observation.direction,
+            timeframe_minutes=observation.timeframe_minutes,
+            level=observation.level,
+            reason="runtime history",
+            entry_price=observation.entry_price,
+            opened_at=observation.opened_at,
+            expires_at=observation.expires_at,
+            threshold_segment=observation.threshold_segment,
+            status=observation.status,
+            result=observation.result,
+            exit_price=observation.exit_price,
+            settled_at=observation.settled_at,
+            pnl=observation.pnl,
+            decision_id=observation.decision_id,
+        )
+
+    @staticmethod
+    def _runtime_observations_from_rows(
+        rows: Iterable[Mapping[str, Any]],
+    ) -> list[ObservationSignal]:
+        accepted = {field.name for field in fields(ObservationSignal)}
+        restored = []
+        for row in rows:
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
+            observation = ObservationSignal(
+                **{key: value for key, value in payload.items() if key in accepted}
+            )
+            restored.append(
+                observation
+                if observation.status == "OPEN"
+                else SQLiteMonitorStore._compact_runtime_observation(observation)
+            )
+        return restored
+
+    def load_runtime_observations(
+        self,
+        symbol: str,
+        *,
+        limit: int = 5000,
+    ) -> list[ObservationSignal]:
+        normalized_symbol = symbol.upper()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                select observation_signals.payload,
+                       {_OBSERVATION_LIFECYCLE_COLUMNS},
+                       {_LINKED_CONTEXT_COLUMNS}
+                from observation_signals
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                where observation_signals.symbol = ?
+                order by observation_signals.opened_at desc
+                limit ?
+                """,
+                (normalized_symbol, max(1, int(limit))),
+            )
+            return self._runtime_observations_from_rows(rows)
+
     def load_observations_for_profile(
         self,
         symbol: str,
@@ -3203,17 +3273,8 @@ class SQLiteMonitorStore:
                 order by observation_signals.opened_at desc
                 """,
                 (normalized_symbol, cutoff),
-            ).fetchall()
-        accepted = {field.name for field in fields(ObservationSignal)}
-        observations = []
-        for row in rows:
-            payload = _hydrate_decision_linked_payload(
-                json.loads(row["payload"]),
-                row,
             )
-            clean_payload = {key: value for key, value in payload.items() if key in accepted}
-            observations.append(ObservationSignal(**clean_payload))
-        return observations
+            return self._runtime_observations_from_rows(rows)
 
     def load_adaptive_profile_observations(
         self,
@@ -3267,20 +3328,8 @@ class SQLiteMonitorStore:
                          observation_signals.observation_key
                 """,
                 parameters,
-            ).fetchall()
-        accepted = {field.name for field in fields(ObservationSignal)}
-        observations = []
-        for row in rows:
-            payload = _hydrate_decision_linked_payload(
-                json.loads(row["payload"]),
-                row,
             )
-            observations.append(
-                ObservationSignal(
-                    **{key: value for key, value in payload.items() if key in accepted}
-                )
-            )
-        return observations
+            return self._runtime_observations_from_rows(rows)
 
     def save_daily_profile_selection(self, symbol: str, snapshot: dict[str, Any]) -> None:
         payload = json.dumps(snapshot, ensure_ascii=False)
@@ -3506,41 +3555,43 @@ class SQLiteMonitorStore:
         connection: sqlite3.Connection,
         symbol: str,
     ) -> dict[str, list[str] | list[int]]:
-        def distinct(expression: str) -> list[str]:
-            rows = connection.execute(
-                f"""
-                select distinct upper({expression}) as value
-                from observation_signals
-                left join decision_contexts
-                  on decision_contexts.symbol = observation_signals.symbol
-                 and decision_contexts.decision_id = observation_signals.decision_id
-                where observation_signals.symbol = ?
-                  and coalesce({expression}, '') != ''
-                order by value
-                """,
-                (symbol,),
-            ).fetchall()
-            return [str(row["value"]) for row in rows]
-
-        result_rows = connection.execute(
-            """
-            select distinct
-                case when upper(status) = 'OPEN'
-                     then 'OPEN' else upper(coalesce(result, '')) end as value
+        projections = [
+            f"upper({expression}) as {name}"
+            for name, expression in _OBSERVATION_CANONICAL_FILTER_SQL.items()
+        ]
+        projections.append(
+            "case when upper(observation_signals.status) = 'OPEN' "
+            "then 'OPEN' else upper(coalesce(observation_signals.result, '')) "
+            "end as result"
+        )
+        rows = connection.execute(
+            f"""
+            select distinct {', '.join(projections)}
             from observation_signals
+            left join decision_contexts
+              on decision_contexts.symbol = observation_signals.symbol
+             and decision_contexts.decision_id = observation_signals.decision_id
             where observation_signals.symbol = ?
             """,
             (symbol,),
         ).fetchall()
+
+        options = {
+            name: sorted(
+                {
+                    str(row[name])
+                    for row in rows
+                    if row[name] is not None and str(row[name])
+                }
+            )
+            for name in _OBSERVATION_CANONICAL_FILTER_SQL
+        }
         result_order = {"OPEN": 0, "WIN": 1, "LOSS": 2}
         results = sorted(
-            {str(row["value"]) for row in result_rows if row["value"]},
+            {str(row["result"]) for row in rows if row["result"]},
             key=lambda item: result_order.get(item, 99),
         )
-        return {
-            key: distinct(expression)
-            for key, expression in _OBSERVATION_CANONICAL_FILTER_SQL.items()
-        } | {
+        return options | {
             "result": results,
             "page_size": list(ORDER_PAGE_SIZES),
         }

@@ -575,6 +575,42 @@ class MonitorState:
             decision_id=observation.decision_id,
         )
 
+    def compact_settled_observations(
+        self,
+        observation_keys: set[str] | None = None,
+    ) -> int:
+        keys = None if observation_keys is None else set(observation_keys)
+
+        def compact(rows: Sequence[ObservationSignal]) -> list[ObservationSignal]:
+            return [
+                self._compact_shadow_seed_observation(item)
+                if item.status == "SETTLED"
+                and (keys is None or item.observation_key in keys)
+                else item
+                for item in rows
+            ]
+
+        with self._lock:
+            before = sum(
+                item.status == "SETTLED"
+                and (keys is None or item.observation_key in keys)
+                and bool(
+                    item.decision_inputs
+                    or item.decision_trace
+                    or item.quality_score_inputs
+                    or item.entry_structure_shadow
+                )
+                for item in self.observations
+            )
+            self.observations = compact(self.observations)
+            self._adaptive_profile_observations = compact(
+                self._adaptive_profile_observations
+            )
+            self._direction_pulse_history = compact(
+                self._direction_pulse_history
+            )
+            return before
+
     def seed_shadow_history(
         self,
         observations: Sequence[ObservationSignal],
@@ -642,7 +678,12 @@ class MonitorState:
                 stake_progression_credits=restored_credits,
                 active_second_order_ids=active_second_order_ids,
             )
-            restored_observations = list(deepcopy(observations))
+            restored_observations = [
+                self._compact_shadow_seed_observation(item)
+                if item.status == "SETTLED"
+                else deepcopy(item)
+                for item in observations
+            ]
             self.observations = restored_observations
             self._adaptive_profile_observations = list(restored_observations)
             self.adaptive_profile_states = {}
@@ -5079,6 +5120,10 @@ class MonitorState:
                     max(int(item.settled_at) for item in settled) + 1,
                 )
                 self._refresh_direction_pulse_shadow(current_time)
+                if self.storage:
+                    self.compact_settled_observations(
+                        {item.observation_key for item in settled}
+                    )
             else:
                 for observation, previous_state in previous_states:
                     observation.__dict__.clear()
@@ -5244,6 +5289,16 @@ class MonitorState:
     ) -> list[ObservationSignal]:
         if not self.storage:
             return list(fallback)
+        runtime_loader = getattr(
+            self.storage,
+            "load_runtime_observations",
+            None,
+        )
+        if runtime_loader is not None:
+            try:
+                return runtime_loader(self.symbol, limit=5000)
+            except Exception:  # noqa: BLE001 - 失败时继续使用兼容读取路径。
+                pass
         loader = getattr(self.storage, "load_observations", None)
         if loader is None:
             return list(fallback)

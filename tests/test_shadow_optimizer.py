@@ -258,6 +258,10 @@ class ShadowOptimizerTest(unittest.TestCase):
             opened_at=first.kline.open_time,
             expires_at=event(22).kline.close_time,
             threshold_segment="WD-00",
+            decision_inputs={"large": "experiment-input"},
+            decision_trace=[{"large": "experiment-trace"}],
+            quality_score_inputs={"large": "experiment-quality"},
+            entry_structure_shadow={"large": "experiment-structure"},
         )
         for arm_id in arm_ids:
             optimizer.runtime(arm_id).state(arm_id).observations.append(
@@ -288,6 +292,20 @@ class ShadowOptimizerTest(unittest.TestCase):
             }
             self.assertEqual(rows["experiment-open-observation"]["status"], "SETTLED")
             self.assertIsNotNone(rows["experiment-open-observation"]["settled_at"])
+            persisted_detail = rows["experiment-open-observation"]["detail"]
+            self.assertEqual(
+                persisted_detail["decision_inputs"],
+                {"large": "experiment-input"},
+            )
+            live = next(
+                item
+                for item in restarted.runtime(arm_id).state(arm_id).observations
+                if item.observation_key == "experiment-open-observation"
+            )
+            self.assertEqual(live.decision_inputs, {})
+            self.assertEqual(live.decision_trace, [])
+            self.assertEqual(live.quality_score_inputs, {})
+            self.assertEqual(live.entry_structure_shadow, {})
 
     def test_restart_does_not_inject_formal_post_effective_observation_into_arms(self):
         optimizer = self._optimizer(created_at_ms=1_000)

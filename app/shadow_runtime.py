@@ -768,6 +768,16 @@ class ShadowRuntime:
                 "arm": arm_state,
             }
 
+    def compact_settled_observations(
+        self,
+        arm_id: str,
+        observation_keys: set[str],
+    ) -> int:
+        with self._lock:
+            return self._arm(arm_id).state.compact_settled_observations(
+                observation_keys
+            )
+
     def _arm_checkpoint(self, arm: _ArmRuntime) -> dict[str, object]:
         state = arm.state
         return _jsonable(

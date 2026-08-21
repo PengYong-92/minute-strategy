@@ -919,6 +919,14 @@ class ShadowOptimizer:
             daily_rollup=self._daily_rollup(runtime, arm_id, event),
             state_version=1,
         )
+        runtime.compact_settled_observations(
+            arm_id,
+            {
+                str(item["observation_key"])
+                for item in observations
+                if str(item["status"]).upper() == "SETTLED"
+            },
+        )
 
     def _persist_gap(self, arm_id: str, event: MarketEvent, reason: str) -> None:
         runtime = self._runtimes[arm_id]

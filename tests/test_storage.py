@@ -2846,6 +2846,30 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
                         "modern",
                     )
 
+    def test_observation_filter_options_use_one_canonical_projection_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.save_observation(observation("filter-options"), "BTCUSDT")
+            statements = []
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.set_trace_callback(statements.append)
+
+                options = store._observation_filter_options_sql(
+                    connection,
+                    "BTCUSDT",
+                )
+
+        selects = [
+            statement
+            for statement in statements
+            if statement.lstrip().lower().startswith("select")
+        ]
+        self.assertEqual(len(selects), 1)
+        self.assertIn("SHORT", options["direction"])
+        self.assertIn("WIN", options["result"])
+
     def test_persists_daily_profile_selection_idempotently_and_loads_effective_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -2989,6 +3013,132 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 650)
         self.assertEqual(sum(item.result == "LOSS" for item in rows), 150)
+
+    def test_runtime_profile_history_compacts_settled_context_but_keeps_open_context(self):
+        settled = replace(
+            observation("runtime-settled", opened_at=1_000),
+            decision_id="settled-decision",
+            decision_inputs={"large": "settled-input"},
+            decision_trace=[{"large": "settled-trace"}],
+            quality_score_inputs={"large": "settled-quality"},
+            entry_structure_shadow={"large": "settled-structure"},
+        )
+        opened = replace(
+            observation(
+                "runtime-open",
+                status="OPEN",
+                result=None,
+                opened_at=2_000,
+            ),
+            decision_id="open-decision",
+            decision_inputs={"frozen": "open-input"},
+            decision_trace=[{"frozen": "open-trace"}],
+            quality_score_inputs={"frozen": "open-quality"},
+            entry_structure_shadow={"frozen": "open-structure"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observations([settled, opened], "BTCUSDT")
+
+            restored = {
+                item.observation_key: item
+                for item in store.load_observations_for_profile(
+                    "BTCUSDT",
+                    lookback_days=7,
+                )
+            }
+            adaptive = store.load_adaptive_profile_observations(
+                "BTCUSDT",
+                lookback_days=15,
+                evaluated_at=1_000_000,
+            )
+
+        compact = restored["runtime-settled"]
+        self.assertEqual(compact.decision_id, "settled-decision")
+        self.assertEqual(compact.result, "WIN")
+        self.assertEqual(compact.pnl, 8.0)
+        self.assertEqual(compact.decision_inputs, {})
+        self.assertEqual(compact.decision_trace, [])
+        self.assertEqual(compact.quality_score_inputs, {})
+        self.assertEqual(compact.entry_structure_shadow, {})
+        self.assertEqual(adaptive[0].decision_inputs, {})
+
+        pending = restored["runtime-open"]
+        self.assertEqual(pending.decision_inputs, {"frozen": "open-input"})
+        self.assertEqual(pending.decision_trace, [{"frozen": "open-trace"}])
+        self.assertEqual(
+            pending.entry_structure_shadow,
+            {"frozen": "open-structure"},
+        )
+
+    def test_compact_runtime_history_still_rejects_frozen_identity_conflicts(self):
+        config = runtime_config_snapshot({"threshold": 81.5})
+        source = observation("runtime-integrity", opened_at=1_000)
+        profile_key = source.profile_key
+        context = decision_context(
+            config,
+            decision_id="runtime-integrity-decision",
+            closed_kline_at_ms=source.opened_at,
+            inputs={
+                "identity": {
+                    "direction": source.direction,
+                    "profile_key": profile_key,
+                    "strategy_family": source.strategy_family,
+                    "strategy_tag": source.strategy_tag,
+                    "timeframe_minutes": source.timeframe_minutes,
+                    "threshold_segment": source.threshold_segment,
+                    "level": source.level,
+                },
+                "signal": {},
+                "score": {"edge": source.edge},
+                "market": {
+                    "candidate_time_ms": source.opened_at,
+                    "entry_price": source.entry_price,
+                },
+            },
+        )
+        linked = replace(
+            source,
+            decision_id=context.decision_id,
+            context_version=context.context_version,
+            runtime_config_hash=context.runtime_config_hash,
+            strategy_build_id=context.strategy_build_id,
+            candidate_origin=context.candidate_origin,
+            decision_inputs=context.to_dict()["inputs"],
+            decision_trace=context.to_dict()["decision_trace"],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.save_runtime_config_snapshot(config)
+            store.save_decision_context(context)
+            store.save_observation(linked, "BTCUSDT")
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "update observation_signals "
+                    "set payload = json_set(payload, '$.strategy_tag', 'tampered')"
+                )
+                connection.commit()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "persisted strategy_tag does not match decision context",
+            ):
+                store.load_runtime_observations("BTCUSDT")
+            with self.assertRaisesRegex(
+                ValueError,
+                "persisted strategy_tag does not match decision context",
+            ):
+                store.load_observations_for_profile("BTCUSDT", lookback_days=7)
+            with self.assertRaisesRegex(
+                ValueError,
+                "persisted strategy_tag does not match decision context",
+            ):
+                store.load_adaptive_profile_observations(
+                    "BTCUSDT",
+                    lookback_days=15,
+                    evaluated_at=1_000_000,
+                )
 
     def test_profile_restore_loads_one_day_buffer_for_scheduled_daily_cutoff(self):
         with tempfile.TemporaryDirectory() as temp_dir:

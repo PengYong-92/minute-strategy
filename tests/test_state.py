@@ -3839,6 +3839,11 @@ class MonitorStateTest(unittest.TestCase):
                 settled[0].edge,
                 settled[0].decision_inputs["score"]["edge"],
             )
+            self.assertIsNot(state.observations[0], settled[0])
+            self.assertEqual(state.observations[0].decision_inputs, {})
+            self.assertEqual(state.observations[0].decision_trace, [])
+            self.assertEqual(state.observations[0].quality_score_inputs, {})
+            self.assertEqual(state.observations[0].entry_structure_shadow, {})
             self.assertEqual(
                 store.load_observations("BTCUSDT")[0].status,
                 "SETTLED",
