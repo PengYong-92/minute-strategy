@@ -91,7 +91,7 @@ class ShadowOptimizer:
         max_challengers: int = 7,
         created_at_ms: int | None = None,
     ) -> None:
-        self.seed = deepcopy(dict(seed))
+        self.seed = dict(seed)
         self.store = store
         self.created_at_ms = int(
             time.time() * 1000 if created_at_ms is None else created_at_ms
@@ -243,6 +243,10 @@ class ShadowOptimizer:
             self._champion_arm_id = champion_arm_id
 
         self._arm_ids = tuple(str(row["arm_id"]) for row in ordered_rows)
+        self._effective_from_by_arm = {
+            str(row["arm_id"]): int(row["effective_from_ms"])
+            for row in ordered_rows
+        }
         self._retired_arms = {
             str(row["arm_id"])
             for row in ordered_rows
@@ -967,7 +971,10 @@ class ShadowOptimizer:
             "threshold_segment",
             "profile_key",
         }
+        effective_from = self._effective_from_by_arm[arm_id]
         for observation in observations:
+            if int(observation.opened_at) < effective_from:
+                continue
             signature = (
                 observation.status,
                 observation.result,
@@ -1063,6 +1070,7 @@ class ShadowOptimizer:
             "pending_promotion": deepcopy(self._pending_promotion),
             "pending_lifecycle": deepcopy(self._pending_lifecycle),
             "next_evaluation": "07:50 Asia/Shanghai",
+            "seed": deepcopy(self.seed.get("seed_metadata") or {}),
         }
 
     def compact(self, current_time_ms: int) -> dict[str, int]:

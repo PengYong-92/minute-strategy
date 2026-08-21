@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.models import FearGreedContext, Kline, Signal
+from app.models import FearGreedContext, Kline, ObservationSignal, Signal
 from app.shadow_models import MarketEvent
 from app.shadow_models import ShadowEvaluationMetrics
 from app.shadow_optimizer import ShadowLifecycleScheduler, ShadowOptimizer
@@ -161,6 +161,133 @@ class ShadowOptimizerTest(unittest.TestCase):
 
         self.assertEqual(len(choose_calls), 1)
         self.assertEqual(len(analyze_calls), 1)
+
+    def test_first_event_never_persists_warmup_observations_as_experiment_samples(self):
+        historical = ObservationSignal(
+            observation_key="historical-seed-observation",
+            strategy_family="long_observe",
+            strategy_tag="generic_long_observe",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="warmup only",
+            entry_price=100.0,
+            opened_at=1,
+            expires_at=2,
+            threshold_segment="WD-00",
+            status="SETTLED",
+            result="WIN",
+            exit_price=101.0,
+            settled_at=2,
+            pnl=8.0,
+        )
+        self.seed = {**self.seed, "observations": (historical,)}
+        optimizer = self._optimizer()
+
+        self._process_actionable(optimizer, event(20))
+
+        store = ShadowSQLiteStore(self.path)
+        for arm_id in optimizer.arm_ids:
+            stored_keys = {
+                row["observation_key"]
+                for row in store.load_recovery_state(arm_id)["observations"]
+            }
+            self.assertNotIn("historical-seed-observation", stored_keys)
+
+    def test_restart_restores_warmup_observations_without_persisting_one_copy_per_arm(self):
+        historical = ObservationSignal(
+            observation_key="historical-seed-observation",
+            strategy_family="long_observe",
+            strategy_tag="generic_long_observe",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="warmup only",
+            entry_price=100.0,
+            opened_at=1,
+            expires_at=2,
+            threshold_segment="WD-00",
+            status="SETTLED",
+            result="WIN",
+            exit_price=101.0,
+            settled_at=2,
+            pnl=8.0,
+        )
+        self.seed = {**self.seed, "observations": (historical,)}
+        optimizer = self._optimizer(created_at_ms=1_000)
+        first = event(20)
+        self._process_actionable(optimizer, first)
+        experiment_id = optimizer.experiment_id
+        arm_ids = optimizer.arm_ids
+        optimizer.close()
+
+        restarted = ShadowOptimizer(
+            seed={
+                **self.seed,
+                "klines": (*self.seed["klines"], first.kline),
+            },
+            store=ShadowSQLiteStore(self.path),
+            max_challengers=2,
+            created_at_ms=9_999,
+        )
+        self.addCleanup(restarted.close)
+
+        self.assertEqual(restarted.experiment_id, experiment_id)
+        for arm_id in arm_ids:
+            observations = restarted.runtime(arm_id).state(arm_id).observations
+            self.assertIn(
+                "historical-seed-observation",
+                {item.observation_key for item in observations},
+            )
+
+    def test_restart_persists_lifecycle_updates_for_experiment_open_observations(self):
+        optimizer = self._optimizer(created_at_ms=1_000)
+        first = event(20)
+        self._process_actionable(optimizer, first)
+        second = event(21)
+        arm_ids = optimizer.arm_ids
+        experiment_observation = ObservationSignal(
+            observation_key="experiment-open-observation",
+            strategy_family="long_observe",
+            strategy_tag="generic_long_observe",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="experiment observation",
+            entry_price=100.0,
+            opened_at=first.kline.open_time,
+            expires_at=event(22).kline.close_time,
+            threshold_segment="WD-00",
+        )
+        for arm_id in arm_ids:
+            optimizer.runtime(arm_id).state(arm_id).observations.append(
+                replace(experiment_observation)
+            )
+        self._process_actionable(optimizer, second)
+        optimizer.close()
+
+        restarted = ShadowOptimizer(
+            seed={
+                **self.seed,
+                "klines": (*self.seed["klines"], first.kline, second.kline),
+                "observations": (experiment_observation,),
+            },
+            store=ShadowSQLiteStore(self.path),
+            max_challengers=2,
+            created_at_ms=9_999,
+        )
+        self.addCleanup(restarted.close)
+
+        self._process_actionable(restarted, event(22))
+
+        store = ShadowSQLiteStore(self.path)
+        for arm_id in arm_ids:
+            rows = {
+                row["observation_key"]: row
+                for row in store.load_recovery_state(arm_id)["observations"]
+            }
+            self.assertEqual(rows["experiment-open-observation"]["status"], "SETTLED")
+            self.assertIsNotNone(rows["experiment-open-observation"]["settled_at"])
 
     def test_duplicate_is_idempotent_and_gap_freezes_each_arm_with_audit(self):
         optimizer = self._optimizer()

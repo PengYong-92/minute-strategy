@@ -94,6 +94,7 @@ from app.time_period_guard import (
     evaluate_time_period_guard,
 )
 from app.strategy import (
+    DYNAMIC_PROFILE_LOOKBACK_MINUTES,
     LIVE_TRADE_TIMEFRAMES,
     analyze_observation_signals,
     analyze_volume_price,
@@ -112,6 +113,9 @@ from app.wave_batch_guard import (
 DAY_MS = 86_400_000
 REALTIME_PRICE_STALE_MS = 5_000
 ORDER_GATE_TRACE_VERSION = "ORDER_GATE_TRACE_V1"
+SHADOW_KLINE_SEED_LIMIT = DYNAMIC_PROFILE_LOOKBACK_MINUTES + max(
+    LIVE_TRADE_TIMEFRAMES
+)
 
 
 @dataclass
@@ -447,12 +451,36 @@ class MonitorState:
 
     def shadow_runtime_seed(self) -> dict[str, object]:
         with self._lock:
+            shadow_max_klines = (
+                min(self.max_klines, SHADOW_KLINE_SEED_LIMIT)
+                if self.max_klines > 0
+                else SHADOW_KLINE_SEED_LIMIT
+            )
+            seed_klines = tuple(self.klines[-shadow_max_klines:])
+            evaluated_at = seed_klines[-1].close_time if seed_klines else 0
+            observation_history_days = max(
+                15,
+                self.observation_profile_lookback_days,
+                self.daily_profile_selector_config.effective_stable_lookback_days,
+            )
+            observation_cutoff = evaluated_at - (observation_history_days + 1) * DAY_MS
+            seed_observations = tuple(
+                self._compact_shadow_seed_observation(item)
+                for item in self.observations
+                if not evaluated_at
+                or item.status == "OPEN"
+                or item.opened_at >= observation_cutoff
+                or (
+                    item.settled_at is not None
+                    and item.settled_at >= evaluated_at - 15 * DAY_MS
+                )
+            )
             constructor = {
                 "max_open_orders": self.order_policy.max_open_orders,
                 "max_open_long_orders": self.order_policy.max_open_long_orders,
                 "max_open_short_orders": self.order_policy.max_open_short_orders,
                 "min_order_gap_ms": self.order_policy.min_order_gap_ms,
-                "max_klines": self.max_klines,
+                "max_klines": shadow_max_klines,
                 "rolling_edge_config": deepcopy(self.rolling_edge_config),
                 "enable_rolling_edge_guard": self.enable_rolling_edge_guard,
                 "result_sequence_guard_config": deepcopy(
@@ -506,15 +534,46 @@ class MonitorState:
                 "symbol": self.symbol,
                 "context": (self.symbol, self._symbol_generation),
                 "constructor": constructor,
-                "klines": tuple(self.klines),
-                "observations": tuple(deepcopy(self.observations)),
+                "klines": seed_klines,
+                "observations": seed_observations,
                 "daily_profile_selection": deepcopy(self.daily_profile_selection),
                 "fear_greed": (
                     deepcopy(self.fear_greed.to_dict()) if self.fear_greed else None
                 ),
                 "profile_admission_policy": self.profile_admission_policy.to_dict(),
                 "runtime_config": self._decision_runtime_config().to_dict(),
+                "seed_metadata": {
+                    "source_kline_count": len(self.klines),
+                    "kline_count": len(seed_klines),
+                    "source_observation_count": len(self.observations),
+                    "observation_count": len(seed_observations),
+                    "observation_history_days": observation_history_days + 1,
+                },
             }
+
+    @staticmethod
+    def _compact_shadow_seed_observation(
+        observation: ObservationSignal,
+    ) -> ObservationSignal:
+        return ObservationSignal(
+            observation_key=observation.observation_key,
+            strategy_family=observation.strategy_family,
+            strategy_tag=observation.strategy_tag,
+            direction=observation.direction,
+            timeframe_minutes=observation.timeframe_minutes,
+            level=observation.level,
+            reason="shadow warmup",
+            entry_price=observation.entry_price,
+            opened_at=observation.opened_at,
+            expires_at=observation.expires_at,
+            threshold_segment=observation.threshold_segment,
+            status=observation.status,
+            result=observation.result,
+            exit_price=observation.exit_price,
+            settled_at=observation.settled_at,
+            pnl=observation.pnl,
+            decision_id=observation.decision_id,
+        )
 
     def seed_shadow_history(
         self,
@@ -528,10 +587,10 @@ class MonitorState:
         with self._lock:
             restored = list(deepcopy(observations))
             self.observations = restored
-            self._adaptive_profile_observations = list(deepcopy(restored))
+            self._adaptive_profile_observations = list(restored)
             self.adaptive_profile_states = {}
             self._rebuild_all_adaptive_profile_states(int(evaluated_at))
-            self._direction_pulse_history = list(deepcopy(restored))
+            self._direction_pulse_history = list(restored)
             self.direction_pulse_shadow = empty_direction_pulse_shadow(
                 current_time=int(evaluated_at)
             )
@@ -585,12 +644,10 @@ class MonitorState:
             )
             restored_observations = list(deepcopy(observations))
             self.observations = restored_observations
-            self._adaptive_profile_observations = list(
-                deepcopy(restored_observations)
-            )
+            self._adaptive_profile_observations = list(restored_observations)
             self.adaptive_profile_states = {}
             self._rebuild_all_adaptive_profile_states(int(evaluated_at))
-            self._direction_pulse_history = list(deepcopy(restored_observations))
+            self._direction_pulse_history = list(restored_observations)
             self.direction_pulse_shadow = empty_direction_pulse_shadow(
                 current_time=int(evaluated_at)
             )

@@ -285,7 +285,7 @@ class ShadowSupervisor:
         from app.shadow_candidates import build_profile_admission_arms
         from app.shadow_storage import ShadowSQLiteStore
 
-        seed = deepcopy(self.seed_supplier())
+        seed = self.seed_supplier()
         context = self._normalize_context(seed.get("context"))
         definitions = build_profile_admission_arms(
             seed,

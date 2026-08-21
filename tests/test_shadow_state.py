@@ -1,7 +1,7 @@
 import threading
 import unittest
 
-from app.models import FearGreedContext, Kline, Signal
+from app.models import FearGreedContext, Kline, ObservationSignal, Signal
 from app.profile_admission import baseline_policy, candidate_policy
 from app.state import MonitorState
 
@@ -40,6 +40,79 @@ class ShadowStateBoundaryTest(unittest.TestCase):
 
         seed["constructor"]["max_open_orders"] = 99
         self.assertEqual(self.state.order_policy.max_open_orders, 2)
+
+    def test_runtime_seed_bounds_analyzer_history_and_compacts_observations(self):
+        self.state.klines = [kline(index) for index in range(43_215)]
+        observation = ObservationSignal(
+            observation_key="seed-observation",
+            strategy_family="long_observe",
+            strategy_tag="generic_long_observe",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="historical seed",
+            entry_price=100.0,
+            opened_at=self.state.klines[-1].close_time - 60_000,
+            expires_at=self.state.klines[-1].close_time,
+            threshold_segment="WD-00",
+            status="SETTLED",
+            result="WIN",
+            exit_price=101.0,
+            settled_at=self.state.klines[-1].close_time - 1,
+            pnl=8.0,
+            decision_id="decision-seed",
+            decision_inputs={"identity": {"large": "payload"}, "score": {}},
+            decision_trace=[{"gate": "large-payload"}],
+            quality_score_inputs={"macd": 12.0},
+            entry_structure_shadow={"large": "payload"},
+        )
+        self.state.observations = [observation]
+
+        seed = self.state.shadow_runtime_seed()
+
+        self.assertEqual(len(seed["klines"]), 43_210)
+        self.assertEqual(seed["klines"][0], kline(5))
+        self.assertEqual(seed["constructor"]["max_klines"], 43_210)
+        compact = seed["observations"][0]
+        self.assertEqual(compact.observation_key, "seed-observation")
+        self.assertEqual(compact.decision_id, "decision-seed")
+        self.assertEqual(compact.result, "WIN")
+        self.assertEqual(compact.pnl, 8.0)
+        self.assertEqual(compact.decision_inputs, {})
+        self.assertEqual(compact.decision_trace, [])
+        self.assertEqual(compact.quality_score_inputs, {})
+        self.assertEqual(compact.entry_structure_shadow, {})
+
+    def test_shadow_history_keeps_one_detached_observation_graph_per_state(self):
+        observation = ObservationSignal(
+            observation_key="seed-observation",
+            strategy_family="long_observe",
+            strategy_tag="generic_long_observe",
+            direction="LONG",
+            timeframe_minutes=10,
+            level="B",
+            reason="historical seed",
+            entry_price=100.0,
+            opened_at=1,
+            expires_at=2,
+            threshold_segment="WD-00",
+            status="SETTLED",
+            result="WIN",
+            exit_price=101.0,
+            settled_at=2,
+            pnl=8.0,
+        )
+
+        self.state.seed_shadow_history(
+            (observation,),
+            None,
+            evaluated_at=3,
+        )
+
+        restored = self.state.observations[0]
+        self.assertIsNot(restored, observation)
+        self.assertIs(self.state._adaptive_profile_observations[0], restored)
+        self.assertIs(self.state._direction_pulse_history[0], restored)
 
     def test_market_context_is_frozen_and_rejects_stale_symbol_generation(self):
         self.state.fear_greed = FearGreedContext(

@@ -106,7 +106,7 @@ class ShadowRuntime:
         if not isinstance(constructor, Mapping):
             raise ValueError("seed constructor must be a mapping")
         seed_klines = tuple(seed.get("klines") or ())
-        seed_observations = tuple(deepcopy(seed.get("observations") or ()))
+        seed_observations = tuple(seed.get("observations") or ())
         daily_selection = deepcopy(seed.get("daily_profile_selection"))
         seed_cursor = seed_klines[-1].open_time if seed_klines else None
         evaluated_at = seed_klines[-1].close_time if seed_klines else 0
@@ -196,7 +196,7 @@ class ShadowRuntime:
             seed_klines = tuple(
                 item for item in seed_klines if item.open_time <= cursor_open_time
             )
-        restored_seed = {**deepcopy(dict(seed)), "klines": seed_klines}
+        restored_seed = {**dict(seed), "klines": seed_klines}
         runtime = cls.from_seed(
             restored_seed,
             generation=generation,
@@ -307,6 +307,28 @@ class ShadowRuntime:
         arm_state = runtime_state.get("arm")
         if not isinstance(arm_state, Mapping):
             raise ValueError("persisted runtime requires arm state")
+        merged_observations: dict[str, dict[str, object]] = {}
+        for item in seed.get("observations") or ():
+            payload = (
+                item.to_dict()
+                if isinstance(item, ObservationSignal)
+                else deepcopy(dict(item))
+            )
+            key = str(payload.get("observation_key", ""))
+            if key:
+                merged_observations[key] = payload
+        for item in observations:
+            payload = deepcopy(dict(item))
+            key = str(payload.get("observation_key", ""))
+            if key:
+                merged_observations[key] = payload
+        ordered_observations = sorted(
+            merged_observations.values(),
+            key=lambda item: (
+                int(item.get("opened_at", 0) or 0),
+                str(item.get("observation_key", "")),
+            ),
+        )
         checkpoint = {
             key: deepcopy(runtime_state.get(key))
             for key in (
@@ -328,13 +350,14 @@ class ShadowRuntime:
                     normalized_arm_id: {
                         **deepcopy(dict(arm_state)),
                         "orders": deepcopy(orders),
-                        "observations": deepcopy(observations),
+                        "observations": ordered_observations,
                     }
                 },
             }
         )
+        restored_seed = {**dict(seed), "observations": ()}
         return cls.from_checkpoint(
-            seed,
+            restored_seed,
             checkpoint=checkpoint,
             policies={normalized_arm_id: policy},
         )
