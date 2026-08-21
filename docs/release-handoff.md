@@ -2441,3 +2441,49 @@ https=200
 1. 正式库仍有1条2026年7月旧格式`OPEN`观察，没有V2冻结上下文且已超出当前实时精确到期K线回放范围；不得直接篡改结果，后续应提供可审计的历史到期K线修复工具。
 2. 影子库存在多个历史实验仍标记为`RUNNING`。恢复只选择最新实验，因此当前不会重复执行旧实验，但生命周期创建分支应保证所有被替代实验原子标记为`SUPERSEDED_*`，避免状态歧义和无效磁盘保留。
 3. 实例无Swap，最终可用内存仍只有约340MiB。当前cgroup限制可保护整机，但需持续监控`MemoryCurrent/MemoryPeak`、API延迟、`NRestarts`和影子缺口；扩展Challenger前必须先降低主进程启动常驻内存或升级实例。
+
+## 48. 2026-08-21观察历史内存与画像接口修复
+
+### 48.1 故障根因
+
+`59f0544`发布后服务进程和Nginx均未退出，`NRestarts=0`且没有OOM，但页面和API间歇性超时。2GiB、无Swap实例上的服务cgroup常驻约1.03GiB，超过当时950MiB的`MemoryHigh`；`memory.events.high`累计超过290万次，多个Python线程和影子子进程停在`mem_cgroup_handle_over_high`，因此表现为服务仍是`active`但请求长期无响应。
+
+确认存在两个叠加根因：
+
+1. 正式状态启动时把数千条已结算观察的完整`decision_inputs`、`decision_trace`、质量评分和结构快照同时保存在多份运行时历史中，主进程RSS增长到约853MiB；
+2. `/api/observations`每10秒由页面刷新一次，每次为11个筛选维度和结果分别执行12条全表`distinct`查询，反复对约1.7GiB正式SQLite做连接和JSON提取。故障进程运行不足一小时累计读取约80GiB，单次接口约6.99秒，并持续把服务cgroup推入高位节流。
+
+紧急恢复阶段仅终止已被节流卡死的影子子进程，并临时提高运行时软限制，正式主进程、SQLite、订单、观察、Nginx和SSL均未重启或清理。该操作使公网接口暂时恢复，但旧代码仍处于再次节流的临界状态。
+
+### 48.2 代码修复与一致性边界
+
+提交`1b118b2`只修改观察历史读取、内存生命周期和诊断筛选，不修改画像选择、评分、阈值、方向、开单门禁、并发订单、滚单、Webhook或预热逻辑：
+
+- 观察筛选选项改为一条包含全部规范字段的`select distinct`，仍以冻结决策上下文为权威，不退回可能漂移的冗余列；
+- 正式画像、自适应画像和方向脉冲历史逐行执行原有`_hydrate_decision_linked_payload`严格校验，通过后立即把`SETTLED`对象压缩为画像统计所需的身份、时间、结果和PnL字段；
+- `OPEN`观察始终保留完整冻结上下文，完整恢复失败直接报错，不允许降级为压缩对象；
+- 正式观察只在正式SQLite结算事务成功后压缩；影子观察只在`save_event_bundle`成功后压缩，影子重启恢复时也压缩已结算历史。影子SQLite仍保存完整分析参数，内存压缩不删减数据库审计数据；
+- 方向脉冲继续优先使用5000条历史，但改用上述有界运行时读取路径。
+
+独立审查第一轮发现并阻止了“压缩读取绕过冻结校验、OPEN静默降级、影子未压缩”三个发布风险；修复并新增回归后，第二轮复审确认无发布阻塞。最终`python3 -m unittest discover -s tests`共1152项通过，Python编译、Shell语法、启动帮助和`git diff --check`通过。
+
+生产库只读基准结果：5000条历史逐条严格校验并压缩耗时约8.89秒，独立进程峰值约40MiB；筛选选项单扫描约0.60秒。旧实现的完整对象常驻约853MiB，旧观察页面接口约6.99秒。
+
+### 48.3 受控发布
+
+| 项目 | 本次值 |
+|---|---|
+| 代码提交 | `1b118b2`，已合并并推送`main` |
+| 发布目录 | `/opt/victory-event-monitor/releases/event-contract-monitor-1b118b2-20260821-233747` |
+| 发布包SHA-256 | `238f199a350977f67dbfc875fffb602b15c9f91ffe0f454c92cc4a95b559a125` |
+| 发布时间 | `2026-08-21 23:42:56 CST` |
+| 影子配置 | `SHADOW_OPTIMIZER=1`、队列120、1个Challenger，共2个arm |
+| 内存保护 | `MemoryHigh=950M`、`MemoryMax=1200M` |
+
+发布包在服务器完成SHA-256、Python编译、关键模块导入、Shell语法和无`data/`检查后才切换。发布前正式库为观察`OPEN=3/SETTLED=9932`、订单`SETTLED=4`，`PRAGMA quick_check=ok`。未备份、清空、覆盖或迁移任何正式订单、观察、审计、预热和影子实验数据，未修改Nginx、SSL和Webhook开关。
+
+首次启动验收：预热`READY/161280`、`last_error=null`，影子`RUNNING`、2个arm、`failed_arms={}`、`gap_count=0`，服务`active`、`NRestarts=0`。启动后主进程RSS约154MiB、影子子进程约98MiB；访问最重观察接口并形成可回收SQLite页缓存后，cgroup峰值约673MiB，其中后续采样约281MiB为匿名内存、344MiB为文件页缓存，仍低于950MiB软限制。`memory.events`的`high/max/oom/oom_kill`均为0，整机可用内存约896MiB。内部接口采样为`state 0.14s`、`orders 0.39s`、`observations 2.50s`、`observation-summary 0.17s`，公网`/api/state`约0.23s且HTTP 200。
+
+发布后两条到期冻结观察均已正常结算：`1787326680000|10|LONG|generic_long_observe`为`LOSS/-10U`，`1787326980000|10|short_observe|generic_short_observe|SHORT|WD-15`为`WIN/+8U`；正式库计数从发布前`OPEN=3/SETTLED=9932`推进到`OPEN=2/SETTLED=9935`。最终两条OPEN中，一条是已记录的2026年7月无V2决策上下文遗留项，另一条是发布后新生成且尚未到期的正常观察。该过程没有再次出现`settlement conflicts with frozen observation data`。
+
+跨约12分钟最终采样：`state 0.13s`、`observations 2.48s`、公网首页0.08s且HTTP 200；影子`last_event_id`持续推进，2个arm全部活跃，`failed_arms={}`、`gap_count=0`。cgroup当前约450MiB、峰值约673MiB，`high/max/oom/oom_kill`仍全为0，`NRestarts=0`；发布边界后的日志中没有`Traceback`、冻结冲突、`database is locked`、`STORAGE_ERROR`、OOM或影子失败。
