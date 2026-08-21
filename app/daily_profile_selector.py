@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import math
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Sequence
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from app.models import ObservationSignal
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+QUALIFICATION_VERSION = "DAILY_PROFILE_QUALIFICATION_V2"
 
 
 @dataclass(frozen=True)
@@ -20,29 +22,85 @@ class DailyProfileSelectorConfig:
     min_ev: float = 0.0
     exit_win_rate: float = 0.60
     exit_ev: float = 0.0
-    degraded_runs_to_exit: int = 1
+    degraded_runs_to_exit: int = 2
     max_active_profiles: int = 0
     evaluation_hour: int = 7
     evaluation_minute: int = 50
     activation_hour: int = 8
     activation_minute: int = 0
+    stable_lookback_days: int | None = None
+    joint_failures_to_exit: int | None = None
+    joint_failures_source: str = field(default="", init=False)
+
+    @property
+    def effective_stable_lookback_days(self) -> int:
+        if self.stable_lookback_days is None:
+            return max(14, int(self.lookback_days))
+        return int(self.stable_lookback_days)
+
+    @property
+    def stable_lookback_source(self) -> str:
+        if self.stable_lookback_days is not None:
+            return "stable_lookback_days"
+        return "lookback_days" if int(self.lookback_days) > 14 else "default"
 
     def normalized(self) -> "DailyProfileSelectorConfig":
-        return DailyProfileSelectorConfig(
-            lookback_days=max(1, int(self.lookback_days)),
+        lookback_days = int(self.lookback_days)
+        stable_lookback_days = (
+            None if self.stable_lookback_days is None else int(self.stable_lookback_days)
+        )
+        degraded_runs_to_exit = int(self.degraded_runs_to_exit)
+        if lookback_days <= 0:
+            raise ValueError("lookback_days must be positive")
+        if stable_lookback_days is not None and stable_lookback_days <= 0:
+            raise ValueError("stable_lookback_days must be positive")
+        if stable_lookback_days is not None and stable_lookback_days < lookback_days:
+            raise ValueError("stable_lookback_days must not be shorter than lookback_days")
+        if degraded_runs_to_exit <= 0:
+            raise ValueError("degraded_runs_to_exit must be positive")
+
+        min_win_rate = float(self.min_win_rate)
+        exit_win_rate = float(self.exit_win_rate)
+        if not math.isfinite(min_win_rate) or not 0.0 <= min_win_rate <= 1.0:
+            raise ValueError("min_win_rate must be between 0 and 1")
+        if not math.isfinite(exit_win_rate) or not 0.0 <= exit_win_rate <= 1.0:
+            raise ValueError("exit_win_rate must be between 0 and 1")
+        min_ev = float(self.min_ev)
+        exit_ev = float(self.exit_ev)
+        if not math.isfinite(min_ev) or not math.isfinite(exit_ev):
+            raise ValueError("EV thresholds must be finite")
+
+        if self.joint_failures_to_exit is None:
+            effective_failures = degraded_runs_to_exit
+            source = (
+                self.joint_failures_source
+                or ("default" if degraded_runs_to_exit == 2 else "degraded_runs_to_exit")
+            )
+        else:
+            effective_failures = int(self.joint_failures_to_exit)
+            source = self.joint_failures_source or "joint_failures_to_exit"
+        if effective_failures <= 0:
+            raise ValueError("joint_failures_to_exit must be positive")
+
+        normalized = DailyProfileSelectorConfig(
+            lookback_days=lookback_days,
             min_samples=max(1, int(self.min_samples)),
             weekend_min_samples=max(1, int(self.weekend_min_samples)),
-            min_win_rate=min(1.0, max(0.0, float(self.min_win_rate))),
-            min_ev=float(self.min_ev),
-            exit_win_rate=min(1.0, max(0.0, float(self.exit_win_rate))),
-            exit_ev=float(self.exit_ev),
-            degraded_runs_to_exit=max(1, int(self.degraded_runs_to_exit)),
+            min_win_rate=min_win_rate,
+            min_ev=min_ev,
+            exit_win_rate=exit_win_rate,
+            exit_ev=exit_ev,
+            degraded_runs_to_exit=degraded_runs_to_exit,
             max_active_profiles=max(0, int(self.max_active_profiles)),
             evaluation_hour=min(23, max(0, int(self.evaluation_hour))),
             evaluation_minute=min(59, max(0, int(self.evaluation_minute))),
             activation_hour=min(23, max(0, int(self.activation_hour))),
             activation_minute=min(59, max(0, int(self.activation_minute))),
+            stable_lookback_days=stable_lookback_days,
+            joint_failures_to_exit=effective_failures,
         )
+        object.__setattr__(normalized, "joint_failures_source", source)
+        return normalized
 
 
 def profile_key(
@@ -98,27 +156,19 @@ def build_daily_selection(
     evaluated_at_ms: int,
     *,
     config: DailyProfileSelectorConfig | None = None,
-    previous_snapshot: dict | None = None,
+    previous_snapshot: dict | Sequence[dict] | None = None,
 ) -> dict:
     resolved = (config or DailyProfileSelectorConfig()).normalized()
-    window = selection_window(
+    fast_window = _selection_window_for(evaluated_at_ms, resolved.lookback_days, resolved)
+    stable_window = _selection_window_for(
         evaluated_at_ms,
-        lookback_days=resolved.lookback_days,
-        evaluation_hour=resolved.evaluation_hour,
-        evaluation_minute=resolved.evaluation_minute,
-        activation_hour=resolved.activation_hour,
-        activation_minute=resolved.activation_minute,
+        resolved.effective_stable_lookback_days,
+        resolved,
     )
+
     grouped: dict[str, list[ObservationSignal]] = {}
     for item in observations:
-        if (
-            item.status != "SETTLED"
-            or item.result not in {"WIN", "LOSS"}
-            or item.settled_at is None
-            or item.opened_at < window["lookback_start"]
-            or item.opened_at >= window["lookback_end"]
-            or item.settled_at >= window["lookback_end"]
-        ):
+        if not _eligible_for_window(item, stable_window):
             continue
         key = profile_key(
             item.timeframe_minutes,
@@ -129,16 +179,25 @@ def build_daily_selection(
         )
         grouped.setdefault(key, []).append(item)
 
-    previous_by_key = {
-        str(item.get("key", "")): item
-        for item in (previous_snapshot or {}).get("selected_profiles", [])
-        if item.get("key")
-    }
+    evaluation_key = fast_window["lookback_end"]
+    previous_by_key = _previous_candidates(
+        previous_snapshot,
+        evaluation_key=evaluation_key,
+        evaluated_at_ms=evaluated_at_ms,
+    )
     for key in previous_by_key:
         grouped.setdefault(key, [])
 
     candidates = [
-        _candidate_summary(key, rows, previous_by_key.get(key), resolved)
+        _candidate_summary(
+            key,
+            rows,
+            previous_by_key.get(key),
+            resolved,
+            fast_window,
+            stable_window,
+            evaluation_key=evaluation_key,
+        )
         for key, rows in grouped.items()
     ]
     selected = [item for item in candidates if item.pop("_selected")]
@@ -150,20 +209,37 @@ def build_daily_selection(
             continue
         if (
             resolved.max_active_profiles > 0
-            and item["selection_state"] in {"SELECTED", "RETAINED", "RETAINED_DEGRADED"}
+            and item["selection_state"] in {"SELECTED", "RETAINED", "QUALIFICATION_WATCH"}
         ):
             item["selection_state"] = "RANKED_OUT"
             item["selection_reason"] = f"合格画像超过上限 {resolved.max_active_profiles}，本日未启用"
+            item["reason"] = item["selection_reason"]
 
     candidates.sort(key=_candidate_sort_key)
     selected_profiles = [item for item in candidates if item["key"] in selected_keys]
-    effective_local = datetime.fromtimestamp(window["effective_from"] / 1000, tz=SHANGHAI)
+    effective_local = datetime.fromtimestamp(fast_window["effective_from"] / 1000, tz=SHANGHAI)
+    config_snapshot = asdict(resolved)
+    config_snapshot.update(
+        {
+            "effective_stable_lookback_days": resolved.effective_stable_lookback_days,
+            "stable_lookback_source": resolved.stable_lookback_source,
+            "effective_joint_failures_to_exit": resolved.joint_failures_to_exit,
+            "retention_min_win_rate": resolved.exit_win_rate,
+            "retention_min_ev": resolved.exit_ev,
+        }
+    )
     return {
         "version": f"DPS-{effective_local.strftime('%Y%m%d-%H%M')}",
         "status": "READY",
         "evaluated_at": int(evaluated_at_ms),
-        **window,
-        "config": asdict(resolved),
+        "evaluation_key": evaluation_key,
+        **fast_window,
+        "fast_7d": _window_metadata(fast_window, resolved.lookback_days),
+        "stable_14d": _window_metadata(
+            stable_window,
+            resolved.effective_stable_lookback_days,
+        ),
+        "config": config_snapshot,
         "candidates": candidates,
         "selected_profiles": selected_profiles,
         "selected_count": len(selected_profiles),
@@ -175,72 +251,229 @@ def build_daily_selection(
     }
 
 
+def _selection_window_for(
+    evaluated_at_ms: int,
+    lookback_days: int,
+    config: DailyProfileSelectorConfig,
+) -> dict:
+    return selection_window(
+        evaluated_at_ms,
+        lookback_days=lookback_days,
+        evaluation_hour=config.evaluation_hour,
+        evaluation_minute=config.evaluation_minute,
+        activation_hour=config.activation_hour,
+        activation_minute=config.activation_minute,
+    )
+
+
+def _eligible_for_window(item: ObservationSignal, window: dict) -> bool:
+    return bool(
+        item.status == "SETTLED"
+        and item.result in {"WIN", "LOSS"}
+        and item.settled_at is not None
+        and item.opened_at >= window["lookback_start"]
+        and item.opened_at < window["lookback_end"]
+        and item.settled_at < window["lookback_end"]
+    )
+
+
+def _previous_candidates(
+    previous_snapshot: dict | Sequence[dict] | None,
+    *,
+    evaluation_key: int,
+    evaluated_at_ms: int,
+) -> dict[str, dict]:
+    if not previous_snapshot:
+        return {}
+    snapshots = (
+        [previous_snapshot]
+        if isinstance(previous_snapshot, dict)
+        else [item for item in previous_snapshot if isinstance(item, dict)]
+    )
+    chosen: dict[str, tuple[tuple[int, int, int], dict]] = {}
+    for snapshot_index, snapshot in enumerate(snapshots):
+        if _future_prior(snapshot, evaluation_key, evaluated_at_ms):
+            continue
+        inherited = {
+            name: snapshot[name]
+            for name in ("evaluation_key", "lookback_end", "evaluated_at")
+            if snapshot.get(name) is not None
+        }
+        candidates = _nearest_rows_by_key(
+            snapshot.get("candidates", []),
+            inherited,
+            evaluation_key,
+            evaluated_at_ms,
+        )
+        selected = _nearest_rows_by_key(
+            snapshot.get("selected_profiles", []),
+            inherited,
+            evaluation_key,
+            evaluated_at_ms,
+        )
+        for key in candidates.keys() | selected.keys():
+            candidate = candidates.get(key)
+            selected_row = selected.get(key)
+            previously_selected = bool(
+                selected_row is not None
+                and (
+                    candidate is None
+                    or _prior_rank(selected_row) >= _prior_rank(candidate)
+                )
+            )
+            row = (
+                {**(candidate or {}), **selected_row}
+                if previously_selected
+                else dict(candidate or selected_row or {})
+            )
+            row["_previously_selected"] = previously_selected
+            rank = (*_prior_rank(row), snapshot_index)
+            if key not in chosen or rank >= chosen[key][0]:
+                chosen[key] = (rank, row)
+    return {key: row for key, (_rank, row) in chosen.items()}
+
+
+def _nearest_rows_by_key(
+    rows: Sequence[dict],
+    inherited: dict,
+    evaluation_key: int,
+    evaluated_at_ms: int,
+) -> dict[str, dict]:
+    chosen: dict[str, tuple[tuple[int, int], dict]] = {}
+    for item in rows:
+        if not isinstance(item, dict) or not item.get("key"):
+            continue
+        row = {**inherited, **item}
+        if _future_prior(row, evaluation_key, evaluated_at_ms):
+            continue
+        key = str(row["key"])
+        rank = _prior_rank(row)
+        if key not in chosen or rank >= chosen[key][0]:
+            chosen[key] = (rank, row)
+    return {key: row for key, (_rank, row) in chosen.items()}
+
+
+def _future_prior(item: dict, evaluation_key: int, evaluated_at_ms: int) -> bool:
+    return any(
+        _optional_int(item.get(name)) > limit
+        for name, limit in (
+            ("evaluation_key", evaluation_key),
+            ("lookback_end", evaluation_key),
+            ("evaluated_at", evaluated_at_ms),
+        )
+        if _optional_int(item.get(name)) is not None
+    )
+
+
+def _prior_rank(item: dict) -> tuple[int, int]:
+    primary = _optional_int(item.get("evaluation_key"))
+    if primary is None:
+        primary = _optional_int(item.get("lookback_end"))
+    return (
+        primary if primary is not None else -1,
+        _optional_int(item.get("evaluated_at")) or -1,
+    )
+
+
+def _optional_int(value) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _candidate_summary(
     key: str,
     rows: Sequence[ObservationSignal],
     previous: dict | None,
     config: DailyProfileSelectorConfig,
+    fast_window: dict,
+    stable_window: dict,
+    *,
+    evaluation_key: int,
 ) -> dict:
-    samples = []
-    next_independent_at = 0
-    for item in sorted(rows, key=lambda row: (row.opened_at, row.observation_key)):
-        if item.opened_at < next_independent_at:
-            continue
-        samples.append(item)
-        next_independent_at = item.expires_at
-
     parts = key.split("|", 4)
     if len(parts) != 5:
         parts = ["0", "unknown", "unknown", "", "GLOBAL"]
-    sample_size = len(samples)
-    wins = sum(1 for item in samples if item.result == "WIN")
-    pnl = round(sum(float(item.pnl) for item in samples), 4)
-    win_rate = wins / sample_size if sample_size else 0.0
-    ev = round(pnl / sample_size, 4) if sample_size else 0.0
     min_samples = (
         config.weekend_min_samples
         if parts[4].upper().startswith("WE-")
         else config.min_samples
     )
-    entry_qualified = (
-        sample_size >= min_samples
-        and win_rate >= config.min_win_rate
-        and ev >= config.min_ev
+    fast = _window_summary(rows, fast_window, config.lookback_days, min_samples, config)
+    stable = _window_summary(
+        rows,
+        stable_window,
+        config.effective_stable_lookback_days,
+        min_samples,
+        config,
     )
 
-    degraded_runs = 0
+    joint_failure_runs = 0
     selected = False
-    if previous is not None:
-        degraded = (
-            sample_size < min_samples
-            or win_rate < config.exit_win_rate
-            or ev <= config.exit_ev
+    previously_selected = bool(previous and previous.get("_previously_selected"))
+    candidate_same_evaluation = bool(
+        previous
+        and previous.get("evaluation_key", previous.get("lookback_end")) == evaluation_key
+    )
+    same_evaluation_day = candidate_same_evaluation
+    migration_state = str((previous or {}).get("migration_state", ""))
+    migration_evaluation_key = (previous or {}).get("migration_evaluation_key")
+    legacy_selected = previously_selected and not any(
+        field in previous
+        for field in (
+            "fast_7d",
+            "stable_14d",
+            "qualification_state",
+            "joint_failure_runs",
         )
-        degraded_runs = int(previous.get("degraded_runs", 0)) + 1 if degraded else 0
-        if degraded and degraded_runs >= config.degraded_runs_to_exit:
-            state = "DEGRADED_EXIT"
-            reason = f"连续 {degraded_runs} 次低于退出条件"
-        elif degraded:
-            selected = True
-            state = "RETAINED_DEGRADED"
-            reason = f"本次退化，保留观察 {degraded_runs}/{config.degraded_runs_to_exit}"
-        else:
-            selected = True
-            state = "RETAINED"
-            reason = "历史启用画像仍高于退出条件"
-    elif entry_qualified:
+    )
+    same_day_migration = bool(
+        previously_selected
+        and migration_state == "LEGACY_SELECTED_MIGRATED"
+        and migration_evaluation_key == evaluation_key
+    )
+    if legacy_selected or same_day_migration:
         selected = True
+        qualification_state = "QUALIFIED"
+        state = "RETAINED"
+        reason = "旧版已启用画像迁移为双窗口合格状态"
+        migration_state = "LEGACY_SELECTED_MIGRATED"
+        migration_evaluation_key = evaluation_key
+    elif previously_selected:
+        if fast["retention_qualified"] or stable["retention_qualified"]:
+            selected = True
+            qualification_state = "QUALIFIED"
+            state = "RETAINED"
+            reason = "7天或14天窗口仍达到保留条件"
+        else:
+            previous_runs = _non_negative_int(previous.get("joint_failure_runs", 0))
+            joint_failure_runs = previous_runs if same_evaluation_day else previous_runs + 1
+            if joint_failure_runs >= config.joint_failures_to_exit:
+                qualification_state = "DEGRADED_EXIT"
+                state = "DEGRADED_EXIT"
+                reason = f"连续 {joint_failure_runs} 次7天与14天窗口均未达标"
+            else:
+                selected = True
+                qualification_state = "QUALIFICATION_WATCH"
+                state = "QUALIFICATION_WATCH"
+                reason = (
+                    f"7天与14天窗口均未达标，保留观察 "
+                    f"{joint_failure_runs}/{config.joint_failures_to_exit}"
+                )
+    elif fast["qualified"]:
+        selected = True
+        qualification_state = "QUALIFIED"
         state = "SELECTED"
-        reason = "达到新增画像启用条件"
-    elif sample_size < min_samples:
-        state = "INSUFFICIENT_SAMPLES"
-        reason = f"独立样本 {sample_size} < {min_samples}"
-    elif win_rate < config.min_win_rate:
-        state = "LOW_WIN_RATE"
-        reason = f"胜率 {win_rate:.2%} < {config.min_win_rate:.2%}"
+        reason = "7天快速窗口达到新增画像启用条件"
+    elif previous and previous.get("qualification_state") == "DEGRADED_EXIT":
+        qualification_state = "DEGRADED_EXIT"
+        joint_failure_runs = _non_negative_int(previous.get("joint_failure_runs", 0))
+        state = "DEGRADED_EXIT"
+        reason = "画像仍未重新达到7天快速启用条件"
     else:
-        state = "LOW_EV"
-        reason = f"EV {ev:.2f}U < {config.min_ev:.2f}U"
+        qualification_state = "NOT_QUALIFIED"
+        state, reason = _entry_failure(fast, config)
 
     return {
         "key": key,
@@ -249,18 +482,135 @@ def _candidate_summary(
         "strategy_tag": parts[2],
         "direction": parts[3],
         "threshold_segment": parts[4],
+        "evaluation_key": evaluation_key,
+        "migration_state": migration_state,
+        "migration_evaluation_key": migration_evaluation_key,
+        "fast_7d": fast,
+        "stable_14d": stable,
+        "sample_size": fast["sample_size"],
+        "min_samples_required": fast["min_samples_required"],
+        "wins": fast["wins"],
+        "losses": fast["losses"],
+        "win_rate": fast["win_rate"],
+        "pnl": fast["pnl"],
+        "ev": fast["ev"],
+        "qualification_state": qualification_state,
+        "joint_failure_runs": joint_failure_runs,
+        "degraded_runs": joint_failure_runs,
+        "selection_state": state,
+        "selection_reason": reason,
+        "reason": reason,
+        "version": QUALIFICATION_VERSION,
+        "_selected": selected,
+    }
+
+
+def _window_summary(
+    rows: Sequence[ObservationSignal],
+    window: dict,
+    lookback_days: int,
+    min_samples: int,
+    config: DailyProfileSelectorConfig,
+) -> dict:
+    samples = _independent_samples(rows, window["lookback_start"], window["lookback_end"])
+    sample_size = len(samples)
+    wins = sum(1 for item in samples if item.result == "WIN")
+    raw_pnl = math.fsum(float(item.pnl) for item in samples)
+    raw_win_rate = wins / sample_size if sample_size else 0.0
+    raw_ev = raw_pnl / sample_size if sample_size else 0.0
+    entry_win_rate_qualified = raw_win_rate >= config.min_win_rate
+    entry_ev_qualified = raw_ev >= config.min_ev
+    qualified = (
+        sample_size >= min_samples
+        and entry_win_rate_qualified
+        and entry_ev_qualified
+    )
+    retention_qualified = (
+        sample_size >= min_samples
+        and raw_win_rate >= config.exit_win_rate
+        and raw_ev >= config.exit_ev
+    )
+    return {
+        "lookback_days": lookback_days,
+        "lookback_start": window["lookback_start"],
+        "lookback_end": window["lookback_end"],
         "sample_size": sample_size,
         "min_samples_required": min_samples,
         "wins": wins,
         "losses": sample_size - wins,
-        "win_rate": round(win_rate, 6),
-        "pnl": pnl,
-        "ev": ev,
-        "degraded_runs": degraded_runs,
-        "selection_state": state,
-        "selection_reason": reason,
-        "_selected": selected,
+        "win_rate": _display_number(raw_win_rate, 6),
+        "pnl": _display_number(raw_pnl, 4),
+        "ev": _display_number(raw_ev, 4),
+        "qualified": qualified,
+        "win_rate_qualified": entry_win_rate_qualified,
+        "ev_qualified": entry_ev_qualified,
+        "retention_qualified": retention_qualified,
     }
+
+
+def _independent_samples(
+    rows: Sequence[ObservationSignal],
+    lookback_start: int,
+    lookback_end: int,
+) -> list[ObservationSignal]:
+    samples = []
+    seen_observation_keys = set()
+    next_independent_at = 0
+    for item in sorted(rows, key=lambda row: (row.opened_at, row.observation_key)):
+        if (
+            item.opened_at < lookback_start
+            or item.opened_at >= lookback_end
+            or item.settled_at is None
+            or item.settled_at >= lookback_end
+        ):
+            continue
+        identity = str(item.observation_key or "")
+        if identity and identity in seen_observation_keys:
+            continue
+        if identity:
+            seen_observation_keys.add(identity)
+        if item.opened_at < next_independent_at:
+            continue
+        samples.append(item)
+        next_independent_at = item.expires_at
+    return samples
+
+
+def _entry_failure(
+    fast: dict,
+    config: DailyProfileSelectorConfig,
+) -> tuple[str, str]:
+    if fast["sample_size"] < fast["min_samples_required"]:
+        return (
+            "INSUFFICIENT_SAMPLES",
+            f"独立样本 {fast['sample_size']} < {fast['min_samples_required']}",
+        )
+    if not fast["win_rate_qualified"]:
+        return (
+            "LOW_WIN_RATE",
+            f"胜率 {fast['win_rate']:.2%} < {config.min_win_rate:.2%}",
+        )
+    return "LOW_EV", f"EV {fast['ev']:.2f}U < {config.min_ev:.2f}U"
+
+
+def _window_metadata(window: dict, lookback_days: int) -> dict:
+    return {
+        "lookback_days": lookback_days,
+        "lookback_start": window["lookback_start"],
+        "lookback_end": window["lookback_end"],
+    }
+
+
+def _non_negative_int(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _display_number(value: float, digits: int) -> float:
+    displayed = round(value, digits)
+    return 0.0 if displayed == 0 else displayed
 
 
 def _candidate_sort_key(item: dict) -> tuple:

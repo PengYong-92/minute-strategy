@@ -2,9 +2,13 @@
 import argparse
 import json
 import math
+import sqlite3
 import sys
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Sequence
+from contextlib import closing
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,6 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.adaptive_profile_state import (
+    ADAPTIVE_PROFILE_STATE_VERSION,
+    AdaptiveGlobalProfileWindowReplay,
+    adaptive_replay_event_sort_key,
+    evaluate_adaptive_profile_state,
+)
 from app.daily_profile_selector import (
     SHANGHAI,
     DailyProfileSelectorConfig,
@@ -22,20 +32,347 @@ from app.daily_profile_selector import (
     selection_window,
 )
 from app.models import ObservationSignal
-from scripts.analyze_observations_db import load_observations
+from app.profile_admission import (
+    ProfileAdmissionContext,
+    ProfileAdmissionPolicy,
+    evaluate_profile_admission,
+    policy_grid,
+    select_admitted_candidate,
+)
+from app.stake_progression import TWO_STAGE_VERSION, TwoStageStakeProgression
+from app.storage import (
+    hydrate_decision_linked_payload,
+    linked_decision_context_select_columns,
+)
 
 
+ACCEPTANCE = {
+    "total_win_rate_min": 0.60,
+    "direction_win_rate_min": 0.5556,
+    "total_order_retention_min": 0.80,
+    "direction_order_retention_min": 0.70,
+    "base_first_order_retention_min": 0.85,
+    "ev_min": 0.0,
+    "positive_oos_windows_min": 2,
+}
+GUARD_REJECTIONS = (
+    "profile_not_selected",
+    "adaptive_profile_paused",
+    "adaptive_profile_second_blocked",
+    "global_capacity",
+    "direction_capacity_long",
+    "direction_capacity_short",
+    "cooldown",
+    "three_loss_pause",
+)
+EQUALITY_FIELDS = (
+    "order_id",
+    "direction",
+    "opened_at",
+    "settled_at",
+    "expires_at",
+    "stake",
+    "win_return",
+    "progression_step",
+    "progression_source_order_id",
+    "progression_version",
+    "progression_allowed",
+)
+OBSERVATION_LIFECYCLE_FIELDS = (
+    "observation_key",
+    "status",
+    "result",
+    "opened_at",
+    "expires_at",
+    "settled_at",
+    "exit_price",
+    "pnl",
+)
+REQUIRED_OBSERVATION_LIFECYCLE_FIELDS = frozenset(
+    OBSERVATION_LIFECYCLE_FIELDS[:-2]
+)
+REPORT_SCHEMA_VERSION = "CAUSAL_PROFILE_REPLAY_V2"
+ADAPTIVE_LOOKBACK_MS = 15 * 86_400_000
 DAY_MS = 86_400_000
+PROFILE_SEARCH_ACCEPTANCE = {
+    "total_win_rate_min": 0.60,
+    "direction_win_rate_min": 0.5556,
+    "ev_min": 0.0,
+    "orders_per_day_min": 45.0,
+    "orders_per_day_max": 55.0,
+    "positive_oos_windows_min": 2,
+}
+PROFILE_SEARCH_COMPARISON_METRICS = (
+    "orders",
+    "wins",
+    "losses",
+    "win_rate",
+    "pnl",
+    "ev",
+    "max_drawdown",
+    "max_loss_streak",
+)
+
+
+@dataclass(frozen=True)
+class ReplayExecutionConfig:
+    max_open_orders: int
+    max_open_long_orders: int
+    max_open_short_orders: int
+    min_order_gap_ms: int
+    stake: float
+    win_return: float
+    stake_progression_enabled: bool
+    stake_progression_max_orders: int
+    stake_progression_max_active: int
+    stake_progression_second_stake: float
+    stake_progression_base_only_segments: tuple[str, ...]
+
+    def normalized(self) -> "ReplayExecutionConfig":
+        integer_values = {
+            "max_open_orders": self.max_open_orders,
+            "max_open_long_orders": self.max_open_long_orders,
+            "max_open_short_orders": self.max_open_short_orders,
+            "stake_progression_max_orders": self.stake_progression_max_orders,
+            "stake_progression_max_active": self.stake_progression_max_active,
+        }
+        normalized_integers: dict[str, int] = {}
+        for name, value in integer_values.items():
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a positive integer")
+            normalized = int(value)
+            if normalized <= 0 or normalized != value:
+                raise ValueError(f"{name} must be a positive integer")
+            normalized_integers[name] = normalized
+        if normalized_integers["max_open_long_orders"] > normalized_integers["max_open_orders"]:
+            raise ValueError("max_open_long_orders must not exceed max_open_orders")
+        if normalized_integers["max_open_short_orders"] > normalized_integers["max_open_orders"]:
+            raise ValueError("max_open_short_orders must not exceed max_open_orders")
+        if normalized_integers["stake_progression_max_orders"] != 2:
+            raise ValueError("stake_progression_max_orders must be 2 for TWO_STAGE_V1")
+        if (
+            normalized_integers["stake_progression_max_active"]
+            > normalized_integers["max_open_orders"]
+        ):
+            raise ValueError("stake_progression_max_active must not exceed max_open_orders")
+
+        if isinstance(self.min_order_gap_ms, bool):
+            raise ValueError("min_order_gap_ms must be a non-negative integer")
+        min_order_gap_ms = int(self.min_order_gap_ms)
+        if min_order_gap_ms < 0 or min_order_gap_ms != self.min_order_gap_ms:
+            raise ValueError("min_order_gap_ms must be a non-negative integer")
+        if type(self.stake_progression_enabled) is not bool:
+            raise ValueError("stake_progression_enabled must be explicitly true or false")
+
+        amounts: dict[str, float] = {}
+        for name, value in (
+            ("stake", self.stake),
+            ("win_return", self.win_return),
+            ("stake_progression_second_stake", self.stake_progression_second_stake),
+        ):
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a positive finite amount")
+            amount = float(value)
+            if not math.isfinite(amount) or amount <= 0:
+                raise ValueError(f"{name} must be a positive finite amount")
+            amounts[name] = amount
+        if amounts["win_return"] <= amounts["stake"]:
+            raise ValueError("win_return must exceed stake")
+        if float(self.stake_progression_second_stake) != float(self.win_return):
+            raise ValueError("stake_progression_second_stake must equal win_return")
+
+        if isinstance(self.stake_progression_base_only_segments, str):
+            raise ValueError("stake_progression_base_only_segments must be a sequence")
+        segments = tuple(
+            sorted(
+                {
+                    str(item).strip().upper()
+                    for item in self.stake_progression_base_only_segments
+                    if str(item).strip()
+                }
+            )
+        )
+        if segments:
+            raise ValueError("stake_progression_base_only_segments must be empty")
+        return ReplayExecutionConfig(
+            **normalized_integers,
+            min_order_gap_ms=min_order_gap_ms,
+            stake=amounts["stake"],
+            win_return=amounts["win_return"],
+            stake_progression_enabled=self.stake_progression_enabled,
+            stake_progression_second_stake=amounts["stake_progression_second_stake"],
+            stake_progression_base_only_segments=segments,
+        )
+
+    @property
+    def enable_stake_progression(self) -> bool:
+        return self.stake_progression_enabled
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self.normalized())
+        payload["stake_progression_base_only_segments"] = list(
+            payload["stake_progression_base_only_segments"]
+        )
+        payout_ratio = self.win_return / self.stake - 1.0
+        payload["stake_progression_second_win_return"] = round(
+            self.stake_progression_second_stake * (1.0 + payout_ratio),
+            4,
+        )
+        payload["progression_version"] = TWO_STAGE_VERSION
+        return payload
+
+
+ProductionReplayConfig = ReplayExecutionConfig
+
+
+def _observation_lifecycle_select(columns: set[str]) -> tuple[str, ...]:
+    return tuple(
+        f"observation_signals.{field} as lifecycle_{field}"
+        for field in OBSERVATION_LIFECYCLE_FIELDS
+        if field in columns
+    )
+
+
+def load_replay_observations(
+    db_path: str | Path,
+    symbol: str,
+) -> list[ObservationSignal]:
+    path = Path(db_path).resolve()
+    uri = f"{path.as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("pragma query_only = on")
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "select name from sqlite_master where type = 'table'"
+            )
+        }
+        if "observation_signals" not in tables:
+            raise ValueError("observation_signals table is missing")
+        observation_columns = {
+            str(row["name"])
+            for row in connection.execute("pragma table_info(observation_signals)")
+        }
+        context_columns = (
+            {
+                str(row["name"])
+                for row in connection.execute("pragma table_info(decision_contexts)")
+            }
+            if "decision_contexts" in tables
+            else set()
+        )
+        linked_context_columns = {
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "symbol",
+            "closed_kline_at_ms",
+            "candidate_origin",
+            "input_payload",
+            "outcome_payload",
+        }
+        where = "where observation_signals.symbol = ?"
+        if "status" in observation_columns:
+            where += " and observation_signals.status = 'SETTLED'"
+        lifecycle_select = _observation_lifecycle_select(observation_columns)
+        if (
+            "decision_id" in observation_columns
+            and linked_context_columns <= context_columns
+        ):
+            select_columns = ",\n                       ".join(
+                (
+                    "observation_signals.payload",
+                    *lifecycle_select,
+                    linked_decision_context_select_columns(),
+                )
+            )
+            rows = connection.execute(
+                f"""
+                select {select_columns}
+                from observation_signals
+                left join decision_contexts
+                  on decision_contexts.symbol = observation_signals.symbol
+                 and decision_contexts.decision_id = observation_signals.decision_id
+                {where}
+                order by observation_signals.settled_at,
+                         observation_signals.opened_at,
+                         observation_signals.observation_key
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+            hydrate_lifecycle = True
+        elif REQUIRED_OBSERVATION_LIFECYCLE_FIELDS <= observation_columns:
+            select_columns = ",\n                       ".join(
+                ("observation_signals.payload", *lifecycle_select)
+            )
+            rows = connection.execute(
+                f"""
+                select {select_columns}
+                from observation_signals
+                {where}
+                order by observation_signals.settled_at,
+                         observation_signals.opened_at,
+                         observation_signals.observation_key
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+            hydrate_lifecycle = True
+        else:
+            rows = connection.execute(
+                f"select observation_signals.payload from observation_signals {where}",
+                (symbol.upper(),),
+            ).fetchall()
+            hydrate_lifecycle = False
+
+    accepted = {item.name for item in fields(ObservationSignal)}
+    observations = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if hydrate_lifecycle:
+            payload = hydrate_decision_linked_payload(payload, row)
+        observations.append(
+            ObservationSignal(
+                **{key: value for key, value in payload.items() if key in accepted}
+            )
+        )
+    return sorted(observations, key=_settlement_event_key)
 
 
 def replay_daily_profile_selection(
     observations: Sequence[ObservationSignal],
     config: DailyProfileSelectorConfig,
     *,
+    execution: ReplayExecutionConfig | None = None,
     require_full_lookback: bool = True,
-    max_open_orders: int = 5,
-    min_order_gap_ms: int = 2 * 60_000,
+    max_open_orders: int | None = None,
+    max_open_long_orders: int | None = None,
+    max_open_short_orders: int | None = None,
+    min_order_gap_ms: int | None = None,
+    stake: float | None = None,
+    win_return: float | None = None,
+    stake_progression_enabled: bool | None = None,
+    stake_progression_max_orders: int | None = None,
+    stake_progression_max_active: int | None = None,
+    stake_progression_second_stake: float | None = None,
+    stake_progression_base_only_segments: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    config = config.normalized()
+    execution = _resolve_execution(
+        execution,
+        max_open_orders=max_open_orders,
+        max_open_long_orders=max_open_long_orders,
+        max_open_short_orders=max_open_short_orders,
+        min_order_gap_ms=min_order_gap_ms,
+        stake=stake,
+        win_return=win_return,
+        stake_progression_enabled=stake_progression_enabled,
+        stake_progression_max_orders=stake_progression_max_orders,
+        stake_progression_max_active=stake_progression_max_active,
+        stake_progression_second_stake=stake_progression_second_stake,
+        stake_progression_base_only_segments=stake_progression_base_only_segments,
+    )
     settled = sorted(
         (
             item
@@ -44,119 +381,135 @@ def replay_daily_profile_selection(
             and item.result in {"WIN", "LOSS"}
             and item.settled_at is not None
         ),
-        key=lambda item: (item.opened_at, item.observation_key),
+        key=_settlement_event_key,
     )
-    if not settled:
-        return _empty_replay(
-            config,
-            max_open_orders=max_open_orders,
-            min_order_gap_ms=min_order_gap_ms,
-        )
+    workload: dict[str, int] = {"settled_observations": len(settled)}
+    snapshots = _build_schedule(
+        settled,
+        config,
+        require_full_lookback=require_full_lookback,
+        workload=workload,
+    )
+    event_rows = _build_adaptive_event_rows(settled, workload=workload)
+    adaptive_timeline = _adaptive_timeline(event_rows)
+    execution_windows = _prepare_execution_windows(settled, snapshots)
+    execution_plan_rows = sum(
+        len(rows)
+        for window in execution_windows
+        for _opened_at, rows in window["groups"]
+    )
+    workload["execution_plan_rows"] = execution_plan_rows
+    workload["execution_replay_rows"] = execution_plan_rows * 3
+    baseline_result = _execute_replay(
+        execution_windows,
+        execution,
+        adaptive_timeline,
+        apply_adaptive=False,
+        include_structure_shadow=False,
+    )
+    structure_result = _execute_replay(
+        execution_windows,
+        execution,
+        adaptive_timeline,
+        apply_adaptive=False,
+        include_structure_shadow=True,
+    )
+    candidate_result = _execute_replay(
+        execution_windows,
+        execution,
+        adaptive_timeline,
+        apply_adaptive=True,
+        include_structure_shadow=False,
+    )
 
-    snapshots = _build_schedule(settled, config, require_full_lookback=require_full_lookback)
-    trades: list[dict[str, Any]] = []
-    rejections = {
-        "profile_not_selected": 0,
-        "hold_open_order": 0,
-        "cooldown": 0,
-        "three_loss_pause": 0,
-    }
-    eligible_events = 0
-    last_order_opened_at: int | None = None
-    open_expiries: list[int] = []
-    max_open_orders = max(1, int(max_open_orders))
-    min_order_gap_ms = max(0, int(min_order_gap_ms))
-
-    for snapshot in snapshots:
-        grouped: dict[int, list[ObservationSignal]] = defaultdict(list)
-        for item in settled:
-            if item.opened_at < snapshot["effective_from"]:
-                continue
-            if item.opened_at >= snapshot["effective_until"]:
-                break
-            grouped[item.opened_at].append(item)
-
-        selected_profiles = snapshot.get("selected_profiles") or []
-        for opened_at, rows in sorted(grouped.items()):
-            eligible_events += 1
-            by_key = {
-                _observation_profile_key(item): item
-                for item in sorted(rows, key=lambda row: row.observation_key)
+    oos_start, oos_end = _oos_bounds(settled, snapshots)
+    baseline = _execution_report(baseline_result, oos_start, oos_end)
+    candidate = _execution_report(candidate_result, oos_start, oos_end)
+    profile_admission_search = search_profile_admission_policies(
+        execution_windows,
+        execution,
+        adaptive_timeline,
+        baseline,
+        oos_start,
+        oos_end,
+    )
+    workload["profile_admission_search_replay_rows"] = execution_plan_rows * len(
+        policy_grid()
+    )
+    acceptance = evaluate_release_gates(baseline, candidate)
+    equality = build_structure_shadow_equality_report(
+        baseline_result["trade_rows"],
+        structure_result["trade_rows"],
+        baseline_result["webhook_count"],
+        structure_result["webhook_count"],
+    )
+    ranking = rank_passing_configurations(
+        [
+            {
+                "name": "adaptive_candidate",
+                "passed": acceptance["passed"],
+                "total": candidate["total"],
             }
-            chosen = next(
-                (by_key[item["key"]] for item in selected_profiles if item["key"] in by_key),
-                None,
-            )
-            if chosen is None:
-                rejections["profile_not_selected"] += 1
-                continue
-            open_expiries = [expires_at for expires_at in open_expiries if expires_at > opened_at]
-            if len(open_expiries) >= max_open_orders:
-                rejections["hold_open_order"] += 1
-                continue
-            if last_order_opened_at is not None and opened_at - last_order_opened_at < min_order_gap_ms:
-                rejections["cooldown"] += 1
-                continue
-            if _has_three_segment_losses(trades, chosen, opened_at):
-                rejections["three_loss_pause"] += 1
-                continue
-
-            selected = next(item for item in selected_profiles if item["key"] == _observation_profile_key(chosen))
-            trades.append(
-                {
-                    "opened_at": chosen.opened_at,
-                    "settled_at": chosen.settled_at,
-                    "expires_at": chosen.expires_at,
-                    "direction": chosen.direction,
-                    "threshold_segment": chosen.threshold_segment,
-                    "strategy_family": chosen.strategy_family,
-                    "strategy_tag": chosen.strategy_tag,
-                    "profile_key": selected["key"],
-                    "training_samples": selected["sample_size"],
-                    "training_win_rate": selected["win_rate"],
-                    "training_ev": selected["ev"],
-                    "result": chosen.result,
-                    "pnl": float(chosen.pnl),
-                }
-            )
-            last_order_opened_at = opened_at
-            open_expiries.append(chosen.expires_at)
-
+        ]
+    )
     compact_schedule = [_compact_snapshot(item) for item in snapshots]
+    data = _data_summary(settled, snapshots, require_full_lookback)
+    base_first_retention = round(
+        _retention(
+            candidate["base_first_orders"],
+            baseline["base_first_orders"],
+        ),
+        6,
+    )
     return {
-        "config": config.normalized().__dict__,
-        "execution": {
-            "max_open_orders": max_open_orders,
-            "min_order_gap_ms": min_order_gap_ms,
-        },
-        "data": {
-            "settled_observations": len(settled),
-            "first_observation": _iso(settled[0].opened_at),
-            "last_observation": _iso(settled[-1].opened_at),
-            "require_full_lookback": require_full_lookback,
-            "out_of_sample_from": _iso(snapshots[0]["effective_from"]) if snapshots else None,
-            "out_of_sample_until": _iso(min(snapshots[-1]["effective_until"], settled[-1].opened_at + 1))
-            if snapshots
-            else None,
-        },
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "config": _config_snapshot(config),
+        "execution": execution.to_dict(),
+        "data": data,
         "schedule": compact_schedule,
         "schedule_stats": _schedule_stats(compact_schedule),
-        "eligible_events": eligible_events,
-        "rejections": rejections,
-        "trades": summarize_trades(trades),
-        "by_direction": _group_summaries(trades, "direction"),
-        "by_profile": _group_summaries(trades, "profile_key"),
-        "by_day": _group_summaries(trades, "day"),
-        "trade_rows": trades,
-        "leakage_violations": _count_leakage_violations(settled, snapshots),
+        "events": event_rows,
+        "workload": workload,
+        "baseline": baseline,
+        "candidate": candidate,
+        "total": candidate["total"],
+        "by_direction": candidate["by_direction"],
+        "base_first_retention": base_first_retention,
+        "maximum_drawdown": candidate["total"]["max_drawdown"],
+        "longest_loss_streak": candidate["total"]["max_loss_streak"],
+        "daily_best": candidate["daily_best"],
+        "daily_worst": candidate["daily_worst"],
+        "guard_rejections": candidate["guard_rejections"],
+        "oos_windows": candidate["oos_windows"],
+        "acceptance": acceptance,
+        "passing_configuration_ranking": ranking,
+        "profile_admission_search": profile_admission_search,
+        "aggregate_gates_passed": profile_admission_search[
+            "aggregate_gates_passed"
+        ],
+        "stability_proven": profile_admission_search["stability_proven"],
+        "release_allowed": profile_admission_search["release_allowed"],
+        "equivalence_scope": profile_admission_search["equivalence_scope"],
+        "structure_shadow_equality": equality,
+        "eligible_events": candidate_result["eligible_events"],
+        "rejections": candidate["guard_rejections"],
+        "trades": candidate["total"],
+        "by_profile": _group_summaries(candidate["trade_rows"], "profile_key"),
+        "by_day": candidate["daily"],
+        "leakage_violations": _count_leakage_violations(
+            settled,
+            snapshots,
+            workload=workload,
+        ),
     }
 
 
 def summarize_trades(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    ordered = sorted(trades, key=lambda item: item["opened_at"])
+    ordered = sorted(trades, key=_trade_settlement_key)
     wins = sum(1 for item in ordered if item["result"] == "WIN")
     losses = len(ordered) - wins
-    pnl = round(sum(float(item["pnl"]) for item in ordered), 4)
+    raw_pnl = math.fsum(float(item["pnl"]) for item in ordered)
+    pnl = round(raw_pnl, 4)
     win_rate = wins / len(ordered) if ordered else 0.0
     low, high = _wilson_interval(wins, len(ordered))
     equity = 0.0
@@ -173,6 +526,13 @@ def summarize_trades(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
             max_loss_streak = max(max_loss_streak, loss_streak)
         else:
             loss_streak = 0
+    by_opened = sorted(
+        ordered,
+        key=lambda item: (
+            int(item["opened_at"]),
+            str(item.get("observation_key", "")),
+        ),
+    )
     return {
         "orders": len(ordered),
         "wins": wins,
@@ -180,12 +540,740 @@ def summarize_trades(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "win_rate": round(win_rate, 6),
         "win_rate_ci95": [round(low, 6), round(high, 6)],
         "pnl": pnl,
-        "ev": round(pnl / len(ordered), 4) if ordered else 0.0,
+        "ev": round(raw_pnl / len(ordered), 4) if ordered else 0.0,
         "max_drawdown": round(max_drawdown, 4),
         "max_loss_streak": max_loss_streak,
-        "first_trade": _iso(ordered[0]["opened_at"]) if ordered else None,
-        "last_trade": _iso(ordered[-1]["opened_at"]) if ordered else None,
+        "first_trade": _iso(by_opened[0]["opened_at"]) if by_opened else None,
+        "last_trade": _iso(by_opened[-1]["opened_at"]) if by_opened else None,
     }
+
+
+def evaluate_release_gates(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    acceptance: dict[str, float | int] | None = None,
+) -> dict[str, Any]:
+    thresholds = dict(ACCEPTANCE if acceptance is None else acceptance)
+    baseline_total = baseline["total"]
+    candidate_total = candidate["total"]
+    baseline_by_direction = baseline["by_direction"]
+    candidate_by_direction = candidate["by_direction"]
+    candidate_trades = candidate.get("trade_rows")
+
+    gates: dict[str, dict[str, Any]] = {}
+
+    def minimum(name: str, actual: float, threshold: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "minimum": float(threshold),
+            "passed": float(actual) >= float(threshold),
+        }
+
+    def not_worse(name: str, actual: float, baseline_value: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "baseline": round(float(baseline_value), 6),
+            "passed": float(actual) <= float(baseline_value),
+        }
+
+    def win_rate(summary: dict[str, Any]) -> float:
+        orders = int(summary["orders"])
+        return int(summary["wins"]) / orders if orders > 0 else 0.0
+
+    def ev(summary: dict[str, Any], trades: Sequence[dict[str, Any]] | None) -> float:
+        orders = int(summary["orders"])
+        if orders <= 0:
+            return 0.0
+        pnl = (
+            math.fsum(float(item["pnl"]) for item in trades)
+            if trades is not None
+            else float(summary["pnl"])
+        )
+        return pnl / orders
+
+    direction_trades = {
+        direction: (
+            [item for item in candidate_trades if item["direction"] == direction]
+            if candidate_trades is not None
+            else None
+        )
+        for direction in ("LONG", "SHORT")
+    }
+
+    minimum("total_win_rate", win_rate(candidate_total), thresholds["total_win_rate_min"])
+    for direction in ("LONG", "SHORT"):
+        minimum(
+            f"{direction.lower()}_win_rate",
+            win_rate(candidate_by_direction[direction]),
+            thresholds["direction_win_rate_min"],
+        )
+    minimum(
+        "total_order_retention",
+        _retention(candidate_total["orders"], baseline_total["orders"]),
+        thresholds["total_order_retention_min"],
+    )
+    for direction in ("LONG", "SHORT"):
+        minimum(
+            f"{direction.lower()}_order_retention",
+            _retention(
+                candidate_by_direction[direction]["orders"],
+                baseline_by_direction[direction]["orders"],
+            ),
+            thresholds["direction_order_retention_min"],
+        )
+    minimum(
+        "base_first_order_retention",
+        _retention(candidate["base_first_orders"], baseline["base_first_orders"]),
+        thresholds["base_first_order_retention_min"],
+    )
+    minimum("total_ev", ev(candidate_total, candidate_trades), thresholds["ev_min"])
+    minimum(
+        "long_ev",
+        ev(candidate_by_direction["LONG"], direction_trades["LONG"]),
+        thresholds["ev_min"],
+    )
+    minimum(
+        "short_ev",
+        ev(candidate_by_direction["SHORT"], direction_trades["SHORT"]),
+        thresholds["ev_min"],
+    )
+    positive_windows = 0
+    for item in candidate["oos_windows"]:
+        if candidate_trades is None:
+            window_pnl = float(item["pnl"])
+        else:
+            lower = int(item["start_at"])
+            upper = int(item["end_at"])
+            window_pnl = math.fsum(
+                float(trade["pnl"])
+                for trade in candidate_trades
+                if lower <= int(trade["opened_at"]) < upper
+            )
+        positive_windows += int(window_pnl > 0.0)
+    minimum(
+        "positive_oos_windows",
+        positive_windows,
+        thresholds["positive_oos_windows_min"],
+    )
+    not_worse(
+        "maximum_drawdown_not_worse",
+        candidate_total["max_drawdown"],
+        baseline_total["max_drawdown"],
+    )
+    not_worse(
+        "longest_loss_streak_not_worse",
+        candidate_total["max_loss_streak"],
+        baseline_total["max_loss_streak"],
+    )
+    return {
+        "thresholds": thresholds,
+        "gates": gates,
+        "passed": all(item["passed"] for item in gates.values()),
+    }
+
+
+def evaluate_profile_admission_search_gates(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    active_oos_days: float,
+    full_day_metrics: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    thresholds = dict(PROFILE_SEARCH_ACCEPTANCE)
+    gates: dict[str, dict[str, Any]] = {}
+    candidate_trades = candidate.get("trade_rows")
+
+    def raw_win_rate(summary: dict[str, Any]) -> float:
+        orders = int(summary["orders"])
+        return int(summary["wins"]) / orders if orders else 0.0
+
+    def raw_pnl(
+        summary: dict[str, Any],
+        trades: Sequence[dict[str, Any]] | None,
+    ) -> float:
+        if trades is not None:
+            return math.fsum(float(item["pnl"]) for item in trades)
+        return float(summary["pnl"])
+
+    def minimum(name: str, actual: float, threshold: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "minimum": float(threshold),
+            "passed": float(actual) >= float(threshold),
+        }
+
+    def range_gate(name: str, actual: float, lower: float, upper: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "minimum": float(lower),
+            "maximum": float(upper),
+            "passed": float(lower) <= float(actual) <= float(upper),
+        }
+
+    def not_worse(name: str, actual: float, baseline_value: float) -> None:
+        gates[name] = {
+            "actual": round(float(actual), 6),
+            "baseline": round(float(baseline_value), 6),
+            "passed": float(actual) <= float(baseline_value),
+        }
+
+    total = candidate["total"]
+    by_direction = candidate["by_direction"]
+    minimum("total_win_rate", raw_win_rate(total), thresholds["total_win_rate_min"])
+    for direction in ("LONG", "SHORT"):
+        minimum(
+            f"{direction.lower()}_win_rate",
+            raw_win_rate(by_direction[direction]),
+            thresholds["direction_win_rate_min"],
+        )
+
+    direction_trades = {
+        direction: (
+            [item for item in candidate_trades if item["direction"] == direction]
+            if candidate_trades is not None
+            else None
+        )
+        for direction in ("LONG", "SHORT")
+    }
+    total_orders = int(total["orders"])
+    total_ev = raw_pnl(total, candidate_trades) / total_orders if total_orders else 0.0
+    minimum("total_ev", total_ev, thresholds["ev_min"])
+    for direction in ("LONG", "SHORT"):
+        summary = by_direction[direction]
+        orders = int(summary["orders"])
+        direction_ev = (
+            raw_pnl(summary, direction_trades[direction]) / orders if orders else 0.0
+        )
+        minimum(f"{direction.lower()}_ev", direction_ev, thresholds["ev_min"])
+
+    if full_day_metrics is not None:
+        orders_per_day = (
+            sum(int(item["orders"]) for item in full_day_metrics)
+            / len(full_day_metrics)
+            if full_day_metrics
+            else 0.0
+        )
+    else:
+        orders_per_day = (
+            total_orders / float(active_oos_days)
+            if float(active_oos_days) > 0.0
+            else 0.0
+        )
+    range_gate(
+        "orders_per_day",
+        orders_per_day,
+        thresholds["orders_per_day_min"],
+        thresholds["orders_per_day_max"],
+    )
+
+    positive_windows = 0
+    window_win_rates = []
+    for window in candidate["oos_windows"]:
+        if candidate_trades is not None and "start_at" in window and "end_at" in window:
+            trades = [
+                item
+                for item in candidate_trades
+                if int(window["start_at"])
+                <= int(item["opened_at"])
+                < int(window["end_at"])
+            ]
+            window_pnl = math.fsum(float(item["pnl"]) for item in trades)
+            window_orders = len(trades)
+            window_wins = sum(1 for item in trades if item["result"] == "WIN")
+        else:
+            window_pnl = float(window["pnl"])
+            window_orders = int(window["orders"])
+            window_wins = int(window["wins"])
+        positive_windows += int(window_pnl > 0.0)
+        window_win_rates.append(window_wins / window_orders if window_orders else 0.0)
+    minimum(
+        "positive_oos_windows",
+        positive_windows,
+        thresholds["positive_oos_windows_min"],
+    )
+    candidate_drawdown, candidate_loss_streak = _raw_risk_metrics(
+        candidate_trades,
+        total,
+    )
+    baseline_drawdown, baseline_loss_streak = _raw_risk_metrics(
+        baseline.get("trade_rows"),
+        baseline["total"],
+    )
+    not_worse(
+        "maximum_drawdown_not_worse",
+        candidate_drawdown,
+        baseline_drawdown,
+    )
+    not_worse(
+        "longest_loss_streak_not_worse",
+        candidate_loss_streak,
+        baseline_loss_streak,
+    )
+    failed_gates = [name for name, gate in gates.items() if not gate["passed"]]
+    return {
+        "thresholds": thresholds,
+        "gates": gates,
+        "passed": not failed_gates,
+        "failed_gates": failed_gates,
+        "orders_per_day_raw": orders_per_day,
+        "minimum_window_win_rate_raw": min(window_win_rates, default=0.0),
+        "maximum_drawdown_raw": candidate_drawdown,
+    }
+
+
+def rank_profile_admission_configurations(
+    configurations: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        (dict(item) for item in configurations),
+        key=lambda item: (
+            -int(bool(item["aggregate_gates_passed"])),
+            -float(item["minimum_window_win_rate_raw"]),
+            abs(float(item["orders_per_day_raw"]) - 50.0),
+            float(
+                item.get(
+                    "maximum_drawdown_raw",
+                    item["total"]["max_drawdown"],
+                )
+            ),
+            int(item["total"]["max_loss_streak"]),
+            int(item["policy_complexity"]),
+            str(item["policy_hash"]),
+        ),
+    )
+
+
+def _profile_admission_baseline_comparison(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    def compare(
+        baseline_summary: dict[str, Any],
+        candidate_summary: dict[str, Any],
+    ) -> dict[str, dict[str, float | int]]:
+        baseline_metrics = {
+            metric: baseline_summary[metric]
+            for metric in PROFILE_SEARCH_COMPARISON_METRICS
+        }
+        candidate_metrics = {
+            metric: candidate_summary[metric]
+            for metric in PROFILE_SEARCH_COMPARISON_METRICS
+        }
+        return {
+            "baseline": baseline_metrics,
+            "candidate": candidate_metrics,
+            "delta": {
+                metric: candidate_metrics[metric] - baseline_metrics[metric]
+                for metric in PROFILE_SEARCH_COMPARISON_METRICS
+            },
+        }
+
+    return {
+        "total": compare(baseline["total"], candidate["total"]),
+        "by_direction": {
+            direction: compare(
+                baseline["by_direction"][direction],
+                candidate["by_direction"][direction],
+            )
+            for direction in ("LONG", "SHORT")
+        },
+    }
+
+
+def search_profile_admission_policies(
+    execution_windows: Sequence[dict[str, Any]],
+    execution: ReplayExecutionConfig,
+    adaptive_timeline: dict[str, Any],
+    baseline: dict[str, Any],
+    oos_start: int,
+    oos_end: int,
+    *,
+    frozen_policy_hash: str | None = None,
+    forward_start_at: int | None = None,
+) -> dict[str, Any]:
+    policies = policy_grid()
+    active_oos_ms = max(0, int(oos_end) - int(oos_start))
+    active_oos_days = active_oos_ms / DAY_MS
+    configurations = []
+    reports_by_hash: dict[str, dict[str, Any]] = {}
+    for policy in policies:
+        execution_result = _execute_replay(
+            execution_windows,
+            execution,
+            adaptive_timeline,
+            apply_adaptive=True,
+            include_structure_shadow=False,
+            admission_policy=policy,
+        )
+        report = _execution_report(execution_result, oos_start, oos_end)
+        reports_by_hash[policy.policy_hash] = report
+        full_day_metrics = _full_oos_day_metrics(
+            report["trade_rows"],
+            oos_start,
+            oos_end,
+        )
+        gate_report = evaluate_profile_admission_search_gates(
+            baseline,
+            report,
+            active_oos_days=active_oos_days,
+            full_day_metrics=full_day_metrics,
+        )
+        configurations.append(
+            {
+                "policy": policy.to_dict(),
+                "policy_hash": policy.policy_hash,
+                "policy_complexity": policy.complexity,
+                "aggregate_gates_passed": gate_report["passed"],
+                "failed_gates": gate_report["failed_gates"],
+                "gates": gate_report["gates"],
+                "total": report["total"],
+                "by_direction": report["by_direction"],
+                "daily": report["daily"],
+                "full_day_metrics": full_day_metrics,
+                "oos_windows": report["oos_windows"],
+                "orders_per_day": round(gate_report["orders_per_day_raw"], 6),
+                "orders_per_day_raw": gate_report["orders_per_day_raw"],
+                "minimum_window_win_rate": round(
+                    gate_report["minimum_window_win_rate_raw"],
+                    6,
+                ),
+                "minimum_window_win_rate_raw": gate_report[
+                    "minimum_window_win_rate_raw"
+                ],
+                "maximum_drawdown_raw": gate_report["maximum_drawdown_raw"],
+                "admission_codes": report["admission_codes"],
+            }
+        )
+
+    ranked = rank_profile_admission_configurations(configurations)
+    rank_by_hash = {
+        item["policy_hash"]: rank for rank, item in enumerate(ranked, start=1)
+    }
+    for rank, item in enumerate(ranked, start=1):
+        item["rank"] = rank
+    for item in configurations:
+        item["rank"] = rank_by_hash[item["policy_hash"]]
+    best = ranked[0]
+    stability = _forward_stability_report(
+        best,
+        trade_rows=reports_by_hash[best["policy_hash"]]["trade_rows"],
+        frozen_policy_hash=frozen_policy_hash,
+        forward_start_at=forward_start_at,
+        oos_end=oos_end,
+    )
+    aggregate_gates_passed = bool(best["aggregate_gates_passed"])
+    stability_proven = bool(stability["passed"])
+    release_allowed = aggregate_gates_passed and stability_proven
+    return {
+        "grid_size": len(policies),
+        "evaluated_count": len(configurations),
+        "active_oos_ms": active_oos_ms,
+        "active_oos_days": round(active_oos_days, 6),
+        "configurations": configurations,
+        "ranking": [item["policy_hash"] for item in ranked],
+        "best_candidate": best,
+        "baseline_comparison": _profile_admission_baseline_comparison(
+            baseline,
+            best,
+        ),
+        "aggregate_gates_passed": aggregate_gates_passed,
+        "stability": stability,
+        "stability_proven": stability_proven,
+        "release_allowed": release_allowed,
+        "release_policy": best["policy"] if release_allowed else None,
+        "equivalence_scope": {
+            "scope": "PROFILE_ADMISSION_LAYER_ONLY",
+            "includes": [
+                "shared_profile_admission_policy",
+                "candidate_ranking",
+                "replay_execution_guards",
+            ],
+            "excludes": ["runtime_guards_not_modeled_by_this_replay"],
+        },
+    }
+
+
+def _forward_stability_report(
+    candidate: dict[str, Any],
+    *,
+    trade_rows: Sequence[dict[str, Any]] | None = None,
+    frozen_policy_hash: str | None,
+    forward_start_at: int | None,
+    oos_end: int,
+) -> dict[str, Any]:
+    frozen = bool(
+        frozen_policy_hash
+        and frozen_policy_hash == candidate["policy_hash"]
+        and forward_start_at is not None
+    )
+    complete_days = int(
+        max(0, int(oos_end) - int(forward_start_at)) // DAY_MS
+        if frozen and forward_start_at is not None
+        else 0
+    )
+    evaluated_days = min(7, complete_days)
+    rows = list(
+        trade_rows
+        if trade_rows is not None
+        else candidate.get("trade_rows") or []
+    )
+    daily = []
+    forward_rows = []
+    if frozen and forward_start_at is not None:
+        for day in range(evaluated_days):
+            lower = int(forward_start_at) + day * DAY_MS
+            upper = lower + DAY_MS
+            day_rows = [
+                item
+                for item in rows
+                if lower <= int(item["opened_at"]) < upper
+            ]
+            wins = sum(1 for item in day_rows if item["result"] == "WIN")
+            pnl = math.fsum(float(item["pnl"]) for item in day_rows)
+            orders = len(day_rows)
+            forward_rows.extend(day_rows)
+            daily.append(
+                {
+                    "day": day + 1,
+                    "start_at": lower,
+                    "end_at": upper,
+                    "orders": orders,
+                    "wins": wins,
+                    "losses": orders - wins,
+                    "win_rate": round(wins / orders, 6) if orders else 0.0,
+                    "pnl": round(pnl, 4),
+                    "ev": round(pnl / orders, 4) if orders else 0.0,
+                }
+            )
+    qualifying_win_rate_days = sum(
+        1
+        for item in daily
+        if item["orders"] > 0
+        and int(item["wins"]) / int(item["orders"]) >= 0.5556
+    )
+    positive_ev_days = (
+        sum(
+            1
+            for day in range(evaluated_days)
+            if math.fsum(
+                float(item["pnl"])
+                for item in forward_rows
+                if int(forward_start_at) + day * DAY_MS
+                <= int(item["opened_at"])
+                < int(forward_start_at) + (day + 1) * DAY_MS
+            )
+            > 0.0
+        )
+        if forward_start_at is not None
+        else 0
+    )
+    combined_orders = len(forward_rows)
+    combined_wins = sum(1 for item in forward_rows if item["result"] == "WIN")
+    combined_win_rate = combined_wins / combined_orders if combined_orders else 0.0
+    orders_per_day = combined_orders / evaluated_days if evaluated_days else 0.0
+    gates = {
+        "policy_frozen": {"actual": frozen, "required": True, "passed": frozen},
+        "complete_forward_days": {
+            "actual": complete_days,
+            "minimum": 7,
+            "passed": complete_days >= 7,
+        },
+        "qualifying_win_rate_days": {
+            "actual": qualifying_win_rate_days,
+            "minimum": 5,
+            "daily_win_rate_minimum": 0.5556,
+            "passed": qualifying_win_rate_days >= 5,
+        },
+        "positive_ev_days": {
+            "actual": positive_ev_days,
+            "minimum": 5,
+            "daily_ev_strictly_positive": True,
+            "passed": positive_ev_days >= 5,
+        },
+        "combined_win_rate": {
+            "actual": round(combined_win_rate, 6),
+            "minimum": 0.60,
+            "passed": combined_win_rate >= 0.60,
+        },
+        "orders_per_day": {
+            "actual": round(orders_per_day, 6),
+            "minimum": 45.0,
+            "maximum": 55.0,
+            "passed": 45.0 <= orders_per_day <= 55.0,
+        },
+    }
+    return {
+        "complete_forward_days": complete_days,
+        "evaluated_forward_days": evaluated_days,
+        "daily": daily,
+        "combined_orders": combined_orders,
+        "combined_wins": combined_wins,
+        "gates": gates,
+        "failed_gates": [name for name, gate in gates.items() if not gate["passed"]],
+        "passed": all(gate["passed"] for gate in gates.values()),
+    }
+
+
+def _raw_risk_metrics(
+    trades: Sequence[dict[str, Any]] | None,
+    summary: dict[str, Any],
+) -> tuple[float, int]:
+    if trades is None:
+        return float(summary["max_drawdown"]), int(summary["max_loss_streak"])
+    equity = 0.0
+    peak = 0.0
+    maximum_drawdown = 0.0
+    loss_streak = 0
+    maximum_loss_streak = 0
+    for item in sorted(trades, key=_trade_settlement_key):
+        equity += float(item["pnl"])
+        peak = max(peak, equity)
+        maximum_drawdown = max(maximum_drawdown, peak - equity)
+        if item["result"] == "LOSS":
+            loss_streak += 1
+            maximum_loss_streak = max(maximum_loss_streak, loss_streak)
+        else:
+            loss_streak = 0
+    return maximum_drawdown, maximum_loss_streak
+
+
+def _full_oos_day_metrics(
+    trades: Sequence[dict[str, Any]],
+    oos_start: int,
+    oos_end: int,
+) -> list[dict[str, Any]]:
+    complete_days = max(0, int(oos_end) - int(oos_start)) // DAY_MS
+    metrics = []
+    for day in range(complete_days):
+        lower = int(oos_start) + day * DAY_MS
+        upper = lower + DAY_MS
+        metrics.append(
+            {
+                "day": day + 1,
+                "start_at": lower,
+                "end_at": upper,
+                **summarize_trades(
+                    [
+                        item
+                        for item in trades
+                        if lower <= int(item["opened_at"]) < upper
+                    ]
+                ),
+            }
+        )
+    return metrics
+
+
+def rank_passing_configurations(
+    configurations: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    passing = [
+        dict(item)
+        for item in configurations
+        if bool(item.get("passed", item.get("acceptance", {}).get("passed", False)))
+    ]
+    return sorted(
+        passing,
+        key=lambda item: (
+            -(
+                int(item["total"]["wins"]) / int(item["total"]["orders"])
+                if int(item["total"]["orders"])
+                else 0.0
+            ),
+            -int(item["total"]["orders"]),
+            float(item["total"]["max_drawdown"]),
+            str(item.get("name", "")),
+        ),
+    )
+
+
+def build_structure_shadow_equality_report(
+    baseline_rows: Sequence[dict[str, Any]],
+    structure_shadow_rows: Sequence[dict[str, Any]],
+    baseline_webhook_count: int,
+    structure_shadow_webhook_count: int,
+) -> dict[str, Any]:
+    differences: list[dict[str, Any]] = []
+    row_count = max(len(baseline_rows), len(structure_shadow_rows))
+    for index in range(row_count):
+        baseline = baseline_rows[index] if index < len(baseline_rows) else None
+        shadow = structure_shadow_rows[index] if index < len(structure_shadow_rows) else None
+        fields = [
+            field
+            for field in EQUALITY_FIELDS
+            if (baseline or {}).get(field) != (shadow or {}).get(field)
+        ]
+        if baseline is None or shadow is None:
+            fields = ["order_presence", *fields]
+        if fields:
+            differences.append(
+                {
+                    "index": index,
+                    "fields": fields,
+                    "baseline": {
+                        field: (baseline or {}).get(field) for field in EQUALITY_FIELDS
+                    }
+                    if baseline is not None
+                    else None,
+                    "structure_shadow": {
+                        field: (shadow or {}).get(field) for field in EQUALITY_FIELDS
+                    }
+                    if shadow is not None
+                    else None,
+                }
+            )
+    if int(baseline_webhook_count) != int(structure_shadow_webhook_count):
+        differences.append(
+            {
+                "index": None,
+                "fields": ["webhook_count"],
+                "baseline": int(baseline_webhook_count),
+                "structure_shadow": int(structure_shadow_webhook_count),
+            }
+        )
+    return {
+        "equal": not differences,
+        "independent_execution_count": 2,
+        "compared_fields": [*EQUALITY_FIELDS, "webhook_count"],
+        "baseline_order_count": len(baseline_rows),
+        "structure_shadow_order_count": len(structure_shadow_rows),
+        "baseline_webhook_count": int(baseline_webhook_count),
+        "structure_shadow_webhook_count": int(structure_shadow_webhook_count),
+        "differences": differences,
+    }
+
+
+def _resolve_execution(
+    execution: ReplayExecutionConfig | None,
+    **explicit: Any,
+) -> ReplayExecutionConfig:
+    supplied = {name: value for name, value in explicit.items() if value is not None}
+    if execution is not None:
+        if supplied:
+            raise ValueError("execution config and explicit production values are mutually exclusive")
+        if not isinstance(execution, ReplayExecutionConfig):
+            raise TypeError("execution must be a ReplayExecutionConfig")
+        return execution.normalized()
+    missing = [name for name, value in explicit.items() if value is None]
+    if missing:
+        raise ValueError(
+            "explicit production execution settings are required: " + ", ".join(missing)
+        )
+    return ReplayExecutionConfig(
+        max_open_orders=explicit["max_open_orders"],
+        max_open_long_orders=explicit["max_open_long_orders"],
+        max_open_short_orders=explicit["max_open_short_orders"],
+        min_order_gap_ms=explicit["min_order_gap_ms"],
+        stake=explicit["stake"],
+        win_return=explicit["win_return"],
+        stake_progression_enabled=explicit["stake_progression_enabled"],
+        stake_progression_max_orders=explicit["stake_progression_max_orders"],
+        stake_progression_max_active=explicit["stake_progression_max_active"],
+        stake_progression_second_stake=explicit["stake_progression_second_stake"],
+        stake_progression_base_only_segments=tuple(
+            explicit["stake_progression_base_only_segments"]
+        ),
+    ).normalized()
 
 
 def _build_schedule(
@@ -193,13 +1281,24 @@ def _build_schedule(
     config: DailyProfileSelectorConfig,
     *,
     require_full_lookback: bool,
+    workload: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    first_opened_at = observations[0].opened_at
-    last_opened_at = observations[-1].opened_at
+    if not observations:
+        return []
+    config = config.normalized()
+    first_opened_at = min(item.opened_at for item in observations)
+    last_opened_at = max(item.opened_at for item in observations)
     current_date = datetime.fromtimestamp(first_opened_at / 1000, tz=SHANGHAI).date()
     end_date = datetime.fromtimestamp(last_opened_at / 1000, tz=SHANGHAI).date()
     previous = None
     snapshots = []
+    opened_rows = sorted(
+        observations,
+        key=lambda item: (item.opened_at, *_settlement_event_key(item)),
+    )
+    opened_times = [item.opened_at for item in opened_rows]
+    selector_input_rows = 0
+    selector_max_rows = 0
     while current_date <= end_date:
         evaluated_at = int(
             datetime.combine(
@@ -209,29 +1308,717 @@ def _build_schedule(
             ).timestamp()
             * 1000
         )
-        window = selection_window(
+        stable_window = selection_window(
             evaluated_at,
-            lookback_days=config.lookback_days,
+            lookback_days=config.effective_stable_lookback_days,
             evaluation_hour=config.evaluation_hour,
             evaluation_minute=config.evaluation_minute,
             activation_hour=config.activation_hour,
             activation_minute=config.activation_minute,
         )
-        full_lookback = first_opened_at <= window["lookback_start"]
+        full_lookback = first_opened_at <= stable_window["lookback_start"]
         if (
             (full_lookback or not require_full_lookback)
-            and window["effective_from"] <= last_opened_at
+            and stable_window["effective_from"] <= last_opened_at
         ):
+            left = bisect_left(opened_times, stable_window["lookback_start"])
+            right = bisect_left(opened_times, stable_window["lookback_end"], left)
+            known = [
+                item
+                for item in opened_rows[left:right]
+                if item.settled_at is not None and item.settled_at < evaluated_at
+            ]
+            selector_input_rows += len(known)
+            selector_max_rows = max(selector_max_rows, len(known))
             snapshot = build_daily_selection(
-                observations,
+                known,
                 evaluated_at,
                 config=config,
                 previous_snapshot=previous,
             )
+            snapshot["sample_keys"] = [
+                item.observation_key
+                for item in sorted(known, key=_settlement_event_key)
+                if stable_window["lookback_start"]
+                <= item.opened_at
+                < stable_window["lookback_end"]
+            ]
             snapshots.append(snapshot)
             previous = snapshot
         current_date += timedelta(days=1)
+    if workload is not None:
+        workload["schedule_selector_input_rows"] = selector_input_rows
+        workload["schedule_selector_max_rows"] = selector_max_rows
     return snapshots
+
+
+def _build_adaptive_event_rows(
+    observations: Sequence[ObservationSignal],
+    *,
+    workload: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    tracker = AdaptiveGlobalProfileWindowReplay(
+        lookback_ms=ADAPTIVE_LOOKBACK_MS,
+    )
+    states: dict[str, dict[str, Any]] = {}
+    rows = []
+    for item in sorted(observations, key=adaptive_replay_event_sort_key):
+        key = _observation_profile_key(item)
+        before = states.get(key) or _adaptive_state((), key, int(item.settled_at))
+        after = before
+        if _is_adaptive_profile_key(key):
+            evaluated_at = int(item.settled_at) + 1
+            after = tracker.advance(item, evaluated_at)
+            states[key] = after
+        rows.append(
+            {
+                "observation_key": item.observation_key,
+                "profile_key": key,
+                "direction": item.direction,
+                "opened_at": item.opened_at,
+                "settled_at": item.settled_at,
+                "result": item.result,
+                "adaptive_state_before": before["status"],
+                "adaptive_state_after": after["status"],
+                "adaptive_transition_after": str(after.get("transition", "")),
+                "adaptive_version": str(after.get("version", "")),
+                "n12_after": after["n12"],
+                "n20_after": after["n20"],
+                "adaptive_evaluated_at": int(after.get("evaluated_at", 0)),
+            }
+        )
+    if workload is not None:
+        tracker_workload = tracker.workload_report()
+        workload["adaptive_events"] = len(observations)
+        workload["adaptive_incremental_adds"] = tracker_workload[
+            "incremental_adds"
+        ]
+        workload["adaptive_window_rebuilds"] = (
+            tracker_workload["window_rebuilds"]
+            + tracker_workload["global_identity_rebuilds"]
+        )
+        workload["adaptive_window_rebuild_input_rows"] = (
+            tracker_workload["window_rebuild_input_rows"]
+            + tracker_workload["global_identity_rebuild_input_rows"]
+        )
+        workload["adaptive_max_window_events"] = tracker_workload[
+            "max_window_events"
+        ]
+        workload["adaptive_retained_index_events"] = tracker_workload[
+            "retained_index_events"
+        ]
+        workload["adaptive_jump_cache_entries"] = tracker_workload[
+            "jump_cache_entries"
+        ]
+        workload["adaptive_successor_cache_entries"] = tracker_workload[
+            "successor_cache_entries"
+        ]
+        workload["adaptive_jump_cache_entry_bound"] = tracker_workload[
+            "jump_cache_entry_bound"
+        ]
+        workload["adaptive_dynamic_work_units"] = tracker_workload[
+            "dynamic_work_units"
+        ]
+        workload["adaptive_dynamic_claim_heap_entries"] = tracker_workload[
+            "dynamic_claim_heap_entries"
+        ]
+        workload["adaptive_dynamic_claim_heap_entry_bound"] = tracker_workload[
+            "dynamic_claim_heap_entry_bound"
+        ]
+        workload["adaptive_dynamic_claim_heap_compactions"] = tracker_workload[
+            "dynamic_claim_heap_compactions"
+        ]
+        workload["adaptive_dynamic_claim_heap_compaction_input_rows"] = (
+            tracker_workload["dynamic_claim_heap_compaction_input_rows"]
+        )
+        workload["adaptive_active_profile_trackers"] = tracker_workload[
+            "active_profile_trackers"
+        ]
+        workload["adaptive_retained_profile_tracker_events"] = tracker_workload[
+            "retained_profile_tracker_events"
+        ]
+        workload["adaptive_retained_profile_tracker_event_bound"] = (
+            tracker_workload["retained_profile_tracker_event_bound"]
+        )
+    return rows
+
+
+def _adaptive_timeline(
+    event_rows: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    by_profile: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    settled_times = []
+    for row in event_rows:
+        settled_at = int(row["settled_at"])
+        settled_times.append(settled_at)
+        by_profile[row["profile_key"]].append(
+            (
+                settled_at,
+                {
+                    "version": row["adaptive_version"],
+                    "status": row["adaptive_state_after"],
+                    "transition": row["adaptive_transition_after"],
+                    "profile_key": row["profile_key"],
+                    "evaluated_at": row["adaptive_evaluated_at"],
+                    "n12": row["n12_after"],
+                    "n20": row["n20_after"],
+                },
+            )
+        )
+    by_profile_rows = dict(by_profile)
+    return {
+        "by_profile": by_profile_rows,
+        "times_by_profile": {
+            key: [item[0] for item in entries]
+            for key, entries in by_profile_rows.items()
+        },
+        "settled_times": settled_times,
+    }
+
+
+def _prepare_execution_windows(
+    observations: Sequence[ObservationSignal],
+    snapshots: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    opened_rows = sorted(
+        observations,
+        key=lambda item: (item.opened_at, item.observation_key),
+    )
+    opened_times = [item.opened_at for item in opened_rows]
+    windows = []
+    for snapshot in snapshots:
+        left = bisect_left(opened_times, int(snapshot["effective_from"]))
+        right = bisect_left(
+            opened_times,
+            int(snapshot["effective_until"]),
+            left,
+        )
+        groups = []
+        position = left
+        while position < right:
+            opened_at = opened_rows[position].opened_at
+            group_end = bisect_right(opened_times, opened_at, position, right)
+            groups.append((opened_at, tuple(opened_rows[position:group_end])))
+            position = group_end
+        windows.append({"snapshot": snapshot, "groups": tuple(groups)})
+    return tuple(windows)
+
+
+@dataclass
+class _SegmentLossLedger:
+    streaks: dict[tuple[Any, str], int]
+
+    @classmethod
+    def create(cls) -> "_SegmentLossLedger":
+        return cls(streaks={})
+
+    def settle(self, order: dict[str, Any]) -> None:
+        settled_at = int(order["settled_at"])
+        day = datetime.fromtimestamp(settled_at / 1000, tz=SHANGHAI).date()
+        key = (day, str(order["threshold_segment"]))
+        self.streaks[key] = (
+            self.streaks.get(key, 0) + 1
+            if order["result"] == "LOSS"
+            else 0
+        )
+
+    def blocks(self, candidate: ObservationSignal, opened_at: int) -> bool:
+        day = datetime.fromtimestamp(opened_at / 1000, tz=SHANGHAI).date()
+        return self.streaks.get((day, candidate.threshold_segment), 0) >= 3
+
+
+def _execute_replay(
+    execution_windows: Sequence[dict[str, Any]],
+    execution: ReplayExecutionConfig,
+    adaptive_timeline: dict[str, Any],
+    *,
+    apply_adaptive: bool,
+    include_structure_shadow: bool,
+    admission_policy: ProfileAdmissionPolicy | None = None,
+) -> dict[str, Any]:
+    trades: list[dict[str, Any]] = []
+    open_orders: list[dict[str, Any]] = []
+    rejections = {name: 0 for name in GUARD_REJECTIONS}
+    admission_codes: dict[str, int] = defaultdict(int)
+    eligible_events = 0
+    webhook_count = 0
+    last_order_opened_at: dict[str, int | None] = {"LONG": None, "SHORT": None}
+    progression = TwoStageStakeProgression(
+        enabled=execution.stake_progression_enabled,
+        base_stake=execution.stake,
+        base_win_return=execution.win_return,
+        max_active=execution.stake_progression_max_active,
+        max_open_orders=execution.max_open_orders,
+        activated_at=0,
+        second_stake=execution.stake_progression_second_stake,
+    )
+    loss_ledger = _SegmentLossLedger.create()
+
+    for window in execution_windows:
+        snapshot = window["snapshot"]
+        selected_profiles = snapshot.get("selected_profiles") or []
+        selected_by_key = {item["key"]: item for item in selected_profiles}
+        candidate_by_key = {
+            item["key"]: item for item in snapshot.get("candidates") or []
+        }
+        candidate_by_key.update(selected_by_key)
+
+        for opened_at, rows in window["groups"]:
+            eligible_events += 1
+            _settle_due_orders(open_orders, opened_at, progression, loss_ledger)
+            admission = None
+            adaptive = None
+            evaluated_through = 0
+            if admission_policy is None:
+                by_key: dict[str, ObservationSignal] = {}
+                for item in sorted(rows, key=lambda row: row.observation_key):
+                    by_key.setdefault(_observation_profile_key(item), item)
+                chosen = next(
+                    (
+                        by_key[item["key"]]
+                        for item in selected_profiles
+                        if item["key"] in by_key
+                    ),
+                    None,
+                )
+            else:
+                (
+                    contexts,
+                    candidate_by_ordinal,
+                    adaptive_by_ordinal,
+                    evaluated_by_ordinal,
+                ) = _admission_contexts(
+                    rows,
+                    selected_profiles,
+                    candidate_by_key,
+                    adaptive_timeline,
+                    open_orders,
+                    opened_at,
+                )
+                for context in contexts:
+                    decision = evaluate_profile_admission(context, admission_policy)
+                    admission_codes[decision.code] += 1
+                admission = select_admitted_candidate(contexts, admission_policy)
+                chosen = (
+                    candidate_by_ordinal[admission.context.candidate_ordinal]
+                    if admission is not None
+                    else None
+                )
+                if admission is not None:
+                    ordinal = admission.context.candidate_ordinal
+                    adaptive = adaptive_by_ordinal[ordinal]
+                    evaluated_through = evaluated_by_ordinal[ordinal]
+            if chosen is None:
+                rejections["profile_not_selected"] += 1
+                continue
+
+            direction = str(chosen.direction).upper()
+            chosen_profile_key = _observation_profile_key(chosen)
+            profile = candidate_by_key.get(chosen_profile_key) or {
+                "key": chosen_profile_key,
+                "sample_size": 0,
+                "win_rate": 0.0,
+                "ev": 0.0,
+                "selection_state": "NOT_SELECTED",
+            }
+            if adaptive is None:
+                adaptive, evaluated_through = _adaptive_state_before(
+                    adaptive_timeline,
+                    profile["key"],
+                    opened_at,
+                )
+            direction_open_count = sum(
+                1 for order in open_orders if order["direction"] == direction
+            )
+            if admission_policy is None and apply_adaptive and adaptive["status"] == "PAUSED":
+                rejections["adaptive_profile_paused"] += 1
+                continue
+            if (
+                admission_policy is None
+                and apply_adaptive
+                and adaptive["status"] == "WATCH"
+                and direction_open_count >= 1
+            ):
+                rejections["adaptive_profile_second_blocked"] += 1
+                continue
+            if len(open_orders) >= execution.max_open_orders:
+                rejections["global_capacity"] += 1
+                continue
+            direction_limit = (
+                execution.max_open_long_orders
+                if direction == "LONG"
+                else execution.max_open_short_orders
+            )
+            last_opened = last_order_opened_at[direction]
+            if (
+                last_opened is not None
+                and opened_at - last_opened < execution.min_order_gap_ms
+            ):
+                rejections["cooldown"] += 1
+                continue
+            if direction_open_count >= direction_limit:
+                rejections[f"direction_capacity_{direction.lower()}"] += 1
+                continue
+            if loss_ledger.blocks(chosen, opened_at):
+                rejections["three_loss_pause"] += 1
+                continue
+
+            order_id = len(trades) + 1
+            allow_progression = (
+                admission.decision.allow_progression
+                if admission is not None
+                else not (apply_adaptive and adaptive["status"] == "WATCH")
+            )
+            if allow_progression:
+                terms, _credit = progression.assign(
+                    order_id,
+                    opened_at,
+                    direction=direction,
+                )
+                order_stake = terms.stake
+                order_win_return = terms.win_return
+                progression_step = terms.step
+                progression_source_order_id = terms.source_order_id
+            else:
+                order_stake = execution.stake
+                order_win_return = execution.win_return
+                progression_step = 1
+                progression_source_order_id = None
+            progression_version = (
+                TWO_STAGE_VERSION if execution.stake_progression_enabled else ""
+            )
+            pnl = (
+                round(order_win_return - order_stake, 4)
+                if chosen.result == "WIN"
+                else round(-order_stake, 4)
+            )
+            trade = {
+                "order_id": order_id,
+                "observation_key": chosen.observation_key,
+                "opened_at": chosen.opened_at,
+                "settled_at": chosen.settled_at,
+                "expires_at": chosen.expires_at,
+                "direction": direction,
+                "threshold_segment": chosen.threshold_segment,
+                "strategy_family": chosen.strategy_family,
+                "strategy_tag": chosen.strategy_tag,
+                "profile_key": profile["key"],
+                "training_samples": profile["sample_size"],
+                "training_win_rate": profile["win_rate"],
+                "training_ev": profile["ev"],
+                "adaptive_state_before": adaptive["status"],
+                "adaptive_transition_before": str(adaptive.get("transition", "")),
+                "adaptive_n12_before": adaptive["n12"],
+                "adaptive_n20_before": adaptive["n20"],
+                "adaptive_evaluated_through": evaluated_through,
+                "order_slot": "FIRST" if direction_open_count == 0 else "SECOND",
+                "order_slot_scope": "DIRECTION_V2",
+                "result": chosen.result,
+                "stake": float(order_stake),
+                "win_return": float(order_win_return),
+                "pnl": pnl,
+                "progression_step": progression_step,
+                "progression_source_order_id": progression_source_order_id,
+                "progression_version": progression_version,
+                "progression_allowed": allow_progression,
+            }
+            if admission is not None:
+                trade.update(
+                    {
+                        "admission_policy_version": admission.decision.policy_version,
+                        "admission_policy_hash": admission.decision.policy_hash,
+                        "admission_channel": admission.decision.channel,
+                        "admission_code": admission.decision.code,
+                    }
+                )
+            if include_structure_shadow:
+                trade["entry_structure_shadow"] = dict(
+                    chosen.entry_structure_shadow
+                    if isinstance(chosen.entry_structure_shadow, dict)
+                    else {}
+                )
+            trades.append(trade)
+            open_orders.append(trade)
+            last_order_opened_at[direction] = opened_at
+            webhook_count += 1
+
+    _settle_due_orders(open_orders, 2**63 - 1, progression, loss_ledger)
+    return {
+        "trade_rows": trades,
+        "guard_rejections": rejections,
+        "admission_codes": dict(sorted(admission_codes.items())),
+        "eligible_events": eligible_events,
+        "webhook_count": webhook_count,
+    }
+
+
+def _admission_contexts(
+    rows: Sequence[ObservationSignal],
+    selected_profiles: Sequence[dict[str, Any]],
+    candidate_by_key: dict[str, dict[str, Any]],
+    adaptive_timeline: dict[str, Any],
+    open_orders: Sequence[dict[str, Any]],
+    opened_at: int,
+) -> tuple[
+    tuple[ProfileAdmissionContext, ...],
+    dict[int, ObservationSignal],
+    dict[int, dict[str, Any]],
+    dict[int, int],
+]:
+    selected_ranks = {
+        item["key"]: rank
+        for rank, item in enumerate(selected_profiles, start=1)
+    }
+    direction_open_counts = {
+        direction: sum(1 for order in open_orders if order["direction"] == direction)
+        for direction in ("LONG", "SHORT")
+    }
+    candidate_by_ordinal: dict[int, ObservationSignal] = {}
+    adaptive_by_ordinal: dict[int, dict[str, Any]] = {}
+    evaluated_by_ordinal: dict[int, int] = {}
+    contexts = []
+    ordered_rows = sorted(
+        rows,
+        key=lambda item: (
+            item.observation_key,
+            item.candidate_origin,
+            item.decision_id,
+        ),
+    )
+    used_ordinals: set[int] = set()
+    fallback_ordinal = 1
+    for item in ordered_rows:
+        identity = (
+            item.decision_inputs.get("identity")
+            if isinstance(item.decision_inputs, dict)
+            else None
+        )
+        candidate_identity = (
+            identity.get("candidate_identity", identity)
+            if isinstance(identity, dict)
+            else None
+        )
+        frozen_ordinal = (
+            candidate_identity.get("candidate_ordinal")
+            if isinstance(candidate_identity, dict)
+            else None
+        )
+        if (
+            type(frozen_ordinal) is int
+            and frozen_ordinal >= 0
+            and frozen_ordinal not in used_ordinals
+        ):
+            ordinal = frozen_ordinal
+        else:
+            while fallback_ordinal in used_ordinals:
+                fallback_ordinal += 1
+            ordinal = fallback_ordinal
+            fallback_ordinal += 1
+        used_ordinals.add(ordinal)
+        profile_key_value = _observation_profile_key(item)
+        profile = candidate_by_key.get(profile_key_value) or {}
+        adaptive, evaluated_through = _adaptive_state_before(
+            adaptive_timeline,
+            profile_key_value,
+            opened_at,
+        )
+        candidate_by_ordinal[ordinal] = item
+        adaptive_by_ordinal[ordinal] = adaptive
+        evaluated_by_ordinal[ordinal] = evaluated_through
+        direction = str(item.direction).upper()
+        n12 = adaptive.get("n12") or _empty_sample_summary()
+        n20 = adaptive.get("n20") or _empty_sample_summary()
+        daily_sample_size = int(profile.get("sample_size", 0))
+        daily_win_rate = (
+            int(profile["wins"]) / daily_sample_size
+            if daily_sample_size > 0 and profile.get("wins") is not None
+            else float(profile.get("win_rate", 0.0))
+        )
+        contexts.append(
+            ProfileAdmissionContext(
+                profile_key=profile_key_value,
+                direction=direction,
+                order_slot=(
+                    "FIRST"
+                    if direction_open_counts.get(direction, 0) == 0
+                    else "SECOND"
+                ),
+                daily_selected=profile_key_value in selected_ranks,
+                qualification_state=str(
+                    profile.get(
+                        "qualification_state",
+                        (
+                            "QUALIFIED"
+                            if profile_key_value in selected_ranks
+                            else "NOT_QUALIFIED"
+                        ),
+                    )
+                ),
+                daily_rank=selected_ranks.get(profile_key_value),
+                daily_win_rate=daily_win_rate,
+                adaptive_state=str(adaptive["status"]),
+                adaptive_transition=str(adaptive.get("transition", "")),
+                adaptive_evaluated_at=int(adaptive.get("evaluated_at", 0)),
+                n12_sample_size=int(n12.get("sample_size", 0)),
+                n12_wins=int(n12.get("wins", 0)),
+                n20_sample_size=int(n20.get("sample_size", 0)),
+                n20_ev=float(n20.get("ev", 0.0)),
+                candidate_origin=str(item.candidate_origin or "REPLAY_OBSERVATION"),
+                candidate_ordinal=ordinal,
+            )
+        )
+    return (
+        tuple(contexts),
+        candidate_by_ordinal,
+        adaptive_by_ordinal,
+        evaluated_by_ordinal,
+    )
+
+
+def _settle_due_orders(
+    open_orders: list[dict[str, Any]],
+    current_time: int,
+    progression: TwoStageStakeProgression,
+    loss_ledger: _SegmentLossLedger,
+) -> None:
+    due = sorted(
+        (
+            item
+            for item in open_orders
+            if item["settled_at"] is not None and item["settled_at"] <= current_time
+        ),
+        key=_trade_settlement_key,
+    )
+    for order in due:
+        progression.settle(
+            order["order_id"],
+            order["opened_at"],
+            order["progression_step"],
+            order["result"],
+            order["settled_at"],
+            allow_credit=order["progression_allowed"],
+            direction=order["direction"],
+        )
+        loss_ledger.settle(order)
+        open_orders.remove(order)
+
+
+def _adaptive_state_before(
+    timeline: dict[str, Any],
+    profile_key_value: str,
+    opened_at: int,
+) -> tuple[dict[str, Any], int]:
+    entries = timeline["by_profile"].get(profile_key_value, [])
+    times = timeline.get("times_by_profile", {}).get(profile_key_value)
+    if times is None:
+        times = [item[0] for item in entries]
+    position = bisect_left(times, opened_at)
+    state = (
+        entries[position - 1][1]
+        if position
+        else _adaptive_state((), profile_key_value, opened_at)
+    )
+    settled_times = timeline["settled_times"]
+    global_position = bisect_left(settled_times, opened_at)
+    evaluated_through = settled_times[global_position - 1] if global_position else 0
+    return state, evaluated_through
+
+
+def _adaptive_state(
+    observations: Sequence[ObservationSignal],
+    key: str,
+    evaluated_at: int,
+) -> dict[str, Any]:
+    if not _is_adaptive_profile_key(key):
+        return {
+            "version": ADAPTIVE_PROFILE_STATE_VERSION,
+            "status": "WARMUP",
+            "transition": "NONE->WARMUP",
+            "profile_key": key,
+            "evaluated_at": evaluated_at,
+            "n12": _empty_sample_summary(),
+            "n20": _empty_sample_summary(),
+        }
+    return evaluate_adaptive_profile_state(observations, key, max(0, int(evaluated_at)))
+
+
+def _execution_report(
+    execution_result: dict[str, Any],
+    oos_start: int,
+    oos_end: int,
+) -> dict[str, Any]:
+    trades = execution_result["trade_rows"]
+    directions = {
+        direction: summarize_trades(
+            [item for item in trades if item["direction"] == direction]
+        )
+        for direction in ("LONG", "SHORT")
+    }
+    daily = _group_summaries(trades, "day")
+    daily_best = max(daily, key=lambda item: (item["pnl"], item["day"])) if daily else None
+    daily_worst = min(daily, key=lambda item: (item["pnl"], item["day"])) if daily else None
+    return {
+        "total": summarize_trades(trades),
+        "by_direction": directions,
+        "base_first_orders": sum(
+            1
+            for item in trades
+            if item["progression_step"] == 1 and item["order_slot"] == "FIRST"
+        ),
+        "daily": daily,
+        "daily_best": daily_best,
+        "daily_worst": daily_worst,
+        "guard_rejections": dict(execution_result["guard_rejections"]),
+        "admission_codes": dict(execution_result.get("admission_codes") or {}),
+        "oos_windows": _oos_windows(trades, oos_start, oos_end),
+        "webhook_count": execution_result["webhook_count"],
+        "eligible_events": execution_result["eligible_events"],
+        "trade_rows": list(trades),
+    }
+
+
+def _oos_windows(
+    trades: Sequence[dict[str, Any]],
+    start_at: int,
+    end_at: int,
+) -> list[dict[str, Any]]:
+    start_at = int(start_at)
+    end_at = max(start_at + 3, int(end_at))
+    span = end_at - start_at
+    boundaries = [start_at + (span * index) // 3 for index in range(4)]
+    boundaries[-1] = end_at
+    windows = []
+    for index in range(3):
+        lower = boundaries[index]
+        upper = boundaries[index + 1]
+        summary = summarize_trades(
+            [item for item in trades if lower <= item["opened_at"] < upper]
+        )
+        windows.append(
+            {
+                "window": index + 1,
+                "start_at": lower,
+                "end_at": upper,
+                "start_local": _iso(lower),
+                "end_local": _iso(upper),
+                **summary,
+            }
+        )
+    return windows
+
+
+def _oos_bounds(
+    observations: Sequence[ObservationSignal],
+    snapshots: Sequence[dict[str, Any]],
+) -> tuple[int, int]:
+    if snapshots:
+        start_at = snapshots[0]["effective_from"]
+        observed_end = max((item.opened_at for item in observations), default=start_at) + 1
+        return start_at, max(start_at + 3, min(snapshots[-1]["effective_until"], observed_end))
+    if observations:
+        start_at = min(item.opened_at for item in observations)
+        return start_at, max(start_at + 3, max(item.opened_at for item in observations) + 1)
+    return 0, 3
 
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +2031,7 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "effective_from": snapshot["effective_from"],
         "effective_until": snapshot["effective_until"],
         "effective_from_local": _iso(snapshot["effective_from"]),
+        "sample_keys": list(snapshot.get("sample_keys") or []),
         "selected_count": snapshot["selected_count"],
         "selected_profiles": [
             {
@@ -258,6 +2046,7 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                     "win_rate",
                     "pnl",
                     "ev",
+                    "qualification_state",
                     "selection_state",
                 )
             }
@@ -286,11 +2075,16 @@ def _schedule_stats(schedule: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _group_summaries(trades: Sequence[dict[str, Any]], field: str) -> list[dict[str, Any]]:
+def _group_summaries(
+    trades: Sequence[dict[str, Any]],
+    field: str,
+) -> list[dict[str, Any]]:
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in trades:
         key = (
-            datetime.fromtimestamp(item["opened_at"] / 1000, tz=SHANGHAI).strftime("%Y-%m-%d")
+            datetime.fromtimestamp(item["settled_at"] / 1000, tz=SHANGHAI).strftime(
+                "%Y-%m-%d"
+            )
             if field == "day"
             else str(item[field])
         )
@@ -299,59 +2093,52 @@ def _group_summaries(trades: Sequence[dict[str, Any]], field: str) -> list[dict[
     return sorted(rows, key=lambda item: item[field])
 
 
-def _has_three_segment_losses(
-    trades: Sequence[dict[str, Any]],
-    candidate: ObservationSignal,
-    opened_at: int,
-) -> bool:
-    day = opened_at // DAY_MS
-    matching = [
-        item
-        for item in trades
-        if item["settled_at"] is not None
-        and item["settled_at"] <= opened_at
-        and item["settled_at"] // DAY_MS == day
-        and item["threshold_segment"] == candidate.threshold_segment
-    ]
-    consecutive = 0
-    for item in sorted(matching, key=lambda row: row["settled_at"], reverse=True):
-        if item["result"] != "LOSS":
-            break
-        consecutive += 1
-    return consecutive >= 3
-
-
 def _count_leakage_violations(
     observations: Sequence[ObservationSignal],
     snapshots: Sequence[dict[str, Any]],
+    *,
+    workload: dict[str, int] | None = None,
 ) -> int:
+    by_key: dict[str, list[ObservationSignal]] = defaultdict(list)
+    for item in observations:
+        by_key[item.observation_key].append(item)
     violations = 0
+    checked_keys = 0
     for snapshot in snapshots:
-        for selected in snapshot.get("selected_profiles") or []:
-            rows = [
-                item
-                for item in observations
-                if _observation_profile_key(item) == selected["key"]
-                and snapshot["lookback_start"] <= item.opened_at < snapshot["lookback_end"]
-                and item.settled_at is not None
-                and item.settled_at < snapshot["lookback_end"]
-            ]
-            samples = []
-            next_independent_at = 0
-            for item in sorted(rows, key=lambda row: (row.opened_at, row.observation_key)):
-                if item.opened_at < next_independent_at:
-                    continue
-                samples.append(item)
-                next_independent_at = item.expires_at
-            wins = sum(1 for item in samples if item.result == "WIN")
-            pnl = round(sum(float(item.pnl) for item in samples), 4)
-            if (
-                len(samples) != selected["sample_size"]
-                or wins != selected["wins"]
-                or pnl != selected["pnl"]
-            ):
-                violations += 1
+        sample_keys = set(snapshot.get("sample_keys") or [])
+        checked_keys += len(sample_keys)
+        if any(
+            item.settled_at is None or item.settled_at >= snapshot["lookback_end"]
+            for key in sample_keys
+            for item in by_key.get(key, ())
+        ):
+            violations += 1
+    if workload is not None:
+        workload["leakage_sample_keys_checked"] = checked_keys
     return violations
+
+
+def _data_summary(
+    observations: Sequence[ObservationSignal],
+    snapshots: Sequence[dict[str, Any]],
+    require_full_lookback: bool,
+) -> dict[str, Any]:
+    if not observations:
+        return {
+            "settled_observations": 0,
+            "require_full_lookback": require_full_lookback,
+            "out_of_sample_from": None,
+            "out_of_sample_until": None,
+        }
+    oos_start, oos_end = _oos_bounds(observations, snapshots)
+    return {
+        "settled_observations": len(observations),
+        "first_observation": _iso(min(item.opened_at for item in observations)),
+        "last_observation": _iso(max(item.opened_at for item in observations)),
+        "require_full_lookback": require_full_lookback,
+        "out_of_sample_from": _iso(oos_start) if snapshots else None,
+        "out_of_sample_until": _iso(oos_end) if snapshots else None,
+    }
 
 
 def _observation_profile_key(item: ObservationSignal) -> str:
@@ -364,82 +2151,259 @@ def _observation_profile_key(item: ObservationSignal) -> str:
     )
 
 
-def _wilson_interval(wins: int, count: int, z: float = 1.959963984540054) -> tuple[float, float]:
+def _is_adaptive_profile_key(value: str) -> bool:
+    parts = value.split("|")
+    if len(parts) != 5 or parts[0] != "10" or parts[3] not in {"LONG", "SHORT"}:
+        return False
+    segment = parts[4]
+    if len(segment) != 5 or segment[:3] not in {"WD-", "WE-"}:
+        return False
+    try:
+        return 0 <= int(segment[3:]) <= 23
+    except ValueError:
+        return False
+
+
+def _empty_sample_summary() -> dict[str, Any]:
+    return {
+        "sample_size": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "pnl": 0.0,
+        "ev": 0.0,
+    }
+
+
+def _settlement_event_key(item: ObservationSignal) -> tuple:
+    return (
+        int(item.settled_at or 0),
+        int(item.opened_at),
+        str(item.observation_key),
+        str(item.decision_id),
+        int(item.expires_at),
+        str(item.result),
+        float(item.pnl).hex(),
+    )
+
+
+def _trade_settlement_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
+    return (
+        int(item.get("settled_at") or 0),
+        int(item.get("opened_at") or 0),
+        str(item.get("observation_key") or ""),
+        int(item.get("order_id") or 0),
+    )
+
+
+def _retention(candidate_count: int, baseline_count: int) -> float:
+    if int(baseline_count) <= 0:
+        return 1.0 if int(candidate_count) <= 0 else 1.0
+    return int(candidate_count) / int(baseline_count)
+
+
+def _wilson_interval(
+    wins: int,
+    count: int,
+    z: float = 1.959963984540054,
+) -> tuple[float, float]:
     if count <= 0:
         return 0.0, 0.0
     ratio = wins / count
     denominator = 1.0 + z * z / count
     center = (ratio + z * z / (2 * count)) / denominator
-    margin = z * math.sqrt(ratio * (1 - ratio) / count + z * z / (4 * count * count)) / denominator
+    margin = (
+        z
+        * math.sqrt(ratio * (1 - ratio) / count + z * z / (4 * count * count))
+        / denominator
+    )
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
 def _iso(timestamp_ms: int | None) -> str | None:
     if timestamp_ms is None:
         return None
-    return datetime.fromtimestamp(timestamp_ms / 1000, tz=SHANGHAI).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=SHANGHAI).isoformat(
+        timespec="seconds"
+    )
 
 
-def _empty_replay(
-    config: DailyProfileSelectorConfig,
-    *,
-    max_open_orders: int,
-    min_order_gap_ms: int,
-) -> dict[str, Any]:
+def _config_snapshot(config: DailyProfileSelectorConfig) -> dict[str, Any]:
+    normalized = config.normalized()
     return {
-        "config": config.normalized().__dict__,
-        "execution": {
-            "max_open_orders": max(1, int(max_open_orders)),
-            "min_order_gap_ms": max(0, int(min_order_gap_ms)),
-        },
-        "data": {"settled_observations": 0},
-        "schedule": [],
-        "schedule_stats": _schedule_stats([]),
-        "eligible_events": 0,
-        "rejections": {},
-        "trades": summarize_trades([]),
-        "by_direction": [],
-        "by_profile": [],
-        "by_day": [],
-        "trade_rows": [],
-        "leakage_violations": 0,
+        **normalized.__dict__,
+        "effective_stable_lookback_days": normalized.effective_stable_lookback_days,
+        "stable_lookback_source": normalized.stable_lookback_source,
+        "effective_joint_failures_to_exit": normalized.joint_failures_to_exit,
     }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="严格走前回放每日观察画像选择器")
+def _split_csv(value: str) -> tuple[str, ...]:
+    return tuple(item.strip().upper() for item in str(value).split(",") if item.strip())
+
+
+def _finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
+    return parsed
+
+
+def _unit_interval_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="严格因果回放每日与自适应观察画像")
     parser.add_argument("--db-path", type=Path, required=True)
     parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--lookback-days", type=int, default=7, help="快速画像回看天数，默认: 7")
+    parser.add_argument(
+        "--stable-lookback-days",
+        type=int,
+        help="稳定画像回看天数；未指定时取 14 与快速窗口天数的较大值",
+    )
     parser.add_argument("--min-samples", type=int, default=20)
-    parser.add_argument("--min-win-rate", type=float, default=0.60)
-    parser.add_argument("--min-ev", type=float, default=0.0)
-    parser.add_argument("--max-open-orders", type=int, default=5)
-    parser.add_argument("--min-order-gap-minutes", type=float, default=2.0)
+    parser.add_argument("--min-win-rate", type=_unit_interval_float, default=0.60)
+    parser.add_argument("--min-ev", type=_finite_float, default=0.0)
+    parser.add_argument(
+        "--degraded-runs-to-exit",
+        type=int,
+        default=2,
+        help="兼容连续退化退出次数，默认: 2",
+    )
+    parser.add_argument(
+        "--joint-failures-to-exit",
+        type=int,
+        help="双窗口同时失败退出次数；未指定时沿用兼容连续退化次数",
+    )
+    parser.add_argument("--max-open-orders", type=int, required=True, help="生产全局并发上限")
+    parser.add_argument(
+        "--max-open-long-orders",
+        type=int,
+        required=True,
+        help="生产 LONG 方向并发上限",
+    )
+    parser.add_argument(
+        "--max-open-short-orders",
+        type=int,
+        required=True,
+        help="生产 SHORT 方向并发上限",
+    )
+    parser.add_argument(
+        "--min-order-gap-minutes",
+        type=_finite_float,
+        required=True,
+        help="生产同方向冷却/最小开单间隔（分钟）",
+    )
+    parser.add_argument("--stake", type=_finite_float, required=True, help="生产基础 stake")
+    parser.add_argument("--win-return", type=_finite_float, required=True, help="生产基础赢单返还")
+    progression = parser.add_mutually_exclusive_group(required=True)
+    progression.add_argument(
+        "--stake-progression",
+        dest="stake_progression_enabled",
+        action="store_true",
+        help="显式启用生产两阶段金额叠加",
+    )
+    progression.add_argument(
+        "--no-stake-progression",
+        dest="stake_progression_enabled",
+        action="store_false",
+        help="显式关闭生产两阶段金额叠加",
+    )
+    parser.add_argument(
+        "--stake-progression-max-orders",
+        type=int,
+        required=True,
+        help="生产金额叠加级数；TWO_STAGE_V1 必须为 2",
+    )
+    parser.add_argument(
+        "--stake-progression-max-active",
+        type=int,
+        required=True,
+        help="生产并行第二级订单上限",
+    )
+    parser.add_argument(
+        "--stake-progression-second-stake",
+        type=_finite_float,
+        required=True,
+        help="生产第二级 stake；必须与 --win-return 相等",
+    )
+    parser.add_argument(
+        "--stake-progression-base-only-segments",
+        required=True,
+        help="当前生产兼容参数不生效；回放只接受显式空字符串",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--allow-partial-lookback", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
-    config = DailyProfileSelectorConfig(
-        min_samples=args.min_samples,
-        min_win_rate=args.min_win_rate,
-        min_ev=args.min_ev,
-        exit_win_rate=args.min_win_rate,
-        exit_ev=args.min_ev,
-        degraded_runs_to_exit=1,
-        max_active_profiles=0,
-    )
+    try:
+        config = DailyProfileSelectorConfig(
+            lookback_days=args.lookback_days,
+            stable_lookback_days=args.stable_lookback_days,
+            min_samples=args.min_samples,
+            min_win_rate=args.min_win_rate,
+            min_ev=args.min_ev,
+            exit_win_rate=args.min_win_rate,
+            exit_ev=args.min_ev,
+            degraded_runs_to_exit=args.degraded_runs_to_exit,
+            joint_failures_to_exit=args.joint_failures_to_exit,
+            max_active_profiles=0,
+        ).normalized()
+        execution = ReplayExecutionConfig(
+            max_open_orders=args.max_open_orders,
+            max_open_long_orders=args.max_open_long_orders,
+            max_open_short_orders=args.max_open_short_orders,
+            min_order_gap_ms=round(args.min_order_gap_minutes * 60_000),
+            stake=args.stake,
+            win_return=args.win_return,
+            stake_progression_enabled=args.stake_progression_enabled,
+            stake_progression_max_orders=args.stake_progression_max_orders,
+            stake_progression_max_active=args.stake_progression_max_active,
+            stake_progression_second_stake=args.stake_progression_second_stake,
+            stake_progression_base_only_segments=_split_csv(
+                args.stake_progression_base_only_segments
+            ),
+        ).normalized()
+    except (TypeError, ValueError, OverflowError) as error:
+        parser.error(str(error))
     result = replay_daily_profile_selection(
-        load_observations(args.db_path, args.symbol),
+        load_replay_observations(args.db_path, args.symbol),
         config,
+        execution=execution,
         require_full_lookback=not args.allow_partial_lookback,
-        max_open_orders=args.max_open_orders,
-        min_order_gap_ms=round(args.min_order_gap_minutes * 60_000),
     )
-    payload = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(payload + "\n", encoding="utf-8")
+        with args.output.open("w", encoding="utf-8") as output:
+            json.dump(
+                result,
+                output,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            output.write("\n")
     else:
-        print(payload)
+        json.dump(
+            result,
+            sys.stdout,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        sys.stdout.write("\n")
     return 0
 
 

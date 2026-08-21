@@ -60,6 +60,66 @@ class SessionEdge:
     ev: float
 
 
+def _applied_score_components(
+    branch: str,
+    direction_multiplier: float = 0.0,
+    *,
+    base_points: float = 0.0,
+    volume_points: float = 0.0,
+    move_points: float = 0.0,
+    trend_points: float = 0.0,
+    close_points: float = 0.0,
+    indicator_points: float = 0.0,
+    diagnostic_trend_score: float | None = None,
+    diagnostic_unweighted_volume_points: float | None = None,
+    diagnostic_unweighted_move_points: float | None = None,
+) -> dict[str, object]:
+    reconstructed_raw_score = direction_multiplier * (
+        base_points
+        + volume_points
+        + move_points
+        + trend_points
+        + close_points
+        + indicator_points
+    )
+    components: dict[str, object] = {
+        "branch": branch,
+        "direction_multiplier": direction_multiplier,
+        "base_points": base_points,
+        "volume_points": volume_points,
+        "move_points": move_points,
+        "trend_points": trend_points,
+        "close_points": close_points,
+        "indicator_points": indicator_points,
+        "reconstructed_raw_score": reconstructed_raw_score,
+    }
+    if diagnostic_trend_score is not None:
+        components["diagnostic_trend_score"] = diagnostic_trend_score
+    if diagnostic_unweighted_volume_points is not None:
+        components["diagnostic_unweighted_volume_points"] = diagnostic_unweighted_volume_points
+    if diagnostic_unweighted_move_points is not None:
+        components["diagnostic_unweighted_move_points"] = diagnostic_unweighted_move_points
+    return components
+
+
+def _empty_decision_inputs(branch: str) -> dict[str, object]:
+    return {
+        "indicators": {},
+        "volume_price": {},
+        "thresholds": {},
+        "score": {
+            "raw_direction": "WAIT",
+            "raw_score": 0.0,
+            "signed_score": 0.0,
+            "score_abs": 0.0,
+            "edge": 0.0,
+            "final_direction": "WAIT",
+            "actionable": False,
+            **_applied_score_components(branch),
+        },
+    }
+
+
 NORMAL_DOWN_SHORT_EXTENSION_EDGE_BY_TIMEFRAME = {
     10: {
         "WD-02": SessionEdge(27, 0.7407, 3.3333),
@@ -151,11 +211,27 @@ def analyze_volume_price(
     if timeframe_minutes not in LIVE_TRADE_TIMEFRAMES:
         raise ValueError("only 10-minute analysis is supported")
     if not klines:
-        return _signal("WAIT", timeframe_minutes, "B", "暂无K线数据", 0.0, 0)
+        return _signal(
+            "WAIT",
+            timeframe_minutes,
+            "B",
+            "暂无K线数据",
+            0.0,
+            0,
+            decision_inputs=_empty_decision_inputs("no_klines_wait"),
+        )
 
     if len(klines) < timeframe_minutes * 3:
         latest = klines[-1]
-        return _signal("WAIT", timeframe_minutes, "B", "历史K线不足，等待累计样本", latest.close, latest.open_time)
+        return _signal(
+            "WAIT",
+            timeframe_minutes,
+            "B",
+            "历史K线不足，等待累计样本",
+            latest.close,
+            latest.open_time,
+            decision_inputs=_empty_decision_inputs("insufficient_history_wait"),
+        )
 
     latest = klines[-1]
     recent_size = timeframe_minutes
@@ -163,9 +239,14 @@ def analyze_volume_price(
     history = list(klines[:-recent_size]) or list(klines[:-1])
     threshold_segment = _threshold_segment(latest.close_time)
 
-    volume_ratio, volume_threshold, low_volume_threshold, volume_noise = _volume_context(
-        history, recent, recent_size, threshold_segment
-    )
+    (
+        volume_ratio,
+        volume_threshold,
+        low_volume_threshold,
+        volume_noise,
+        current_volume,
+        volume_baseline,
+    ) = _volume_context(history, recent, recent_size, threshold_segment)
     price_position = _price_position(history, latest.close)
     price_change_pct = _window_change(recent)
     window_returns = _window_returns(history[-DYNAMIC_PROFILE_LOOKBACK_MINUTES:], recent_size, threshold_segment)
@@ -197,12 +278,17 @@ def analyze_volume_price(
     )
     regime = _regime_label(fear_greed, technical, mtf_30m_bias)
     candle_strength = _candle_close_strength(latest)
-    has_upper_rejection = candle_strength <= 0.35 and (latest.high - latest.close) > (latest.close - latest.low) * 1.2
-    has_lower_reclaim = candle_strength >= 0.65 and (latest.close - latest.low) > (latest.high - latest.close) * 1.2
+    candle_range = latest.high - latest.low
+    upper_wick = latest.high - latest.close
+    lower_wick = latest.close - latest.low
+    upper_wick_ratio = upper_wick / candle_range if candle_range > 0.0 else 0.0
+    lower_wick_ratio = lower_wick / candle_range if candle_range > 0.0 else 0.0
+    has_upper_rejection = candle_strength <= 0.35 and upper_wick > lower_wick * 1.2
+    has_lower_reclaim = candle_strength >= 0.65 and lower_wick > upper_wick * 1.2
     trend_score = _trend_consistency(recent)
     base_threshold = _dynamic_trade_threshold(window_returns, volume_noise)
 
-    raw_direction, score, reason = _score_setup(
+    raw_direction, raw_score, reason, score_components = _score_setup(
         position=position,
         volume_state=volume_state,
         direction=direction,
@@ -223,18 +309,26 @@ def analyze_volume_price(
         fear_greed_value=fear_greed.value if fear_greed else None,
     )
 
-    score = _clamp(score, -100.0, 100.0)
+    score = _clamp(raw_score, -100.0, 100.0)
     session_edge = _session_edge(timeframe_minutes, threshold_segment, raw_direction)
     trend_broad_short = _is_trend_broad_short_reason(reason)
-    threshold = _dynamic_direction_threshold(base_threshold, raw_direction)
-    threshold = _session_adjusted_threshold(
-        threshold,
+    direction_threshold = _dynamic_direction_threshold(base_threshold, raw_direction)
+    session_adjusted_threshold = _session_adjusted_threshold(
+        direction_threshold,
         session_edge,
         allow_unprofiled=trend_broad_short,
     )
     fear_greed_adjustment = _fear_greed_threshold_adjustment(raw_direction, fear_greed)
     regime_adjustment = _regime_threshold_adjustment(raw_direction, regime, technical)
-    threshold = round(_clamp(threshold + fear_greed_adjustment + regime_adjustment, 58.0, 95.0), 1)
+    threshold = round(
+        _clamp(
+            session_adjusted_threshold + fear_greed_adjustment + regime_adjustment,
+            58.0,
+            95.0,
+        ),
+        1,
+    )
+    pre_override_threshold = threshold
     session_edge_min = _session_min_edge(
         session_edge,
         raw_direction,
@@ -260,6 +354,7 @@ def analyze_volume_price(
         edge = score_abs - threshold
         session_allowed = True
         reason = f"{reason}；{normal_down_short_override_reason}"
+    normal_down_short_threshold_adjustment = threshold - pre_override_threshold
     max_trade_edge = max_trade_edge_for(timeframe_minutes, threshold_segment, raw_direction)
     long_rebound_guard_reason = _long_rebound_guard_reason(
         raw_direction,
@@ -309,6 +404,84 @@ def analyze_volume_price(
     session_sample_size = session_edge.sample_size if session_edge else 0
     session_win_rate = session_edge.win_rate if session_edge else 0.0
     session_ev = session_edge.ev if session_edge else 0.0
+    decision_inputs = {
+        "indicators": {
+            "macd_line": technical.macd_line,
+            "macd_signal_line": technical.macd_signal_line,
+            "macd_histogram": technical.macd_histogram,
+            "macd_histogram_delta": technical.macd_histogram_delta,
+            "atr": technical.atr,
+            "macd_histogram_atr": technical.macd_histogram_atr,
+            "macd_delta_atr": technical.macd_delta_atr,
+            "rsi": technical.rsi,
+            "bollinger_position": technical.bollinger_position,
+            "bollinger_width": technical.bollinger_width,
+            "mtf_10m_bias": mtf_10m_bias,
+            "mtf_30m_bias": mtf_30m_bias,
+            "indicator_profile_segment": indicator_profile.segment,
+            "indicator_profile_sample_size": indicator_profile.sample_size,
+            "rsi_lower_threshold": indicator_profile.rsi_lower,
+            "rsi_upper_threshold": indicator_profile.rsi_upper,
+            "bollinger_lower_threshold": indicator_profile.bollinger_lower,
+            "bollinger_upper_threshold": indicator_profile.bollinger_upper,
+            "macd_histogram_threshold": indicator_profile.macd_histogram_threshold,
+            "macd_delta_threshold": indicator_profile.macd_delta_threshold,
+        },
+        "volume_price": {
+            "current_volume": current_volume,
+            "volume_baseline": volume_baseline,
+            "volume_ratio": volume_ratio,
+            "high_volume_threshold": volume_threshold,
+            "low_volume_threshold": low_volume_threshold,
+            "volume_noise": volume_noise,
+            "volume_state": volume_state,
+            "price_change_pct": price_change_pct,
+            "move_threshold_pct": move_threshold_pct,
+            "price_direction": direction,
+            "price_position": price_position,
+            "position": position,
+            "close_strength": close_strength,
+            "candle_strength": candle_strength,
+            "upper_wick_ratio": upper_wick_ratio,
+            "lower_wick_ratio": lower_wick_ratio,
+            "has_upper_rejection": has_upper_rejection,
+            "has_lower_reclaim": has_lower_reclaim,
+        },
+        "thresholds": {
+            "window_return_sample_size": len(window_returns),
+            "volume_noise": volume_noise,
+            "move_threshold_pct": move_threshold_pct,
+            "base_threshold": base_threshold,
+            "direction_threshold": direction_threshold,
+            "session_adjusted_threshold": session_adjusted_threshold,
+            "session_threshold_adjustment": session_adjusted_threshold - direction_threshold,
+            "fear_greed_adjustment": fear_greed_adjustment,
+            "regime_adjustment": regime_adjustment,
+            "pre_override_threshold": pre_override_threshold,
+            "normal_down_short_override_applied": normal_down_short_override_reason is not None,
+            "normal_down_short_threshold_adjustment": normal_down_short_threshold_adjustment,
+            "calculated_threshold": threshold,
+            "session_edge_min": session_edge_min,
+            "max_trade_edge": max_trade_edge,
+            "session_sample_size": session_sample_size,
+            "session_win_rate": session_win_rate,
+            "session_ev": session_ev,
+            "fear_greed_value": fear_greed.value if fear_greed else None,
+            "fear_greed_average_30d": fear_greed.average_30d if fear_greed else 0.0,
+            "fear_greed_trend": fear_greed.trend if fear_greed else "",
+            "regime": regime,
+        },
+        "score": {
+            "raw_direction": raw_direction,
+            "raw_score": raw_score,
+            "signed_score": score,
+            "score_abs": score_abs,
+            "edge": edge,
+            "final_direction": final_direction,
+            "actionable": actionable,
+            **score_components,
+        },
+    }
 
     return _signal(
         final_direction,
@@ -372,6 +545,7 @@ def analyze_volume_price(
         observe_direction,
         observe_only,
         _profile_key(strategy_family, observe_direction or final_direction or raw_direction, threshold_segment),
+        decision_inputs=decision_inputs,
     )
 
 
@@ -400,15 +574,49 @@ def _score_setup(
     timeframe_minutes: int,
     regime: str,
     fear_greed_value: int | None,
-) -> tuple[str, float, str]:
+) -> tuple[str, float, str, dict[str, object]]:
     if volume_state == "LOW":
         if position == "LOW" and direction == "DOWN":
-            return "WAIT", 0.0, "低位缩量下跌：买盘未明显承接，等待"
-        return "WAIT", 0.0, f"{_cn_position(position)}缩量{_cn_direction(direction)}：量能不足，等待"
+            return (
+                "WAIT",
+                0.0,
+                "低位缩量下跌：买盘未明显承接，等待",
+                _applied_score_components("low_volume_low_position_down_wait"),
+            )
+        return (
+            "WAIT",
+            0.0,
+            f"{_cn_position(position)}缩量{_cn_direction(direction)}：量能不足，等待",
+            _applied_score_components("low_volume_wait"),
+        )
 
     volume_points = _volume_points(volume_ratio, volume_threshold)
     move_points = _move_points(price_change_pct, move_threshold_pct)
-    trend_points = abs(trend_score) * 12.0
+
+    def components(
+        branch: str,
+        direction_multiplier: float = 0.0,
+        *,
+        base_points: float = 0.0,
+        applied_volume_points: float = 0.0,
+        applied_move_points: float = 0.0,
+        applied_trend_points: float = 0.0,
+        close_points: float = 0.0,
+        indicator_points: float = 0.0,
+    ) -> dict[str, object]:
+        return _applied_score_components(
+            branch,
+            direction_multiplier,
+            base_points=base_points,
+            volume_points=applied_volume_points,
+            move_points=applied_move_points,
+            trend_points=applied_trend_points,
+            close_points=close_points,
+            indicator_points=indicator_points,
+            diagnostic_trend_score=trend_score,
+            diagnostic_unweighted_volume_points=volume_points,
+            diagnostic_unweighted_move_points=move_points,
+        )
 
     short_observe = _fear_falling_trend_short_confirmed(
         timeframe_minutes,
@@ -423,27 +631,66 @@ def _score_setup(
     if position == "HIGH" and volume_state == "HIGH" and direction == "DOWN":
         confirmed, note = confirm_short_setup(technical, mtf_10m_bias, has_lower_reclaim, indicator_profile)
         if not confirmed:
-            return "WAIT", 0.0, f"高位放量下跌：SHORT确认不足（{note}），仅预警观察不开单"
+            return (
+                "WAIT",
+                0.0,
+                f"高位放量下跌：SHORT确认不足（{note}），仅预警观察不开单",
+                components("high_position_high_volume_down_unconfirmed_wait"),
+            )
         indicator_points = short_indicator_points(technical, mtf_10m_bias, mtf_30m_bias)
         close_points = (1.0 - close_strength) * 8.0
-        score = -(30.0 + volume_points + move_points + max(-trend_score, 0.0) * 10.0 + close_points + indicator_points)
-        return "SHORT", score, "高位放量下跌：MACD/RSI/BOLL确认卖压，动态评分偏空"
+        score_components = components(
+            "high_position_high_volume_down_short",
+            -1.0,
+            base_points=30.0,
+            applied_volume_points=volume_points,
+            applied_move_points=move_points,
+            applied_trend_points=max(-trend_score, 0.0) * 10.0,
+            close_points=close_points,
+            indicator_points=indicator_points,
+        )
+        score = float(score_components["reconstructed_raw_score"])
+        return (
+            "SHORT",
+            score,
+            "高位放量下跌：MACD/RSI/BOLL确认卖压，动态评分偏空",
+            score_components,
+        )
 
     if position == "HIGH" and volume_state == "HIGH" and (has_upper_rejection or direction == "FLAT"):
-        return "WAIT", 0.0, "高位放量滞涨：回测胜率不足，仅预警观察不开单"
+        return (
+            "WAIT",
+            0.0,
+            "高位放量滞涨：回测胜率不足，仅预警观察不开单",
+            components("high_position_high_volume_stall_wait"),
+        )
 
     if position == "LOW" and volume_state == "HIGH" and direction == "UP":
-        return "WAIT", 0.0, "低位放量上涨：容易把低位反弹误判为确定性机会，回测未覆盖赔率，仅预警观察不开单"
+        return (
+            "WAIT",
+            0.0,
+            "低位放量上涨：容易把低位反弹误判为确定性机会，回测未覆盖赔率，仅预警观察不开单",
+            components("low_position_high_volume_up_wait"),
+        )
 
     if position == "LOW" and volume_state == "HIGH" and direction == "DOWN" and has_lower_reclaim:
-        return "WAIT", 0.0, "低位放量承接：三个月回测未覆盖赔率，仅预警观察不开单"
+        return (
+            "WAIT",
+            0.0,
+            "低位放量承接：三个月回测未覆盖赔率，仅预警观察不开单",
+            components("low_position_high_volume_down_reclaim_wait"),
+        )
 
     if volume_state == "HIGH" and direction == "UP":
-        return "WAIT", 0.0, "量增价升：回测未达到事件合约盈亏平衡，仅观察不开单"
+        return (
+            "WAIT",
+            0.0,
+            "量增价升：回测未达到事件合约盈亏平衡，仅观察不开单",
+            components("high_volume_up_wait"),
+        )
 
     if volume_state == "HIGH" and direction == "DOWN":
         close_points = (1.0 - close_strength) * 6.0
-        score = 34.0 + volume_points + move_points + max(-trend_score, 0.0) * 10.0 + close_points
         strict_rebound_risk = _trend_strict_rebound_risk(
             timeframe_minutes,
             position,
@@ -472,24 +719,68 @@ def _score_setup(
                 "WAIT",
                 0.0,
                 "趋势过滤禁多：STRICT候选，RSI未跌透或恐慌低值下双周期反弹，禁止急跌反抽LONG，仅记录观察",
+                components("high_volume_down_strict_wait"),
             )
         if broad_rebound_risk:
+            score_components = components(
+                "high_volume_down_broad_short",
+                -1.0,
+                base_points=34.0,
+                applied_volume_points=volume_points,
+                applied_move_points=move_points,
+                applied_trend_points=max(-trend_score, 0.0) * 10.0,
+                close_points=close_points,
+            )
+            score = float(score_components["reconstructed_raw_score"])
             return (
                 "SHORT",
-                -score,
+                score,
                 "趋势候选顺势SHORT：BROAD_ONLY，双周期反弹中破位或BOLL未跌透，放弃急跌反抽LONG并顺势试空",
+                score_components,
             )
         reason = "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多"
         if short_observe:
             reason += "；SHORT观察：恐慌下行中位急跌且RSI/BOLL未过冷，仅记录不阻断"
-        return "LONG", score, reason
+        score_components = components(
+            "high_volume_down_rebound_long",
+            1.0,
+            base_points=34.0,
+            applied_volume_points=volume_points,
+            applied_move_points=move_points,
+            applied_trend_points=max(-trend_score, 0.0) * 10.0,
+            close_points=close_points,
+        )
+        score = float(score_components["reconstructed_raw_score"])
+        return (
+            "LONG",
+            score,
+            reason,
+            score_components,
+        )
 
     if volume_state == "HIGH" and direction == "FLAT" and position != "LOW":
-        return "WAIT", 0.0, "量增价平：胜率未覆盖事件合约赔率，仅预警观察不开单"
+        return (
+            "WAIT",
+            0.0,
+            "量增价平：胜率未覆盖事件合约赔率，仅预警观察不开单",
+            components("high_volume_flat_wait"),
+        )
 
     if volume_state == "NORMAL" and direction == "UP":
-        score = 20.0 + move_points * 0.8 + max(trend_score, 0.0) * 8.0
-        return "LONG", score, "量平价升：趋势延续但量能未放大"
+        score_components = components(
+            "normal_volume_up_long",
+            1.0,
+            base_points=20.0,
+            applied_move_points=move_points * 0.8,
+            applied_trend_points=max(trend_score, 0.0) * 8.0,
+        )
+        score = float(score_components["reconstructed_raw_score"])
+        return (
+            "LONG",
+            score,
+            "量平价升：趋势延续但量能未放大",
+            score_components,
+        )
 
     if volume_state == "NORMAL" and direction == "DOWN":
         confirmed, note = confirm_short_setup(
@@ -500,12 +791,35 @@ def _score_setup(
             require_bollinger_room=False,
         )
         if not confirmed:
-            return "WAIT", 0.0, f"量平价跌：SHORT确认不足（{note}），等待"
+            return (
+                "WAIT",
+                0.0,
+                f"量平价跌：SHORT确认不足（{note}），等待",
+                components("normal_volume_down_unconfirmed_wait"),
+            )
         indicator_points = short_indicator_points(technical, mtf_10m_bias, mtf_30m_bias)
-        score = -(18.0 + move_points * 0.8 + max(-trend_score, 0.0) * 8.0 + indicator_points)
-        return "SHORT", score, "量平价跌：MACD/RSI确认弱势延续，动态评分偏空"
+        score_components = components(
+            "normal_volume_down_short",
+            -1.0,
+            base_points=18.0,
+            applied_move_points=move_points * 0.8,
+            applied_trend_points=max(-trend_score, 0.0) * 8.0,
+            indicator_points=indicator_points,
+        )
+        score = float(score_components["reconstructed_raw_score"])
+        return (
+            "SHORT",
+            score,
+            "量平价跌：MACD/RSI确认弱势延续，动态评分偏空",
+            score_components,
+        )
 
-    return "WAIT", 0.0, f"{_cn_position(position)}{_cn_volume(volume_state)}{_cn_direction(direction)}：信号不足"
+    return (
+        "WAIT",
+        0.0,
+        f"{_cn_position(position)}{_cn_volume(volume_state)}{_cn_direction(direction)}：信号不足",
+        components("no_setup_wait"),
+    )
 
 
 def _fear_falling_trend_short_confirmed(
@@ -856,17 +1170,17 @@ def _dedupe_observation_signals(signals: Sequence[Signal]) -> list[Signal]:
 
 def _volume_context(
     history: Sequence[Kline], recent: Sequence[Kline], window_size: int, threshold_segment: str
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     scoped_history = history[-DYNAMIC_PROFILE_LOOKBACK_MINUTES:]
     baseline_volumes = _rolling_volume_sums(scoped_history, window_size, threshold_segment)
     if len(baseline_volumes) < 20:
         baseline_volumes = _rolling_volume_sums(scoped_history, window_size, None)
     baseline_volumes = [item for item in baseline_volumes if item > 0]
+    recent_volume = sum(item.volume for item in recent)
     if not baseline_volumes:
-        return 1.0, 1.5, 0.75, 0.0
+        return 1.0, 1.5, 0.75, 0.0, recent_volume, 0.0
 
     baseline = median(baseline_volumes)
-    recent_volume = sum(item.volume for item in recent)
     volume_ratio = recent_volume / baseline if baseline > 0 else 1.0
     q75 = _percentile(baseline_volumes, 75)
     q25 = _percentile(baseline_volumes, 25)
@@ -874,7 +1188,7 @@ def _volume_context(
     noise = mad / baseline if baseline > 0 else 0.0
     high_threshold = _clamp(q75 / baseline + 0.2 + noise * 0.35, 1.25, 2.4) if baseline > 0 else 1.5
     low_threshold = _clamp(q25 / baseline - 0.1, 0.45, 0.8) if baseline > 0 else 0.75
-    return volume_ratio, high_threshold, low_threshold, noise
+    return volume_ratio, high_threshold, low_threshold, noise, recent_volume, baseline
 
 
 def _window_returns(klines: Sequence[Kline], window_size: int, threshold_segment: str | None = None) -> list[float]:
@@ -1307,6 +1621,7 @@ def _signal(
     observe_direction: str = "",
     observe_only: bool = False,
     profile_key: str = "",
+    decision_inputs: dict[str, object] | None = None,
 ) -> Signal:
     return Signal(
         direction=direction,
@@ -1359,6 +1674,7 @@ def _signal(
         observe_direction=observe_direction,
         observe_only=observe_only,
         profile_key=profile_key,
+        decision_inputs=decision_inputs if decision_inputs is not None else {},
     )
 
 

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+STRATEGY_BUILD_ID="${STRATEGY_BUILD_ID-}"
 HOST="${HOST:-127.0.0.1}"
 SYMBOL="${SYMBOL:-BTCUSDT}"
 PORT="${PORT:-8000}"
@@ -12,6 +13,10 @@ POLL_SECONDS="${POLL_SECONDS:-10}"
 KLINE_LIMIT="${KLINE_LIMIT:-300}"
 DATA_DIR="${DATA_DIR:-$ROOT_DIR/data}"
 DB_PATH="${DB_PATH:-$ROOT_DIR/data/monitor.sqlite3}"
+SHADOW_OPTIMIZER="${SHADOW_OPTIMIZER:-0}"
+SHADOW_DB_PATH="${SHADOW_DB_PATH:-$ROOT_DIR/data/monitor.shadow.sqlite3}"
+SHADOW_QUEUE_SIZE="${SHADOW_QUEUE_SIZE:-120}"
+SHADOW_MAX_CHALLENGERS="${SHADOW_MAX_CHALLENGERS:-7}"
 WEBHOOK_URL="${WEBHOOK_URL:-https://event.easy-tx.com/api/signals/ingest}"
 WEBHOOK_TOKEN="${WEBHOOK_TOKEN:-}"
 WEBHOOK_TIMEOUT="${WEBHOOK_TIMEOUT:-5}"
@@ -46,15 +51,30 @@ OBSERVATION_PROFILE_MIN_WIN_RATE="${OBSERVATION_PROFILE_MIN_WIN_RATE:-0.72}"
 OBSERVATION_PROFILE_MIN_EV="${OBSERVATION_PROFILE_MIN_EV:-4}"
 OBSERVATION_PROFILE_MIN_EDGE="${OBSERVATION_PROFILE_MIN_EDGE:-10}"
 LIVE_SHORT_SEGMENTS="${LIVE_SHORT_SEGMENTS:-WD-02,WD-23}"
+PROFILE_ADMISSION_ENABLE="${PROFILE_ADMISSION_ENABLE:-0}"
+if [ "${PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS+x}" = "x" ]; then
+  echo "PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS 已废弃；请分别配置 LONG/SHORT N12 上限" >&2
+  exit 2
+fi
+PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS="${PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS:-7}"
+PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS="${PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS:-9}"
+PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR="${PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR:-off}"
+PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR="${PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR:-0.625}"
+PROFILE_ADMISSION_FAST_DIRECTIONS="${PROFILE_ADMISSION_FAST_DIRECTIONS:-SHORT}"
+PROFILE_ADMISSION_FAST_N12_MIN_WINS="${PROFILE_ADMISSION_FAST_N12_MIN_WINS:-7}"
+PROFILE_ADMISSION_FAST_N12_MAX_WINS="${PROFILE_ADMISSION_FAST_N12_MAX_WINS:-8}"
+PROFILE_ADMISSION_FAST_N20_EV_MIN="${PROFILE_ADMISSION_FAST_N20_EV_MIN:-0}"
 DAILY_PROFILE_SELECTOR="${DAILY_PROFILE_SELECTOR:-1}"
 DAILY_PROFILE_LOOKBACK_DAYS="${DAILY_PROFILE_LOOKBACK_DAYS:-7}"
+DAILY_PROFILE_STABLE_LOOKBACK_DAYS="${DAILY_PROFILE_STABLE_LOOKBACK_DAYS-}"
 DAILY_PROFILE_MIN_SAMPLES="${DAILY_PROFILE_MIN_SAMPLES:-20}"
 DAILY_PROFILE_WEEKEND_MIN_SAMPLES="${DAILY_PROFILE_WEEKEND_MIN_SAMPLES:-10}"
 DAILY_PROFILE_MIN_WIN_RATE="${DAILY_PROFILE_MIN_WIN_RATE:-0.60}"
 DAILY_PROFILE_MIN_EV="${DAILY_PROFILE_MIN_EV:-0}"
 DAILY_PROFILE_EXIT_WIN_RATE="${DAILY_PROFILE_EXIT_WIN_RATE:-0.60}"
 DAILY_PROFILE_EXIT_EV="${DAILY_PROFILE_EXIT_EV:-0}"
-DAILY_PROFILE_DEGRADED_RUNS="${DAILY_PROFILE_DEGRADED_RUNS:-1}"
+DAILY_PROFILE_DEGRADED_RUNS="${DAILY_PROFILE_DEGRADED_RUNS:-2}"
+DAILY_PROFILE_JOINT_FAILURES_TO_EXIT="${DAILY_PROFILE_JOINT_FAILURES_TO_EXIT-}"
 DAILY_PROFILE_MAX_ACTIVE="${DAILY_PROFILE_MAX_ACTIVE:-0}"
 DAILY_PROFILE_EVALUATION_TIME="${DAILY_PROFILE_EVALUATION_TIME:-07:50}"
 DAILY_PROFILE_ACTIVATION_TIME="${DAILY_PROFILE_ACTIVATION_TIME:-08:00}"
@@ -66,19 +86,27 @@ WARMUP_CURRENT_MONTH_DAILY="${WARMUP_CURRENT_MONTH_DAILY:-1}"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run.sh [SYMBOL] [PORT]
-       scripts/run.sh [options]
+用法: scripts/run.sh [SYMBOL] [PORT]
+      scripts/run.sh [参数]
 
 启动币安事件合约量价监控程序。
 
 参数:
   --symbol SYMBOL        交易对，默认: BTCUSDT
+  --strategy-build-id ID 策略构建标识；未指定时由程序按策略源码生成
   --host HOST            监听地址，默认: 127.0.0.1
   --port PORT            页面端口，默认: 8000
   --poll-seconds N       币安轮询间隔秒数，默认: 10
   --limit N              每次拉取的 1分钟K线数量，默认: 300
   --data-dir DIR         本地 Binance Vision 缓存目录，默认: ./data
   --db-path PATH         SQLite 持久化路径，默认: ./data/monitor.sqlite3
+  --enable-shadow-optimizer
+                         启用独立进程持续影子参数优化，默认关闭
+  --no-shadow-optimizer  关闭持续影子参数优化
+  --shadow-db-path PATH  影子参数独立SQLite路径，默认: ./data/monitor.shadow.sqlite3
+  --shadow-queue-size N  影子分钟事件有界队列长度，默认: 120
+  --shadow-max-challengers N
+                         并行影子候选数量，范围1到7，默认: 7
   --webhook-url URL      外部信号 webhook 地址，默认: event.easy-tx 导入接口
   --webhook-token TOKEN  外部信号 importToken
   --webhook-timeout N    Webhook 超时秒数，默认: 5
@@ -137,10 +165,31 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
                          观察画像动态放行最低评分边际，默认: 10
   --live-short-segments LIST
                          允许实际开 SHORT 的时段，逗号分隔，默认: WD-02,WD-23
+  --enable-profile-admission
+                         显式启用冻结画像准入候选；默认关闭并使用兼容基准
+                         前向稳定性尚未证明，release_allowed 固定为 false
+  --profile-admission-resident-long-n12-max-wins N
+                         LONG 常驻画像 N12 最大胜数，候选默认: 7
+  --profile-admission-resident-short-n12-max-wins N
+                         SHORT 常驻画像 N12 最大胜数，候选默认: 9
+  --profile-admission-resident-long-win-rate-floor N|off
+                         LONG 常驻画像当日胜率下限，候选默认: off
+  --profile-admission-resident-short-win-rate-floor N|off
+                         SHORT 常驻画像当日胜率下限，候选默认: 0.625
+  --profile-admission-fast-directions LIST
+                         快速通道允许方向，逗号分隔，候选默认: SHORT
+  --profile-admission-fast-n12-min-wins N
+                         快速通道 N12 最小胜数，候选默认: 7
+  --profile-admission-fast-n12-max-wins N
+                         快速通道 N12 最大胜数，候选默认: 8
+  --profile-admission-fast-n20-ev-min N
+                         快速通道 N20 最低 EV，候选默认: 0
   --no-daily-profile-selector
                          关闭每日观察画像策略选择器，回退到静态主策略
   --daily-profile-lookback-days N
                          每日画像统计回看天数，默认: 7
+  --daily-profile-stable-lookback-days N
+                         稳定窗口天数，未指定时取 14 与快速窗口天数的较大值
   --daily-profile-min-samples N
                          工作日新画像入选所需最小独立样本数，默认: 20
   --daily-profile-weekend-min-samples N
@@ -154,7 +203,9 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   --daily-profile-exit-ev N
                          已启用画像退化EV线，默认: 0U
   --daily-profile-degraded-runs N
-                         连续退化多少次后退出，默认: 1
+                         兼容连续退化次数，默认: 2
+  --daily-profile-joint-failures-to-exit N
+                         双窗口同时失败多少次后退出，未指定时沿用连续退化次数
   --daily-profile-max-active N
                          每天最多启用画像数量，0 表示不限制，默认: 0
   --daily-profile-evaluation-time HH:MM
@@ -171,7 +222,8 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   -h, --help             显示帮助并退出
 
 环境变量覆盖:
-  SYMBOL, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
+  SYMBOL, STRATEGY_BUILD_ID, HOST, PORT, POLL_SECONDS, KLINE_LIMIT, DATA_DIR, DB_PATH,
+  SHADOW_OPTIMIZER, SHADOW_DB_PATH, SHADOW_QUEUE_SIZE, SHADOW_MAX_CHALLENGERS,
   WEBHOOK_URL, WEBHOOK_TOKEN, WEBHOOK_TIMEOUT,
   WARMUP_MONTHS, WARMUP_TIMEOUT, STAKE, TRADE_SCORE_THRESHOLD, WIN_RETURN,
   MAX_OPEN_ORDERS, MAX_OPEN_LONG_ORDERS, MAX_OPEN_SHORT_ORDERS,
@@ -186,11 +238,20 @@ Usage: scripts/run.sh [SYMBOL] [PORT]
   OBSERVATION_PROFILE_PROMOTION, OBSERVATION_PROFILE_LOOKBACK_DAYS,
   OBSERVATION_PROFILE_MIN_SAMPLES, OBSERVATION_PROFILE_MIN_WIN_RATE,
   OBSERVATION_PROFILE_MIN_EV, OBSERVATION_PROFILE_MIN_EDGE, LIVE_SHORT_SEGMENTS,
+  PROFILE_ADMISSION_ENABLE,
+  PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS,
+  PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS,
+  PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR,
+  PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR,
+  PROFILE_ADMISSION_FAST_DIRECTIONS, PROFILE_ADMISSION_FAST_N12_MIN_WINS,
+  PROFILE_ADMISSION_FAST_N12_MAX_WINS, PROFILE_ADMISSION_FAST_N20_EV_MIN,
   DAILY_PROFILE_SELECTOR, DAILY_PROFILE_LOOKBACK_DAYS,
+  DAILY_PROFILE_STABLE_LOOKBACK_DAYS,
   DAILY_PROFILE_MIN_SAMPLES, DAILY_PROFILE_WEEKEND_MIN_SAMPLES,
   DAILY_PROFILE_MIN_WIN_RATE, DAILY_PROFILE_MIN_EV,
   DAILY_PROFILE_EXIT_WIN_RATE, DAILY_PROFILE_EXIT_EV,
-  DAILY_PROFILE_DEGRADED_RUNS, DAILY_PROFILE_MAX_ACTIVE,
+  DAILY_PROFILE_DEGRADED_RUNS, DAILY_PROFILE_JOINT_FAILURES_TO_EXIT,
+  DAILY_PROFILE_MAX_ACTIVE,
   DAILY_PROFILE_EVALUATION_TIME, DAILY_PROFILE_ACTIVATION_TIME,
   NO_WARMUP, NO_PERSISTENCE, NO_WEBHOOK, NO_WEBSOCKET,
   WARMUP_CURRENT_MONTH_DAILY, PYTHON_BIN
@@ -220,6 +281,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --symbol=*)
       SYMBOL="${1#*=}"
+      shift
+      ;;
+    --strategy-build-id)
+      require_value "$1" "${2:-}"
+      STRATEGY_BUILD_ID="$2"
+      shift 2
+      ;;
+    --strategy-build-id=*)
+      STRATEGY_BUILD_ID="${1#*=}"
       shift
       ;;
     --host)
@@ -274,6 +344,41 @@ while [ "$#" -gt 0 ]; do
       ;;
     --db-path=*)
       DB_PATH="${1#*=}"
+      shift
+      ;;
+    --enable-shadow-optimizer)
+      SHADOW_OPTIMIZER="1"
+      shift
+      ;;
+    --no-shadow-optimizer)
+      SHADOW_OPTIMIZER="0"
+      shift
+      ;;
+    --shadow-db-path)
+      require_value "$1" "${2:-}"
+      SHADOW_DB_PATH="$2"
+      shift 2
+      ;;
+    --shadow-db-path=*)
+      SHADOW_DB_PATH="${1#*=}"
+      shift
+      ;;
+    --shadow-queue-size)
+      require_value "$1" "${2:-}"
+      SHADOW_QUEUE_SIZE="$2"
+      shift 2
+      ;;
+    --shadow-queue-size=*)
+      SHADOW_QUEUE_SIZE="${1#*=}"
+      shift
+      ;;
+    --shadow-max-challengers)
+      require_value "$1" "${2:-}"
+      SHADOW_MAX_CHALLENGERS="$2"
+      shift 2
+      ;;
+    --shadow-max-challengers=*)
+      SHADOW_MAX_CHALLENGERS="${1#*=}"
       shift
       ;;
     --webhook-url)
@@ -550,6 +655,82 @@ while [ "$#" -gt 0 ]; do
       LIVE_SHORT_SEGMENTS="${1#*=}"
       shift
       ;;
+    --enable-profile-admission)
+      PROFILE_ADMISSION_ENABLE="1"
+      shift
+      ;;
+    --profile-admission-resident-long-n12-max-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-long-n12-max-wins=*)
+      PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-resident-short-n12-max-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-short-n12-max-wins=*)
+      PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-resident-long-win-rate-floor)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-long-win-rate-floor=*)
+      PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR="${1#*=}"
+      shift
+      ;;
+    --profile-admission-resident-short-win-rate-floor)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR="$2"
+      shift 2
+      ;;
+    --profile-admission-resident-short-win-rate-floor=*)
+      PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-directions)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_DIRECTIONS="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-directions=*)
+      PROFILE_ADMISSION_FAST_DIRECTIONS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-n12-min-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_N12_MIN_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-n12-min-wins=*)
+      PROFILE_ADMISSION_FAST_N12_MIN_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-n12-max-wins)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_N12_MAX_WINS="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-n12-max-wins=*)
+      PROFILE_ADMISSION_FAST_N12_MAX_WINS="${1#*=}"
+      shift
+      ;;
+    --profile-admission-fast-n20-ev-min)
+      require_value "$1" "${2:-}"
+      PROFILE_ADMISSION_FAST_N20_EV_MIN="$2"
+      shift 2
+      ;;
+    --profile-admission-fast-n20-ev-min=*)
+      PROFILE_ADMISSION_FAST_N20_EV_MIN="${1#*=}"
+      shift
+      ;;
     --no-daily-profile-selector)
       DAILY_PROFILE_SELECTOR="0"
       shift
@@ -561,6 +742,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --daily-profile-lookback-days=*)
       DAILY_PROFILE_LOOKBACK_DAYS="${1#*=}"
+      shift
+      ;;
+    --daily-profile-stable-lookback-days)
+      require_value "$1" "${2:-}"
+      DAILY_PROFILE_STABLE_LOOKBACK_DAYS="$2"
+      shift 2
+      ;;
+    --daily-profile-stable-lookback-days=*)
+      DAILY_PROFILE_STABLE_LOOKBACK_DAYS="${1#*=}"
       shift
       ;;
     --daily-profile-min-samples)
@@ -624,6 +814,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --daily-profile-degraded-runs=*)
       DAILY_PROFILE_DEGRADED_RUNS="${1#*=}"
+      shift
+      ;;
+    --daily-profile-joint-failures-to-exit)
+      require_value "$1" "${2:-}"
+      DAILY_PROFILE_JOINT_FAILURES_TO_EXIT="$2"
+      shift 2
+      ;;
+    --daily-profile-joint-failures-to-exit=*)
+      DAILY_PROFILE_JOINT_FAILURES_TO_EXIT="${1#*=}"
       shift
       ;;
     --daily-profile-max-active)
@@ -772,11 +971,43 @@ case "$DAILY_PROFILE_SELECTOR" in
     EXTRA_ARGS+=(--no-daily-profile-selector)
     ;;
 esac
+case "$PROFILE_ADMISSION_ENABLE" in
+  1|true|TRUE|yes|YES|y|Y|on|ON)
+    EXTRA_ARGS+=(--enable-profile-admission)
+    ;;
+  0|false|FALSE|no|NO|n|N|off|OFF)
+    ;;
+  *)
+    echo "PROFILE_ADMISSION_ENABLE 必须为布尔值，实际为: $PROFILE_ADMISSION_ENABLE" >&2
+    exit 2
+    ;;
+esac
+case "$SHADOW_OPTIMIZER" in
+  1|true|TRUE|yes|YES|y|Y|on|ON)
+    EXTRA_ARGS+=(--enable-shadow-optimizer)
+    ;;
+  0|false|FALSE|no|NO|n|N|off|OFF)
+    EXTRA_ARGS+=(--no-shadow-optimizer)
+    ;;
+  *)
+    echo "SHADOW_OPTIMIZER 必须为布尔值，实际为: $SHADOW_OPTIMIZER" >&2
+    exit 2
+    ;;
+esac
 case "$WARMUP_CURRENT_MONTH_DAILY" in
   0|false|FALSE|no|NO|n|N|off|OFF)
     EXTRA_ARGS+=(--no-current-month-daily)
     ;;
 esac
+if [ -n "$DAILY_PROFILE_STABLE_LOOKBACK_DAYS" ]; then
+  EXTRA_ARGS+=(--daily-profile-stable-lookback-days "$DAILY_PROFILE_STABLE_LOOKBACK_DAYS")
+fi
+if [ -n "$DAILY_PROFILE_JOINT_FAILURES_TO_EXIT" ]; then
+  EXTRA_ARGS+=(--daily-profile-joint-failures-to-exit "$DAILY_PROFILE_JOINT_FAILURES_TO_EXIT")
+fi
+if [ -n "$STRATEGY_BUILD_ID" ]; then
+  EXTRA_ARGS+=(--strategy-build-id "$STRATEGY_BUILD_ID")
+fi
 
 "$PYTHON_BIN" - <<'PY'
 import sys
@@ -796,6 +1027,9 @@ exec "$PYTHON_BIN" -m app.server \
   --limit "$KLINE_LIMIT" \
   --data-dir "$DATA_DIR" \
   --db-path "$DB_PATH" \
+  --shadow-db-path "$SHADOW_DB_PATH" \
+  --shadow-queue-size "$SHADOW_QUEUE_SIZE" \
+  --shadow-max-challengers "$SHADOW_MAX_CHALLENGERS" \
   --webhook-url "$WEBHOOK_URL" \
   --webhook-token "$WEBHOOK_TOKEN" \
   --webhook-timeout "$WEBHOOK_TIMEOUT" \
@@ -823,6 +1057,14 @@ exec "$PYTHON_BIN" -m app.server \
   --observation-profile-min-ev "$OBSERVATION_PROFILE_MIN_EV" \
   --observation-profile-min-edge "$OBSERVATION_PROFILE_MIN_EDGE" \
   --live-short-segments "$LIVE_SHORT_SEGMENTS" \
+  --profile-admission-resident-long-n12-max-wins "$PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS" \
+  --profile-admission-resident-short-n12-max-wins "$PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS" \
+  --profile-admission-resident-long-win-rate-floor "$PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR" \
+  --profile-admission-resident-short-win-rate-floor "$PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR" \
+  --profile-admission-fast-directions "$PROFILE_ADMISSION_FAST_DIRECTIONS" \
+  --profile-admission-fast-n12-min-wins "$PROFILE_ADMISSION_FAST_N12_MIN_WINS" \
+  --profile-admission-fast-n12-max-wins "$PROFILE_ADMISSION_FAST_N12_MAX_WINS" \
+  --profile-admission-fast-n20-ev-min "$PROFILE_ADMISSION_FAST_N20_EV_MIN" \
   --daily-profile-lookback-days "$DAILY_PROFILE_LOOKBACK_DAYS" \
   --daily-profile-min-samples "$DAILY_PROFILE_MIN_SAMPLES" \
   --daily-profile-weekend-min-samples "$DAILY_PROFILE_WEEKEND_MIN_SAMPLES" \

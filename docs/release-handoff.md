@@ -1,8 +1,40 @@
 # minute-strategy 发布交接文档
 
+## 当前未发布候选：画像准入自动优化（2026-08-20）
+
+本轮不由人工挑参数。固定目标按字典序执行：聚合硬门槛全部通过；最差时间窗口胜率最高；日均单量最接近50；随后比较最大回撤、最长连亏和参数复杂度。订单目标为完整交易日日均45至55笔，胜率和跨窗口稳定性优先于精确凑满50笔。
+
+共享门槛无法同时满足胜率和订单量，因此32组固定网格改为LONG/SHORT独立常驻参数，未引入价格结构、趋势、30分钟或其他指标：LONG常驻N12胜数上限搜索`7/8`，SHORT搜索`8/9`；LONG每日画像胜率下限搜索`off/0.60`，SHORT搜索`off/0.625`；FAST固定仅SHORT、ACTIVE、N12最少7胜、N20 EV不低于0，N12上限搜索`7/8`。
+
+自动排名第一的冻结候选哈希为`8ac0366d26a6f6e7cd0e69f887d73b6eeb8f7d548bc664caabc28f0ec66072bc`：LONG常驻N12上限7、SHORT上限9、LONG每日胜率下限关闭、SHORT下限62.5%、FAST N12为7至8胜。
+
+严格因果回放输入为只读复制库`/private/tmp/monitor-replay.sqlite3`，源文件回放前后SHA-256均为`69095ea164818bd80f715c61e7906b37a8523f7af4d113238c8a1ae28d5e5414`。报告位于`/private/tmp/profile-admission-optimizer-report.json`，加载4997条已结算观察，样本外区间为3.207639天，`leakage_violations=0`，结构影子订单和Webhook equality 为true。
+
+复现使用第42.3节的完整生产参数命令，仅将`--output`改为`/private/tmp/profile-admission-optimizer-report.json`。修正完整日单量口径和冻结候选序号后，最终报告SHA-256为`b3faaa786ab998a69f0a983e034560ab7d86dc7473bbd2c794ccd2b3d157e73c`。自动搜索的单量门槛只读取3个完整交易日，不把末尾不完整日加入分母。
+
+最终验证：`python3 -m unittest discover -s tests`共1032项通过，画像准入相关364项通过；`compileall`、`bash -n`、前端JavaScript语法检查和`git diff --check`均通过。独立只读审查复核了主信号序号、全拒绝WAIT、完整日单量及废弃配置四项修复，未发现残留问题或新回归。
+
+| 指标 | 当前基准 | 自动最优 | 变化 |
+|---|---:|---:|---:|
+| 订单 | 183 | 147 | -36 |
+| 完整日日均订单 | 53.67 | 47.00 | -6.67 |
+| 胜率 | 53.55% | 60.54% | +6.99pp |
+| PnL | -72.4U | +148.0U | +220.4U |
+| EV | -0.396U | +1.007U | +1.402U |
+| 最大回撤 | 186.4U | 94.8U | -91.6U |
+| 最长连亏 | 5 | 4 | -1 |
+
+方向拆分：LONG 26单、17胜、65.38%、PnL +65.2U、EV +2.508U；SHORT 121单、72胜、59.50%、PnL +82.8U、EV +0.684U。三个顺序窗口为61单/54.10%/EV -0.0525U、42单/69.05%/EV +2.9619U、44单/61.36%/EV +0.6091U。32组中6组通过聚合门槛。
+
+排名第二的配置为141单、85胜、60.28%、完整日日均45单，最差窗口胜率同为54.10%，但单量离50更远。排名第三为160单、96胜、60.00%、完整日日均49.33单，但最差窗口胜率只有53.03%。因此自动选择147单方案：先保证最差窗口胜率，再在同等窗口表现中选择更接近50单的配置。
+
+实现已修正以下等价性问题：FAST不再降低评分阈值；冻结主信号序号`0`在回放中不会被重分配并误入FAST；每个参与排序的候选保留准入审计；全部候选拒绝后的无方向WAIT不会中断处理；回放不再按画像键合并同一时点的不同来源；搜索报告提供相对基准的总计及LONG/SHORT差异；服务端和中文启动脚本使用LONG/SHORT独立参数，画像开关拼写错误、参数非法或继续使用废弃共享N12变量时启动失败。
+
+聚合门槛为true，但冻结策略后的7个完整前向日尚不存在，`stability_proven=false`、`release_allowed=false`。当前状态为：**代码完成，未部署、未推送、未创建tag、未合并main、未清空订单**。后续无需人工重选参数；保持该策略哈希不变累计7个完整前向交易日，再由同一程序自动判断至少5天胜率不低于55.56%、至少5天EV为正、合计胜率不低于60%且日均45至55单。
+
 ## 1. 文档目的
 
-本文汇总 `minute-strategy` 截至2026-08-15的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
+本文汇总 `minute-strategy` 截至2026-08-20的生产发布、策略变更、运行配置、数据基线、验证结果、已知差异和后续观察要求。各发布章节保留当时的事实快照，章节中的“当前”仅指该章节记录时点。
 
 `docs/release-handoff.md` 是项目唯一的发布交接文档。后续发布只更新或追加本文，不再创建带日期、提交号或版本号的交接文档副本。
 
@@ -12,14 +44,14 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 当前功能基线 | `721388ac2ece2a9e3d87015646807d5aaf25a637`（WebSocket低延迟行情、08:00今日统计、12:00-18:00影子时段守卫） |
-| 固化标签 | `v2026.08.15-time-period-shadow-guard` |
-| 当前生产提交 | `721388ac2ece2a9e3d87015646807d5aaf25a637` |
-| 当前生产事实 | 第39节 |
-| 本地未部署功能 | 无；第37节仅为待优化设计，未实现 |
-| 下一开发计划 | 第34节10分钟入场价格结构确认、第37节08:00交易日内按方向动态调节；均未实施 |
+| 当前功能基线 | `6474dd81b005ca8c1d011a739bca71335f26b1e6`（方向脉冲影子与结算即更新） |
+| 固化标签 | `v2026.08.16-direction-pulse-shadow` |
+| 当前生产提交 | `6474dd81b005ca8c1d011a739bca71335f26b1e6` |
+| 当前生产事实 | 第41节 |
+| 本地未部署功能 | `feature/adaptive-resident-profiles` 的自适应常驻画像、价格结构影子、V2审计/容量治理及严格因果发布门槛，见第42节 |
+| 下一开发检查点 | 当前候选未通过第42节发布硬门槛；硬门槛全部通过前不得发布 |
 
-第2至38节是历史发布、本地开发或较早分析快照；如与第39节冲突，以第39节为准。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 和 `feature/websocket-low-latency` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
+第2至41节是历史发布、本地开发或生产事实快照；生产现状以第41节为准。第42节只记录当前功能分支的本地实现和发布前门槛，不代表生产已经切换。生产运行代码来自 `main`，`feature/1m-wave-direction-guard` 和 `feature/websocket-low-latency` 保留为历史功能分支。第27至28节记录的统计与观察能力已经发布，但其中明确标记为观察候选的规则仍未启用真实拦截。
 
 ## 2. 发布身份
 
@@ -1755,7 +1787,7 @@ candidate_origin                  # NATIVE_ACTIONABLE / PROFILE_PROMOTED_WAIT / 
 1. 影子模式与当前基准订单ID、方向、入场时间和金额完全一致，证明第一阶段没有暗改开单；
 2. 两年样本外组合中，允许组总胜率不低于60%，LONG和SHORT分别不低于事件合约盈亏平衡胜率55.56%，且两方向EV均大于0；
 3. `PROFILE_PROMOTED_WAIT` 的 `CONFIRMED` 组胜率至少比其 `NEUTRAL/PENDING/CONFLICT` 组高3个百分点，并且差异不是由单一WD/WE时段贡献；
-4. 组合方案至少保留当前基准40%的订单，避免以接近停单换取表面胜率；若达不到，只能继续观察，不能降低胜率要求倒推上线；
+4. 组合方案总订单至少保留当前基准80%，LONG和SHORT分别至少保留各自基准70%，避免以接近停单换取表面胜率；若达不到，只能继续观察，不能降低胜率要求倒推上线；
 5. 最大回撤和最长连亏均不得劣于当前基准；
 6. 至少三分之二的样本外滚动窗口EV为正，不能只依赖某一段行情；
 7. BTC和ETH分别报告，不允许一个币种的正结果掩盖另一个币种的负结果；
@@ -1774,7 +1806,21 @@ candidate_origin                  # NATIVE_ACTIONABLE / PROFILE_PROMOTED_WAIT / 
 6. 依据第34.10节决定继续观察、否决该方案或提出真实准入设计；
 7. 真实准入必须作为单独提交、单独标签和单独生产样本边界发布，不能与画像门槛、连亏守卫、评分系统或订单容量同时修改。
 
-本节是下一开发计划的唯一有效定义。当前仅更新交接文档，不修改代码、不运行回测、不发布服务器、不重启服务，也不改变已经打开或后续模拟订单。
+### 34.12 2026-08-17整合决定
+
+本节保留为价格结构设计的历史来源。其完整有效定义已整合到 `docs/superpowers/specs/2026-08-16-adaptive-resident-profiles-design.md`，后续开发、测试和验收只以该统一设计文档为准；如本节旧表述与统一设计冲突，以统一设计为准。
+
+当前决定：
+
+- 开发分支为`feature/adaptive-resident-profiles`；
+- 自适应画像与价格结构在同一开发文档、同一分支实施；
+- 价格结构第一阶段固定为`SHADOW_ONLY`，只记录和统计，不影响任何开单结果；
+- 画像采用7天快速入选、14天稳定保留和双窗口连续失效退出，不再以14天单窗替代7天；
+- N12/N20先降级第二席位和18U，只有N12与完整N20同时恶化才暂停全部正式单；
+- 价格结构不加入画像键，不参与7天/14天资格、N12/N20状态、评分或动态阈值；
+- 胜率和订单量双优先，正式方案总订单至少保留基准80%，后续价格结构真实门禁也沿用该底线；
+- 所有实际影响开单的动态值、阈值、模式、版本和守卫结论统一写入`DECISION_CONTEXT_V2`；完整启动配置按`runtime_config_hash`去重保存，后续必须能从任意候选复现当时决策；
+- 当前仅完成设计整合，尚未修改业务代码、运行回放、发布服务器或创建标签。
 
 ## 35. WebSocket低延迟行情分支（2026-08-14完成，2026-08-15发布）
 
@@ -2061,3 +2107,141 @@ python3 -m pip install -r requirements.txt
 6. 预热为`READY`、154080根，`last_error=null`。页面和`/api/state.direction_pulse_shadow`均已上线；恢复结果为LONG N12/N16均50.00%，SHORT N12 58.33%，SHORT N16 43.75%/`WATCH`，但真实订单口径未被收紧。
 7. 合并后的完整测试为523项通过；Python编译、`node --check app/static/app.js`、`bash -n scripts/run.sh`及`git diff --check`通过。生产发布目录也通过Python编译和模块导入检查。
 8. 生产事件证据已确认结算即更新：服务启动快照`evaluated_at=1786861974285`；下一笔LONG独立观察于2026-08-16 14:34:59 CST结算后，`evaluated_at`和LONG `last_settled_at`均立即推进到`1786862099999`，未等待下一4小时边界，`last_error`仍为空。该证据作为标签后的文档提交，不移动发布标签。
+
+## 42. 2026-08-19自适应常驻画像严格因果回放（本地未部署）
+
+### 42.1 分支、版本与实现状态
+
+| 项目 | 当前值 |
+|---|---|
+| 开发分支 | `feature/adaptive-resident-profiles` |
+| Task 17起点 | `29390cee3166a95cbf931ee8b2a3ae66116b123b`（首个Task 17提交的直接父提交） |
+| 决策上下文 | `DECISION_CONTEXT_V2` |
+| 信号审计 | `SIGNAL_AUDIT_V2` |
+| 每日资格 | `DAILY_PROFILE_QUALIFICATION_V2` |
+| 即时画像 | `ADAPTIVE_PROFILE_STATE_V1`，N12/N20逐笔结算更新 |
+| 价格结构 | `ENTRY_STRUCTURE_SHADOW_V1`，保持`SHADOW_ONLY` |
+| 金额叠加 | `TWO_STAGE_V1` |
+| 当前状态 | 本地实现完成，**未部署**、未合并`main`、未推送、未打标签、未清空订单 |
+
+`scripts/replay_daily_profile_selector.py`现在拒绝任何缺少生产执行参数的运行，不再沿用旧`max_open_orders=5`。全局并发、LONG/SHORT方向并发、同方向冷却/最小开单间隔、基础`stake`、`win_return`、金额叠加开关、级数、并行第二级上限、第二级金额及仅基础金额时段均必须显式提供。`TWO_STAGE_V1`回放进一步要求第二级`stake`的原始值严格等于`win_return`，并要求仅基础金额时段为空；非空列表会被拒绝，因为当前生产`AccountSimulator`不实施该兼容参数。验证后的金额原值会传入生产`TwoStageStakeProgression`，不在回放配置归一化阶段提前舍入。
+
+回放将守卫的`allow_progression`与全局`stake_progression_enabled`分开：除adaptive `WATCH`外均调用ledger `assign`，全局关闭时也由ledger返回四位量化的基础条款；只有`WATCH`令`allow_progression=false`并绕过ledger使用原始基础条款。报告中的`progression_allowed`记录该守卫值，progression版本仍由全局开关决定，与生产`selected_order_terms`语义一致。
+
+adaptive回放按生产`settled_at -> profile_key -> opened_at -> observation_key -> decision_id`稳定顺序生成全局结算事件时间线。每个候选只读取其开单时点已经结算的事件；每日07:50快照严格排除`settled_at >= 07:50`的数据。N12/N20在每笔结算后以`evaluated_at=settled_at+1`立即推进；公开`app.adaptive_profile_state.AdaptiveGlobalProfileWindowReplay`维护完整`[evaluated_at-15天, evaluated_at)`全局身份窗口，再由`AdaptiveProfileWindowReplay`维护各画像的canonical区间链和状态转换。全局binding记录真实owner事件序号，同binding的后续claim不会延长owner寿命；owner淘汰后，只有所有剩余claim仍为原binding且首个claim已经接纳时才O(1)转移，否则按完整活动窗口的因果顺序重绑定。单画像正常路径使用跳跃索引；重复身份使用按身份pair维护的owner堆和动态区间选择，单次opened逆序在离开活动窗口后立即恢复正常路径。该实现没有任意事件条数上限，不截断重复身份、重叠区间或最后N20之前的候选。baseline、structure-shadow和adaptive candidate使用同一个按开单时间预分组的只读执行计划，但分别创建独立订单、金额叠加和守卫状态；结构 equality 报告真实逐笔比较订单ID、方向、开结算/到期时间、stake、progression字段和Webhook计数，不使用固定相等结论。
+
+日画像快照不再对全部历史逐日扫描：回放先按`opened_at`排序，再用`bisect`只截取稳定窗口并保留`settled_at < evaluated_at`的因果记录。三个执行分支不再各自执行`days × observations`分组；三段连亏也不再逐候选排序全部历史交易，而是在订单结算时按上海自然日和时段维护增量连亏账本。`workload`固定输出日窗口输入总数/峰值、adaptive事件数/增量加入数/窗口重建次数/实际重建输入总数/单画像窗口峰值、活动profile tracker数、tracker保留事件数/上界、保留索引事件数、jump/successor缓存项、jump缓存上界、动态区间工作量、动态claim heap项数/上界/压缩次数/压缩输入、执行计划行数/三次实际消费行数及leakage样本键检查数，便于用真实工作量而不是脆弱耗时判断复杂度。
+
+### 42.2 迁移、加载与容量行为
+
+本分支的SQLite变更保持增量兼容：V2表、索引和列通过事务迁移增加，迁移失败整体回滚；旧订单、旧观察和旧审计继续可读，不重写、不删除、不执行固定TTL清理。Task 17使用回放专用加载器以SQLite URI `mode=ro`并启用`query_only`打开源库，不执行`SQLiteMonitorStore`初始化或任何迁移。V2记录通过`app.storage.linked_decision_context_select_columns()`和`app.storage.hydrate_decision_linked_payload()`两个公开接口联结`decision_contexts`并水合完整decision-linked payload和生命周期列，回放脚本不再导入storage私有常量或私有hydration函数；loader测试使用固定字段oracle，不调用被测hydration生成expected。V3及legacy紧凑库即使`observation_signals`缺少后加的`exit_price/pnl`列，也只为数据库实际存在的生命周期列生成alias，缺失列完全不进入`sqlite.Row`，从而保留紧凑payload中的有效生命周期值。是否联结生产context水合路径只取决于observation的`decision_id`和完整context schema。旧`observation_signals` payload fixture仍可读取。回放只写指定JSON报告，不修改数据库，不生成生产订单，不发送真实Webhook。正式复核仍应先复制源SQLite，再对副本运行回放。
+
+单文件容量门槛保持：
+
+| 状态 | 文件大小 | 行为 |
+|---|---:|---|
+| `NORMAL` | `< 2.5GiB` | 正常写入V2核心数据和紧凑审计 |
+| `WARNING` | `>= 2.5GiB` | API和页面持续告警 |
+| `COMPACT_ONLY` | `>= 2.75GiB` | 停止普通WAIT可选审计，保留订单、观察、状态变化和决定性阻止 |
+| `HARD_LIMIT` | `>= 3GiB`（`3221225472`字节） | 禁止继续分配SQLite页面；核心持久化失败时暂停新开单 |
+
+3GiB上限内至少为核心表保留256MiB。容量降级不得删除历史订单或观察，也不得创建无法持久化的订单。
+
+### 42.3 可复现回放命令
+
+以下命令以复制到`/private/tmp`的SQLite为输入，参数对应当前生产总并发2、LONG 1、SHORT 2、同方向间隔2分钟和10U/18U两阶段金额：
+
+```bash
+python3 scripts/replay_daily_profile_selector.py \
+  --db-path /private/tmp/monitor-replay.sqlite3 \
+  --symbol BTCUSDT \
+  --lookback-days 7 \
+  --stable-lookback-days 14 \
+  --min-samples 20 \
+  --min-win-rate 0.60 \
+  --min-ev 0 \
+  --degraded-runs-to-exit 2 \
+  --joint-failures-to-exit 2 \
+  --max-open-orders 2 \
+  --max-open-long-orders 1 \
+  --max-open-short-orders 2 \
+  --min-order-gap-minutes 2 \
+  --stake 10 \
+  --win-return 18 \
+  --stake-progression \
+  --stake-progression-max-orders 2 \
+  --stake-progression-max-active 1 \
+  --stake-progression-second-stake 18 \
+  --stake-progression-base-only-segments "" \
+  --output /private/tmp/adaptive-profile-release-gates.json
+```
+
+不得直接对生产SQLite做试验性写入。命令缺少任一显式并发、冷却、金额或progression参数时必须由CLI返回错误，不得猜测生产值；`--stake-progression-second-stake`必须与`--win-return`原始值相等。`--stake-progression-base-only-segments`是当前生产不生效的兼容参数，回放只接受显式空字符串。
+
+### 42.4 发布验收门槛
+
+| 门槛 | 最低要求 |
+|---|---:|
+| 样本外总胜率 | `>= 60%` |
+| LONG样本外胜率 | `>= 55.56%` |
+| SHORT样本外胜率 | `>= 55.56%` |
+| 总订单保留率 | `>= 80%` |
+| LONG订单保留率 | `>= 70%` |
+| SHORT订单保留率 | `>= 70%` |
+| 10U基础首单保留率 | `>= 85%` |
+| 总EV、LONG EV、SHORT EV | 各自`>= 0` |
+| 三个按时间顺序的OOS窗口 | 至少2个窗口EV为正 |
+| 最大回撤 | 不得高于baseline |
+| 最长连亏 | 不得长于baseline |
+
+所有硬门槛通过的配置才进入排序，顺序固定为原始`wins/orders`总胜率降序、订单数降序、最大回撤升序；排序不读取六位展示胜率。报告同时输出baseline和candidate的总计、LONG/SHORT、胜率、EV、PnL、最大回撤、最长连亏、每日最佳/最差、每类guard rejection、基础首单和三个OOS窗口。报告字段保持原有展示精度，`acceptance.gates.*.actual`最多展示6位；但`passed`不读取已经舍入的展示胜率或EV，而是以原始胜/订单计数、逐笔PnL/订单数和原始订单计数比率判定。正OOS窗口也按窗口逐笔原始PnL的严格正号统计，微小负值不会因展示为`-0.0`而被计为正窗口。任一门槛失败时`acceptance.passed=false`，本分支继续保持**未部署**。
+
+默认JSON契约升级为`CAUSAL_PROFILE_REPLAY_V2`。V2保留`schedule`并删除内容完全相同的`daily_snapshots`别名；逐笔候选订单只保留`candidate.trade_rows`，删除顶层重复`trade_rows`；每个adaptive事件保留前后状态、版本和`n12_after/n20_after`，删除与前一事件after重复的`n12_before/n20_before`。CLI使用紧凑JSON流式写入文件或stdout，不再先构造一份完整缩进字符串。依赖旧别名的离线消费者必须按`report_schema_version`切换到上述唯一字段。
+
+### 42.5 本地验证
+
+Task 17采用测试先行，先确认旧实现因缺少显式生产参数、N12/N20结算时间线、方向并发、发布门槛、配置排序和结构 equality 比较而失败，再实现回放。后续规格及代码质量修复也逐项确认红灯：V3紧凑库错误落入payload-only路径、高精度金额被提前舍入、globally disabled错误绕过ledger、WATCH条款被回放层重复舍入、缺失生命周期列的NULL alias覆盖payload有效值、CLI未展示生产约束、硬门槛误用已舍入胜率/EV/retention和OOS EV、leakage内层重复建集合、日窗口累计全历史、缺少共享执行计划、adaptive重建工作量超线性、报告重复、配置排序误用展示胜率，以及非法非有限CLI值泄漏traceback，均在实现前由定向测试复现。全精度门槛红测覆盖每方向3胜2负但PnL仅`-0.0001`、`1394/2509=0.5555998405...`、舍入后看似达到订单保留阈值的原始比率，以及展示为`-0.0`的微小负OOS。
+
+代码质量复核曾发现256条deque上限会改变完整15天生产语义，该实现及对应“截断可审计”测试已撤销。公开`AdaptiveProfileWindowReplay`现在保留完整15天事件：窗口尚未滑动时复用生产增量状态转换；滑动后，身份唯一且opened顺序单调的正常路径用区间后继二分和倍增跳跃索引定位末端最多`N20+2`个独立样本，单事件查询上界为`O(log W + N20)`。jump缓存明确允许`O(W log W)`空间，报告和测试按`retained_index_events * (bit_length(retained_index_events) + 1)`约束缓存项；已淘汰前缀达到活动窗口大小时执行几何压缩，摊还输入为`O(n)`，索引事件保留量不超过约两倍活动窗口。重复身份以最早opened claim为真实owner增量维护canonical区间；pair claim heap继续使用惰性删除，但总项数一旦超过活动pair claims的2倍，就只从当前活动serial/event重建并按pair线性`heapify`，不重建owner token或canonical选择。压缩输入摊还为`O(n)`，持有内存为`O(W)`；heap push、pop和压缩重建均计入`dynamic_work_units`。opened乱序以活动逆序pair定位，逆序pair淘汰后立即丢弃动态结构并恢复跳跃快路径，不等待几何压缩。仍存在跨binding冲突或逆序影响最后`N20+2`时才回退完整活动窗口，保持重复身份、重叠区间及previous-state语义。窗口外输入和`state_at`前推后的`advance`回退均以明确`ValueError`拒绝。
+
+脚本改用公开`AdaptiveGlobalProfileWindowReplay`和公开生产排序键。同一observation/decision跨LONG/SHORT、tag或segment时共享全局绑定；冲突声明保持拒绝。owner、较早冲突、后续同binding的7事件差分证明同binding引用不会延长原owner寿命，原owner淘汰后较早冲突按窗口因果顺序接管；固定种子360事件随机多画像差分逐事件与完整15天生产rebuild一致。同binding owner转移使用有序claim索引，不重建全窗；异binding或其他身份依赖无法证明安全时才执行一次完整重绑定。全局窗口另按profile维护活动accepted事件计数：淘汰后只把受影响tracker推进到当前cutoff，计数归零便立即累计workload并退休tracker；拒绝事件不进入计数。完整身份重绑定会从当前活动窗口同时重建accepted计数和tracker，因而当前tracker及其事件内存均为`O(W)`，不会保留无限历史profile对象。差分还覆盖340条高密度同画像重复身份与重叠区间、275条跨15天淘汰、同结算时间全局排序，以及3800条6分钟重叠事件的跨窗口抽样全字段比较。性能回归使用11分钟2000/4000条普通流、重复身份流和单次opened逆序流，100分钟窗2000/4000条一次性profile流，以及8分钟3000/6000条重叠流；门槛读取真实`window_rebuild_input_rows`、tracker/内部事件数、动态索引工作量和缓存项，不以`bounded_work_units`替代实际工作。
+
+`python3 -m unittest tests.test_daily_profile_replay`现有50项通过，`tests.test_adaptive_profile_state`现有34项通过；两者与storage、storage schema、simulator、stake progression关联模块合计342项通过。完整`python3 -m unittest discover -s tests`共997项通过；Python compileall、CLI help和`git diff --check`均通过。覆盖范围包括只读V3/V2/legacy加载、严格15天滑动、全局owner因果转移、活动profile tracker退休、重复身份/单次逆序近线性路径、下降opened pair heap几何压缩、生产progression拒绝约束、enabled/disabled/WATCH高精度金额与`AccountSimulator`一致性、全精度发布门槛、复杂度工作量、报告去重、公开loader接口和无traceback CLI错误。
+
+已按42.3命令实际回放`/private/tmp/monitor-replay.sqlite3`：共加载4997条结算观察，4次日快照评估，`leakage_violations=0`，结构影子 equality 为true。全精度验收输出为`acceptance.passed=false`：总胜率actual为`0.535519`、SHORT胜率为`0.516949`，总/LONG/SHORT EV分别为`-0.395628/-0.172308/-0.518644`，三个OOS窗口仅1个原始PnL为正；LONG胜率、订单保留、最大回撤和最长连亏门槛通过。改造后的候选仍为183单、98胜85负、PnL `-72.4U`，LONG 65单/37胜、SHORT 118单/61胜，所有核心指标与改造前一致。
+
+本次复审实现的独立工作量基准中，11分钟普通流2000/4000条的全窗重建输入均为0，4000条最终保留2037个索引事件、15114个jump缓存项和2036个successor缓存项，低于显式上界24444。重复身份2000/4000条的全窗重建输入均为0，动态索引实际工作量为4144/16144，4000条仍低于`n * (bit_length(n) + 4)=64000`的回归上界；全局重复身份的重建输入也均为0，4000条发生2036次快速owner转移，claim索引3928项，等于活动窗口1964条的两倍上限。单次opened逆序2000/4000条的全窗重建输入均为0，动态工作量8073/8452（`1.047x`），逆序淘汰后4000条流恢复jump快路径并生成15114个缓存项。同pair、结算单调、opened持续递减基准将活动窗口固定为100条：2000/4000条后heap均只保留100项、显式上界200，分别压缩19/39次，压缩输入1881/3861（`2.053x`），窗口重建输入190000/390000（`2.053x`，未恶化），抽样状态与完整窗口rebuild全字段一致。新增的一次性profile基准同样使用100分钟窗和每分钟一个唯一合法tag：2000/4000条后活动tracker、tracker内部事件、保留索引和事件上界均稳定为100，没有随历史翻倍。真实复制库工作量为日选择输入15914行、单窗口峰值3980行、adaptive 4997次增量加入、内部/全局身份重建输入合计0行、单画像窗口峰值63行、活动profile tracker 264个、tracker事件4266条（上界4266）、保留索引4934条、jump缓存12825项（上界32921）、successor缓存4374项；该库未出现病理pair序列，因此dynamic claim heap项、上界、压缩次数和压缩输入均为0；共享执行计划922行、三次独立执行共消费2766行、leakage检查15914个样本键。默认紧凑V2报告为3860363字节（约3.7MiB），未恢复任何重复JSON字段。源库回放前后SHA-256均为`69095ea164818bd80f715c61e7906b37a8523f7af4d113238c8a1ae28d5e5414`，确认只读且未迁移。实际复制库回放已经完成，但候选不满足发布硬门槛，本节继续保持**未部署**、未推送、未打标签、未合并`main`、未清空订单。
+
+## 43. 2026-08-21持续影子参数优化器（本地未部署）
+
+### 43.1 本次实现
+
+在 `feature/adaptive-resident-profiles` 分支完成 Champion-Challenger 持续影子优化器。正式进程在闭合分钟批次成功提交后，向默认深度120的有界跨进程队列投递不可变行情事件；独立CPU进程运行当前 Champion 与最多7个 Challenger。所有参数组使用完整 `MonitorState`，独立维护订单、方向容量、冷却、两阶段金额资格、画像和守卫，不复用正式订单状态，不发送Webhook。REST补偿批次只执行一次正式同源批量更新并以最后一分钟推进游标；相同`analyzer_hash`的参数组共享一次只读原始分析帧，各组的画像准入、守卫、容量、开单与结算仍完全隔离。
+
+第一阶段只优化已有生产同源实现的 `ProfileAdmissionPolicy` 参数族。完整运行配置、参数快照、分析器哈希、事件ID、决策输入、首个阻止原因、影子订单、观察结果、日汇总、正式策略回执及生命周期证据写入独立 `monitor.shadow.sqlite3`。正式 `monitor.sqlite3` 的schema、事务和历史订单不变。
+
+### 43.2 自动评估和切换
+
+每天北京时间07:50评估，08:00处理待晋级候选。硬门槛为7个完整无缺口前向日、300笔已结、总胜率至少60%、LONG/SHORT分别至少55.56%、5个合格胜率日、5个正EV日、相对Champion提高至少2个百分点并至少5天胜出、日均订单不低于35且保留Champion至少70%单量、连亏和回撤不劣于Champion。通过后按胜率优先字典序确定唯一候选，7日内最多晋级一次。
+
+晋级和回退使用独立请求/结果队列，不与可丢弃的普通状态队列共用。请求包含`symbol + generation + experiment + arm + parameter_hash`完整上下文；正式在途订单为0时立即切换，存在在途订单时等待结算，最长10分钟，只改变后续新订单的画像准入策略。影子侧先暂存请求，不提前提交Champion；正式应用成功、不可变正式策略回执写入影子库并返回ACK后，影子侧才原子提交生命周期。拒绝、过期、存储失败或上下文不一致均不提交。启用影子优化器重启时只信任正式策略回执，不以实验意向状态恢复。原Champion继续作为14日对照。新版本满足连续8亏、50/100笔胜率规则，或双方同期均至少20笔且回撤达到旧版1.25倍时自动回退；失败版本进入 `RETIRED`，重启后仍不会再次消费或晋级。
+
+### 43.3 隔离、容量和可观测性
+
+影子事件队列满时不等待、不重试正式批次，只记录缺口并冻结受影响前向日期。事件游标与该分钟结算、状态、决定、订单和日汇总在同一影子SQLite事务提交；重复事件幂等，缺失分钟禁止使用未来价格补写。切换币种会附带新代次种子原子重建，并取消旧币种尚未生效的正式策略请求。停机期间正式种子若已经越过旧实验最小游标，旧实验标记为`SUPERSEDED_SEED_ADVANCE`并从当前种子创建替代实验，不再把所有arm永久冻结在旧游标。
+
+影子库schema为V3，上限5GiB：4GiB告警、4.5GiB进入`COMPACT_ONLY`、5GiB停止普通明细分配，核心记录优先复用回收页，SQLite实际容量不足时只冻结受影响参数组。新库启用增量回收，容量状态分别报告有效占用、主库加WAL物理占用和可回收页。普通未开单影子明细保留30天，压缩前在同一事务写入`shadow_decision_rollups`，长期保留日期、方向、画像、首个阻止原因、次数和分数/阈值区间；参数、订单、日汇总、正式回执和生命周期永久保留。页面增加“参数影子优化”摘要；只读接口为 `/api/shadow`、`/api/shadow/experiment`、`/api/shadow/orders`，订单接口使用SQLite真实分页。
+
+### 43.4 启动和当前状态
+
+默认关闭，不影响当前主程序。显式启用方式：
+
+```bash
+bash scripts/run.sh \
+  --enable-shadow-optimizer \
+  --shadow-db-path data/monitor.shadow.sqlite3 \
+  --shadow-queue-size 120 \
+  --shadow-max-challengers 7
+```
+
+当前状态：**本地实现，未部署、未推送、未合并main、未创建标签、未清空订单**。已完成真实`spawn`子进程冒烟，证明完整影子运行时可启动、接收闭合分钟事件并推进独立SQLite游标。独立代码审查发现的生命周期提前提交、旧请求跨币种/代次生效、停机种子领先冻结、REST批次逐分钟偏差、重复分析计算和空间压缩丢失长期统计均已按上述边界修复。最终全量`python3 -m unittest discover -s tests`共1138项通过；`python3 -m compileall -q app scripts tests`、`node --check app/static/app.js`、`bash -n scripts/run.sh`和`git diff --check`全部通过。

@@ -4,9 +4,11 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import combinations
+from pathlib import Path
 from typing import Any
 
 from app.models import Signal
+from app.source_fingerprint import python_source_fingerprint
 
 
 BASE_STAKE = 10.0
@@ -23,6 +25,14 @@ KEY_SUBSET_VALIDATION_DELTA_PNL_BAND = 30.0
 KEY_SUBSET_MIN_BLOCK_COVERAGE = 0.6
 GUARD_COMPARE_MIN_OBSERVED = 20
 GUARD_COMPARE_MIN_DIFF = 4
+PROFILE_SUMMARY_SCHEMA_VERSION = 1
+
+
+def order_profile_algorithm_fingerprint() -> str:
+    return python_source_fingerprint(
+        Path(__file__).resolve().parent,
+        prefix="order-profile-src",
+    )
 
 
 def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -55,6 +65,7 @@ def sample_from_entry_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "result": _get(snapshot, "result"),
         "pnl": _float(_get(snapshot, "pnl")),
         "stake": _float(_get(snapshot, "stake")),
+        "win_return": _float(_get(snapshot, "win_return")),
         "stake_progression_step": int(_get(snapshot, "stake_progression_step", 1) or 1),
         "opened_at": int(_get(snapshot, "opened_at", 0) or 0),
         "settled_at": _get(snapshot, "settled_at"),
@@ -135,8 +146,7 @@ def summarize_order_samples_with_guard(
     _attach_reconstructed_order_slots(snapshots)
     settled = _settled_samples(snapshots)
     open_orders = sum(1 for sample in snapshots if sample.get("result") not in {"WIN", "LOSS"})
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+    summary = {
         "snapshot_count": len(snapshots),
         "sample_count": len(settled),
         "open_orders": open_orders,
@@ -174,8 +184,25 @@ def summarize_order_samples_with_guard(
         "profile_guard_shadow": _profile_guard_shadow_summary(settled),
         "profile_guard_policy": _profile_guard_policy_summary(settled),
         "profile_guard_shadow_compare": _profile_guard_shadow_compare(settled),
-        "elapsed_seconds": round(time.perf_counter() - started, 4),
     }
+    summary["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+    summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return summary
+
+
+def summarize_profile_guard_materialization(
+    samples: Sequence[dict[str, Any]],
+    *,
+    min_history: int = 15,
+    min_group_size: int = 2,
+) -> dict[str, Any]:
+    snapshots = [dict(sample) for sample in samples]
+    _attach_reconstructed_order_slots(snapshots)
+    return evaluate_profile_guard(
+        _settled_samples(snapshots),
+        min_history=max(1, int(min_history)),
+        min_group_size=max(1, int(min_group_size)),
+    )
 
 
 def risk_hint_keys_for_sample(sample: Mapping[str, Any]) -> list[str]:

@@ -19,6 +19,7 @@ class MarketDataCoordinator:
         rest_limit: int = 300,
         enable_websocket: bool = True,
         reconnect_max_seconds: float = 30,
+        shadow_publisher=None,
     ):
         self.state = state
         self.rest_client = rest_client
@@ -27,6 +28,7 @@ class MarketDataCoordinator:
         self.rest_limit = max(1, int(rest_limit))
         self.enable_websocket = bool(enable_websocket)
         self.reconnect_max_seconds = max(1.0, float(reconnect_max_seconds))
+        self.shadow_publisher = shadow_publisher
         self._queue: queue.Queue = queue.Queue()
         self._stop_requested = threading.Event()
         self._stop_event = threading.Event()
@@ -208,8 +210,51 @@ class MarketDataCoordinator:
         if processed and self._context_active(context):
             self._cursor[context] = fresh[-1].open_time
             self._clear_retry(context)
+            self._publish_shadow_batch(context, fresh)
         elif self._context_active(context):
             self._mark_retry(context, fresh)
+
+    def _publish_shadow_batch(
+        self,
+        context: tuple[str, int],
+        klines: Sequence[Kline],
+    ) -> None:
+        if self.shadow_publisher is None:
+            return
+        snapshotter = getattr(self.state, "shadow_market_context", None)
+        fear_greed = (
+            snapshotter(expected_context=context)
+            if callable(snapshotter)
+            else None
+        )
+        try:
+            published = self.shadow_publisher.try_publish(
+                context=context,
+                klines=tuple(klines),
+                fear_greed=fear_greed,
+            )
+        except Exception as exc:  # noqa: BLE001 - 影子优化不得影响正式行情路径。
+            self._record_shadow_publish_error(
+                f"shadow event publish failed: {exc}",
+                context,
+            )
+            return
+        if not published:
+            self._record_shadow_publish_error(
+                "shadow event queue full: event batch discarded",
+                context,
+            )
+
+    def _record_shadow_publish_error(
+        self,
+        message: str,
+        context: tuple[str, int],
+    ) -> None:
+        recorder = getattr(self.state, "record_shadow_event_gap", None)
+        if callable(recorder):
+            recorder(message, expected_context=context)
+            return
+        self.state.record_error(message, expected_context=context)
 
     def _download_closed_klines(self, context: tuple[str, int]) -> list[Kline]:
         if self.rest_client is None or not self._context_active(context):

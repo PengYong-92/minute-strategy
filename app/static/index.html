@@ -149,6 +149,10 @@
           <strong id="direction-pulse-shadow-status">-</strong>
         </article>
         <article class="card highlight-card">
+          <span>参数影子优化</span>
+          <strong id="shadow-optimizer-status">-</strong>
+        </article>
+        <article class="card highlight-card">
           <span>结算序列守卫</span>
           <strong id="result-sequence-guard-status">-</strong>
         </article>
@@ -166,7 +170,7 @@
         <div id="daily-profile-list" class="daily-profile-list"></div>
       </section>
 
-      <section class="panel analysis-panel">
+      <section id="latest-analysis" class="panel analysis-panel">
         <div class="panel-head">
           <h2>最新K线分析</h2>
           <span id="last-error"></span>
@@ -227,6 +231,7 @@
                 <th>策略</th>
                 <th>时段胜率/EV</th>
                 <th>开单阈值</th>
+                <th data-column="entry-structure">价格结构</th>
                 <th>金额</th>
                 <th>入场点位</th>
                 <th>入场时间</th>
@@ -311,6 +316,15 @@
         </div>
         <div id="observation-filters" class="order-filters observation-filters">
           <label>
+            窗口
+            <select id="obs-window-filter">
+              <option value="7d">7天</option>
+              <option value="14d" selected>14天</option>
+              <option value="30d">30天</option>
+              <option value="all">全部</option>
+            </select>
+          </label>
+          <label>
             方向
             <select id="obs-direction-filter">
               <option value="">全部</option>
@@ -337,6 +351,24 @@
           <label>
             胜负
             <select id="obs-result-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            结构状态
+            <select id="obs-structure-state-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            结构偏向
+            <select id="obs-structure-bias-filter">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            候选来源
+            <select id="obs-origin-filter">
               <option value="">全部</option>
             </select>
           </label>

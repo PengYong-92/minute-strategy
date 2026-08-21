@@ -3,9 +3,60 @@ from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from app.models import Kline, Signal, SimulatedOrder
+from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
+
+
+LEGACY_SIGNAL_FIELD_NAMES = tuple(
+    """
+    direction timeframe_minutes level reason price open_time volume_ratio price_position
+    price_change_pct score threshold volume_threshold move_threshold_pct close_strength
+    analysis_window_minutes threshold_window_minutes threshold_segment mtf_10m_bias mtf_30m_bias
+    macd_histogram macd_histogram_delta rsi bollinger_position bollinger_width
+    indicator_profile_segment indicator_profile_sample_size rsi_lower_threshold rsi_upper_threshold
+    bollinger_lower_threshold bollinger_upper_threshold macd_histogram_threshold macd_delta_threshold
+    fear_greed_value fear_greed_classification fear_greed_trend fear_greed_average_30d
+    fear_greed_adjustment session_allowed session_sample_size session_win_rate session_ev
+    session_edge_min regime risk_flags strategy_family strategy_tag observe_direction observe_only
+    profile_key daily_profile_selected daily_profile_version order_slot order_slot_scope wave_state
+    wave_raw_state wave_window wave_efficiency wave_direction_ratio wave_atr_strength
+    wave_confirmations wave_confirmed_at wave_batch_id wave_guard_mode wave_guard_status
+    wave_guard_reason calculated_threshold quality_score quality_score_version quality_score_mode
+    quality_score_context quality_score_components quality_score_inputs direction_pulse_shadow
+    profile_health_status profile_health_sample_size profile_health_win_rate profile_health_ev
+    profile_health_evaluated_at profile_degradation_probe profile_degradation_triggered_at
+    """.split()
+)
+
+LEGACY_SIMULATED_ORDER_FIELD_NAMES = tuple(
+    """
+    id direction timeframe_minutes level reason entry_price opened_at expires_at threshold_segment
+    score threshold session_allowed session_sample_size session_win_rate session_ev session_edge_min
+    regime strategy_family strategy_tag profile_key daily_profile_selected daily_profile_version
+    order_slot order_slot_scope stake win_return stake_progression_step status result exit_price
+    settled_at pnl stake_progression_source_order_id stake_progression_version wave_state wave_raw_state
+    wave_window wave_efficiency wave_direction_ratio wave_atr_strength wave_confirmations
+    wave_confirmed_at wave_batch_id wave_guard_mode wave_guard_status wave_guard_reason
+    calculated_threshold quality_score quality_score_version quality_score_mode quality_score_context
+    quality_score_components quality_score_inputs direction_pulse_shadow profile_health_status
+    profile_health_sample_size profile_health_win_rate profile_health_ev profile_health_evaluated_at
+    profile_degradation_probe profile_degradation_triggered_at
+    """.split()
+)
+
+DECISION_CONTEXT_FIELD_NAMES = {
+    "decision_id",
+    "context_version",
+    "runtime_config_hash",
+    "strategy_build_id",
+    "candidate_origin",
+    "decision_inputs",
+    "decision_trace",
+    "first_decisive_block",
+    "adaptive_profile_state",
+    "entry_structure_shadow",
+}
 
 
 def signal(
@@ -32,6 +83,66 @@ def signal(
 
 
 class SimulatorTest(unittest.TestCase):
+    def test_order_deep_copies_all_decision_context_fields(self):
+        selected = replace(
+            signal(),
+            decision_id="decision-1",
+            context_version="context-v1",
+            runtime_config_hash="config-hash",
+            strategy_build_id="build-1",
+            candidate_origin="strategy",
+            decision_inputs={"indicators": {"samples": [1.0, 2.0]}},
+            decision_trace=[{"block": "strategy", "details": {"passed": True}}],
+            first_decisive_block="strategy",
+            adaptive_profile_state={"profile": {"weights": [0.4, 0.6]}},
+            entry_structure_shadow={"structure": {"levels": [99.0, 101.0]}},
+        )
+
+        order = AccountSimulator().open_order(selected, 100.0, 1_000)
+
+        field_names = (
+            "decision_id",
+            "context_version",
+            "runtime_config_hash",
+            "strategy_build_id",
+            "candidate_origin",
+            "decision_inputs",
+            "decision_trace",
+            "first_decisive_block",
+            "adaptive_profile_state",
+            "entry_structure_shadow",
+        )
+        for field_name in field_names:
+            with self.subTest(field=field_name):
+                self.assertEqual(getattr(order, field_name), getattr(selected, field_name))
+
+        self.assertIsNot(order.decision_inputs, selected.decision_inputs)
+        self.assertIsNot(
+            order.decision_inputs["indicators"],
+            selected.decision_inputs["indicators"],
+        )
+        self.assertIsNot(order.decision_trace, selected.decision_trace)
+        self.assertIsNot(order.decision_trace[0], selected.decision_trace[0])
+        self.assertIsNot(order.adaptive_profile_state, selected.adaptive_profile_state)
+        self.assertIsNot(order.entry_structure_shadow, selected.entry_structure_shadow)
+
+        selected.decision_inputs["indicators"]["samples"].append(3.0)
+        selected.decision_trace[0]["details"]["passed"] = False
+        selected.decision_trace.append({"block": "guard"})
+        selected.adaptive_profile_state["profile"]["weights"][0] = 1.0
+        selected.entry_structure_shadow["structure"]["levels"].append(102.0)
+
+        self.assertEqual(order.decision_inputs, {"indicators": {"samples": [1.0, 2.0]}})
+        self.assertEqual(
+            order.decision_trace,
+            [{"block": "strategy", "details": {"passed": True}}],
+        )
+        self.assertEqual(order.adaptive_profile_state, {"profile": {"weights": [0.4, 0.6]}})
+        self.assertEqual(
+            order.entry_structure_shadow,
+            {"structure": {"levels": [99.0, 101.0]}},
+        )
+
     def test_order_copies_direction_pulse_shadow_context(self):
         context = {
             "version": "DIRECTION_PULSE_V1_SHADOW",
@@ -199,10 +310,12 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(long_order.stake_progression_step, 2)
 
     def test_simulated_order_progression_metadata_defaults_are_backward_compatible(self):
+        field_names = tuple(field.name for field in fields(SimulatedOrder))
         self.assertEqual(
-            [field.name for field in fields(SimulatedOrder)][-2:],
-            ["profile_degradation_probe", "profile_degradation_triggered_at"],
+            field_names[: len(LEGACY_SIMULATED_ORDER_FIELD_NAMES)],
+            LEGACY_SIMULATED_ORDER_FIELD_NAMES,
         )
+        self.assertTrue(DECISION_CONTEXT_FIELD_NAMES.issubset(field_names))
         order = SimulatedOrder(
             id=1,
             direction="LONG",
@@ -221,15 +334,48 @@ class SimulatorTest(unittest.TestCase):
         self.assertIn("stake_progression_source_order_id", order.to_dict())
 
     def test_signal_probe_metadata_defaults_preserve_legacy_positional_arguments(self):
+        field_names = tuple(field.name for field in fields(Signal))
         self.assertEqual(
-            [field.name for field in fields(Signal)][-2:],
-            ["profile_degradation_probe", "profile_degradation_triggered_at"],
+            field_names[: len(LEGACY_SIGNAL_FIELD_NAMES)],
+            LEGACY_SIGNAL_FIELD_NAMES,
         )
+        self.assertTrue(DECISION_CONTEXT_FIELD_NAMES.issubset(field_names))
         legacy = Signal("LONG", 1, "A", "legacy", 100.0, 0, 2.5)
 
         self.assertEqual(legacy.volume_ratio, 2.5)
         self.assertFalse(legacy.profile_degradation_probe)
         self.assertEqual(legacy.profile_degradation_triggered_at, 0)
+
+    def test_legacy_model_construction_uses_empty_decision_context_defaults(self):
+        legacy_models = [
+            Signal("LONG", 1, "A", "legacy", 100.0, 0),
+            SimulatedOrder(1, "LONG", 1, "A", "legacy", 100.0, 0, 60_000),
+            ObservationSignal(
+                "observation-1",
+                "unknown",
+                "unknown",
+                "LONG",
+                1,
+                "A",
+                "legacy",
+                100.0,
+                0,
+                60_000,
+            ),
+        ]
+
+        for model in legacy_models:
+            with self.subTest(model=type(model).__name__):
+                self.assertEqual(model.decision_id, "")
+                self.assertEqual(model.context_version, "")
+                self.assertEqual(model.runtime_config_hash, "")
+                self.assertEqual(model.strategy_build_id, "")
+                self.assertEqual(model.candidate_origin, "")
+                self.assertEqual(model.decision_inputs, {})
+                self.assertEqual(model.decision_trace, [])
+                self.assertEqual(model.first_decisive_block, "")
+                self.assertEqual(model.adaptive_profile_state, {})
+                self.assertEqual(model.entry_structure_shadow, {})
 
     def test_simulated_order_keeps_legacy_positional_argument_order(self):
         order = SimulatedOrder(
@@ -1197,6 +1343,39 @@ class SimulatorTest(unittest.TestCase):
 
         self.assertEqual(settled, [])
         self.assertEqual(order.status, "OPEN")
+
+    def test_progression_disabled_order_neither_consumes_nor_creates_credit(self):
+        pending = StakeProgressionCredit(
+            source_order_id=7,
+            created_at=0,
+            direction="LONG",
+        )
+        simulator = AccountSimulator(
+            enable_stake_progression=True,
+            stake_progression_credits=[pending],
+        )
+
+        watch_signal = replace(
+            signal("LONG"),
+            adaptive_profile_state={"status": "WATCH"},
+        )
+        order, consumed = simulator.open_order_with_credit(
+            watch_signal,
+            entry_price=100.0,
+            opened_at=1_000,
+            allow_progression=False,
+        )
+        event = simulator.settle_expired_order_events(
+            order.expires_at,
+            101.0,
+        )[0]
+
+        self.assertEqual(order.adaptive_profile_state["status"], "WATCH")
+        self.assertEqual(order.stake, 10.0)
+        self.assertIsNone(consumed)
+        self.assertIsNone(event.progression_credit)
+        self.assertEqual(simulator.stake_progression.credits, [pending])
+        self.assertEqual(pending.status, "PENDING")
 
 
 if __name__ == "__main__":

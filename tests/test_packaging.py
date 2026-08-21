@@ -50,6 +50,7 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("wave-batch-guard-status", index_html)
         self.assertIn("profile-degradation-guard-status", index_html)
         self.assertIn("direction-pulse-shadow-status", index_html)
+        self.assertIn("shadow-optimizer-status", index_html)
         self.assertIn("fmtWaveState", app_js)
         self.assertIn("fmtWaveBatchGuard", app_js)
         self.assertIn("fmtProfileDegradationGuard", app_js)
@@ -121,6 +122,137 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("setInterval(loadPrice, 1000)", app_js)
         self.assertNotIn("price: (state) => fmtPrice(state.latest_price)", app_js)
         self.assertNotIn("function renderSignals", app_js)
+
+    def test_dashboard_has_compact_adaptive_and_structure_diagnostics(self):
+        index_html = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        styles_css = (ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertEqual(index_html.count('id="latest-analysis"'), 1)
+        orders_head = index_html.split('<section class="panel orders-panel">', 1)[1].split("</thead>", 1)[0]
+        self.assertEqual(orders_head.count("</th>"), 18)
+        self.assertIn('data-column="entry-structure"', index_html)
+        self.assertIn('id="obs-window-filter"', index_html)
+        self.assertIn('<option value="14d" selected>14天</option>', index_html)
+        self.assertIn('id="obs-structure-state-filter"', index_html)
+        self.assertIn('id="obs-structure-bias-filter"', index_html)
+        self.assertIn('id="obs-origin-filter"', index_html)
+        self.assertIn('colspan="18"', app_js)
+        self.assertIn("function formatAdaptiveProfile", app_js)
+        self.assertIn("function formatEntryStructure", app_js)
+        self.assertIn("entry_structure_state", app_js)
+        self.assertIn("entry_structure_bias", app_js)
+        self.assertIn("candidate_origin", app_js)
+        self.assertIn("overflow-x: auto", styles_css)
+        self.assertIn(".orders-panel table", styles_css)
+        self.assertIn("min-width: 2100px", styles_css)
+
+    def test_dashboard_formats_and_escapes_dynamic_diagnostics(self):
+        script = """
+const fs = require("fs");
+const elements = new Map();
+global.document = {
+  getElementById(id) {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        addEventListener() {},
+        className: "",
+        disabled: false,
+        innerHTML: "",
+        textContent: "",
+        value: id === "obs-window-filter" ? "14d" : "",
+      });
+    }
+    return elements.get(id);
+  },
+};
+global.fetch = () => new Promise(() => {});
+global.setInterval = () => 0;
+const source = fs.readFileSync(process.argv[1], "utf8");
+eval(source + `\n
+const adaptive = formatAdaptiveProfile({
+  qualification_state: "QUALIFIED",
+  status: "ACTIVE",
+  fast_7d: {sample_size: 24, win_rate: 0.625, ev: 0.8333},
+  stable_14d: {sample_size: 40, win_rate: 0.6, ev: 0.8},
+  n12: {sample_size: 12, wins: 7},
+  n20: {sample_size: 20, ev: 0.4},
+});
+const structure = formatEntryStructure({
+  entry_structure_state: "RESISTANCE_REJECTION",
+  entry_structure_bias: "CONFIRMED",
+  active_level_source: "SWING",
+  candidate_origin: "NATIVE_ACTIONABLE",
+});
+const malicious = '<img src=x onerror="alert(1)">';
+renderOrders([{
+  id: malicious,
+  direction: "LONG",
+  timeframe_minutes: 10,
+  level: "A",
+  threshold_segment: "WD-02",
+  strategy_tag: malicious,
+  strategy_family: "base",
+  threshold: 10,
+  score: 11,
+  calculated_threshold: 10,
+  stake: 10,
+  entry_price: 100,
+  opened_at: 1,
+  exit_price: null,
+  settled_at: null,
+  status: "OPEN",
+  result: "",
+  pnl: 0,
+  reason: malicious,
+  entry_structure_shadow: {
+    entry_structure_state: malicious,
+    entry_structure_bias: "CONFIRMED",
+  },
+}]);
+fillFilter("obs-origin-filter", [malicious], "origin");
+elements.get("obs-structure-state-filter").value = "RESISTANCE_REJECTION";
+elements.get("obs-structure-bias-filter").value = "CONFLICT";
+elements.get("obs-origin-filter").value = "PROFILE_PROMOTED_WAIT";
+process.stdout.write(JSON.stringify({
+  adaptive,
+  structure,
+  missingAdaptive: formatAdaptiveProfile(null),
+  missingStructure: formatEntryStructure({}),
+  orderHtml: elements.get("orders").innerHTML,
+  optionHtml: elements.get("obs-origin-filter").innerHTML,
+  observationQuery: observationQuery(),
+  summaryQuery: observationSummaryQuery(),
+}));`);
+"""
+        result = run(
+            ["node", "-e", script, str(ROOT / "app" / "static" / "app.js")],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload["adaptive"],
+            "QUALIFIED · 7d N24 62.50% EV +0.83U · 14d N40 60.00% EV +0.80U · ACTIVE N12 7/12 N20 EV +0.40U",
+        )
+        self.assertEqual(
+            payload["structure"],
+            "RESISTANCE_REJECTION · CONFIRMED · SWING · NATIVE_ACTIONABLE",
+        )
+        self.assertEqual(payload["missingAdaptive"], "-")
+        self.assertEqual(payload["missingStructure"], "-")
+        self.assertNotIn("<img", payload["orderHtml"])
+        self.assertIn("&lt;img", payload["orderHtml"])
+        self.assertNotIn("<img", payload["optionHtml"])
+        self.assertIn("&quot;alert(1)&quot;", payload["optionHtml"])
+        self.assertIn("entry_structure_state=RESISTANCE_REJECTION", payload["observationQuery"])
+        self.assertIn("entry_structure_bias=CONFLICT", payload["observationQuery"])
+        self.assertIn("candidate_origin=PROFILE_PROMOTED_WAIT", payload["observationQuery"])
+        self.assertEqual(payload["summaryQuery"], "window=14d")
 
     def test_dashboard_formats_two_stage_runtime_states(self):
         script = """
@@ -333,6 +465,7 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--live-short-segments", result.stdout)
         self.assertIn("--no-daily-profile-selector", result.stdout)
         self.assertIn("--daily-profile-lookback-days", result.stdout)
+        self.assertIn("--daily-profile-stable-lookback-days", result.stdout)
         self.assertIn("--daily-profile-min-samples", result.stdout)
         self.assertIn("--daily-profile-weekend-min-samples", result.stdout)
         self.assertIn("--daily-profile-min-win-rate", result.stdout)
@@ -340,10 +473,23 @@ process.stdout.write(JSON.stringify({
         self.assertIn("--daily-profile-exit-win-rate", result.stdout)
         self.assertIn("--daily-profile-exit-ev", result.stdout)
         self.assertIn("--daily-profile-degraded-runs", result.stdout)
+        self.assertIn("--daily-profile-joint-failures-to-exit", result.stdout)
+        self.assertIn("未指定时沿用连续退化次数", result.stdout)
         self.assertIn("--daily-profile-max-active", result.stdout)
         self.assertIn("--daily-profile-evaluation-time", result.stdout)
         self.assertIn("--daily-profile-activation-time", result.stdout)
         self.assertIn("--profile-degradation-cooldown-minutes", result.stdout)
+        self.assertIn("--enable-profile-admission", result.stdout)
+        self.assertNotIn("--profile-admission-resident-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-resident-long-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-resident-short-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-resident-long-win-rate-floor", result.stdout)
+        self.assertIn("--profile-admission-resident-short-win-rate-floor", result.stdout)
+        self.assertIn("--profile-admission-fast-directions", result.stdout)
+        self.assertIn("--profile-admission-fast-n12-min-wins", result.stdout)
+        self.assertIn("--profile-admission-fast-n12-max-wins", result.stdout)
+        self.assertIn("--profile-admission-fast-n20-ev-min", result.stdout)
+        self.assertIn("前向稳定性尚未证明", result.stdout)
         self.assertIn("--no-websocket", result.stdout)
         self.assertIn(
             "完整画像连续亏损3单后的冷却分钟数，0关闭，默认: 60",
@@ -351,6 +497,27 @@ process.stdout.write(JSON.stringify({
         )
         self.assertIn("每天北京时间", result.stdout)
         self.assertIn("观察画像", result.stdout)
+
+    def test_run_script_help_has_no_english_argument_labels(self):
+        result = run(
+            ["bash", str(ROOT / "scripts" / "run.sh"), "--help"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("用法:", result.stdout)
+        self.assertIn("参数:", result.stdout)
+        for english_label in (
+            "usage",
+            "options",
+            "show this help message",
+            "missing value",
+        ):
+            self.assertNotIn(english_label, result.stdout.lower())
 
     def test_run_script_handles_empty_extra_args_on_macos_bash(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -413,6 +580,7 @@ process.stdout.write(JSON.stringify({
                     "LIVE_SHORT_SEGMENTS": "WD-23",
                     "DAILY_PROFILE_SELECTOR": "0",
                     "DAILY_PROFILE_LOOKBACK_DAYS": "8",
+                    "DAILY_PROFILE_STABLE_LOOKBACK_DAYS": "16",
                     "DAILY_PROFILE_MIN_SAMPLES": "25",
                     "DAILY_PROFILE_WEEKEND_MIN_SAMPLES": "9",
                     "DAILY_PROFILE_MIN_WIN_RATE": "0.61",
@@ -420,6 +588,7 @@ process.stdout.write(JSON.stringify({
                     "DAILY_PROFILE_EXIT_WIN_RATE": "0.57",
                     "DAILY_PROFILE_EXIT_EV": "0.1",
                     "DAILY_PROFILE_DEGRADED_RUNS": "3",
+                    "DAILY_PROFILE_JOINT_FAILURES_TO_EXIT": "4",
                     "DAILY_PROFILE_MAX_ACTIVE": "2",
                     "DAILY_PROFILE_EVALUATION_TIME": "07:45",
                     "DAILY_PROFILE_ACTIVATION_TIME": "08:05",
@@ -481,6 +650,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(args[args.index("--live-short-segments") + 1], "WD-23")
         self.assertIn("--no-daily-profile-selector", args)
         self.assertEqual(args[args.index("--daily-profile-lookback-days") + 1], "8")
+        self.assertEqual(args[args.index("--daily-profile-stable-lookback-days") + 1], "16")
         self.assertEqual(args[args.index("--daily-profile-min-samples") + 1], "25")
         self.assertEqual(args[args.index("--daily-profile-weekend-min-samples") + 1], "9")
         self.assertEqual(args[args.index("--daily-profile-min-win-rate") + 1], "0.61")
@@ -488,6 +658,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(args[args.index("--daily-profile-exit-win-rate") + 1], "0.57")
         self.assertEqual(args[args.index("--daily-profile-exit-ev") + 1], "0.1")
         self.assertEqual(args[args.index("--daily-profile-degraded-runs") + 1], "3")
+        self.assertEqual(args[args.index("--daily-profile-joint-failures-to-exit") + 1], "4")
         self.assertEqual(args[args.index("--daily-profile-max-active") + 1], "2")
         self.assertEqual(args[args.index("--daily-profile-evaluation-time") + 1], "07:45")
         self.assertEqual(args[args.index("--daily-profile-activation-time") + 1], "08:05")
@@ -496,6 +667,241 @@ process.stdout.write(JSON.stringify({
             args[args.index("--profile-degradation-cooldown-minutes") + 1],
             "75",
         )
+
+    def test_run_script_keeps_optional_daily_profile_args_unset_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+            }
+
+            result = run(
+                ["bash", str(ROOT / "scripts" / "run.sh")],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            args = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("--daily-profile-stable-lookback-days", args)
+        self.assertNotIn("--daily-profile-joint-failures-to-exit", args)
+        self.assertNotIn("--strategy-build-id", args)
+        self.assertEqual(args[args.index("--daily-profile-degraded-runs") + 1], "2")
+
+    def test_run_script_forwards_optional_strategy_build_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            base_env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+            }
+            cases = (
+                ({"STRATEGY_BUILD_ID": "env-build"}, [], "env-build"),
+                ({"STRATEGY_BUILD_ID": "env-build"}, ["--strategy-build-id", "cli-build"], "cli-build"),
+            )
+            for environment, cli_args, expected in cases:
+                result = run(
+                    ["bash", str(ROOT / "scripts" / "run.sh"), *cli_args],
+                    cwd=ROOT,
+                    env={**base_env, **environment},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                args = log_path.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(args[args.index("--strategy-build-id") + 1], expected)
+
+    def test_run_script_forwards_shadow_optimizer_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+                "SHADOW_OPTIMIZER": "1",
+                "SHADOW_DB_PATH": "/tmp/custom-shadow.sqlite3",
+                "SHADOW_QUEUE_SIZE": "12",
+                "SHADOW_MAX_CHALLENGERS": "5",
+            }
+
+            result = run(
+                ["bash", str(ROOT / "scripts" / "run.sh")],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            args = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("--enable-shadow-optimizer", args)
+        self.assertEqual(args[args.index("--shadow-db-path") + 1], "/tmp/custom-shadow.sqlite3")
+        self.assertEqual(args[args.index("--shadow-queue-size") + 1], "12")
+        self.assertEqual(args[args.index("--shadow-max-challengers") + 1], "5")
+
+    def test_run_script_profile_admission_candidate_is_inert_until_explicitly_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            log_path = temp_path / "fake-python-args.txt"
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'if [ "${1:-}" = "-" ]; then cat >/dev/null; exit 0; fi',
+                        'printf "%s\\n" "$@" > "$FAKE_PYTHON_LOG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            base_env = {
+                "PATH": os.environ["PATH"],
+                "PYTHON_BIN": str(fake_python),
+                "FAKE_PYTHON_LOG": str(log_path),
+            }
+
+            default_result = run(
+                ["bash", str(ROOT / "scripts" / "run.sh")],
+                cwd=ROOT,
+                env=base_env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            default_args = log_path.read_text(encoding="utf-8").splitlines()
+            enabled_result = run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "run.sh"),
+                    "--enable-profile-admission",
+                    "--profile-admission-resident-long-n12-max-wins", "6",
+                    "--profile-admission-resident-short-n12-max-wins", "8",
+                    "--profile-admission-resident-long-win-rate-floor", "0.60",
+                    "--profile-admission-resident-short-win-rate-floor", "0.65",
+                    "--profile-admission-fast-directions", "SHORT",
+                    "--profile-admission-fast-n12-min-wins", "6",
+                    "--profile-admission-fast-n12-max-wins", "7",
+                    "--profile-admission-fast-n20-ev-min", "0.25",
+                ],
+                cwd=ROOT,
+                env=base_env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            enabled_args = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(default_result.returncode, 0, default_result.stderr + default_result.stdout)
+        self.assertNotIn("--enable-profile-admission", default_args)
+        self.assertNotIn("--profile-admission-resident-n12-max-wins", default_args)
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-long-n12-max-wins") + 1],
+            "7",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-short-n12-max-wins") + 1],
+            "9",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-long-win-rate-floor") + 1],
+            "off",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-resident-short-win-rate-floor") + 1],
+            "0.625",
+        )
+        self.assertEqual(
+            default_args[default_args.index("--profile-admission-fast-directions") + 1],
+            "SHORT",
+        )
+        self.assertEqual(enabled_result.returncode, 0, enabled_result.stderr + enabled_result.stdout)
+        self.assertIn("--enable-profile-admission", enabled_args)
+        expected = {
+            "--profile-admission-resident-long-n12-max-wins": "6",
+            "--profile-admission-resident-short-n12-max-wins": "8",
+            "--profile-admission-resident-long-win-rate-floor": "0.60",
+            "--profile-admission-resident-short-win-rate-floor": "0.65",
+            "--profile-admission-fast-directions": "SHORT",
+            "--profile-admission-fast-n12-min-wins": "6",
+            "--profile-admission-fast-n12-max-wins": "7",
+            "--profile-admission-fast-n20-ev-min": "0.25",
+        }
+        for option, value in expected.items():
+            self.assertEqual(enabled_args[enabled_args.index(option) + 1], value)
+
+    def test_run_script_rejects_deprecated_shared_profile_admission_environment(self):
+        result = run(
+            ["bash", str(ROOT / "scripts" / "run.sh")],
+            cwd=ROOT,
+            env={
+                "PATH": os.environ["PATH"],
+                "PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS": "8",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS", result.stderr)
 
     def test_run_script_forwards_profile_degradation_cooldown_default_and_cli_forms(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -671,6 +1077,7 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(any(name.endswith("/app/history.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/storage.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/daily_profile_selector.py") for name in names))
+                self.assertTrue(any(name.endswith("/app/profile_admission.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/session_profiles.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/webhook.py") for name in names))
                 self.assertTrue(any(name.endswith("/app/static/index.html") for name in names))

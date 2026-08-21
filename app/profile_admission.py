@@ -1,0 +1,593 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from dataclasses import asdict, dataclass, field, fields
+from typing import Sequence
+
+
+PROFILE_ADMISSION_VERSION = "PROFILE_ADMISSION_V1"
+_ADAPTIVE_STATES = {"WARMUP", "ACTIVE", "WATCH", "PAUSED"}
+_ORDER_SLOTS = {"FIRST", "SECOND"}
+_DIRECTIONS = {"LONG", "SHORT"}
+_RESIDENT_QUALIFICATIONS = {"QUALIFIED", "QUALIFICATION_WATCH"}
+_PROFILE_SEGMENT = re.compile(r"(?:WD|WE)-(?:0[0-9]|1[0-9]|2[0-3])\Z")
+
+
+def _normalized_values(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
+    normalized = tuple(sorted({str(value).strip().upper() for value in values if str(value).strip()}))
+    if not normalized:
+        raise ValueError(f"{field_name} must not be empty")
+    return normalized
+
+
+@dataclass(frozen=True)
+class ProfileAdmissionPolicy:
+    version: str = PROFILE_ADMISSION_VERSION
+    resident_allowed_states: tuple[str, ...] = ("ACTIVE", "WATCH")
+    resident_n12_max_wins: int = 12
+    resident_long_n12_max_wins: int | None = None
+    resident_short_n12_max_wins: int | None = None
+    resident_daily_win_rate_floor: float | None = None
+    resident_long_daily_win_rate_floor: float | None = None
+    resident_short_daily_win_rate_floor: float | None = None
+    fast_enabled: bool = False
+    fast_directions: tuple[str, ...] = ("SHORT",)
+    fast_allowed_states: tuple[str, ...] = ("ACTIVE",)
+    fast_n12_min_wins: int = 7
+    fast_n12_max_wins: int = 8
+    fast_n20_ev_min: float = 0.0
+    fast_allow_second_order: bool = False
+    fast_allow_progression: bool = False
+    watch_allow_first_order: bool = True
+    watch_allow_second_order: bool = False
+    watch_allow_progression: bool = False
+    _canonical_json: str = field(init=False, repr=False, compare=False)
+    _policy_hash: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.version != PROFILE_ADMISSION_VERSION:
+            raise ValueError(f"unsupported profile admission version: {self.version}")
+        object.__setattr__(
+            self,
+            "resident_allowed_states",
+            _normalized_values(
+                self.resident_allowed_states,
+                field_name="resident_allowed_states",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "fast_directions",
+            _normalized_values(self.fast_directions, field_name="fast_directions"),
+        )
+        object.__setattr__(
+            self,
+            "fast_allowed_states",
+            _normalized_values(
+                self.fast_allowed_states,
+                field_name="fast_allowed_states",
+            ),
+        )
+        unknown_resident = set(self.resident_allowed_states) - _ADAPTIVE_STATES
+        unknown_fast = set(self.fast_allowed_states) - _ADAPTIVE_STATES
+        if unknown_resident:
+            raise ValueError(f"unknown resident states: {sorted(unknown_resident)}")
+        if unknown_fast:
+            raise ValueError(f"unknown fast states: {sorted(unknown_fast)}")
+        if set(self.fast_directions) - {"SHORT"}:
+            raise ValueError("fast_directions only supports SHORT")
+        if set(self.fast_allowed_states) - {"ACTIVE"}:
+            raise ValueError("fast_allowed_states only supports ACTIVE")
+        for name in (
+            "fast_enabled",
+            "fast_allow_second_order",
+            "fast_allow_progression",
+            "watch_allow_first_order",
+            "watch_allow_second_order",
+            "watch_allow_progression",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        if self.fast_allow_second_order or self.fast_allow_progression:
+            raise ValueError("FAST must not allow second orders or progression")
+        if self.watch_allow_second_order or self.watch_allow_progression:
+            raise ValueError("WATCH must not allow second orders or progression")
+        if (
+            type(self.resident_n12_max_wins) is not int
+            or not 0 <= self.resident_n12_max_wins <= 12
+        ):
+            raise ValueError("resident_n12_max_wins must be between 0 and 12")
+        for name in (
+            "resident_long_n12_max_wins",
+            "resident_short_n12_max_wins",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not int or not 0 <= value <= 12
+            ):
+                raise ValueError(f"{name} must be between 0 and 12")
+        if (
+            type(self.fast_n12_min_wins) is not int
+            or type(self.fast_n12_max_wins) is not int
+            or not 0 <= self.fast_n12_min_wins <= self.fast_n12_max_wins <= 12
+        ):
+            raise ValueError("fast_n12 bounds must satisfy 0 <= min <= max <= 12")
+        if isinstance(self.fast_n20_ev_min, bool) or not math.isfinite(
+            float(self.fast_n20_ev_min)
+        ):
+            raise ValueError("fast_n20_ev_min must be finite")
+        for name in (
+            "resident_daily_win_rate_floor",
+            "resident_long_daily_win_rate_floor",
+            "resident_short_daily_win_rate_floor",
+        ):
+            raw_floor = getattr(self, name)
+            if raw_floor is None:
+                continue
+            if isinstance(raw_floor, bool):
+                raise ValueError(f"{name} must be between 0 and 1")
+            floor = float(raw_floor)
+            if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+            object.__setattr__(
+                self,
+                name,
+                0.0 if floor == 0.0 else floor,
+            )
+        fast_n20_ev_min = float(self.fast_n20_ev_min)
+        object.__setattr__(
+            self,
+            "fast_n20_ev_min",
+            0.0 if fast_n20_ev_min == 0.0 else fast_n20_ev_min,
+        )
+        canonical_json = json.dumps(
+            self.to_dict(),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        object.__setattr__(self, "_canonical_json", canonical_json)
+        object.__setattr__(
+            self,
+            "_policy_hash",
+            hashlib.sha256(canonical_json.encode("ascii")).hexdigest(),
+        )
+
+    def to_dict(self) -> dict:
+        payload = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if item.init
+        }
+        for name in (
+            "resident_allowed_states",
+            "fast_directions",
+            "fast_allowed_states",
+        ):
+            payload[name] = list(payload[name])
+        return payload
+
+    def to_json(self) -> str:
+        return self._canonical_json
+
+    @property
+    def policy_hash(self) -> str:
+        return self._policy_hash
+
+    @property
+    def complexity(self) -> int:
+        return sum(
+            (
+                int(self.fast_enabled),
+                int(self.resident_daily_win_rate_floor is not None),
+                int(self.resident_long_n12_max_wins is not None),
+                int(self.resident_short_n12_max_wins is not None),
+                int(self.resident_long_daily_win_rate_floor is not None),
+                int(self.resident_short_daily_win_rate_floor is not None),
+            )
+        )
+
+    def resident_n12_limit(self, direction: str) -> int:
+        override = (
+            self.resident_long_n12_max_wins
+            if str(direction).upper() == "LONG"
+            else self.resident_short_n12_max_wins
+        )
+        return self.resident_n12_max_wins if override is None else override
+
+    def resident_win_rate_floor(self, direction: str) -> float | None:
+        override = (
+            self.resident_long_daily_win_rate_floor
+            if str(direction).upper() == "LONG"
+            else self.resident_short_daily_win_rate_floor
+        )
+        return self.resident_daily_win_rate_floor if override is None else override
+
+
+@dataclass(frozen=True)
+class ProfileAdmissionContext:
+    profile_key: str
+    direction: str
+    order_slot: str
+    daily_selected: bool
+    qualification_state: str
+    daily_rank: int | None
+    daily_win_rate: float
+    adaptive_state: str
+    adaptive_transition: str
+    adaptive_evaluated_at: int
+    n12_sample_size: int
+    n12_wins: int
+    n20_sample_size: int
+    n20_ev: float
+    candidate_origin: str
+    candidate_ordinal: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "direction", str(self.direction).upper())
+        object.__setattr__(self, "order_slot", str(self.order_slot).upper())
+        object.__setattr__(self, "adaptive_state", str(self.adaptive_state).upper())
+        if type(self.adaptive_transition) is not str:
+            raise ValueError("adaptive_transition must be a string")
+        object.__setattr__(
+            self,
+            "adaptive_transition",
+            self.adaptive_transition.strip().upper(),
+        )
+        object.__setattr__(
+            self,
+            "qualification_state",
+            str(self.qualification_state).upper(),
+        )
+        object.__setattr__(
+            self,
+            "candidate_origin",
+            str(self.candidate_origin).upper(),
+        )
+        if type(self.profile_key) is not str:
+            raise ValueError("profile_key must be a canonical string")
+        profile_parts = self.profile_key.split("|")
+        if (
+            len(profile_parts) != 5
+            or profile_parts[0] != "10"
+            or not profile_parts[1]
+            or not profile_parts[2]
+            or profile_parts[3] not in _DIRECTIONS
+            or _PROFILE_SEGMENT.fullmatch(profile_parts[4]) is None
+        ):
+            raise ValueError("profile_key must be a canonical 10-minute profile key")
+        if self.order_slot not in _ORDER_SLOTS:
+            raise ValueError(f"unknown order_slot: {self.order_slot}")
+        if self.direction not in _DIRECTIONS:
+            raise ValueError(f"unknown direction: {self.direction}")
+        if profile_parts[3] != self.direction:
+            raise ValueError("profile_key direction must equal context direction")
+        if self.adaptive_state not in _ADAPTIVE_STATES:
+            raise ValueError(f"unknown adaptive_state: {self.adaptive_state}")
+        if type(self.daily_selected) is not bool:
+            raise ValueError("daily_selected must be a boolean")
+        if self.daily_rank is not None and (type(self.daily_rank) is not int or self.daily_rank <= 0):
+            raise ValueError("daily_rank must be a positive integer")
+        if isinstance(self.daily_win_rate, bool):
+            raise ValueError("daily_win_rate must be between 0 and 1")
+        daily_win_rate = float(self.daily_win_rate)
+        if not math.isfinite(daily_win_rate) or not 0.0 <= daily_win_rate <= 1.0:
+            raise ValueError("daily_win_rate must be between 0 and 1")
+        object.__setattr__(
+            self,
+            "daily_win_rate",
+            0.0 if daily_win_rate == 0.0 else daily_win_rate,
+        )
+        for name in ("n12_sample_size", "n12_wins", "n20_sample_size"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.n12_sample_size > 12 or self.n12_wins > self.n12_sample_size:
+            raise ValueError("n12_wins must fit n12_sample_size <= 12")
+        if self.n20_sample_size > 20:
+            raise ValueError("n20_sample_size must not exceed 20")
+        if self.n20_sample_size < self.n12_sample_size:
+            raise ValueError("n20_sample_size must include the N12 samples")
+        if self.adaptive_state == "WARMUP" and self.n12_sample_size >= 12:
+            raise ValueError("WARMUP must not contain a mature N12 window")
+        if self.adaptive_state != "WARMUP" and self.n12_sample_size != 12:
+            raise ValueError(f"{self.adaptive_state} requires a mature N12 window")
+        if self.adaptive_state == "PAUSED" and self.n20_sample_size != 20:
+            raise ValueError("PAUSED requires a complete N20 window")
+        if isinstance(self.n20_ev, bool):
+            raise ValueError("n20_ev must be finite")
+        n20_ev = float(self.n20_ev)
+        if not math.isfinite(n20_ev):
+            raise ValueError("n20_ev must be finite")
+        if self.n20_sample_size == 0 and n20_ev != 0.0:
+            raise ValueError("n20_ev must be zero without N20 samples")
+        object.__setattr__(self, "n20_ev", 0.0 if n20_ev == 0.0 else n20_ev)
+        if type(self.adaptive_evaluated_at) is not int or self.adaptive_evaluated_at < 0:
+            raise ValueError("adaptive_evaluated_at must be a non-negative integer")
+        if type(self.candidate_ordinal) is not int or self.candidate_ordinal < 0:
+            raise ValueError("candidate_ordinal must be a non-negative integer")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ProfileAdmissionDecision:
+    allowed: bool
+    channel: str
+    code: str
+    allow_second_order: bool
+    allow_progression: bool
+    policy_version: str
+    policy_hash: str
+    rank_key: tuple
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        payload["rank_key"] = list(self.rank_key)
+        return payload
+
+
+@dataclass(frozen=True)
+class RankedAdmission:
+    context: ProfileAdmissionContext
+    decision: ProfileAdmissionDecision
+
+
+def baseline_policy() -> ProfileAdmissionPolicy:
+    return ProfileAdmissionPolicy(
+        resident_allowed_states=("ACTIVE", "WATCH", "WARMUP"),
+        resident_n12_max_wins=12,
+        fast_enabled=False,
+    )
+
+
+def candidate_policy() -> ProfileAdmissionPolicy:
+    return ProfileAdmissionPolicy(
+        resident_allowed_states=("ACTIVE", "WATCH"),
+        resident_n12_max_wins=12,
+        resident_long_n12_max_wins=7,
+        resident_short_n12_max_wins=9,
+        resident_daily_win_rate_floor=None,
+        resident_long_daily_win_rate_floor=None,
+        resident_short_daily_win_rate_floor=0.625,
+        fast_enabled=True,
+        fast_directions=("SHORT",),
+        fast_allowed_states=("ACTIVE",),
+        fast_n12_min_wins=7,
+        fast_n12_max_wins=8,
+        fast_n20_ev_min=0.0,
+    )
+
+
+def policy_grid() -> tuple[ProfileAdmissionPolicy, ...]:
+    return tuple(
+        ProfileAdmissionPolicy(
+            resident_allowed_states=("ACTIVE", "WATCH"),
+            resident_n12_max_wins=12,
+            resident_long_n12_max_wins=long_max,
+            resident_short_n12_max_wins=short_max,
+            resident_daily_win_rate_floor=None,
+            resident_long_daily_win_rate_floor=long_floor,
+            resident_short_daily_win_rate_floor=short_floor,
+            fast_enabled=True,
+            fast_directions=("SHORT",),
+            fast_allowed_states=("ACTIVE",),
+            fast_n12_min_wins=7,
+            fast_n12_max_wins=fast_max,
+            fast_n20_ev_min=0.0,
+        )
+        for long_max in (7, 8)
+        for short_max in (8, 9)
+        for long_floor in (None, 0.60)
+        for short_floor in (None, 0.625)
+        for fast_max in (7, 8)
+    )
+
+
+def _rank_key(context: ProfileAdmissionContext, channel: str) -> tuple:
+    return (
+        0 if channel == "RESIDENT" else 1,
+        context.daily_rank if context.daily_rank is not None else 1_000_000,
+        context.profile_key,
+        context.candidate_origin,
+        context.candidate_ordinal,
+    )
+
+
+def _decision(
+    context: ProfileAdmissionContext,
+    policy: ProfileAdmissionPolicy,
+    *,
+    allowed: bool,
+    channel: str,
+    code: str,
+    allow_second_order: bool = False,
+    allow_progression: bool = False,
+) -> ProfileAdmissionDecision:
+    return ProfileAdmissionDecision(
+        allowed=allowed,
+        channel=channel,
+        code=code,
+        allow_second_order=allow_second_order,
+        allow_progression=allow_progression,
+        policy_version=policy.version,
+        policy_hash=policy.policy_hash,
+        rank_key=_rank_key(context, channel if allowed else "NONE"),
+    )
+
+
+def evaluate_profile_admission(
+    context: ProfileAdmissionContext,
+    policy: ProfileAdmissionPolicy,
+) -> ProfileAdmissionDecision:
+    state = context.adaptive_state
+    if state == "PAUSED":
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="ADAPTIVE_PAUSED",
+        )
+
+    if context.daily_selected:
+        if context.qualification_state not in _RESIDENT_QUALIFICATIONS:
+            return _decision(
+                context,
+                policy,
+                allowed=False,
+                channel="NONE",
+                code="RESIDENT_QUALIFICATION_BLOCKED",
+            )
+        if state not in policy.resident_allowed_states:
+            return _decision(
+                context,
+                policy,
+                allowed=False,
+                channel="NONE",
+                code="RESIDENT_STATE_BLOCKED",
+            )
+        if context.n12_wins > policy.resident_n12_limit(context.direction):
+            return _decision(
+                context,
+                policy,
+                allowed=False,
+                channel="NONE",
+                code="RESIDENT_N12_OVERHEATED",
+            )
+        resident_floor = policy.resident_win_rate_floor(context.direction)
+        if resident_floor is not None and context.daily_win_rate < resident_floor:
+            return _decision(
+                context,
+                policy,
+                allowed=False,
+                channel="NONE",
+                code="RESIDENT_DAILY_WIN_RATE_BLOCKED",
+            )
+        if state == "WATCH":
+            if context.order_slot == "FIRST" and not policy.watch_allow_first_order:
+                return _decision(
+                    context,
+                    policy,
+                    allowed=False,
+                    channel="NONE",
+                    code="WATCH_FIRST_ORDER_BLOCKED",
+                )
+            if context.order_slot == "SECOND" and not policy.watch_allow_second_order:
+                return _decision(
+                    context,
+                    policy,
+                    allowed=False,
+                    channel="NONE",
+                    code="WATCH_SECOND_ORDER_BLOCKED",
+                )
+            return _decision(
+                context,
+                policy,
+                allowed=True,
+                channel="RESIDENT",
+                code="RESIDENT_WATCH_ADMITTED",
+                allow_second_order=False,
+                allow_progression=False,
+            )
+        return _decision(
+            context,
+            policy,
+            allowed=True,
+            channel="RESIDENT",
+            code="RESIDENT_ADMITTED",
+            allow_second_order=True,
+            allow_progression=True,
+        )
+
+    if not policy.fast_enabled:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="DAILY_PROFILE_NOT_SELECTED",
+        )
+    if context.candidate_ordinal <= 0:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_PRIMARY_BLOCKED",
+        )
+    if context.direction != "SHORT" or context.direction not in policy.fast_directions:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_DIRECTION_BLOCKED",
+        )
+    if state in {"WARMUP", "WATCH"} or state not in policy.fast_allowed_states:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_STATE_BLOCKED",
+        )
+    if not policy.fast_n12_min_wins <= context.n12_wins <= policy.fast_n12_max_wins:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_N12_BLOCKED",
+        )
+    if context.n20_ev < policy.fast_n20_ev_min:
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_N20_EV_BLOCKED",
+        )
+    if context.order_slot == "SECOND":
+        return _decision(
+            context,
+            policy,
+            allowed=False,
+            channel="NONE",
+            code="FAST_SECOND_ORDER_BLOCKED",
+        )
+    return _decision(
+        context,
+        policy,
+        allowed=True,
+        channel="FAST",
+        code="FAST_ADMITTED",
+        allow_second_order=False,
+        allow_progression=False,
+    )
+
+
+def rank_admitted_candidates(
+    contexts: Sequence[ProfileAdmissionContext],
+    policy: ProfileAdmissionPolicy,
+) -> tuple[RankedAdmission, ...]:
+    admitted = [
+        RankedAdmission(context=context, decision=decision)
+        for context in contexts
+        if (decision := evaluate_profile_admission(context, policy)).allowed
+    ]
+    admitted.sort(key=lambda item: item.decision.rank_key)
+    return tuple(admitted)
+
+
+def select_admitted_candidate(
+    contexts: Sequence[ProfileAdmissionContext],
+    policy: ProfileAdmissionPolicy,
+) -> RankedAdmission | None:
+    ranked = rank_admitted_candidates(contexts, policy)
+    return ranked[0] if ranked else None

@@ -34,6 +34,176 @@ def signal(direction="LONG", score=82.0, threshold=70.0, segment="WD-12"):
 
 
 class OrderPolicyTest(unittest.TestCase):
+    def test_evaluate_traces_every_existing_decisive_branch_in_order(self):
+        latest = kline(20)
+        open_long = SimulatedOrder(
+            id=1,
+            direction="LONG",
+            timeframe_minutes=10,
+            level="A",
+            reason="open",
+            entry_price=100.0,
+            opened_at=latest.close_time - 180_000,
+            expires_at=latest.close_time + 600_000,
+        )
+        open_short = replace(open_long, id=2, direction="SHORT")
+        cases = (
+            (
+                "below threshold",
+                OrderPolicy(),
+                replace(signal(score=69.0), direction="WAIT", observe_direction="LONG"),
+                [],
+                None,
+                set(),
+                "BELOW_THRESHOLD",
+                "SCORE",
+                "BELOW_THRESHOLD",
+            ),
+            (
+                "session blocked",
+                OrderPolicy(),
+                replace(
+                    signal(score=82.0),
+                    direction="WAIT",
+                    observe_direction="LONG",
+                    session_allowed=False,
+                ),
+                [],
+                None,
+                set(),
+                "SESSION_BLOCKED",
+                "SESSION",
+                "SESSION_BLOCKED",
+            ),
+            (
+                "overheated",
+                OrderPolicy(),
+                replace(
+                    signal(score=100.0),
+                    direction="WAIT",
+                    observe_direction="LONG",
+                ),
+                [],
+                None,
+                set(),
+                "OVERHEATED",
+                "SCORE",
+                "OVERHEATED",
+            ),
+            (
+                "edge too small",
+                OrderPolicy(),
+                replace(
+                    signal(score=85.0),
+                    direction="WAIT",
+                    observe_direction="LONG",
+                ),
+                [],
+                None,
+                set(),
+                "EDGE_TOO_SMALL",
+                "SCORE",
+                "EDGE_TOO_SMALL",
+            ),
+            (
+                "global capacity",
+                OrderPolicy(max_open_orders=1),
+                signal(),
+                [open_short],
+                None,
+                set(),
+                "HOLD_OPEN_ORDER",
+                "CAPACITY",
+                "MAX_OPEN_ORDERS",
+            ),
+            (
+                "direction cooldown",
+                OrderPolicy(min_order_gap_ms=120_000),
+                signal(),
+                [],
+                {"LONG": latest.close_time - 60_000},
+                set(),
+                "COOLDOWN",
+                "COOLDOWN",
+                "DIRECTION_COOLDOWN",
+            ),
+            (
+                "direction capacity",
+                OrderPolicy(max_open_orders=2, max_open_long_orders=1),
+                signal(),
+                [open_long],
+                None,
+                set(),
+                "HOLD_LONG_OPEN_ORDER",
+                "DIRECTION_CAPACITY",
+                "MAX_DIRECTION_OPEN_ORDERS",
+            ),
+            (
+                "duplicate signal",
+                OrderPolicy(),
+                signal(),
+                [],
+                None,
+                {(1_000, 10, "LONG")},
+                "DUPLICATE_SIGNAL",
+                "DUPLICATE",
+                "DUPLICATE_SIGNAL",
+            ),
+            (
+                "opened",
+                OrderPolicy(),
+                signal(),
+                [],
+                None,
+                set(),
+                "OPENED",
+                "",
+                "OPENED",
+            ),
+        )
+
+        for (
+            label,
+            policy,
+            candidate,
+            orders,
+            last_opened,
+            opened_keys,
+            expected_code,
+            expected_stage,
+            expected_reason,
+        ) in cases:
+            with self.subTest(label=label):
+                gate = policy.evaluate(
+                    candidate,
+                    latest,
+                    orders,
+                    last_opened,
+                    opened_keys,
+                )
+
+                self.assertEqual(gate.code, expected_code)
+                self.assertEqual(gate.first_decisive_block, expected_stage)
+                self.assertTrue(gate.decision_trace)
+                self.assertEqual(
+                    [record["stage"] for record in gate.decision_trace],
+                    list(dict.fromkeys(record["stage"] for record in gate.decision_trace)),
+                )
+                if expected_stage:
+                    self.assertEqual(gate.decision_trace[-1]["result"], "BLOCK")
+                    self.assertEqual(gate.decision_trace[-1]["reason_code"], expected_reason)
+                    self.assertTrue(
+                        all(
+                            record["result"] == "PASS"
+                            for record in gate.decision_trace[:-1]
+                        )
+                    )
+                else:
+                    self.assertTrue(
+                        all(record["result"] == "PASS" for record in gate.decision_trace)
+                    )
+                    self.assertEqual(gate.decision_trace[-1]["reason_code"], expected_reason)
+
     def test_default_policy_allows_opposite_direction_second_order_and_blocks_third(self):
         policy = OrderPolicy()
         latest = kline(20)

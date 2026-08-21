@@ -1,5 +1,8 @@
+import json
 import unittest
+from unittest.mock import patch
 
+from app.indicators import TechnicalContext, build_technical_context
 from app.models import FearGreedContext, Kline, Signal
 from app.strategy import (
     _failed_breakout_observation,
@@ -86,7 +89,181 @@ def neutral_mid_klines():
     return klines
 
 
+def normal_volume_short_klines():
+    klines = []
+    for offset in range(260):
+        idx = 960 + offset
+        close = 105.0 + offset * 0.015
+        low = 100.0 if offset == 0 else close - 0.2
+        klines.append(
+            kline(
+                idx,
+                close,
+                100,
+                open_price=close - 0.01,
+                high=close + 0.2,
+                low=low,
+            )
+        )
+    for offset in range(40):
+        idx = 1220 + offset
+        close = 109.0 + (offset % 3) * 0.02 if offset < 34 else 108.8 + (offset - 34) * 0.3
+        klines.append(
+            kline(
+                idx,
+                close,
+                100,
+                open_price=close - 0.02,
+                high=112.2,
+                low=close - 0.2,
+            )
+        )
+    start = klines[-1].open_time // 60_000 + 1
+    price = 111.2
+    for offset, step in enumerate([-1, -1, 1, -1, -1, 1, -1, -1, -1, -1]):
+        idx = start + offset
+        open_price = price
+        price += step * 0.15
+        close = price
+        klines.append(
+            kline(
+                idx,
+                close,
+                100,
+                open_price=open_price,
+                high=max(open_price, close) + 0.04,
+                low=min(open_price, close) - 0.08,
+            )
+        )
+    return klines
+
+
+APPLIED_SCORE_POINT_FIELDS = (
+    "base_points",
+    "volume_points",
+    "move_points",
+    "trend_points",
+    "close_points",
+    "indicator_points",
+)
+
+
 class StrategyTest(unittest.TestCase):
+    def test_technical_context_exposes_causal_atr_and_normalized_macd(self):
+        closes = [100.0 + index * 0.17 + (0.45 if index % 4 == 0 else -0.2) for index in range(50)]
+        klines = []
+        for index, close in enumerate(closes):
+            open_price = closes[index - 1] if index else close - 0.3
+            klines.append(
+                kline(
+                    index,
+                    close,
+                    100.0 + index,
+                    open_price=open_price,
+                    high=max(open_price, close) + 0.25,
+                    low=min(open_price, close) - 0.15,
+                )
+            )
+
+        context = build_technical_context(klines)
+        true_ranges = []
+        for index, item in enumerate(klines):
+            if index == 0:
+                true_ranges.append(item.high - item.low)
+                continue
+            previous_close = klines[index - 1].close
+            true_ranges.append(
+                max(
+                    item.high - item.low,
+                    abs(item.high - previous_close),
+                    abs(item.low - previous_close),
+                )
+            )
+        expected_atr = sum(true_ranges[-14:]) / 14.0
+
+        self.assertGreater(context.atr, 0.0)
+        self.assertAlmostEqual(context.atr, expected_atr, places=12)
+        self.assertAlmostEqual(
+            context.macd_line - context.macd_signal_line,
+            context.macd_histogram,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            context.macd_histogram_atr,
+            context.macd_histogram / context.atr,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            context.macd_delta_atr,
+            context.macd_histogram_delta / context.atr,
+            places=12,
+        )
+
+    def test_technical_context_uses_safe_zero_defaults_for_insufficient_and_flat_klines(self):
+        insufficient = [
+            kline(index, 100.0 + index, 100.0, high=101.0 + index, low=99.0 + index)
+            for index in range(13)
+        ]
+        flat = [kline(index, 100.0, 100.0, high=100.0, low=100.0) for index in range(40)]
+
+        for context in (
+            build_technical_context([]),
+            build_technical_context(insufficient),
+            build_technical_context(flat),
+        ):
+            with self.subTest(context=context):
+                self.assertEqual(context.macd_line, 0.0)
+                self.assertEqual(context.macd_signal_line, 0.0)
+                self.assertEqual(context.macd_histogram, 0.0)
+                self.assertEqual(context.macd_histogram_delta, 0.0)
+                self.assertEqual(context.atr, 0.0)
+                self.assertEqual(context.macd_histogram_atr, 0.0)
+                self.assertEqual(context.macd_delta_atr, 0.0)
+
+    def test_threshold_near_decision_inputs_preserve_raw_indicator_and_bias_precision(self):
+        technical = TechnicalContext(
+            macd_histogram=-0.00000049,
+            macd_histogram_delta=-0.00000051,
+            rsi=44.999999,
+            bollinger_position=0.34999999,
+            bollinger_width=0.001999999,
+            macd_line=0.123456789123,
+            macd_signal_line=0.123457279123,
+            atr=0.987654321987,
+            macd_histogram_atr=-0.00000049 / 0.987654321987,
+            macd_delta_atr=-0.00000051 / 0.987654321987,
+        )
+        mtf_10m_bias = 0.999949999
+        mtf_30m_bias = -0.999949999
+
+        with (
+            patch("app.strategy.build_technical_context", return_value=technical),
+            patch("app.strategy.trend_bias", side_effect=(mtf_10m_bias, mtf_30m_bias)),
+        ):
+            signal = analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10)
+
+        indicators = signal.decision_inputs["indicators"]
+        expected = {
+            "macd_line": technical.macd_line,
+            "macd_signal_line": technical.macd_signal_line,
+            "macd_histogram": technical.macd_histogram,
+            "macd_histogram_delta": technical.macd_histogram_delta,
+            "atr": technical.atr,
+            "macd_histogram_atr": technical.macd_histogram_atr,
+            "macd_delta_atr": technical.macd_delta_atr,
+            "rsi": technical.rsi,
+            "bollinger_position": technical.bollinger_position,
+            "bollinger_width": technical.bollinger_width,
+            "mtf_10m_bias": mtf_10m_bias,
+            "mtf_30m_bias": mtf_30m_bias,
+        }
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(indicators[key], value)
+        self.assertNotEqual(signal.rsi, indicators["rsi"])
+        self.assertNotEqual(signal.bollinger_position, indicators["bollinger_position"])
+        json.dumps(signal.to_dict(), allow_nan=False)
+
     def test_generic_short_profile_identity_is_stable(self):
         klines = neutral_mid_klines()
         latest = klines[-1]
@@ -506,6 +683,275 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(signal.observe_direction, "LONG")
         self.assertGreaterEqual(signal.price_position, 0.0)
         self.assertLessEqual(signal.price_position, 1.0)
+
+    def test_strategy_decision_inputs_capture_real_indicator_volume_threshold_and_score_values(self):
+        klines = [
+            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
+            for i in range(360, 480)
+        ]
+        for offset in range(10):
+            idx = 480 + offset
+            open_price = 100.0 - offset * 0.2
+            close = open_price - 0.15
+            klines.append(
+                kline(
+                    idx,
+                    close,
+                    160,
+                    open_price=open_price,
+                    high=open_price + 0.05,
+                    low=close - 0.1,
+                )
+            )
+
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
+        inputs = signal.decision_inputs
+
+        self.assertEqual(set(inputs), {"indicators", "volume_price", "thresholds", "score"})
+        self.assertTrue(
+            {
+                "macd_line",
+                "macd_signal_line",
+                "macd_histogram",
+                "macd_histogram_delta",
+                "atr",
+                "macd_histogram_atr",
+                "macd_delta_atr",
+                "rsi",
+                "bollinger_position",
+                "bollinger_width",
+                "indicator_profile_segment",
+                "indicator_profile_sample_size",
+                "rsi_lower_threshold",
+                "rsi_upper_threshold",
+                "bollinger_lower_threshold",
+                "bollinger_upper_threshold",
+                "macd_histogram_threshold",
+                "macd_delta_threshold",
+            }.issubset(inputs["indicators"])
+        )
+        self.assertTrue(
+            {
+                "current_volume",
+                "volume_baseline",
+                "volume_ratio",
+                "high_volume_threshold",
+                "low_volume_threshold",
+                "price_change_pct",
+                "price_position",
+                "close_strength",
+                "candle_strength",
+                "upper_wick_ratio",
+                "lower_wick_ratio",
+            }.issubset(inputs["volume_price"])
+        )
+        self.assertTrue(
+            {
+                "base_threshold",
+                "direction_threshold",
+                "session_adjusted_threshold",
+                "fear_greed_adjustment",
+                "regime_adjustment",
+                "calculated_threshold",
+                "session_edge_min",
+                "max_trade_edge",
+            }.issubset(inputs["thresholds"])
+        )
+        self.assertTrue(
+            {
+                "raw_direction",
+                "raw_score",
+                "signed_score",
+                "branch",
+                "direction_multiplier",
+                "base_points",
+                "volume_points",
+                "move_points",
+                "trend_points",
+                "close_points",
+                "indicator_points",
+                "reconstructed_raw_score",
+            }.issubset(inputs["score"])
+        )
+        self.assertEqual(inputs["volume_price"]["current_volume"], 1600)
+        self.assertAlmostEqual(
+            inputs["volume_price"]["volume_ratio"],
+            inputs["volume_price"]["current_volume"] / inputs["volume_price"]["volume_baseline"],
+        )
+
+    def test_strategy_decision_inputs_do_not_change_existing_deterministic_signal(self):
+        klines = [
+            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
+            for i in range(360, 480)
+        ]
+        for offset in range(10):
+            idx = 480 + offset
+            open_price = 100.0 - offset * 0.2
+            close = open_price - 0.15
+            klines.append(
+                kline(
+                    idx,
+                    close,
+                    160,
+                    open_price=open_price,
+                    high=open_price + 0.05,
+                    low=close - 0.1,
+                )
+            )
+
+        signal = analyze_volume_price(klines, timeframe_minutes=10)
+
+        self.assertEqual(
+            (
+                signal.direction,
+                signal.score,
+                signal.threshold,
+                signal.reason,
+                signal.macd_histogram,
+                signal.macd_histogram_delta,
+                signal.rsi,
+                signal.bollinger_position,
+                signal.bollinger_width,
+            ),
+            (
+                "LONG",
+                100.0,
+                77.0,
+                "放量急跌反抽：回测显示急跌后后续窗口更偏反弹，动态评分偏多",
+                -0.180735,
+                -0.010254,
+                21.33,
+                -0.0249,
+                0.0273,
+            ),
+        )
+        score_inputs = signal.decision_inputs["score"]
+        self.assertEqual(
+            score_inputs["signed_score"],
+            max(-100.0, min(100.0, score_inputs["raw_score"])),
+        )
+        self.assertEqual(score_inputs["branch"], "high_volume_down_rebound_long")
+        self.assertEqual(score_inputs["direction_multiplier"], 1.0)
+        self.assertEqual(score_inputs["base_points"], 34.0)
+        self.assertEqual(
+            score_inputs["move_points"],
+            score_inputs["diagnostic_unweighted_move_points"],
+        )
+        self.assertAlmostEqual(
+            score_inputs["trend_points"],
+            max(-score_inputs["diagnostic_trend_score"], 0.0) * 10.0,
+        )
+        reconstructed = score_inputs["direction_multiplier"] * sum(
+            score_inputs[field] for field in APPLIED_SCORE_POINT_FIELDS
+        )
+        self.assertAlmostEqual(reconstructed, score_inputs["reconstructed_raw_score"])
+        self.assertAlmostEqual(reconstructed, score_inputs["raw_score"])
+        self.assertEqual(
+            signal.decision_inputs["thresholds"]["calculated_threshold"],
+            signal.threshold,
+        )
+
+    def test_scoring_branch_derives_raw_score_from_applied_components(self):
+        from app import strategy as strategy_module
+
+        original = strategy_module._applied_score_components
+
+        def shifted_normal_short_components(branch, direction_multiplier=0.0, **kwargs):
+            if branch == "normal_volume_down_short":
+                kwargs["base_points"] += 0.125
+            return original(branch, direction_multiplier, **kwargs)
+
+        with patch.object(
+            strategy_module,
+            "_applied_score_components",
+            side_effect=shifted_normal_short_components,
+        ):
+            signal = analyze_volume_price(normal_volume_short_klines(), timeframe_minutes=10)
+
+        score_inputs = signal.decision_inputs["score"]
+        self.assertAlmostEqual(
+            score_inputs["raw_score"],
+            score_inputs["reconstructed_raw_score"],
+        )
+
+    def test_normal_volume_short_score_components_use_exact_weighted_terms(self):
+        signal = analyze_volume_price(normal_volume_short_klines(), timeframe_minutes=10)
+        score_inputs = signal.decision_inputs["score"]
+
+        self.assertEqual(score_inputs["raw_direction"], "SHORT")
+        self.assertEqual(score_inputs["branch"], "normal_volume_down_short")
+        self.assertEqual(score_inputs["direction_multiplier"], -1.0)
+        self.assertEqual(score_inputs["base_points"], 18.0)
+        self.assertEqual(score_inputs["volume_points"], 0.0)
+        self.assertAlmostEqual(
+            score_inputs["move_points"],
+            score_inputs["diagnostic_unweighted_move_points"] * 0.8,
+        )
+        self.assertAlmostEqual(
+            score_inputs["trend_points"],
+            max(-score_inputs["diagnostic_trend_score"], 0.0) * 8.0,
+        )
+        self.assertEqual(score_inputs["close_points"], 0.0)
+        reconstructed = score_inputs["direction_multiplier"] * sum(
+            score_inputs[field] for field in APPLIED_SCORE_POINT_FIELDS
+        )
+        self.assertAlmostEqual(reconstructed, score_inputs["reconstructed_raw_score"])
+        self.assertAlmostEqual(reconstructed, score_inputs["raw_score"])
+        self.assertEqual(score_inputs["signed_score"], score_inputs["raw_score"])
+        self.assertNotEqual(score_inputs["signed_score"], signal.score)
+
+    def test_wait_score_components_record_no_applied_points(self):
+        signal = analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10)
+        score_inputs = signal.decision_inputs["score"]
+
+        self.assertEqual(score_inputs["raw_direction"], "WAIT")
+        self.assertEqual(score_inputs["branch"], "no_setup_wait")
+        self.assertEqual(score_inputs["direction_multiplier"], 0.0)
+        for field in APPLIED_SCORE_POINT_FIELDS:
+            with self.subTest(field=field):
+                self.assertEqual(score_inputs[field], 0.0)
+        self.assertEqual(score_inputs["reconstructed_raw_score"], 0.0)
+        self.assertEqual(score_inputs["raw_score"], 0.0)
+
+    def test_all_analyzed_signal_paths_have_strict_json_serializable_decision_inputs(self):
+        deterministic = [
+            kline(i, 100 + (0.2 if i % 2 else -0.2), 100 + (30 if i % 3 == 0 else 0))
+            for i in range(360, 480)
+        ]
+        for offset in range(10):
+            idx = 480 + offset
+            open_price = 100.0 - offset * 0.2
+            close = open_price - 0.15
+            deterministic.append(
+                kline(
+                    idx,
+                    close,
+                    160,
+                    open_price=open_price,
+                    high=open_price + 0.05,
+                    low=close - 0.1,
+                )
+            )
+        signals = [
+            analyze_volume_price([], timeframe_minutes=10),
+            analyze_volume_price([kline(0, 100.0, 100.0)], timeframe_minutes=10),
+            analyze_volume_price(neutral_mid_klines(), timeframe_minutes=10),
+            analyze_volume_price(deterministic, timeframe_minutes=10),
+            analyze_volume_price(
+                fear_falling_mid_drop_klines(),
+                timeframe_minutes=10,
+                fear_greed=FearGreedContext(
+                    value=18,
+                    classification="Extreme Fear",
+                    average_30d=37.0,
+                    trend="falling",
+                ),
+            ),
+        ]
+
+        for result in signals:
+            with self.subTest(reason=result.reason):
+                json.dumps(result.to_dict(), allow_nan=False)
 
     def test_extreme_drop_reclaim_identity_uses_brainstorm_replay_thresholds(self):
         self.assertTrue(

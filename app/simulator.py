@@ -1,5 +1,6 @@
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from time import time
@@ -197,6 +198,16 @@ class AccountSimulator:
             "quality_score_components": dict(signal.quality_score_components),
             "quality_score_inputs": dict(signal.quality_score_inputs),
             "direction_pulse_shadow": dict(signal.direction_pulse_shadow),
+            "decision_id": signal.decision_id,
+            "context_version": signal.context_version,
+            "runtime_config_hash": signal.runtime_config_hash,
+            "strategy_build_id": signal.strategy_build_id,
+            "candidate_origin": signal.candidate_origin,
+            "decision_inputs": deepcopy(signal.decision_inputs),
+            "decision_trace": deepcopy(signal.decision_trace),
+            "first_decisive_block": signal.first_decisive_block,
+            "adaptive_profile_state": deepcopy(signal.adaptive_profile_state),
+            "entry_structure_shadow": deepcopy(signal.entry_structure_shadow),
         }
         if allow_progression:
             terms, credit = self.stake_progression.assign(
@@ -317,8 +328,12 @@ class AccountSimulator:
             result,
             settled_at,
             allow_credit=(
-                order.wave_guard_mode != "RECOVERY"
-                or order.profile_degradation_probe is True
+                str(order.adaptive_profile_state.get("status", "")).upper()
+                != "WATCH"
+                and (
+                    order.wave_guard_mode != "RECOVERY"
+                    or order.profile_degradation_probe is True
+                )
             ),
             direction=order.direction,
         )

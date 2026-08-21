@@ -14,8 +14,10 @@ from app.history import WarmupConfig, WarmupReport, warmup_history
 from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.profile_health_guard import ProfileHealthGuardConfig
+from app.profile_admission import ProfileAdmissionPolicy, baseline_policy
 from app.result_sequence_guard import ResultSequenceGuardConfig
-from app.state import MonitorState
+from app.shadow_supervisor import ShadowSupervisor
+from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState, strategy_source_build_id
 from app.time_period_guard import TimePeriodGuardConfig
 from app.webhook import DEFAULT_IMPORT_TOKEN, DEFAULT_WEBHOOK_URL, WebhookSignalProxy
 
@@ -27,6 +29,15 @@ DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS = ""
 DEFAULT_LIVE_SHORT_SEGMENTS = "WD-02,WD-23"
 
 
+class _ChineseHelpFormatter(argparse.HelpFormatter):
+    def _format_usage(self, *args, **kwargs) -> str:
+        return super()._format_usage(*args, **kwargs).replace(
+            "usage: ",
+            "用法: ",
+            1,
+        )
+
+
 def start_market_data(
     state: MonitorState,
     client: BinanceKlineClient,
@@ -34,6 +45,7 @@ def start_market_data(
     poll_seconds: int,
     limit: int,
     enable_websocket: bool,
+    shadow_publisher=None,
 ) -> MarketDataCoordinator:
     coordinator = MarketDataCoordinator(
         state,
@@ -41,6 +53,7 @@ def start_market_data(
         poll_seconds=poll_seconds,
         rest_limit=limit,
         enable_websocket=enable_websocket,
+        shadow_publisher=shadow_publisher,
     )
     coordinator.start()
     return coordinator
@@ -57,6 +70,22 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                 return
             if parsed.path == "/api/price":
                 self._send_json(state.price_snapshot())
+                return
+            if parsed.path == "/api/shadow":
+                self._send_json(state.shadow_optimizer_status())
+                return
+            if parsed.path == "/api/shadow/experiment":
+                self._send_json(state.shadow_experiment_summary())
+                return
+            if parsed.path == "/api/shadow/orders":
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    state.page_shadow_orders(
+                        arm_id=_query_text(query, "arm_id"),
+                        page=_query_int(query, "page", 1),
+                        page_size=_query_int(query, "page_size", 20),
+                    )
+                )
                 return
             if parsed.path == "/api/orders":
                 query = parse_qs(parsed.query)
@@ -82,11 +111,22 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         tag=_query_text(query, "tag"),
                         segment=_query_text(query, "segment"),
                         result=_query_text(query, "result"),
+                        candidate_origin=_query_text(query, "candidate_origin"),
+                        qualification_state=_query_text(query, "qualification_state"),
+                        adaptive_state=_query_text(query, "adaptive_state"),
+                        entry_structure_state=_query_text(query, "entry_structure_state"),
+                        entry_structure_bias=_query_text(query, "entry_structure_bias"),
+                        active_level_source=_query_text(query, "active_level_source"),
                     )
                 )
                 return
             if parsed.path == "/api/observation-summary":
-                self._send_json(state.observation_summary())
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    state.observation_summary(
+                        window=_query_text(query, "window") or "14d"
+                    )
+                )
                 return
             if parsed.path == "/api/order-profile":
                 self._send_json(state.order_profile_summary())
@@ -199,11 +239,30 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _strict_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} 必须为布尔值，实际为 {value!r}")
+
+
 def _env_float(name: str, default: float | None) -> float | None:
     value = os.getenv(name)
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
 
 
 def _trade_score_threshold(value: str) -> float | None:
@@ -227,6 +286,27 @@ def _split_csv(value: str | None) -> list[str]:
     return [item.strip().upper() for item in value.split(",") if item.strip()]
 
 
+def _profile_admission_directions(value: str) -> tuple[str, ...]:
+    directions = tuple(_split_csv(value))
+    if not directions or set(directions) - {"LONG", "SHORT"}:
+        raise argparse.ArgumentTypeError(
+            "画像准入策略快速方向只能使用 LONG、SHORT，且不能为空"
+        )
+    return directions
+
+
+def _profile_admission_optional_rate(value: str) -> float | None:
+    normalized = str(value).strip().lower()
+    if normalized in {"", "off", "none", "关闭"}:
+        return None
+    try:
+        return float(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "画像准入胜率下限必须是 0 到 1 的数字或 off"
+        ) from exc
+
+
 def _clock_value(value: str) -> tuple[int, int]:
     try:
         hour_text, minute_text = str(value).split(":", 1)
@@ -239,9 +319,31 @@ def _clock_value(value: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _strategy_build_id(value: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise argparse.ArgumentTypeError("策略构建标识不能为空")
+    return normalized
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="币安事件合约量价监控程序")
+    parser = argparse.ArgumentParser(
+        description="币安事件合约量价监控程序",
+        add_help=False,
+        formatter_class=_ChineseHelpFormatter,
+    )
+    parser._optionals.title = "参数"
+    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
     parser.add_argument("--symbol", default=os.getenv("SYMBOL", "BTCUSDT"), help="交易对，默认: BTCUSDT")
+    parser.add_argument(
+        "--strategy-build-id",
+        type=_strategy_build_id,
+        default=os.getenv("STRATEGY_BUILD_ID", DEFAULT_STRATEGY_BUILD_ID),
+        help=(
+            "策略构建标识，用于冻结运行配置和决策身份，可填写 commit 或 tag；"
+            f"默认: {DEFAULT_STRATEGY_BUILD_ID}"
+        ),
+    )
     parser.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"), help="监听地址，默认: 127.0.0.1")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="页面端口，默认: 8000")
     parser.add_argument(
@@ -271,6 +373,42 @@ def main() -> None:
         "--db-path",
         default=os.getenv("DB_PATH", str(PROJECT_ROOT / "data" / "monitor.sqlite3")),
         help="SQLite 持久化路径，默认: ./data/monitor.sqlite3",
+    )
+    shadow_switch = parser.add_mutually_exclusive_group()
+    shadow_switch.add_argument(
+        "--enable-shadow-optimizer",
+        dest="enable_shadow_optimizer",
+        action="store_true",
+        default=_env_bool("SHADOW_OPTIMIZER", False),
+        help="启用独立进程持续影子参数优化，默认: 关闭",
+    )
+    shadow_switch.add_argument(
+        "--no-shadow-optimizer",
+        dest="enable_shadow_optimizer",
+        action="store_false",
+        help="关闭持续影子参数优化",
+    )
+    parser.add_argument(
+        "--shadow-db-path",
+        default=os.getenv(
+            "SHADOW_DB_PATH",
+            str(PROJECT_ROOT / "data" / "monitor.shadow.sqlite3"),
+        ),
+        help="影子参数独立 SQLite 路径，默认: ./data/monitor.shadow.sqlite3",
+    )
+    parser.add_argument(
+        "--shadow-queue-size",
+        type=int,
+        default=int(os.getenv("SHADOW_QUEUE_SIZE", "120")),
+        help="影子分钟事件有界队列长度，默认: 120",
+    )
+    parser.add_argument(
+        "--shadow-max-challengers",
+        type=int,
+        choices=range(1, 8),
+        default=int(os.getenv("SHADOW_MAX_CHALLENGERS", "7")),
+        metavar="1-7",
+        help="并行影子候选数量，范围1到7，默认: 7",
     )
     parser.add_argument(
         "--webhook-url",
@@ -490,6 +628,75 @@ def main() -> None:
         default=os.getenv("LIVE_SHORT_SEGMENTS", DEFAULT_LIVE_SHORT_SEGMENTS),
         help=f"允许实际开 SHORT 的时段，逗号分隔；默认: {DEFAULT_LIVE_SHORT_SEGMENTS}",
     )
+    deprecated_admission_env = "PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS"
+    if deprecated_admission_env in os.environ:
+        parser.error(
+            f"{deprecated_admission_env} 已废弃；请分别配置 LONG/SHORT N12 上限"
+        )
+    try:
+        profile_admission_enabled = _strict_env_bool(
+            "PROFILE_ADMISSION_ENABLE",
+            False,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    parser.add_argument(
+        "--enable-profile-admission",
+        action="store_true",
+        default=profile_admission_enabled,
+        help=(
+            "显式启用冻结画像准入候选；默认关闭并使用兼容基准。"
+            "前向稳定性尚未证明，release_allowed 始终为 false"
+        ),
+    )
+    parser.add_argument(
+        "--profile-admission-resident-long-n12-max-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_RESIDENT_LONG_N12_MAX_WINS", "7")),
+        help="LONG 常驻画像 N12 最大胜数，候选默认: 7",
+    )
+    parser.add_argument(
+        "--profile-admission-resident-short-n12-max-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_RESIDENT_SHORT_N12_MAX_WINS", "9")),
+        help="SHORT 常驻画像 N12 最大胜数，候选默认: 9",
+    )
+    parser.add_argument(
+        "--profile-admission-resident-long-win-rate-floor",
+        type=_profile_admission_optional_rate,
+        default=os.getenv("PROFILE_ADMISSION_RESIDENT_LONG_WIN_RATE_FLOOR", "off"),
+        help="LONG 常驻画像当日胜率下限，off 关闭，候选默认: off",
+    )
+    parser.add_argument(
+        "--profile-admission-resident-short-win-rate-floor",
+        type=_profile_admission_optional_rate,
+        default=os.getenv("PROFILE_ADMISSION_RESIDENT_SHORT_WIN_RATE_FLOOR", "0.625"),
+        help="SHORT 常驻画像当日胜率下限，off 关闭，候选默认: 0.625",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-directions",
+        type=_profile_admission_directions,
+        default=os.getenv("PROFILE_ADMISSION_FAST_DIRECTIONS", "SHORT"),
+        help="快速通道允许方向，逗号分隔，候选默认: SHORT",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-n12-min-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_FAST_N12_MIN_WINS", "7")),
+        help="快速通道 N12 最小胜数，候选默认: 7",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-n12-max-wins",
+        type=int,
+        default=int(os.getenv("PROFILE_ADMISSION_FAST_N12_MAX_WINS", "8")),
+        help="快速通道 N12 最大胜数，候选默认: 8",
+    )
+    parser.add_argument(
+        "--profile-admission-fast-n20-ev-min",
+        type=float,
+        default=float(os.getenv("PROFILE_ADMISSION_FAST_N20_EV_MIN", "0")),
+        help="快速通道 N20 最低 EV，候选默认: 0",
+    )
     parser.add_argument(
         "--no-daily-profile-selector",
         action="store_true",
@@ -501,6 +708,12 @@ def main() -> None:
         type=int,
         default=int(os.getenv("DAILY_PROFILE_LOOKBACK_DAYS", "7")),
         help="每日画像统计回看天数，默认: 7",
+    )
+    parser.add_argument(
+        "--daily-profile-stable-lookback-days",
+        type=int,
+        default=_env_optional_int("DAILY_PROFILE_STABLE_LOOKBACK_DAYS"),
+        help="每日画像稳定窗口天数；未指定时取 14 与快速窗口天数的较大值",
     )
     parser.add_argument(
         "--daily-profile-min-samples",
@@ -541,8 +754,14 @@ def main() -> None:
     parser.add_argument(
         "--daily-profile-degraded-runs",
         type=int,
-        default=int(os.getenv("DAILY_PROFILE_DEGRADED_RUNS", "1")),
-        help="画像连续退化多少次后退出，默认: 1",
+        default=int(os.getenv("DAILY_PROFILE_DEGRADED_RUNS", "2")),
+        help="兼容画像连续退化次数，默认: 2",
+    )
+    parser.add_argument(
+        "--daily-profile-joint-failures-to-exit",
+        type=int,
+        default=_env_optional_int("DAILY_PROFILE_JOINT_FAILURES_TO_EXIT"),
+        help="双窗口同时失败多少次后退出；未指定时沿用连续退化次数",
     )
     parser.add_argument(
         "--daily-profile-max-active",
@@ -563,6 +782,36 @@ def main() -> None:
         help="每天北京时间画像生效时间，格式 HH:MM，默认: 08:00",
     )
     args = parser.parse_args()
+    try:
+        candidate_admission_policy = ProfileAdmissionPolicy(
+            resident_allowed_states=("ACTIVE", "WATCH"),
+            resident_n12_max_wins=12,
+            resident_long_n12_max_wins=(
+                args.profile_admission_resident_long_n12_max_wins
+            ),
+            resident_short_n12_max_wins=(
+                args.profile_admission_resident_short_n12_max_wins
+            ),
+            resident_long_daily_win_rate_floor=(
+                args.profile_admission_resident_long_win_rate_floor
+            ),
+            resident_short_daily_win_rate_floor=(
+                args.profile_admission_resident_short_win_rate_floor
+            ),
+            fast_enabled=True,
+            fast_directions=args.profile_admission_fast_directions,
+            fast_allowed_states=("ACTIVE",),
+            fast_n12_min_wins=args.profile_admission_fast_n12_min_wins,
+            fast_n12_max_wins=args.profile_admission_fast_n12_max_wins,
+            fast_n20_ev_min=args.profile_admission_fast_n20_ev_min,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(f"画像准入策略参数无效：{exc}")
+    profile_admission_policy = (
+        candidate_admission_policy
+        if args.enable_profile_admission
+        else baseline_policy()
+    )
     win_return = args.win_return if args.win_return is not None else round(args.stake * 1.8, 4)
 
     webhook = None
@@ -575,6 +824,7 @@ def main() -> None:
 
     state = MonitorState(
         symbol=args.symbol,
+        strategy_build_id=args.strategy_build_id,
         max_open_orders=args.max_open_orders,
         max_open_long_orders=args.max_open_long_orders,
         max_open_short_orders=args.max_open_short_orders,
@@ -616,8 +866,10 @@ def main() -> None:
         observation_profile_min_edge=args.observation_profile_min_edge,
         live_short_segments=_split_csv(args.live_short_segments),
         enable_daily_profile_selector=not args.no_daily_profile_selector,
+        profile_admission_policy=profile_admission_policy,
         daily_profile_selector_config=DailyProfileSelectorConfig(
             lookback_days=args.daily_profile_lookback_days,
+            stable_lookback_days=args.daily_profile_stable_lookback_days,
             min_samples=args.daily_profile_min_samples,
             weekend_min_samples=args.daily_profile_weekend_min_samples,
             min_win_rate=args.daily_profile_min_win_rate,
@@ -625,6 +877,7 @@ def main() -> None:
             exit_win_rate=args.daily_profile_exit_win_rate,
             exit_ev=args.daily_profile_exit_ev,
             degraded_runs_to_exit=args.daily_profile_degraded_runs,
+            joint_failures_to_exit=args.daily_profile_joint_failures_to_exit,
             max_active_profiles=args.daily_profile_max_active,
             evaluation_hour=args.daily_profile_evaluation_time[0],
             evaluation_minute=args.daily_profile_evaluation_time[1],
@@ -649,6 +902,30 @@ def main() -> None:
             f"missing={len(report.missing_files)}"
         )
 
+    shadow_optimizer = None
+    if args.enable_shadow_optimizer:
+        shadow_optimizer = ShadowSupervisor(
+            seed_supplier=state.shadow_runtime_seed,
+            database_path=args.shadow_db_path,
+            queue_size=args.shadow_queue_size,
+            max_challengers=args.shadow_max_challengers,
+            lifecycle_handler=state.request_shadow_policy_change,
+        )
+        state.attach_shadow_status_provider(shadow_optimizer)
+        state.attach_shadow_policy_audit_sink(
+            shadow_optimizer.record_formal_policy_receipt
+        )
+        try:
+            restored_request = shadow_optimizer.restored_policy_request()
+            if restored_request is not None:
+                state.request_shadow_policy_change(restored_request)
+            shadow_optimizer.start()
+        except Exception as exc:  # noqa: BLE001 - 影子启动失败不得阻断正式服务。
+            recorder = getattr(state, "record_shadow_event_gap", None)
+            if callable(recorder):
+                recorder(f"shadow optimizer startup failed: {exc}")
+            shadow_optimizer.stop()
+
     client = BinanceKlineClient()
     market_data = start_market_data(
         state,
@@ -656,6 +933,7 @@ def main() -> None:
         poll_seconds=args.poll_seconds,
         limit=args.limit,
         enable_websocket=not args.no_websocket,
+        shadow_publisher=shadow_optimizer,
     )
 
     def warmup_loader(target_state: MonitorState) -> None:
@@ -695,6 +973,11 @@ def main() -> None:
     finally:
         server.server_close()
         market_data.stop()
+        if shadow_optimizer is not None:
+            shadow_optimizer.stop()
+        closer = getattr(state, "close", None)
+        if closer is not None:
+            closer()
 
 
 if __name__ == "__main__":

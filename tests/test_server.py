@@ -16,12 +16,462 @@ from unittest.mock import patch
 import app.server as server_module
 from app.history import WarmupReport
 from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
+from app.profile_admission import baseline_policy, candidate_policy
 from app.server import apply_warmup, make_handler
 from app.state import MonitorState
 from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_shadow_optimizer_requires_explicit_enable_and_is_wired_to_market_data(self):
+        fake_server = SimpleNamespace(
+            serve_forever=lambda: None,
+            server_close=lambda: None,
+        )
+        fake_state = SimpleNamespace(
+            symbol="BTCUSDT",
+            shadow_runtime_seed=lambda: {"context": ("BTCUSDT", 0)},
+            request_shadow_policy_change=lambda request: {"status": "APPLIED"},
+            attach_shadow_status_provider=lambda provider: setattr(
+                fake_state,
+                "shadow_provider",
+                provider,
+            ),
+            attach_shadow_policy_audit_sink=lambda sink: setattr(
+                fake_state,
+                "shadow_audit_sink",
+                sink,
+            ),
+            close=lambda: None,
+        )
+        fake_shadow = SimpleNamespace(
+            restored_policy_request=lambda: None,
+            record_formal_policy_receipt=lambda request, result: None,
+            start=lambda: setattr(fake_shadow, "started", True),
+            stop=lambda: setattr(fake_shadow, "stopped", True),
+        )
+        fake_market = SimpleNamespace(stop=lambda: None)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "app.server",
+                    "--no-warmup",
+                    "--no-persistence",
+                    "--no-webhook",
+                    "--enable-shadow-optimizer",
+                    "--shadow-max-challengers",
+                    "5",
+                ],
+            ),
+            patch("app.server.MonitorState", return_value=fake_state),
+            patch("app.server.ShadowSupervisor", return_value=fake_shadow) as shadow_type,
+            patch("app.server.start_market_data", return_value=fake_market) as market,
+            patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+        ):
+            server_module.main()
+
+        self.assertTrue(fake_shadow.started)
+        self.assertTrue(fake_shadow.stopped)
+        self.assertIs(fake_state.shadow_provider, fake_shadow)
+        self.assertIs(
+            fake_state.shadow_audit_sink,
+            fake_shadow.record_formal_policy_receipt,
+        )
+        self.assertEqual(shadow_type.call_args.kwargs["max_challengers"], 5)
+        self.assertIs(
+            market.call_args.kwargs["shadow_publisher"],
+            fake_shadow,
+        )
+
+    def test_shadow_status_api_is_read_only_and_lightweight(self):
+        payload = {"status": "RUNNING", "arms": 8, "settled_orders": 320}
+        state = SimpleNamespace(shadow_optimizer_status=lambda: payload)
+        handler = make_handler(state)
+        instance = object.__new__(handler)
+        instance.path = "/api/shadow"
+        captured = []
+        instance._send_json = captured.append
+
+        instance.do_GET()
+
+        self.assertEqual(captured, [payload])
+
+    def test_profile_admission_startup_requires_explicit_enable_and_freezes_candidate(self):
+        cases = (
+            ({}, [], baseline_policy()),
+            ({"PROFILE_ADMISSION_ENABLE": "1"}, [], candidate_policy()),
+            (
+                {},
+                [
+                    "--enable-profile-admission",
+                    "--profile-admission-resident-long-n12-max-wins", "7",
+                    "--profile-admission-resident-short-n12-max-wins", "9",
+                    "--profile-admission-resident-long-win-rate-floor", "off",
+                    "--profile-admission-resident-short-win-rate-floor", "0.625",
+                    "--profile-admission-fast-directions", "SHORT",
+                    "--profile-admission-fast-n12-min-wins", "7",
+                    "--profile-admission-fast-n12-max-wins", "8",
+                    "--profile-admission-fast-n20-ev-min", "0",
+                ],
+                candidate_policy(),
+            ),
+        )
+        for environment, cli_args, expected in cases:
+            with self.subTest(environment=environment, cli_args=cli_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *cli_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch(
+                        "app.server.start_market_data",
+                        return_value=SimpleNamespace(stop=lambda: None),
+                    ),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                policy = monitor_state.call_args.kwargs["profile_admission_policy"]
+                self.assertEqual(policy.to_dict(), expected.to_dict())
+                self.assertEqual(policy.policy_hash, expected.policy_hash)
+
+    def test_profile_admission_invalid_enabled_candidate_fails_startup(self):
+        invalid_args = (
+            [
+                "--enable-profile-admission",
+                "--profile-admission-fast-n12-min-wins", "9",
+                "--profile-admission-fast-n12-max-wins", "8",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-fast-directions", "SHORT,SIDEWAYS",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-fast-n20-ev-min", "nan",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-resident-long-n12-max-wins", "13",
+            ],
+            [
+                "--enable-profile-admission",
+                "--profile-admission-resident-short-win-rate-floor", "1.1",
+            ],
+        )
+        for cli_args in invalid_args:
+            with self.subTest(cli_args=cli_args):
+                stderr = StringIO()
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch.object(sys, "argv", ["app.server", *cli_args]),
+                    redirect_stderr(stderr),
+                    patch("app.server.MonitorState") as monitor_state,
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    server_module.main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(monitor_state.called)
+                self.assertIn("画像准入策略", stderr.getvalue())
+
+    def test_profile_admission_invalid_environment_switch_fails_startup(self):
+        stderr = StringIO()
+        with (
+            patch.dict(os.environ, {"PROFILE_ADMISSION_ENABLE": "tru"}, clear=True),
+            patch.object(sys, "argv", ["app.server"]),
+            redirect_stderr(stderr),
+            patch("app.server.MonitorState") as monitor_state,
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertFalse(monitor_state.called)
+        self.assertIn("PROFILE_ADMISSION_ENABLE", stderr.getvalue())
+
+    def test_profile_admission_deprecated_shared_environment_fails_startup(self):
+        stderr = StringIO()
+        with (
+            patch.dict(
+                os.environ,
+                {"PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS": "8"},
+                clear=True,
+            ),
+            patch.object(sys, "argv", ["app.server"]),
+            redirect_stderr(stderr),
+            patch("app.server.MonitorState") as monitor_state,
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertFalse(monitor_state.called)
+        self.assertIn("PROFILE_ADMISSION_RESIDENT_N12_MAX_WINS", stderr.getvalue())
+
+    def test_profile_admission_help_is_explicitly_chinese_and_marks_release_blocked(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        help_text = stdout.getvalue()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--enable-profile-admission", help_text)
+        self.assertNotIn("--profile-admission-resident-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-resident-long-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-resident-short-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-resident-long-win-rate-floor", help_text)
+        self.assertIn("--profile-admission-resident-short-win-rate-floor", help_text)
+        self.assertIn("--profile-admission-fast-directions", help_text)
+        self.assertIn("--profile-admission-fast-n12-min-wins", help_text)
+        self.assertIn("--profile-admission-fast-n12-max-wins", help_text)
+        self.assertIn("--profile-admission-fast-n20-ev-min", help_text)
+        self.assertIn("前向稳定性尚未证明", help_text)
+
+    def test_snapshot_capacity_sampling_does_not_hold_realtime_state_lock(self):
+        state = MonitorState(symbol="BTCUSDT")
+        capacity_started = threading.Event()
+        release_capacity = threading.Event()
+        mutation_done = threading.Event()
+        result = {}
+        errors = []
+
+        def blocking_capacity(_sampled_at_ms):
+            capacity_started.set()
+            release_capacity.wait(timeout=2)
+            return {"status": "IN_MEMORY"}
+
+        def take_snapshot():
+            try:
+                result["snapshot"] = state.snapshot()
+            except Exception as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        def update_realtime_state():
+            try:
+                state.reset_symbol("ETHUSDT")
+                state.update_realtime_price(123.0, 2_000, 2_000)
+                mutation_done.set()
+            except Exception as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        with patch.object(state, "_sample_storage_capacity", side_effect=blocking_capacity):
+            snapshot_thread = threading.Thread(target=take_snapshot)
+            snapshot_thread.start()
+            self.assertTrue(capacity_started.wait(timeout=1))
+            mutation_thread = threading.Thread(target=update_realtime_state)
+            mutation_thread.start()
+            try:
+                self.assertTrue(
+                    mutation_done.wait(timeout=0.2),
+                    "容量采样阻塞时不应占用实时状态锁",
+                )
+            finally:
+                release_capacity.set()
+                snapshot_thread.join(timeout=2)
+                mutation_thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(result["snapshot"]["symbol"], "ETHUSDT")
+        self.assertEqual(state.price_snapshot()["latest_price"], 123.0)
+
+    def test_main_injects_versioned_strategy_build_id_from_cli_or_environment(self):
+        cases = (
+            ({}, [], server_module.DEFAULT_STRATEGY_BUILD_ID),
+            ({"STRATEGY_BUILD_ID": "commit-ae7b484"}, [], "commit-ae7b484"),
+            (
+                {"STRATEGY_BUILD_ID": "environment-build"},
+                ["--strategy-build-id", "tag-v2.1.0"],
+                "tag-v2.1.0",
+            ),
+        )
+        for environment, build_args, expected in cases:
+            with self.subTest(environment=environment, build_args=build_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *build_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch(
+                        "app.server.start_market_data",
+                        return_value=SimpleNamespace(stop=lambda: None),
+                    ),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                self.assertEqual(
+                    monitor_state.call_args.kwargs["strategy_build_id"],
+                    expected,
+                )
+
+        self.assertRegex(
+            server_module.DEFAULT_STRATEGY_BUILD_ID,
+            r"^minute-strategy-src-[0-9a-f]{16}$",
+        )
+
+    def test_strategy_source_build_id_is_stable_and_changes_with_source(self):
+        self.assertTrue(hasattr(server_module, "strategy_source_build_id"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "strategy.py"
+            second = root / "order_policy.py"
+            first.write_text("RULE = 1\n", encoding="utf-8")
+            second.write_text("GATE = 2\n", encoding="utf-8")
+
+            initial = server_module.strategy_source_build_id((first, second))
+            repeated = server_module.strategy_source_build_id((second, first))
+            first.write_text("RULE = 3\n", encoding="utf-8")
+            changed = server_module.strategy_source_build_id((first, second))
+
+            self.assertEqual(initial, repeated)
+            self.assertNotEqual(initial, changed)
+
+    def test_help_documents_strategy_build_id_in_chinese(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--strategy-build-id", stdout.getvalue())
+        self.assertIn("策略构建标识", stdout.getvalue())
+
+    def test_server_help_has_no_english_argparse_labels(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        help_text = stdout.getvalue()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("用法:", help_text)
+        self.assertIn("参数:", help_text)
+        for english_label in (
+            "usage",
+            "options",
+            "show this help message",
+            "missing value",
+        ):
+            self.assertNotIn(english_label, help_text.lower())
+
+    def test_daily_profile_startup_defaults_and_explicit_precedence(self):
+        cases = (
+            ({}, [], None, 14, "default", 2, "default"),
+            (
+                {"DAILY_PROFILE_LOOKBACK_DAYS": "15", "DAILY_PROFILE_DEGRADED_RUNS": "5"},
+                [],
+                None,
+                15,
+                "lookback_days",
+                5,
+                "degraded_runs_to_exit",
+            ),
+            (
+                {
+                    "DAILY_PROFILE_DEGRADED_RUNS": "5",
+                    "DAILY_PROFILE_JOINT_FAILURES_TO_EXIT": "4",
+                    "DAILY_PROFILE_STABLE_LOOKBACK_DAYS": "21",
+                },
+                [
+                    "--daily-profile-joint-failures-to-exit", "3",
+                    "--daily-profile-stable-lookback-days", "18",
+                ],
+                18,
+                18,
+                "stable_lookback_days",
+                3,
+                "joint_failures_to_exit",
+            ),
+        )
+        for environment, cli_args, raw_stable, effective_stable, stable_source, failures, failure_source in cases:
+            with self.subTest(environment=environment, cli_args=cli_args):
+                fake_server = SimpleNamespace(serve_forever=lambda: None, server_close=lambda: None)
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["app.server", "--no-warmup", "--no-persistence", "--no-webhook", *cli_args],
+                    ),
+                    patch("app.server.MonitorState", return_value=SimpleNamespace(symbol="BTCUSDT")) as monitor_state,
+                    patch("app.server.start_market_data", return_value=SimpleNamespace(stop=lambda: None)),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                raw = monitor_state.call_args.kwargs["daily_profile_selector_config"]
+                normalized = raw.normalized()
+                self.assertEqual(raw.stable_lookback_days, raw_stable)
+                self.assertEqual(normalized.effective_stable_lookback_days, effective_stable)
+                self.assertEqual(normalized.stable_lookback_source, stable_source)
+                self.assertEqual(normalized.joint_failures_to_exit, failures)
+                self.assertEqual(normalized.joint_failures_source, failure_source)
+
+    def test_help_documents_daily_profile_compatibility_options_in_chinese(self):
+        stdout = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["app.server", "--help"]),
+            redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            server_module.main()
+
+        help_text = stdout.getvalue()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--daily-profile-stable-lookback-days", help_text)
+        self.assertIn("--daily-profile-joint-failures-to-exit", help_text)
+        self.assertIn("未指定时取 14 与快速窗口天数的较大值", help_text)
+        self.assertIn("未指定时沿用连续退化次数", help_text)
+
     def test_main_injects_time_period_guard_config(self):
         cases = (
             ({}, [], False),
@@ -268,6 +718,29 @@ class OrdersApiTest(unittest.TestCase):
         self.assertNotIn("orders", captured[0])
         self.assertNotIn("stats", captured[0])
 
+    def test_shadow_detail_apis_delegate_to_paged_read_model(self):
+        state = SimpleNamespace(
+            shadow_experiment_summary=lambda: {"experiment_id": "exp-1"},
+            page_shadow_orders=lambda **kwargs: {"orders": [], **kwargs},
+        )
+        handler = make_handler(state)
+        experiment = object.__new__(handler)
+        experiment.path = "/api/shadow/experiment"
+        experiment_payload = []
+        experiment._send_json = experiment_payload.append
+        orders = object.__new__(handler)
+        orders.path = "/api/shadow/orders?arm_id=arm-1&page=2&page_size=50"
+        order_payload = []
+        orders._send_json = order_payload.append
+
+        experiment.do_GET()
+        orders.do_GET()
+
+        self.assertEqual(experiment_payload, [{"experiment_id": "exp-1"}])
+        self.assertEqual(order_payload[0]["arm_id"], "arm-1")
+        self.assertEqual(order_payload[0]["page"], 2)
+        self.assertEqual(order_payload[0]["page_size"], 50)
+
     def test_concurrent_symbol_switches_serialize_warmup_and_keep_responses_isolated(self):
         class SwitchingState:
             def __init__(self):
@@ -451,6 +924,254 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(summary_payload["groups"][0]["selection_state"], "ACTIVE")
         self.assertEqual(summary_payload["groups"][0]["selection_reason"], "今日主程序已启用")
 
+    def test_adaptive_structure_and_capacity_api_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(
+                symbol="BTCUSDT",
+                storage=store,
+                enable_daily_profile_selector=True,
+            )
+            profile_key = "10|short_observe|generic_short_observe|SHORT|WD-22"
+            candidate = {
+                "key": profile_key,
+                "direction": "SHORT",
+                "strategy_family": "short_observe",
+                "strategy_tag": "generic_short_observe",
+                "threshold_segment": "WD-22",
+                "qualification_state": "QUALIFIED",
+                "fast_7d": {"sample_size": 24, "win_rate": 0.625, "ev": 0.8},
+                "stable_14d": {"sample_size": 40, "win_rate": 0.6, "ev": 0.7},
+            }
+            selection = {
+                "version": "DPS-20260819-0800",
+                "status": "READY",
+                "evaluated_at": 1_000,
+                "effective_from": 2_000,
+                "effective_until": 86_402_000,
+                "fast_7d": {"lookback_days": 7, "lookback_start": 10, "lookback_end": 20},
+                "stable_14d": {"lookback_days": 14, "lookback_start": 1, "lookback_end": 20},
+                "candidates": [candidate],
+                "selected_profiles": [candidate],
+            }
+            state.daily_profile_selection = selection
+            state.active_daily_profile_selection = selection
+            state.adaptive_profile_states = {
+                profile_key: {
+                    "profile_key": profile_key,
+                    "status": "ACTIVE",
+                    "reason": "N12胜7且N20 EV非负",
+                    "evaluated_at": 3_000,
+                    "n12": {"sample_size": 12, "wins": 7, "win_rate": 7 / 12, "ev": 0.8},
+                    "n20": {"sample_size": 20, "wins": 12, "win_rate": 0.6, "ev": 0.7},
+                }
+            }
+            state.selected_signal = Signal(
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="diagnostic",
+                price=100.0,
+                open_time=3_000,
+                entry_structure_shadow={
+                    "entry_structure_version": "ENTRY_STRUCTURE_SHADOW_V1",
+                    "entry_structure_mode": "SHADOW_ONLY",
+                    "entry_structure_evaluated_at": 3_000,
+                    "entry_structure_state": "RESISTANCE_REJECTION",
+                    "entry_structure_bias": "CONFIRMED",
+                    "entry_structure_reason_code": "STRUCTURE_CONFIRMED",
+                    "candidate_origin": "NATIVE_ACTIONABLE",
+                    "active_level_source": "SWING",
+                },
+            )
+            server = _serve(state)
+            try:
+                payload = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/state"
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        selection_payload = payload["daily_profile_selection"]
+        self.assertEqual(selection_payload["fast_7d"]["lookback_days"], 7)
+        self.assertEqual(selection_payload["stable_14d"]["lookback_days"], 14)
+        self.assertEqual(selection_payload["candidates"][0]["utc_segment_label"], "22:00-22:59 UTC")
+        self.assertEqual(
+            selection_payload["candidates"][0]["shanghai_segment_label"],
+            "次日06:00-06:59 Asia/Shanghai",
+        )
+        self.assertEqual(selection_payload["evaluation_time_label"], "07:50 Asia/Shanghai")
+        self.assertEqual(selection_payload["activation_time_label"], "08:00 Asia/Shanghai")
+        immediate = selection_payload["immediate_state"]["profiles"][0]
+        self.assertEqual(immediate["status"], "ACTIVE")
+        self.assertEqual(immediate["n12"]["sample_size"], 12)
+        self.assertEqual(immediate["n20"]["sample_size"], 20)
+        self.assertIn(
+            payload["storage_capacity"]["status"],
+            {"NORMAL", "WARNING", "COMPACT_ONLY", "HARD_LIMIT"},
+        )
+        self.assertEqual(
+            payload["entry_structure_shadow"]["entry_structure_bias"],
+            "CONFIRMED",
+        )
+
+    def test_observation_windows_filters_and_legacy_normalization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observation(
+                ObservationSignal(
+                    observation_key="legacy",
+                    strategy_family="short_observe",
+                    strategy_tag="legacy_short_observe",
+                    direction="SHORT",
+                    timeframe_minutes=10,
+                    level="B",
+                    reason="legacy",
+                    entry_price=100.0,
+                    opened_at=1_000,
+                    expires_at=601_000,
+                    threshold_segment="WD-22",
+                ),
+                "BTCUSDT",
+            )
+            store.save_observation(
+                ObservationSignal(
+                    observation_key="adaptive",
+                    strategy_family="short_observe",
+                    strategy_tag="adaptive_short_observe",
+                    direction="SHORT",
+                    timeframe_minutes=10,
+                    level="A",
+                    reason="adaptive",
+                    entry_price=100.0,
+                    opened_at=2_000,
+                    expires_at=602_000,
+                    threshold_segment="WD-23",
+                    context_version="DECISION_CONTEXT_V2",
+                    candidate_origin="PROFILE_PROMOTED_WAIT",
+                    adaptive_profile_state={
+                        "qualification_state": "QUALIFIED",
+                        "status": "ACTIVE",
+                    },
+                    entry_structure_shadow={
+                        "entry_structure_state": "RESISTANCE_REJECTION",
+                        "entry_structure_bias": "CONFLICT",
+                        "active_level_source": "SWING",
+                    },
+                ),
+                "BTCUSDT",
+            )
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            server = _serve(state)
+            try:
+                summaries = {
+                    window: _get_json(
+                        f"http://127.0.0.1:{server.server_port}/api/observation-summary"
+                        f"?window={window}"
+                    )
+                    for window in ("7d", "14d", "30d", "all")
+                }
+                default_summary = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/observation-summary"
+                )
+                filtered = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/observations"
+                    "?candidate_origin=PROFILE_PROMOTED_WAIT"
+                    "&qualification_state=QUALIFIED&adaptive_state=ACTIVE"
+                    "&entry_structure_state=RESISTANCE_REJECTION"
+                    "&entry_structure_bias=CONFLICT&active_level_source=SWING"
+                )
+                unfiltered = _get_json(
+                    f"http://127.0.0.1:{server.server_port}/api/observations?page_size=10"
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertEqual([summaries[item]["window"] for item in summaries], ["7d", "14d", "30d", "all"])
+        self.assertEqual(default_summary["window"], "14d")
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(filtered["filters"]["candidate_origin"], "PROFILE_PROMOTED_WAIT")
+        self.assertIn("PROFILE_PROMOTED_WAIT", filtered["filter_options"]["candidate_origin"])
+        current = filtered["observations"][0]
+        self.assertEqual(current["candidate_origin"], "PROFILE_PROMOTED_WAIT")
+        self.assertEqual(current["qualification_state"], "QUALIFIED")
+        self.assertEqual(current["adaptive_state"], "ACTIVE")
+        self.assertEqual(current["entry_structure_state"], "RESISTANCE_REJECTION")
+        self.assertEqual(current["entry_structure_bias"], "CONFLICT")
+        self.assertEqual(current["active_level_source"], "SWING")
+        legacy = next(item for item in unfiltered["observations"] if item["observation_key"] == "legacy")
+        self.assertEqual(legacy["context_version"], "LEGACY")
+        self.assertEqual(legacy["candidate_origin"], "UNKNOWN")
+        self.assertEqual(legacy["qualification_state"], "UNKNOWN")
+        self.assertEqual(legacy["adaptive_state"], "UNKNOWN")
+        self.assertEqual(legacy["entry_structure_state"], "UNKNOWN")
+        self.assertEqual(legacy["entry_structure_bias"], "UNKNOWN")
+        self.assertEqual(legacy["active_level_source"], "UNKNOWN")
+
+    def test_in_memory_observation_diagnostic_filter_options_include_unknown(self):
+        state = MonitorState(symbol="BTCUSDT")
+        state.observations = [
+            ObservationSignal(
+                observation_key="legacy-memory",
+                strategy_family="short_observe",
+                strategy_tag="legacy",
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="B",
+                reason="legacy",
+                entry_price=100.0,
+                opened_at=1_000,
+                expires_at=601_000,
+            ),
+            ObservationSignal(
+                observation_key="current-memory",
+                strategy_family="short_observe",
+                strategy_tag="current",
+                direction="SHORT",
+                timeframe_minutes=10,
+                level="A",
+                reason="current",
+                entry_price=100.0,
+                opened_at=2_000,
+                expires_at=602_000,
+                candidate_origin="NATIVE_ACTIONABLE",
+                adaptive_profile_state={
+                    "qualification_state": "QUALIFIED",
+                    "status": "ACTIVE",
+                },
+                entry_structure_shadow={
+                    "entry_structure_state": "BREAKOUT_CONFIRMED",
+                    "entry_structure_bias": "CONFIRMED",
+                    "active_level_source": "SWING",
+                },
+            ),
+        ]
+
+        payload = state.page_observations(
+            candidate_origin="UNKNOWN",
+            qualification_state="UNKNOWN",
+            adaptive_state="UNKNOWN",
+            entry_structure_state="UNKNOWN",
+            entry_structure_bias="UNKNOWN",
+            active_level_source="UNKNOWN",
+        )
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["observations"][0]["observation_key"], "legacy-memory")
+        expected = {
+            "candidate_origin": {"NATIVE_ACTIONABLE", "UNKNOWN"},
+            "qualification_state": {"QUALIFIED", "UNKNOWN"},
+            "adaptive_state": {"ACTIVE", "UNKNOWN"},
+            "entry_structure_state": {"BREAKOUT_CONFIRMED", "UNKNOWN"},
+            "entry_structure_bias": {"CONFIRMED", "UNKNOWN"},
+            "active_level_source": {"SWING", "UNKNOWN"},
+        }
+        for name, values in expected.items():
+            self.assertEqual(set(payload["filter_options"][name]), values)
+            self.assertEqual(payload["filters"][name], "UNKNOWN")
+
     def test_orders_api_pages_and_filters_persisted_orders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -623,12 +1344,14 @@ class OrdersApiTest(unittest.TestCase):
                 )
                 store.update_order_entry_snapshot_settlement(order, "BTCUSDT")
             state = MonitorState(symbol="BTCUSDT", storage=store)
+            store.wait_for_profile_summary_rebuilds(timeout=10)
             server = _serve(state)
             try:
                 payload = _get_json(f"http://127.0.0.1:{server.server_port}/api/order-profile")
             finally:
                 server.shutdown()
                 server.server_close()
+                state.close()
 
         self.assertEqual(payload["total"]["orders"], 2)
         self.assertEqual(payload["total"]["losses"], 2)

@@ -1,5 +1,129 @@
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields
+import hashlib
+import json
 from typing import Optional
+
+
+_DECISION_CONTEXT_CORE_COMPAT_FIELDS = {
+    "decision_inputs",
+    "decision_trace",
+    "first_decisive_block",
+    "quality_score_inputs",
+}
+
+_DECISION_CONTEXT_EXTENDED_COMPAT_FIELDS = {
+    "quality_score",
+    "quality_score_version",
+    "quality_score_mode",
+    "quality_score_context",
+    "quality_score_components",
+    "adaptive_profile_state",
+    "entry_structure_shadow",
+}
+
+_DECISION_LINKED_LIFECYCLE_FIELDS = {
+    "id",
+    "observation_key",
+    "status",
+    "result",
+    "exit_price",
+    "settled_at",
+    "pnl",
+}
+
+
+def canonical_identity_hash(identity: dict[str, object]) -> str:
+    payload = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def decision_context_reference(
+    *,
+    decision_id: str,
+    context_version: str,
+    runtime_config_hash: str,
+    strategy_build_id: str,
+    candidate_origin: str,
+    identity: dict[str, object],
+) -> dict[str, str]:
+    return {
+        "decision_id": str(decision_id),
+        "context_version": str(context_version),
+        "runtime_config_hash": str(runtime_config_hash),
+        "strategy_build_id": str(strategy_build_id),
+        "candidate_origin": str(candidate_origin),
+        "canonical_identity_hash": canonical_identity_hash(identity),
+    }
+
+
+def bind_canonical_quality_score_inputs(model):
+    decision_inputs = getattr(model, "decision_inputs", None)
+    if not isinstance(decision_inputs, dict) or "identity" not in decision_inputs:
+        return model
+    score = decision_inputs.get("score")
+    if not isinstance(score, dict):
+        return model
+    canonical = score.get("quality_score_inputs")
+    if not isinstance(canonical, dict):
+        legacy = getattr(model, "quality_score_inputs", None)
+        canonical = legacy if isinstance(legacy, dict) else {}
+        score["quality_score_inputs"] = canonical
+    object.__setattr__(model, "quality_score_inputs", canonical)
+    return model
+
+
+def decision_linked_storage_payload(
+    model,
+    *,
+    retain_extended_views: bool = False,
+) -> dict[str, object]:
+    decision_inputs = getattr(model, "decision_inputs", None)
+    identity = (
+        decision_inputs.get("identity")
+        if isinstance(decision_inputs, dict)
+        else None
+    )
+    linked = bool(
+        getattr(model, "decision_id", "")
+        and isinstance(decision_inputs, dict)
+        and isinstance(identity, dict)
+    )
+    omitted = set(_DECISION_CONTEXT_CORE_COMPAT_FIELDS)
+    if not retain_extended_views:
+        omitted.update(_DECISION_CONTEXT_EXTENDED_COMPAT_FIELDS)
+    fully_canonical_model = bool(
+        linked
+        and not retain_extended_views
+        and isinstance(decision_inputs.get("signal"), dict)
+        and (hasattr(model, "id") or hasattr(model, "observation_key"))
+    )
+    if fully_canonical_model:
+        omitted.update(
+            item.name
+            for item in fields(model)
+            if item.name not in _DECISION_LINKED_LIFECYCLE_FIELDS
+        )
+    payload = {
+        item.name: deepcopy(getattr(model, item.name))
+        for item in fields(model)
+        if not (linked and item.name in omitted)
+    }
+    if linked:
+        payload["decision_context_ref"] = decision_context_reference(
+            decision_id=model.decision_id,
+            context_version=model.context_version,
+            runtime_config_hash=model.runtime_config_hash,
+            strategy_build_id=model.strategy_build_id,
+            candidate_origin=model.candidate_origin,
+            identity=identity,
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -111,6 +235,19 @@ class Signal:
     profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
+    decision_id: str = ""
+    context_version: str = ""
+    runtime_config_hash: str = ""
+    strategy_build_id: str = ""
+    candidate_origin: str = ""
+    decision_inputs: dict[str, object] = field(default_factory=dict)
+    decision_trace: list[dict[str, object]] = field(default_factory=list)
+    first_decisive_block: str = ""
+    adaptive_profile_state: dict[str, object] = field(default_factory=dict)
+    entry_structure_shadow: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        bind_canonical_quality_score_inputs(self)
 
     @property
     def actionable(self) -> bool:
@@ -185,6 +322,19 @@ class SimulatedOrder:
     profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
+    decision_id: str = ""
+    context_version: str = ""
+    runtime_config_hash: str = ""
+    strategy_build_id: str = ""
+    candidate_origin: str = ""
+    decision_inputs: dict[str, object] = field(default_factory=dict)
+    decision_trace: list[dict[str, object]] = field(default_factory=list)
+    first_decisive_block: str = ""
+    adaptive_profile_state: dict[str, object] = field(default_factory=dict)
+    entry_structure_shadow: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        bind_canonical_quality_score_inputs(self)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -242,6 +392,19 @@ class ObservationSignal:
     profile_health_win_rate: float = 0.0
     profile_health_ev: float = 0.0
     profile_health_evaluated_at: int = 0
+    decision_id: str = ""
+    context_version: str = ""
+    runtime_config_hash: str = ""
+    strategy_build_id: str = ""
+    candidate_origin: str = ""
+    decision_inputs: dict[str, object] = field(default_factory=dict)
+    decision_trace: list[dict[str, object]] = field(default_factory=list)
+    first_decisive_block: str = ""
+    adaptive_profile_state: dict[str, object] = field(default_factory=dict)
+    entry_structure_shadow: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        bind_canonical_quality_score_inputs(self)
 
     def to_dict(self) -> dict:
         return asdict(self)
