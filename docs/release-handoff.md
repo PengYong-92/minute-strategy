@@ -2364,3 +2364,45 @@ shadow.seed.observations=4264
 跨分钟采样确认`last_event_id`从`9d742828...`推进到`407751257...`。当前实验SQLite已有8个事件游标、72条分钟决策、8份运行态和440条新影子观察；旧实验`shadow-profile-8986b25832f52376a1b86210`被正确标记为`SUPERSEDED_INCOMPLETE_CHECKPOINT`，证明本次恢复保护在真实旧状态上生效。影子库采样大小约122MiB，容量状态为`NORMAL`。
 
 稳定运行约7分钟后的进程RSS为：正式主进程449420KiB、影子子进程176588KiB、resource tracker 9984KiB；整机内存1613MiB中已用1103MiB、可用509MiB、无Swap。systemd自发布边界后的root级warning日志为0。该资源余量明显低于旧实现造成的失联状态，但仍应以后续日常`capacity_status`、`failed_arms`、`gap_count`、`NRestarts`和系统可用内存作为持续运行判据。
+
+## 46. 2026-08-21正式SQLite读写锁修复
+
+### 46.1 线上故障与根因
+
+`8420f54`发布并清空模拟订单后，正式订单一直为0。生产页面在2026-08-21 15:49:31 CST停止推进，并明确显示`order_decision=STORAGE_ERROR`、`risk_pause=存储写入失败，暂停开单`和`波段运行态持久化失败: database is locked`。随后实例的HTTPS、SSH banner和阿里云命令助手同时失去响应；重启实例后服务恢复，证明零订单至少包含一个确定的运行故障，而不是单纯阈值过严。
+
+正式`SQLiteMonitorStore`此前使用SQLite默认`DELETE`日志模式。仪表盘每10秒并发读取观察画像和订单画像，长读事务可以阻塞行情线程提交`wave_runtime`；该写入一旦超时，状态机会按设计进入`STORAGE_ERROR`并暂停正式开单。影子SQLite已经使用WAL，但正式SQLite没有，因此新增影子计算负载后更容易暴露正式库的读写互斥问题。
+
+提交`58b4164cc68097f2879834340d9b55aed44b3c8e`只修复正式存储并发层，不修改画像、评分、方向、阈值、并发订单数、滚单或Webhook逻辑：
+
+- `SQLiteMonitorStore`启动时先把正式库切换为WAL，验证返回模式必须为`wal`；
+- 所有正式连接明确使用对应超时的`busy_timeout`和`synchronous=NORMAL`；
+- WAL初始化发生在线程池创建之前，失败时不遗留画像线程；
+- 新增真实并发回归：保持仪表盘读事务打开，波段运行态写入必须在读事务释放前完成并可由第三个连接读到。
+
+回归测试按TDD先在旧实现上稳定失败，再在修复后通过。最终`python3 -m unittest discover -s tests`共1147项通过，`git diff --check`和Python编译通过；独立代码审查无Critical问题。`main`已推送到`58b4164`。
+
+### 46.2 发布与验证
+
+用户于2026-08-21重启失联实例。发布时先下载并按本地SHA-256 `c741cc9688ee3c5b54661535a5ba9bbadbe6348124db6402eaa19352baffb48f`校验`app/storage.py`，从上一发布目录创建新不可变目录并完成Python编译。首次WAL迁移严格按“停止旧服务并确认旧进程退出、原子切换软链、启动新服务”的顺序执行，避免旧进程读事务干扰日志模式切换。未清空、覆盖或迁移正式订单、观察画像、决策审计及影子实验数据，未修改Nginx、SSL和systemd启动参数。
+
+```text
+commit=58b4164cc68097f2879834340d9b55aed44b3c8e
+current=/opt/victory-event-monitor/releases/event-contract-monitor-58b4164-20260821-1830
+service=active
+NRestarts=0
+database.journal_mode=wal
+database.quick_check=ok
+warmup.status=READY
+warmup.loaded_klines=161280
+warmup.errors=[]
+last_error=null
+shadow.status=RUNNING
+shadow.arms=8
+shadow.failed_arms={}
+shadow.gap_count=0
+journal warnings since release=0
+https=200
+```
+
+跨约5分钟采样确认`updated_at_ms`从`1787309100639`推进到`1787309401680`，最新1分钟K线推进到`1787309399999`，期间没有再次出现`database is locked`、`STORAGE_ERROR`或影子缺口。发布后正式订单仍为0，但当前原因已经恢复为正常策略判断`DAILY_PROFILE_NOT_SELECTED`，页面提示“当前信号未进入今日启用画像，仅记录观察”；这表示存储故障已解除，不代表当前K线满足开单条件。后续判断开单量时必须以发布后的完整运行窗口为边界，不能把15:49前后的故障停机时间计入策略筛选效果。
