@@ -3849,6 +3849,7 @@ class MonitorState:
             context_payload = context.to_dict()
             pending_observation = replace(
                 pending_observation,
+                edge=context_payload["inputs"]["score"]["edge"],
                 decision_id=context.decision_id,
                 context_version=context.context_version,
                 runtime_config_hash=context.runtime_config_hash,
@@ -4897,6 +4898,11 @@ class MonitorState:
                 latest,
                 candidate_origin,
             )
+        if not signal.quality_score_version:
+            signal = self._attach_quality_score(
+                signal,
+                current_time=latest.close_time,
+            )
         observation = self._new_observation(signal, latest, decision)
         if observation is None:
             return False
@@ -4920,8 +4926,10 @@ class MonitorState:
             run=run,
         )
         context_payload = context.to_dict()
+        canonical_edge = context_payload["inputs"]["score"]["edge"]
         observation = replace(
             observation,
+            edge=canonical_edge,
             decision_id=context.decision_id,
             context_version=context.context_version,
             runtime_config_hash=context.runtime_config_hash,

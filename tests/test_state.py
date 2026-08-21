@@ -3802,6 +3802,79 @@ class MonitorStateTest(unittest.TestCase):
         self.assertTrue(recorded)
         self.assertEqual(storage.decision_bundles[0][2].event_kind, "DECISIVE_BLOCK")
 
+    def test_observation_settlement_preserves_frozen_edge_precision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            state = MonitorState(symbol="BTCUSDT", storage=store)
+            opened_at = 1_000
+            signal = Signal(
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="floating point edge regression",
+                price=100.0,
+                open_time=opened_at,
+                score=100.0,
+                threshold=85.6,
+                threshold_segment="WD-08",
+                session_allowed=True,
+                observe_direction="LONG",
+                strategy_family="drop_reclaim",
+                strategy_tag="edge_precision",
+            )
+
+            recorded = state._record_observation(
+                signal,
+                latest_kline(opened_at),
+                "RESEARCH_OBSERVE",
+            )
+            settled = state._settle_observations(
+                opened_at + 10 * MINUTE_MS,
+                101.0,
+            )
+
+            self.assertTrue(recorded)
+            self.assertEqual(len(settled), 1, state.last_error)
+            self.assertEqual(
+                settled[0].edge,
+                settled[0].decision_inputs["score"]["edge"],
+            )
+            self.assertEqual(
+                store.load_observations("BTCUSDT")[0].status,
+                "SETTLED",
+            )
+            state.close()
+
+    def test_open_order_observation_preserves_frozen_edge_precision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            opened_at = 1_800_000_000_000
+            state = adaptive_admission_state("ACTIVE", opened_at, storage=store)
+            signal = replace(
+                selected_profile_signal(opened_at),
+                score=100.0,
+                threshold=85.6,
+                observe_direction="LONG",
+            )
+
+            decision = state._maybe_open_order(
+                signal,
+                latest_kline(opened_at),
+                daily_profile_required=True,
+            )
+            settled = state._settle_observations(
+                opened_at + 10 * MINUTE_MS,
+                101.0,
+            )
+
+            self.assertEqual(decision, "OPENED")
+            self.assertEqual(len(settled), 1, state.last_error)
+            self.assertEqual(
+                settled[0].edge,
+                settled[0].decision_inputs["score"]["edge"],
+            )
+            state.close()
+
     def test_same_state_replay_reuses_opened_decision_without_second_webhook(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
