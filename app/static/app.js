@@ -661,29 +661,39 @@ function orderCalculatedThreshold(order) {
   return calculated > 0 ? calculated : num(order.threshold);
 }
 
+function orderDiagnosticTitle(order) {
+  const parts = [
+    `${order.timeframe_minutes || 10}分钟`,
+    `等级 ${order.level || DASH}`,
+    `策略族 ${order.strategy_family || "unknown"}`,
+    `波段 ${order.wave_state || "UNKNOWN"}`,
+    `波段守卫 ${order.wave_guard_status || "UNKNOWN"}`,
+    `守卫模式 ${order.wave_guard_mode || "NORMAL"}`,
+    `价格结构 ${formatEntryStructure(order.entry_structure_shadow)}`,
+  ];
+  return parts.join(" · ");
+}
+
 function renderOrders(orders) {
   $("orders").innerHTML = orders.length ? orders.map((order) => `
     <tr class="${orderTone(order)}">
       <td>${escapeHtml(order.id)}</td>
       <td class="${directionClass(order.direction)}">${escapeHtml(order.direction)}</td>
-      <td>${escapeHtml(order.timeframe_minutes)}分钟</td>
-      <td>${escapeHtml(order.level)}</td>
       <td>${escapeHtml(order.threshold_segment || DASH)}</td>
-      <td>${escapeHtml(order.strategy_tag || "unknown")}<br><span>${escapeHtml(order.strategy_family || "unknown")}</span><br><span>${escapeHtml(order.wave_state || "UNKNOWN")} · ${escapeHtml(order.wave_guard_status || "UNKNOWN")} · ${escapeHtml(order.wave_guard_mode || "NORMAL")}</span>${order.profile_degradation_probe === true ? '<br><span class="order-probe-label">基础试探</span>' : ""}</td>
-      <td>${escapeHtml(fmtPct(order.session_win_rate))} / ${escapeHtml(fmtMoney(order.session_ev))}</td>
-      <td>${escapeHtml(num(order.threshold).toFixed(1))}<br><span>评分 ${escapeHtml(Math.abs(num(order.score)).toFixed(1))} · 原始 ${escapeHtml(orderCalculatedThreshold(order).toFixed(1))}</span></td>
-      <td data-column="entry-structure" class="diagnostic-cell">${escapeHtml(formatEntryStructure(order.entry_structure_shadow))}</td>
+      <td class="order-strategy-cell" title="${escapeHtml(orderDiagnosticTitle(order))}">
+        <strong>${escapeHtml(order.strategy_tag || "unknown")}</strong>
+        <span class="order-cell-meta">${escapeHtml(order.strategy_family || "unknown")}</span>
+        ${order.profile_degradation_probe === true ? '<span class="order-probe-label">基础试探</span>' : ""}
+      </td>
+      <td>${escapeHtml(fmtPct(order.session_win_rate))}<span class="order-cell-meta">EV ${escapeHtml(fmtMoney(order.session_ev))}</span></td>
+      <td title="评分 ${escapeHtml(Math.abs(num(order.score)).toFixed(1))} · 原始阈值 ${escapeHtml(orderCalculatedThreshold(order).toFixed(1))}">${escapeHtml(num(order.threshold).toFixed(1))}</td>
       <td>${escapeHtml(fmtMoney(order.stake))}</td>
-      <td>${escapeHtml(fmtPrice(order.entry_price))}</td>
-      <td>${escapeHtml(fmtTime(order.opened_at))}</td>
-      <td>${escapeHtml(fmtPrice(order.exit_price))}</td>
-      <td>${escapeHtml(fmtTime(order.settled_at))}</td>
-      <td>${escapeHtml(order.status)}</td>
-      <td>${escapeHtml(order.result || DASH)}</td>
-      <td class="${num(order.pnl) >= 0 ? "long" : "short"}">${escapeHtml(order.status === "SETTLED" ? fmtMoney(order.pnl) : DASH)}</td>
-      <td class="reason">${escapeHtml(order.reason)}<br><span>状态 ${escapeHtml(order.regime || "UNKNOWN")}</span></td>
+      <td class="order-point-cell">${escapeHtml(fmtPrice(order.entry_price))}<span class="order-cell-meta">${escapeHtml(fmtTime(order.opened_at))}</span></td>
+      <td class="order-point-cell">${escapeHtml(fmtPrice(order.exit_price))}<span class="order-cell-meta">${escapeHtml(fmtTime(order.settled_at))}</span></td>
+      <td class="order-result-cell">${escapeHtml(order.status)}<span class="order-cell-meta ${num(order.pnl) >= 0 ? "long" : "short"}">${escapeHtml(order.result || DASH)} · ${escapeHtml(order.status === "SETTLED" ? fmtMoney(order.pnl) : DASH)}</span></td>
+      <td class="reason" title="${escapeHtml(order.reason)} · 状态 ${escapeHtml(order.regime || "UNKNOWN")}"><span class="order-reason-text">${escapeHtml(order.reason)}</span><span class="order-reason-state">状态 ${escapeHtml(order.regime || "UNKNOWN")}</span></td>
     </tr>
-  `).join("") : `<tr><td colspan="18" class="empty-row">没有符合筛选条件的订单</td></tr>`;
+  `).join("") : `<tr><td colspan="11" class="empty-row">没有符合筛选条件的订单</td></tr>`;
 }
 
 function renderObservations(observations) {

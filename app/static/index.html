@@ -220,26 +220,32 @@
           </label>
         </div>
         <div class="table-wrap">
-          <table>
+          <table class="orders-table">
+            <colgroup>
+              <col class="order-col-id">
+              <col class="order-col-direction">
+              <col class="order-col-segment">
+              <col class="order-col-strategy">
+              <col class="order-col-performance">
+              <col class="order-col-threshold">
+              <col class="order-col-stake">
+              <col class="order-col-entry">
+              <col class="order-col-settlement">
+              <col class="order-col-result">
+              <col class="order-col-reason">
+            </colgroup>
             <thead>
               <tr>
                 <th>ID</th>
                 <th>方向</th>
-                <th>周期</th>
-                <th>等级</th>
                 <th>时段</th>
                 <th>策略</th>
-                <th>时段胜率/EV</th>
+                <th>画像表现</th>
                 <th>开单阈值</th>
-                <th data-column="entry-structure">价格结构</th>
                 <th>金额</th>
-                <th>入场点位</th>
-                <th>入场时间</th>
-                <th>到期点位</th>
-                <th>出场时间</th>
-                <th>状态</th>
-                <th>胜负</th>
-                <th>盈亏</th>
+                <th>入场</th>
+                <th>结算</th>
+                <th>结果</th>
                 <th>原因</th>
               </tr>
             </thead>

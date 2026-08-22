@@ -130,14 +130,25 @@ class PackagingTest(unittest.TestCase):
 
         self.assertEqual(index_html.count('id="latest-analysis"'), 1)
         orders_head = index_html.split('<section class="panel orders-panel">', 1)[1].split("</thead>", 1)[0]
-        self.assertEqual(orders_head.count("</th>"), 18)
-        self.assertIn('data-column="entry-structure"', index_html)
+        self.assertEqual(orders_head.count("</th>"), 11)
+        self.assertIn("画像表现", orders_head)
+        self.assertIn("入场", orders_head)
+        self.assertIn("结算", orders_head)
+        self.assertIn("结果", orders_head)
+        self.assertNotIn("<th>周期</th>", orders_head)
+        self.assertNotIn("<th>等级</th>", orders_head)
+        self.assertNotIn("价格结构", orders_head)
         self.assertIn('id="obs-window-filter"', index_html)
         self.assertIn('<option value="14d" selected>14天</option>', index_html)
         self.assertIn('id="obs-structure-state-filter"', index_html)
         self.assertIn('id="obs-structure-bias-filter"', index_html)
         self.assertIn('id="obs-origin-filter"', index_html)
-        self.assertIn('colspan="18"', app_js)
+        self.assertIn('colspan="11"', app_js)
+        self.assertIn('class="order-strategy-cell"', app_js)
+        self.assertIn('class="order-point-cell"', app_js)
+        self.assertIn('class="order-result-cell"', app_js)
+        self.assertIn('class="order-reason-text"', app_js)
+        self.assertIn("orderDiagnosticTitle", app_js)
         self.assertIn("function formatAdaptiveProfile", app_js)
         self.assertIn("function formatEntryStructure", app_js)
         self.assertIn("entry_structure_state", app_js)
@@ -145,7 +156,8 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("candidate_origin", app_js)
         self.assertIn("overflow-x: auto", styles_css)
         self.assertIn(".orders-panel table", styles_css)
-        self.assertIn("min-width: 2100px", styles_css)
+        self.assertIn("min-width: 1400px", styles_css)
+        self.assertIn("-webkit-line-clamp: 2", styles_css)
 
     def test_dashboard_formats_and_escapes_dynamic_diagnostics(self):
         script = """

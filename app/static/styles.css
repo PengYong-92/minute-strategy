@@ -419,30 +419,57 @@ table {
 }
 
 .orders-panel table {
-  width: 2100px;
-  min-width: 2100px;
+  width: 100%;
+  min-width: 1400px;
   table-layout: fixed;
+}
+
+.orders-table .order-col-id {
+  width: 48px;
+}
+
+.orders-table .order-col-direction {
+  width: 80px;
+}
+
+.orders-table .order-col-segment {
+  width: 70px;
+}
+
+.orders-table .order-col-strategy {
+  width: 180px;
+}
+
+.orders-table .order-col-performance {
+  width: 125px;
+}
+
+.orders-table .order-col-threshold {
+  width: 95px;
+}
+
+.orders-table .order-col-stake {
+  width: 82px;
+}
+
+.orders-table .order-col-entry,
+.orders-table .order-col-settlement {
+  width: 150px;
+}
+
+.orders-table .order-col-result {
+  width: 110px;
+}
+
+.orders-table .order-col-reason {
+  width: 310px;
 }
 
 .orders-panel th,
 .orders-panel td {
-  width: 104px;
-}
-
-.orders-panel th:nth-child(6),
-.orders-panel td:nth-child(6) {
-  width: 230px;
-}
-
-.orders-panel th[data-column="entry-structure"],
-.orders-panel td[data-column="entry-structure"] {
-  width: 250px;
-  min-width: 250px;
-}
-
-.orders-panel th:last-child,
-.orders-panel td:last-child {
-  width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
 }
 
 .observation-summary-panel table,
@@ -464,19 +491,49 @@ tbody tr:hover {
 
 td.reason {
   white-space: normal;
-  min-width: 360px;
   line-height: 1.45;
 }
 
-td.diagnostic-cell {
-  line-height: 1.45;
+.order-strategy-cell strong,
+.order-cell-meta,
+.order-reason-state {
+  display: block;
+}
+
+.order-strategy-cell strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-cell-meta {
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-reason-text {
+  display: -webkit-box;
+  overflow: hidden;
   overflow-wrap: anywhere;
-  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+td.reason .order-reason-text {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.order-reason-state {
+  margin-top: 4px;
 }
 
 td.reason span {
-  display: inline-block;
-  margin-top: 4px;
   color: var(--blue);
   font-size: 12px;
 }
