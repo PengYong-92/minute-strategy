@@ -2487,3 +2487,32 @@ https=200
 发布后两条到期冻结观察均已正常结算：`1787326680000|10|LONG|generic_long_observe`为`LOSS/-10U`，`1787326980000|10|short_observe|generic_short_observe|SHORT|WD-15`为`WIN/+8U`；正式库计数从发布前`OPEN=3/SETTLED=9932`推进到`OPEN=2/SETTLED=9935`。最终两条OPEN中，一条是已记录的2026年7月无V2决策上下文遗留项，另一条是发布后新生成且尚未到期的正常观察。该过程没有再次出现`settlement conflicts with frozen observation data`。
 
 跨约12分钟最终采样：`state 0.13s`、`observations 2.48s`、公网首页0.08s且HTTP 200；影子`last_event_id`持续推进，2个arm全部活跃，`failed_arms={}`、`gap_count=0`。cgroup当前约450MiB、峰值约673MiB，`high/max/oom/oom_kill`仍全为0，`NRestarts=0`；发布边界后的日志中没有`Traceback`、冻结冲突、`database is locked`、`STORAGE_ERROR`、OOM或影子失败。
+
+## 49. 2026-08-22模拟订单表静态热更新
+
+提交`a29a6e6`仅调整模拟订单列表的HTML、JavaScript渲染和CSS，不修改服务端状态、开单、结算、画像、数据库、Webhook或启动参数。订单表由18列压缩为11列：隐藏固定周期、等级和独立价格结构列，合并入场点位/时间、结算点位/时间及状态/胜负/盈亏；评分、原始阈值、价格结构和波段守卫等完整诊断值保留在悬停信息中，原因正文限制为两行摘要。表格使用稳定列宽和容器内部横向滚动，避免字段互相覆盖或撑宽页面。
+
+本次未创建新发布目录，也未切换`current`。因为`MonitorHandler._send_file()`每次请求均从当前发布目录读取静态文件，所以将三个文件上传后在同目录原子替换即可生效，无需重启服务。未备份、清空或修改订单及任何SQLite数据。
+
+```text
+commit=a29a6e6
+main/origin-main=a29a6e6
+current=/opt/victory-event-monitor/releases/event-contract-monitor-1b118b2-20260821-233747
+service=active
+MainPID.before=11877
+MainPID.after=11877
+NRestarts.before=0
+NRestarts.after=0
+ActiveEnterTimestamp=Fri 2026-08-21 23:42:56 CST
+index.html.sha256=6682dbea1b9d8f4da6ef580505894b928e0ed811a8787f240475ad8e3dff38fe
+app.js.sha256=7ff95158e87989de4e1e9aba6f35f75b06bde8f26f5cade4ad089963de56e8a2
+styles.css.sha256=f6137ae8ced344f1f453964631ce5f20d578d46abd06c7cf507e64abe8745de3
+orders.total=14
+orders.open=0
+browser.headers=11
+browser.rows=14
+browser.overflow_cells=0
+browser.page_horizontal_overflow=false
+```
+
+合并后的`tests.test_packaging`和`tests.test_server`共50项通过，JavaScript语法和差异检查通过。通过HTTPS下载的三个线上文件与本地提交SHA-256完全一致，订单API和页面渲染均正常。
