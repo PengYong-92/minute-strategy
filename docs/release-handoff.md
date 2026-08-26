@@ -2523,18 +2523,26 @@ browser.page_horizontal_overflow=false
 
 实例物理内存只有约1.6GiB。故障时服务cgroup约1.07GiB并长期超过`MemoryHigh=950M`，`memory.pressure full`约96%，Python线程阻塞在`mem_cgroup_handle_over_high`；2026-08-24内核日志还记录过同一服务约999MiB匿名RSS时被OOM Kill。服务器虽然已有有效的2GiB`/swapfile`，但既未启用也未写入`/etc/fstab`，当时实际Swap为0。
 
-资源不足只是触发条件，持续增长的直接原因是页面查询放大：正式SQLite约3.0GiB、影子SQLite约4.4GiB，而正式订单仅78条、观察约10686条。旧`/api/orders`先恢复全部订单及冻结决策上下文，再在Python中分页；78条订单自身JSON约43KiB，但关联决策输入约30.9MiB。`/api/state`每3秒再次序列化订单和观察集合，订单、观察、画像汇总又每10秒并发刷新；请求慢于刷新周期后会重叠堆积。故障进程中订单接口约34.7秒、观察接口约48秒，主进程和影子进程合计匿名工作集一度超过3GiB并耗尽最初启用的2GiB Swap，最终表现为systemd仍为`active`但HTTP长期无响应。
+Swap缺失只是触发条件，停摆由以下四类问题共同造成：
+
+1. 页面查询放大。旧`/api/orders`先恢复全部订单及冻结决策上下文，再在Python中分页；78条订单自身JSON约43KiB，但关联决策输入约30.9MiB。`/api/state`每3秒再次序列化订单和观察集合，订单、观察、画像汇总又每10秒并发刷新，请求慢于刷新周期后重叠堆积。故障进程中订单接口约34.7秒、观察接口约48秒。
+2. 后台无效扫描。画像汇总线程在正式画像容量已满时仍反复扫描全部决策快照；无待结算订单和观察时，结算流程仍重复排序168480根K线并构造投影；同一根已收盘K线的30天分析在正式、影子路径中重复计算。
+3. 正式库达到硬限制。`monitor.sqlite3`物理大小精确达到3GiB且无空闲页，`order_decision=STORAGE_ERROR`，核心写入被`core write is disabled at HARD_LIMIT`拒绝。空间主要由702070条旧版`signal_audit`记录和过大的`decision_contexts.input_payload`占用。
+4. 决策上下文重复存储。旧上下文把每日画像选择的完整候选数组再次写入每一分钟决策，其中候选数组约334KiB，单条输入约397KiB；完整选择本来已按版本保存在`daily_profile_selections`。
+
+因此故障表象是systemd仍为`active`，但CPU、内存和数据库写入同时受阻，HTTP长期无响应。该结论来自cgroup压力、内核OOM记录、`py-spy`调用栈、接口计时及SQLite页级统计，不是单纯通过增加Swap掩盖问题。
 
 ### 50.2 资源恢复
 
 - 启用原有`/swapfile`并新增2GiB`/swapfile2`，总Swap为4GiB；两项均写入`/etc/fstab`，`vm.swappiness=10`，重启后仍会生效。
 - 配置修改前保留`/etc/fstab.pre-victory-swap-20260826`、`/etc/sysctl.conf.pre-victory-swap-20260826`和`/etc/sysctl.d/99-sysctl.conf.pre-victory-swap-20260826`。
 - 故障恢复时临时把服务运行时限制放宽到`MemoryHigh=1150M/MemoryMax=1400M`以退出严重节流；新版本稳定后已恢复原值`950M/1200M`。
-- 最终Swap使用约122MiB，剩余约3.9GiB；服务和Nginx均为`active`，`NRestarts=0`。
+- 最终Swap使用约126MiB，剩余约3.9GiB；服务和Nginx均为`active`，`NRestarts=0`。
+- 正式库物理上限仍为设计值3GiB，未错误扩展为5GiB；5GiB只适用于影子库。容量判断改为使用有效页数而不是物理文件长度，已释放页可以重新用于核心写入。
 
 ### 50.3 代码修复边界
 
-提交`09a3c63`和`125b894`只修复仪表盘读取、轮询和静态缓存，不修改画像、评分、阈值、方向、开单门禁、订单并发、滚单、结算、Webhook、预热月份或市场数据逻辑：
+提交`09a3c63`、`125b894`、`84f9c06`、`a1a5f04`、`0037114`和`2bcba3d`只处理查询、后台计算、存储容量和运行资源，不修改画像入选、评分、阈值、方向、开单门禁、订单并发、滚单、盈亏判定、Webhook、预热月份或市场数据逻辑：
 
 - `/api/state`不再装载和序列化订单、观察集合，页面继续通过独立分页接口读取；
 - 订单改为SQLite先计数、筛选、排序和分页，只恢复当前页；
@@ -2542,14 +2550,31 @@ browser.page_horizontal_overflow=false
 - 正常页面请求默认使用轻量模式，显式`dashboard=0`仍可取得完整分析载荷，数据库内冻结审计数据没有删减；
 - 前端为重请求增加in-flight保护，订单保持10秒刷新，观察、画像汇总和订单画像调整为60秒；
 - 静态HTML/JS/CSS返回`Cache-Control: no-store`。即使用户仍打开发布前旧标签，服务端也会把其不带参数的订单和观察请求强制转为轻量路径，避免旧脚本继续拖垮服务。
+- 状态、订单、观察和画像汇总增加进程内single-flight与短时响应缓存；订单缓存按内存中的订单修订号失效，开单和结算后立即反映，不以300秒TTL延迟订单状态。
+- 正式画像达到容量或已有构建租约时，画像线程先返回，不再扫描全量快照；无待结算订单/观察时，结算流程直接返回，不再排序全部K线。
+- 同一根已收盘K线的量价分析在一次正式/影子调用范围内复用，避免三次重复30天计算；复用范围使用上下文隔离，不跨K线、不跨线程、不缓存市场结果。
+- 决策上下文只保留每日画像选择的字段、候选数量和完整选择SHA-256，完整候选列表继续由`daily_profile_selections`保存。新上下文输入由约397KiB降至47至49KiB，冻结决策仍可通过版本和哈希追溯。
+- 正式容量状态按`(page_count - freelist_count) * page_size`计算有效占用，同时保留SQLite的3GiB物理页上限，防止已释放页仍被误判为`HARD_LIMIT`。
 
-完整回归为`python3 -m unittest discover -s tests`共1160项通过；Python编译、Shell语法和`git diff --check`通过。测试额外覆盖只恢复请求页、页面载荷裁剪、观察筛选不扫描上下文、请求防重叠、默认轻量兼容及静态缓存禁用。
+完整回归为`python3 -m unittest discover -s tests`共1167项通过；Python编译、Shell语法和`git diff --check`通过。测试额外覆盖只恢复请求页、页面载荷裁剪、观察筛选不扫描上下文、请求防重叠、默认轻量兼容、响应缓存失效、无效后台扫描短路、同K线分析复用、容量有效页计算及每日画像候选压缩。
 
-### 50.4 发布与生产验收
+### 50.4 数据归档与容量恢复
+
+在停止服务并确认`orders=78/open=0/observations=10687/decision_contexts=3767`后，把702070条旧版`event_kind IS NULL`审计记录完整复制到：
 
 ```text
-commits=09a3c63,125b894
-current=/opt/victory-event-monitor/releases/event-contract-monitor-125b894-20260826-212128
+/opt/victory-event-monitor/shared/data/archive/signal-audit-pre-v2-20260826.sqlite3
+```
+
+归档前后按`count/min(id)/max(id)/sum(id)/payload_bytes`核对一致：`702070/1/702070/246451493485/1020058855`，主库和归档库`quick_check`均为`ok`。随后只从主库删除这批已归档旧审计，没有删除订单、观察、决策上下文、每日画像或影子数据。
+
+主库物理文件仍为3GiB，活动页从3GiB降到约1.47GiB，约1.53GiB页变为SQLite可复用空间；`storage_capacity`从`HARD_LIMIT`恢复为`NORMAL`，核心、观察、普通审计和紧凑审计写入全部恢复。归档文件约1.6GiB，服务器根盘最终剩余约9.6GiB。
+
+### 50.5 发布与生产验收
+
+```text
+commits=09a3c63,125b894,84f9c06,a1a5f04,0037114,2bcba3d
+current=/opt/victory-event-monitor/releases/event-contract-monitor-2bcba3d-20260826-230842
 service=active
 nginx=active
 NRestarts=0
@@ -2559,13 +2584,21 @@ warmup.cached_files=28
 warmup.downloaded_files=0
 orders.total=78
 orders.open=0
+storage.status=NORMAL
+storage.effective_bytes=1580716032
+storage.max_bytes=3221225472
+storage.core_write_allowed=true
 swap.total=4.0GiB
-swap.used=122MiB
+swap.used=126MiB
 vm.swappiness=10
 MemoryHigh=950M
 MemoryMax=1200M
+MemoryCurrent.stable=508260352
+cpu.average.15s=5.13%
 ```
 
-发布未备份、清空、覆盖或迁移订单、观察、决策审计、预热缓存和影子数据。预热约4分半完成，168480根K线全部命中缓存。生产默认轻量接口验收为：价格约0.002秒、状态约0.08秒、订单约2.71秒、观察约2.69秒；静态脚本确认返回`Cache-Control: no-store`，HTTPS首页HTTP 200。
+最终版本于23:15:41启动，23:20:11完成预热，168480根K线全部命中28个缓存文件。内部状态接口约0.005秒，订单接口约0.003秒；观察接口首次约1.89秒、随后缓存命中约0.002秒。公网HTTPS首页、状态和订单接口均为HTTP 200，TLS验证结果为0，耗时约0.07秒。
 
-旧页面持续轮询条件下连续取样约2分钟，匿名内存在610至619MiB间收敛，主进程RSS从538MiB回落到529MiB，cgroup总占用约795至804MiB，低于950MiB高水位；`memory.events high/max/oom/oom_kill`均为0，压力采样恢复为0，日志中无新`Traceback`、`database is locked`、冻结冲突、`STORAGE_ERROR`或OOM。4GiB Swap是故障兜底，查询放大修复才是本次停摆的根因修复。
+发布后连续产生4个新分钟决策，`decision_contexts`从3767增至3771，`signal_audit`从4038增至4042，最新决策输入为47至49KiB且不再重复候选数组；状态更新时间逐分钟推进，`last_error=null`，没有再出现`STORAGE_ERROR`。订单仍为78条且无在途订单，未因本次修复清空或改写。
+
+旧页面持续轮询和每分钟分析同时运行时，15秒CPU平均5.13%，故障前同口径约91%；稳定cgroup占用约485MiB，低于950MiB软上限。`memory.events max/oom/oom_kill`均为0，`memory.pressure avg10`恢复为0。日志无新`Traceback`、`database is locked`、冻结冲突、持久化失败、`STORAGE_ERROR`或OOM。4GiB Swap只作为小内存实例的故障兜底，查询放大、重复计算和数据库容量修复才是本次停摆的根因修复。
