@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -47,6 +48,7 @@ class OrdersApiTest(unittest.TestCase):
         order_calls = []
         observation_calls = []
         state = SimpleNamespace(
+            symbol="BTCUSDT",
             page_orders=lambda **kwargs: (
                 order_calls.append(kwargs) or {"orders": []}
             ),
@@ -57,9 +59,11 @@ class OrdersApiTest(unittest.TestCase):
         server = _serve(state)
         try:
             _get_json(f"http://127.0.0.1:{server.server_port}/api/orders")
+            _get_json(f"http://127.0.0.1:{server.server_port}/api/orders")
             _get_json(
                 f"http://127.0.0.1:{server.server_port}/api/orders?dashboard=0"
             )
+            _get_json(f"http://127.0.0.1:{server.server_port}/api/observations")
             _get_json(f"http://127.0.0.1:{server.server_port}/api/observations")
             _get_json(
                 f"http://127.0.0.1:{server.server_port}/api/observations?dashboard=0"
@@ -73,6 +77,35 @@ class OrdersApiTest(unittest.TestCase):
             [call["dashboard"] for call in observation_calls],
             [True, False],
         )
+
+    def test_dashboard_cache_collapses_concurrent_identical_requests(self):
+        calls = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def page_orders(**kwargs):
+            calls.append(kwargs)
+            started.set()
+            self.assertTrue(release.wait(timeout=2.0))
+            return {"orders": [], "total": 0}
+
+        state = SimpleNamespace(symbol="BTCUSDT", page_orders=page_orders)
+        server = _serve(state)
+        url = f"http://127.0.0.1:{server.server_port}/api/orders?page=1&page_size=20"
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(_get_json, url)
+                self.assertTrue(started.wait(timeout=2.0))
+                second = executor.submit(_get_json, url)
+                time.sleep(0.05)
+                release.set()
+                self.assertEqual(first.result(timeout=2.0)["total"], 0)
+                self.assertEqual(second.result(timeout=2.0)["total"], 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(calls), 1)
 
     def test_static_assets_disable_browser_caching(self):
         state = SimpleNamespace()

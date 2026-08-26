@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -27,6 +28,59 @@ PROJECT_ROOT = ROOT.parent
 STATIC_DIR = ROOT / "static"
 DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS = ""
 DEFAULT_LIVE_SHORT_SEGMENTS = "WD-02,WD-23"
+STATE_RESPONSE_CACHE_SECONDS = 2.0
+ORDER_RESPONSE_CACHE_SECONDS = 10.0
+OBSERVATION_RESPONSE_CACHE_SECONDS = 30.0
+SUMMARY_RESPONSE_CACHE_SECONDS = 30.0
+
+
+class _JsonResponseCache:
+    def __init__(self, max_entries: int = 128):
+        self._condition = threading.Condition()
+        self._entries: dict[tuple, tuple[float, bytes]] = {}
+        self._inflight: set[tuple] = set()
+        self._max_entries = max_entries
+
+    def get_or_create(self, key: tuple, ttl_seconds: float, producer) -> bytes:
+        while True:
+            with self._condition:
+                now = time.monotonic()
+                cached = self._entries.get(key)
+                if cached is not None and cached[0] > now:
+                    return cached[1]
+                if key not in self._inflight:
+                    self._inflight.add(key)
+                    break
+                self._condition.wait()
+
+        try:
+            body = _json_bytes(producer())
+        except BaseException:
+            with self._condition:
+                self._inflight.discard(key)
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            now = time.monotonic()
+            expired = [
+                cached_key
+                for cached_key, (expires_at, _) in self._entries.items()
+                if expires_at <= now
+            ]
+            for cached_key in expired:
+                self._entries.pop(cached_key, None)
+            if len(self._entries) >= self._max_entries:
+                oldest = min(self._entries, key=lambda item: self._entries[item][0])
+                self._entries.pop(oldest, None)
+            self._entries[key] = (now + ttl_seconds, body)
+            self._inflight.discard(key)
+            self._condition.notify_all()
+        return body
+
+    def clear(self) -> None:
+        with self._condition:
+            self._entries.clear()
 
 
 class _ChineseHelpFormatter(argparse.HelpFormatter):
@@ -61,12 +115,17 @@ def start_market_data(
 
 def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
     symbol_switch_lock = threading.Lock()
+    response_cache = _JsonResponseCache()
 
     class MonitorHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/api/state":
-                self._send_json(state.snapshot(include_collections=False))
+                self._send_cached_json(
+                    ("state", getattr(state, "symbol", "")),
+                    STATE_RESPONSE_CACHE_SECONDS,
+                    lambda: state.snapshot(include_collections=False),
+                )
                 return
             if parsed.path == "/api/price":
                 self._send_json(state.price_snapshot())
@@ -89,49 +148,76 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                 return
             if parsed.path == "/api/orders":
                 query = parse_qs(parsed.query)
-                self._send_json(
-                    state.page_orders(
-                        page=_query_int(query, "page", 1),
-                        page_size=_query_int(query, "page_size", 20),
-                        direction=_query_text(query, "direction"),
-                        level=_query_text(query, "level"),
-                        segment=_query_text(query, "segment"),
-                        result=_query_text(query, "result"),
-                        dashboard=_query_dashboard(query),
+                dashboard = _query_dashboard(query)
+                kwargs = {
+                    "page": _query_int(query, "page", 1),
+                    "page_size": _query_int(query, "page_size", 20),
+                    "direction": _query_text(query, "direction"),
+                    "level": _query_text(query, "level"),
+                    "segment": _query_text(query, "segment"),
+                    "result": _query_text(query, "result"),
+                    "dashboard": dashboard,
+                }
+                if dashboard:
+                    self._send_cached_json(
+                        (
+                            "orders",
+                            getattr(state, "symbol", ""),
+                            *tuple(kwargs.items()),
+                        ),
+                        ORDER_RESPONSE_CACHE_SECONDS,
+                        lambda: state.page_orders(**kwargs),
                     )
-                )
+                else:
+                    self._send_json(state.page_orders(**kwargs))
                 return
             if parsed.path == "/api/observations":
                 query = parse_qs(parsed.query)
-                self._send_json(
-                    state.page_observations(
-                        page=_query_int(query, "page", 1),
-                        page_size=_query_int(query, "page_size", 20),
-                        direction=_query_text(query, "direction"),
-                        family=_query_text(query, "family"),
-                        tag=_query_text(query, "tag"),
-                        segment=_query_text(query, "segment"),
-                        result=_query_text(query, "result"),
-                        candidate_origin=_query_text(query, "candidate_origin"),
-                        qualification_state=_query_text(query, "qualification_state"),
-                        adaptive_state=_query_text(query, "adaptive_state"),
-                        entry_structure_state=_query_text(query, "entry_structure_state"),
-                        entry_structure_bias=_query_text(query, "entry_structure_bias"),
-                        active_level_source=_query_text(query, "active_level_source"),
-                        dashboard=_query_dashboard(query),
+                dashboard = _query_dashboard(query)
+                kwargs = {
+                    "page": _query_int(query, "page", 1),
+                    "page_size": _query_int(query, "page_size", 20),
+                    "direction": _query_text(query, "direction"),
+                    "family": _query_text(query, "family"),
+                    "tag": _query_text(query, "tag"),
+                    "segment": _query_text(query, "segment"),
+                    "result": _query_text(query, "result"),
+                    "candidate_origin": _query_text(query, "candidate_origin"),
+                    "qualification_state": _query_text(query, "qualification_state"),
+                    "adaptive_state": _query_text(query, "adaptive_state"),
+                    "entry_structure_state": _query_text(query, "entry_structure_state"),
+                    "entry_structure_bias": _query_text(query, "entry_structure_bias"),
+                    "active_level_source": _query_text(query, "active_level_source"),
+                    "dashboard": dashboard,
+                }
+                if dashboard:
+                    self._send_cached_json(
+                        (
+                            "observations",
+                            getattr(state, "symbol", ""),
+                            *tuple(kwargs.items()),
+                        ),
+                        OBSERVATION_RESPONSE_CACHE_SECONDS,
+                        lambda: state.page_observations(**kwargs),
                     )
-                )
+                else:
+                    self._send_json(state.page_observations(**kwargs))
                 return
             if parsed.path == "/api/observation-summary":
                 query = parse_qs(parsed.query)
-                self._send_json(
-                    state.observation_summary(
-                        window=_query_text(query, "window") or "14d"
-                    )
+                window = _query_text(query, "window") or "14d"
+                self._send_cached_json(
+                    ("observation-summary", getattr(state, "symbol", ""), window),
+                    SUMMARY_RESPONSE_CACHE_SECONDS,
+                    lambda: state.observation_summary(window=window),
                 )
                 return
             if parsed.path == "/api/order-profile":
-                self._send_json(state.order_profile_summary())
+                self._send_cached_json(
+                    ("order-profile", getattr(state, "symbol", "")),
+                    SUMMARY_RESPONSE_CACHE_SECONDS,
+                    state.order_profile_summary,
+                )
                 return
             if parsed.path == "/api/signal-audit-summary":
                 self._send_json(state.signal_audit_summary())
@@ -152,6 +238,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                             if market_data is not None:
                                 market_data.request_symbol_refresh()
                         configured_symbol = state.symbol
+                        response_cache.clear()
                 self._send_json({"symbol": configured_symbol})
                 return
             if parsed.path == "/":
@@ -167,13 +254,23 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
             print(f"{self.address_string()} - {fmt % args}")
 
         def _send_json(self, payload: dict) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send_json_body(_json_bytes(payload))
+
+        def _send_cached_json(self, key: tuple, ttl_seconds: float, producer) -> None:
+            self._send_json_body(
+                response_cache.get_or_create(key, ttl_seconds, producer)
+            )
+
+        def _send_json_body(self, body: bytes) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def _send_file(self, path: Path) -> None:
             try:
@@ -206,6 +303,10 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
 
 def _query_text(query: dict, name: str) -> str:
     return str(query.get(name, [""])[0] or "").strip()
+
+
+def _json_bytes(payload: dict) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def _query_dashboard(query: dict) -> bool:
