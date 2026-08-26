@@ -1,4 +1,3 @@
-from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -286,17 +285,18 @@ class AccountSimulator:
         self,
         klines: Sequence[Kline],
     ) -> list[SettlementEvent]:
-        ordered = sorted(klines, key=lambda item: item.close_time)
-        close_times = [item.close_time for item in ordered]
+        open_orders = [order for order in self.orders if order.status == "OPEN"]
+        if not open_orders:
+            return []
+        pending_expiries = {order.expires_at for order in open_orders}
+        expiry_klines = {}
+        for item in klines:
+            if item.close_time in pending_expiries:
+                expiry_klines.setdefault(item.close_time, item)
         events = []
-        for order in self.orders:
-            if order.status != "OPEN":
-                continue
-            index = bisect_left(close_times, order.expires_at)
-            if index >= len(ordered):
-                continue
-            exit_kline = ordered[index]
-            if exit_kline.close_time != order.expires_at:
+        for order in open_orders:
+            exit_kline = expiry_klines.get(order.expires_at)
+            if exit_kline is None:
                 continue
             events.append(
                 self._settle_order(

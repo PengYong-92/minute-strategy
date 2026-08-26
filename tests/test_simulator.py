@@ -1335,6 +1335,18 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(settled, [])
         self.assertEqual(order.status, "OPEN")
 
+    def test_kline_settlement_without_open_orders_does_not_scan_klines(self):
+        class UnexpectedKlines:
+            def __iter__(self):
+                raise AssertionError("settlement should not scan klines without open orders")
+
+        simulator = AccountSimulator()
+
+        self.assertEqual(
+            simulator.settle_expired_order_events_from_klines(UnexpectedKlines()),
+            [],
+        )
+
     def test_direct_settlement_does_not_use_price_after_expiry(self):
         simulator = AccountSimulator()
         order = simulator.open_order(signal("LONG"), entry_price=100.0, opened_at=59_999)

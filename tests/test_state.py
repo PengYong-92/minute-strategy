@@ -9613,12 +9613,43 @@ class MonitorStateTest(unittest.TestCase):
             session_allowed=True,
         )
 
-        snapshot = state._rolling_edge_status(signal, kline(70, 100.0, 100))
+        with patch.object(
+            SimulatedOrder,
+            "to_dict",
+            side_effect=AssertionError("rolling edge must use a narrow order projection"),
+        ):
+            snapshot = state._rolling_edge_status(signal, kline(70, 100.0, 100))
 
         self.assertEqual(snapshot["sample_size"], 2)
         self.assertEqual(snapshot["pnl"], -2.0)
         self.assertEqual(snapshot["ev"], -1.0)
         self.assertEqual(snapshot["status"], "DEGRADED")
+
+    def test_observation_settlement_without_due_items_does_not_scan_klines(self):
+        class UnexpectedKlines:
+            def __iter__(self):
+                raise AssertionError("settlement should not scan klines without due observations")
+
+        state = MonitorState(symbol="BTCUSDT")
+        state.observations = [
+            ObservationSignal(
+                observation_key="future",
+                strategy_family="long_observe",
+                strategy_tag="generic_long_observe",
+                direction="LONG",
+                timeframe_minutes=10,
+                level="A",
+                reason="future",
+                entry_price=100.0,
+                opened_at=1_000,
+                expires_at=601_000,
+            )
+        ]
+
+        self.assertEqual(
+            state._settle_observations(60_000, 100.0, UnexpectedKlines()),
+            [],
+        )
 
     def test_state_records_order_entry_snapshot_and_settlement_asynchronously(self):
         klines = actionable_rebound_klines()

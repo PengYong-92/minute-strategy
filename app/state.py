@@ -2,7 +2,6 @@ import json
 import math
 import threading
 import time
-from bisect import bisect_left
 from collections.abc import Mapping
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -5070,21 +5069,29 @@ class MonitorState:
         current_price: float,
         klines: Sequence[Kline] | None = None,
     ) -> list[ObservationSignal]:
-        ordered_klines = sorted(klines or [], key=lambda item: item.close_time)
-        close_times = [item.close_time for item in ordered_klines]
+        due_observations = [
+            observation
+            for observation in self.observations
+            if observation.status == "OPEN" and current_time >= observation.expires_at
+        ]
+        if not due_observations:
+            return []
+        expiry_klines = {}
+        if klines:
+            pending_expiries = {
+                observation.expires_at for observation in due_observations
+            }
+            for item in klines:
+                if item.close_time in pending_expiries:
+                    expiry_klines.setdefault(item.close_time, item)
         settled = []
         previous_states = []
-        for observation in self.observations:
-            if observation.status != "OPEN" or current_time < observation.expires_at:
-                continue
+        for observation in due_observations:
             settled_at = current_time
             exit_price = current_price
-            if ordered_klines:
-                index = bisect_left(close_times, observation.expires_at)
-                if index >= len(ordered_klines):
-                    continue
-                exit_kline = ordered_klines[index]
-                if exit_kline.close_time != observation.expires_at:
+            if klines:
+                exit_kline = expiry_klines.get(observation.expires_at)
+                if exit_kline is None:
                     continue
                 settled_at = exit_kline.close_time
                 exit_price = exit_kline.close
@@ -5410,7 +5417,11 @@ class MonitorState:
         if self.enable_stake_progression:
             edge_orders = [
                 {
-                    **order.to_dict(),
+                    "timeframe_minutes": order.timeframe_minutes,
+                    "threshold_segment": order.threshold_segment,
+                    "reason": order.reason,
+                    "result": order.result,
+                    "opened_at": order.opened_at,
                     "pnl": (
                         round(self.simulator.win_return - self.simulator.stake, 4)
                         if order.result == "WIN"
