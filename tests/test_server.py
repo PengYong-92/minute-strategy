@@ -43,6 +43,52 @@ class OrdersApiTest(unittest.TestCase):
         self.assertEqual(payload["symbol"], "BTCUSDT")
         self.assertEqual(calls, [{"include_collections": False}])
 
+    def test_dashboard_apis_default_to_compact_mode_but_allow_explicit_full_mode(self):
+        order_calls = []
+        observation_calls = []
+        state = SimpleNamespace(
+            page_orders=lambda **kwargs: (
+                order_calls.append(kwargs) or {"orders": []}
+            ),
+            page_observations=lambda **kwargs: (
+                observation_calls.append(kwargs) or {"observations": []}
+            ),
+        )
+        server = _serve(state)
+        try:
+            _get_json(f"http://127.0.0.1:{server.server_port}/api/orders")
+            _get_json(
+                f"http://127.0.0.1:{server.server_port}/api/orders?dashboard=0"
+            )
+            _get_json(f"http://127.0.0.1:{server.server_port}/api/observations")
+            _get_json(
+                f"http://127.0.0.1:{server.server_port}/api/observations?dashboard=0"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual([call["dashboard"] for call in order_calls], [True, False])
+        self.assertEqual(
+            [call["dashboard"] for call in observation_calls],
+            [True, False],
+        )
+
+    def test_static_assets_disable_browser_caching(self):
+        state = SimpleNamespace()
+        server = _serve(state)
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/static/app.js"
+            ) as response:
+                response.read(1)
+                cache_control = response.headers.get("Cache-Control")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(cache_control, "no-store")
+
     def test_shadow_optimizer_requires_explicit_enable_and_is_wired_to_market_data(self):
         fake_server = SimpleNamespace(
             serve_forever=lambda: None,

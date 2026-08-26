@@ -97,7 +97,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         level=_query_text(query, "level"),
                         segment=_query_text(query, "segment"),
                         result=_query_text(query, "result"),
-                        dashboard=_query_text(query, "dashboard") == "1",
+                        dashboard=_query_dashboard(query),
                     )
                 )
                 return
@@ -118,7 +118,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         entry_structure_state=_query_text(query, "entry_structure_state"),
                         entry_structure_bias=_query_text(query, "entry_structure_bias"),
                         active_level_source=_query_text(query, "active_level_source"),
-                        dashboard=_query_text(query, "dashboard") == "1",
+                        dashboard=_query_dashboard(query),
                     )
                 )
                 return
@@ -196,6 +196,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
 
             self.send_response(200)
             self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -205,6 +206,10 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
 
 def _query_text(query: dict, name: str) -> str:
     return str(query.get(name, [""])[0] or "").strip()
+
+
+def _query_dashboard(query: dict) -> bool:
+    return _query_text(query, "dashboard").lower() not in {"0", "false", "no"}
 
 
 def _query_int(query: dict, name: str, default: int) -> int:
