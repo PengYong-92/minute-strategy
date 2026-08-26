@@ -18,7 +18,7 @@ from app.decision_context import (
     runtime_config_snapshot,
 )
 from app.models import ObservationSignal, Signal, SimulatedOrder
-from app import order_profile
+from app import order_profile, storage as storage_module
 from app.simulator import AccountSimulator
 from app.stake_progression import TWO_STAGE_VERSION, StakeProgressionCredit
 from app.storage import DecisionAudit, SQLiteMonitorStore
@@ -2743,6 +2743,68 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(filtered["orders"][0]["id"], 3)
         self.assertEqual(filtered["orders"][0]["direction"], "SHORT")
 
+    def test_order_dashboard_page_hydrates_only_the_requested_page(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            for order_id in range(1, 31):
+                store.save_order(
+                    SimulatedOrder(
+                        id=order_id,
+                        direction="LONG",
+                        timeframe_minutes=10,
+                        level="B",
+                        reason="page filler",
+                        entry_price=100.0,
+                        opened_at=order_id * 1_000,
+                        expires_at=order_id * 1_000 + 600_000,
+                        threshold_segment="WD-12",
+                    ),
+                    "BTCUSDT",
+                )
+
+            original = storage_module._hydrate_decision_linked_payload
+            with mock.patch.object(
+                storage_module,
+                "_hydrate_decision_linked_payload",
+                wraps=original,
+            ) as hydrate:
+                page = store.page_orders("BTCUSDT", page=2, page_size=10)
+
+        self.assertEqual([item["id"] for item in page["orders"]], list(range(20, 10, -1)))
+        self.assertEqual(hydrate.call_count, 10)
+
+    def test_order_dashboard_page_omits_large_decision_audit_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_order(
+                SimulatedOrder(
+                    id=1,
+                    direction="LONG",
+                    timeframe_minutes=10,
+                    level="B",
+                    reason="dashboard order",
+                    entry_price=100.0,
+                    opened_at=1_000,
+                    expires_at=601_000,
+                    threshold_segment="WD-12",
+                    decision_inputs={"large": "x" * 10_000},
+                    decision_trace=[{"step": "large", "payload": "x" * 10_000}],
+                    quality_score_inputs={"large": "x" * 10_000},
+                ),
+                "BTCUSDT",
+            )
+
+            item = store.page_orders(
+                "BTCUSDT",
+                dashboard=True,
+            )["orders"][0]
+
+        self.assertEqual(item["id"], 1)
+        self.assertEqual(item["reason"], "dashboard order")
+        self.assertNotIn("decision_inputs", item)
+        self.assertNotIn("decision_trace", item)
+        self.assertNotIn("quality_score_inputs", item)
+
     def test_persists_and_pages_observation_signals(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
@@ -2766,6 +2828,53 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
         self.assertEqual(rows[0].result, "WIN")
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["observations"][0]["strategy_tag"], "normal_down_short_extension_observe")
+
+    def test_observation_dashboard_page_omits_large_decision_audit_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            store.save_observation(
+                replace(
+                    observation("dashboard-observation"),
+                    decision_inputs={"large": "x" * 10_000},
+                    decision_trace=[{"step": "large", "payload": "x" * 10_000}],
+                    quality_score_inputs={"large": "x" * 10_000},
+                ),
+                "BTCUSDT",
+            )
+
+            item = store.page_observations(
+                "BTCUSDT",
+                dashboard=True,
+            )["observations"][0]
+
+        self.assertEqual(item["observation_key"], "dashboard-observation")
+        self.assertNotIn("decision_inputs", item)
+        self.assertNotIn("decision_trace", item)
+        self.assertNotIn("quality_score_inputs", item)
+
+    def test_dashboard_filter_options_do_not_scan_decision_context_payloads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "monitor.sqlite3"
+            store = SQLiteMonitorStore(db_path)
+            store.save_observation(observation("dashboard-options"), "BTCUSDT")
+            statements = []
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.set_trace_callback(statements.append)
+                options = store._observation_dashboard_filter_options_sql(
+                    connection,
+                    "BTCUSDT",
+                )
+
+        selects = [
+            statement
+            for statement in statements
+            if statement.lstrip().lower().startswith("select")
+        ]
+        self.assertEqual(len(selects), 1)
+        self.assertNotIn("decision_contexts", selects[0])
+        self.assertNotIn("json_extract", selects[0])
+        self.assertIn("SHORT", options["direction"])
 
     def test_observation_filters_normalize_legacy_empty_values_to_unknown(self):
         modern_values = {

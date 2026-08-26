@@ -193,6 +193,26 @@ _OBSERVATION_CANONICAL_FILTER_SQL = {
     "active_level_source": "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.entry_structure.active_level_source'), ''), nullif(observation_signals.active_level_source, ''), 'UNKNOWN')",
 }
 
+_ORDER_CANONICAL_DIRECTION_SQL = "coalesce(nullif(decision_contexts.direction, ''), nullif(json_extract(decision_contexts.input_payload, '$.identity.direction'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.direction'), ''), nullif(json_extract(orders.payload, '$.direction'), ''), '')"
+_ORDER_CANONICAL_LEVEL_SQL = "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.identity.level'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.level'), ''), nullif(json_extract(orders.payload, '$.level'), ''), '')"
+_ORDER_CANONICAL_SEGMENT_SQL = "coalesce(nullif(json_extract(decision_contexts.input_payload, '$.identity.threshold_segment'), ''), nullif(json_extract(decision_contexts.input_payload, '$.signal.threshold_segment'), ''), nullif(json_extract(orders.payload, '$.threshold_segment'), ''), '')"
+
+_DASHBOARD_OMITTED_AUDIT_FIELDS = {
+    "decision_inputs",
+    "decision_trace",
+    "first_decisive_block",
+    "quality_score_inputs",
+    "quality_score_components",
+    "direction_pulse_shadow",
+}
+
+
+def _dashboard_payload(model: SimulatedOrder | ObservationSignal) -> dict[str, Any]:
+    payload = model.to_dict()
+    for field in _DASHBOARD_OMITTED_AUDIT_FIELDS:
+        payload.pop(field, None)
+    return payload
+
 
 def _joined_decision_context(row: Mapping[str, Any]) -> dict[str, Any] | None:
     row = dict(row)
@@ -3431,16 +3451,132 @@ class SQLiteMonitorStore:
         level: str = "",
         segment: str = "",
         result: str = "",
+        dashboard: bool = False,
     ) -> dict[str, Any]:
-        return page_order_list(
-            self.load_orders(symbol),
-            page=page,
-            page_size=page_size,
-            direction=direction,
-            level=level,
-            segment=segment,
-            result=result,
-        )
+        normalized_symbol = symbol.upper()
+        filters = {
+            "direction": _clean_filter(direction),
+            "level": _clean_filter(level),
+            "segment": _clean_filter(segment),
+            "result": _clean_filter(result),
+        }
+        clauses = ["orders.symbol = ?"]
+        parameters: list[object] = [normalized_symbol]
+        for value, expression in (
+            (filters["direction"], _ORDER_CANONICAL_DIRECTION_SQL),
+            (filters["level"], _ORDER_CANONICAL_LEVEL_SQL),
+            (filters["segment"], _ORDER_CANONICAL_SEGMENT_SQL),
+        ):
+            if value:
+                clauses.append(f"upper({expression}) = ?")
+                parameters.append(value)
+        if filters["result"] == "OPEN":
+            clauses.append("upper(orders.status) = 'OPEN'")
+        elif filters["result"]:
+            clauses.append("upper(coalesce(orders.result, '')) = ?")
+            parameters.append(filters["result"])
+        where_sql = " and ".join(clauses)
+        normalized_page_size = _normalize_page_size(page_size)
+
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"""
+                    select count(*)
+                    from orders
+                    left join decision_contexts
+                      on decision_contexts.symbol = orders.symbol
+                     and decision_contexts.decision_id = orders.decision_id
+                    where {where_sql}
+                    """,
+                    parameters,
+                ).fetchone()[0]
+            )
+            total_pages = max(
+                1, (total + normalized_page_size - 1) // normalized_page_size
+            )
+            normalized_page = min(max(1, int(page or 1)), total_pages)
+            offset = (normalized_page - 1) * normalized_page_size
+            rows = connection.execute(
+                f"""
+                select orders.payload,
+                       {_ORDER_LIFECYCLE_COLUMNS},
+                       {_LINKED_CONTEXT_COLUMNS}
+                from orders
+                left join decision_contexts
+                  on decision_contexts.symbol = orders.symbol
+                 and decision_contexts.decision_id = orders.decision_id
+                where {where_sql}
+                order by orders.opened_at desc, orders.order_id desc
+                limit ? offset ?
+                """,
+                [*parameters, normalized_page_size, offset],
+            ).fetchall()
+            filter_rows = connection.execute(
+                f"""
+                select distinct
+                       upper({_ORDER_CANONICAL_DIRECTION_SQL}) as direction,
+                       upper({_ORDER_CANONICAL_LEVEL_SQL}) as level,
+                       upper({_ORDER_CANONICAL_SEGMENT_SQL}) as segment,
+                       case
+                           when upper(orders.status) = 'OPEN' then 'OPEN'
+                           else upper(coalesce(orders.result, ''))
+                       end as result
+                from orders
+                left join decision_contexts
+                  on decision_contexts.symbol = orders.symbol
+                 and decision_contexts.decision_id = orders.decision_id
+                where orders.symbol = ?
+                """,
+                (normalized_symbol,),
+            ).fetchall()
+
+        accepted = {field.name for field in fields(SimulatedOrder)}
+        orders = []
+        for row in rows:
+            payload = _hydrate_decision_linked_payload(
+                json.loads(row["payload"]),
+                row,
+            )
+            clean_payload = {
+                key: value for key, value in payload.items() if key in accepted
+            }
+            if "calculated_threshold" not in payload:
+                clean_payload["calculated_threshold"] = float(
+                    clean_payload.get("threshold", 0.0)
+                )
+            order = SimulatedOrder(**clean_payload)
+            orders.append(
+                _dashboard_payload(order) if dashboard else order.to_dict()
+            )
+
+        result_order = {"OPEN": 0, "WIN": 1, "LOSS": 2}
+        level_order = {"S": 0, "A": 1, "B": 2}
+        filter_options = {
+            name: {str(row[name]) for row in filter_rows if row[name]}
+            for name in ("direction", "level", "segment", "result")
+        }
+        return {
+            "orders": orders,
+            "total": total,
+            "page": normalized_page,
+            "page_size": normalized_page_size,
+            "total_pages": total_pages,
+            "filters": filters,
+            "filter_options": {
+                "direction": sorted(filter_options["direction"]),
+                "level": sorted(
+                    filter_options["level"],
+                    key=lambda item: level_order.get(item, 99),
+                ),
+                "segment": sorted(filter_options["segment"]),
+                "result": sorted(
+                    filter_options["result"],
+                    key=lambda item: result_order.get(item, 99),
+                ),
+                "page_size": list(ORDER_PAGE_SIZES),
+            },
+        }
 
     def page_observations(
         self,
@@ -3460,6 +3596,7 @@ class SQLiteMonitorStore:
         entry_structure_state: str = "",
         entry_structure_bias: str = "",
         active_level_source: str = "",
+        dashboard: bool = False,
     ) -> dict[str, Any]:
         normalized_symbol = symbol.upper()
         filters = {
@@ -3525,8 +3662,16 @@ class SQLiteMonitorStore:
                 """,
                 [*parameters, normalized_page_size, offset],
             ).fetchall()
-            filter_options = self._observation_filter_options_sql(
-                connection, normalized_symbol
+            filter_options = (
+                self._observation_dashboard_filter_options_sql(
+                    connection,
+                    normalized_symbol,
+                )
+                if dashboard
+                else self._observation_filter_options_sql(
+                    connection,
+                    normalized_symbol,
+                )
             )
 
         accepted = {field.name for field in fields(ObservationSignal)}
@@ -3539,7 +3684,12 @@ class SQLiteMonitorStore:
             clean_payload = {
                 key: value for key, value in payload.items() if key in accepted
             }
-            observations.append(ObservationSignal(**clean_payload).to_dict())
+            observation = ObservationSignal(**clean_payload)
+            observations.append(
+                _dashboard_payload(observation)
+                if dashboard
+                else observation.to_dict()
+            )
         return {
             "observations": observations,
             "total": total,
@@ -3548,6 +3698,60 @@ class SQLiteMonitorStore:
             "total_pages": total_pages,
             "filters": filters,
             "filter_options": filter_options,
+        }
+
+    @staticmethod
+    def _observation_dashboard_filter_options_sql(
+        connection: sqlite3.Connection,
+        symbol: str,
+    ) -> dict[str, list[str] | list[int]]:
+        columns = {
+            "direction": "direction",
+            "family": "strategy_family",
+            "tag": "strategy_tag",
+            "segment": "threshold_segment",
+            "origin": "candidate_origin",
+            "qualification_state": "qualification_state",
+            "adaptive_state": "adaptive_state",
+            "entry_structure_state": "entry_structure_state",
+            "entry_structure_bias": "entry_structure_bias",
+            "active_level_source": "active_level_source",
+        }
+        projections = [
+            f"upper(coalesce(nullif({column}, ''), 'UNKNOWN')) as {name}"
+            for name, column in columns.items()
+        ]
+        rows = connection.execute(
+            f"""
+            select distinct {', '.join(projections)},
+                   case
+                       when upper(status) = 'OPEN' then 'OPEN'
+                       else upper(coalesce(result, ''))
+                   end as result
+            from observation_signals
+            where symbol = ?
+            """,
+            (symbol,),
+        ).fetchall()
+        options = {
+            name: sorted(
+                {
+                    str(row[name])
+                    for row in rows
+                    if row[name] is not None and str(row[name])
+                }
+            )
+            for name in columns
+        }
+        result_order = {"OPEN": 0, "WIN": 1, "LOSS": 2}
+        results = sorted(
+            {str(row["result"]) for row in rows if row["result"]},
+            key=lambda item: result_order.get(item, 99),
+        )
+        return options | {
+            "profile": [],
+            "result": results,
+            "page_size": list(ORDER_PAGE_SIZES),
         }
 
     @staticmethod

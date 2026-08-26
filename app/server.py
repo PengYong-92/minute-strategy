@@ -66,7 +66,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/api/state":
-                self._send_json(state.snapshot())
+                self._send_json(state.snapshot(include_collections=False))
                 return
             if parsed.path == "/api/price":
                 self._send_json(state.price_snapshot())
@@ -97,6 +97,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         level=_query_text(query, "level"),
                         segment=_query_text(query, "segment"),
                         result=_query_text(query, "result"),
+                        dashboard=_query_text(query, "dashboard") == "1",
                     )
                 )
                 return
@@ -117,6 +118,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         entry_structure_state=_query_text(query, "entry_structure_state"),
                         entry_structure_bias=_query_text(query, "entry_structure_bias"),
                         active_level_source=_query_text(query, "active_level_source"),
+                        dashboard=_query_text(query, "dashboard") == "1",
                     )
                 )
                 return

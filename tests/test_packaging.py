@@ -123,6 +123,18 @@ class PackagingTest(unittest.TestCase):
         self.assertNotIn("price: (state) => fmtPrice(state.latest_price)", app_js)
         self.assertNotIn("function renderSignals", app_js)
 
+    def test_dashboard_prevents_overlapping_heavy_requests(self):
+        app_js = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("let ordersRequestInFlight = false", app_js)
+        self.assertIn("let observationsRequestInFlight = false", app_js)
+        self.assertIn("let observationSummaryRequestInFlight = false", app_js)
+        self.assertIn("let orderProfileRequestInFlight = false", app_js)
+        self.assertGreaterEqual(app_js.count('dashboard: "1"'), 2)
+        self.assertIn("setInterval(loadObservations, 60000)", app_js)
+        self.assertIn("setInterval(loadObservationSummary, 60000)", app_js)
+        self.assertIn("setInterval(loadOrderProfile, 60000)", app_js)
+
     def test_dashboard_has_compact_adaptive_and_structure_diagnostics(self):
         index_html = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
         app_js = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")

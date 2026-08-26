@@ -12,6 +12,10 @@ let lastOrderProfile = null;
 let lastObservationSummary = null;
 let stateRequestInFlight = false;
 let priceRequestInFlight = false;
+let ordersRequestInFlight = false;
+let observationsRequestInFlight = false;
+let observationSummaryRequestInFlight = false;
+let orderProfileRequestInFlight = false;
 let symbolRevision = 0;
 
 function num(value, fallback = 0) {
@@ -1042,6 +1046,7 @@ function orderQuery() {
   const params = new URLSearchParams({
     page: String(ordersPage),
     page_size: $("page-size-filter").value,
+    dashboard: "1",
   });
   for (const id of filterIds) {
     const value = $(id).value;
@@ -1054,6 +1059,7 @@ function observationQuery() {
   const params = new URLSearchParams({
     page: String(observationsPage),
     page_size: $("obs-page-size-filter").value,
+    dashboard: "1",
   });
   const names = {
     "obs-direction-filter": "direction",
@@ -1077,42 +1083,74 @@ function observationSummaryQuery() {
 }
 
 async function loadOrders() {
-  const response = await fetch(`/api/orders?${orderQuery()}`);
-  const page = await response.json();
-  ordersPage = page.page;
-  ordersTotalPages = page.total_pages;
-  renderOrders(page.orders || []);
-  applyFilterOptions(page.filter_options);
-  $("orders-page-info").textContent = `共 ${page.total} 条`;
-  $("page-status").textContent = `第 ${page.page} / ${page.total_pages} 页 · 每页 ${page.page_size} 条`;
-  $("prev-page").disabled = page.page <= 1;
-  $("next-page").disabled = page.page >= page.total_pages;
+  if (ordersRequestInFlight) return;
+  ordersRequestInFlight = true;
+  try {
+    const response = await fetch(`/api/orders?${orderQuery()}`);
+    const page = await response.json();
+    ordersPage = page.page;
+    ordersTotalPages = page.total_pages;
+    renderOrders(page.orders || []);
+    applyFilterOptions(page.filter_options);
+    $("orders-page-info").textContent = `共 ${page.total} 条`;
+    $("page-status").textContent = `第 ${page.page} / ${page.total_pages} 页 · 每页 ${page.page_size} 条`;
+    $("prev-page").disabled = page.page <= 1;
+    $("next-page").disabled = page.page >= page.total_pages;
+  } catch (_error) {
+    return;
+  } finally {
+    ordersRequestInFlight = false;
+  }
 }
 
 async function loadObservations() {
-  const response = await fetch(`/api/observations?${observationQuery()}`);
-  const page = await response.json();
-  observationsPage = page.page;
-  observationsTotalPages = page.total_pages;
-  renderObservations(page.observations || []);
-  applyObservationFilterOptions(page.filter_options);
-  $("observations-page-info").textContent = `共 ${page.total} 条`;
-  $("obs-page-status").textContent = `第 ${page.page} / ${page.total_pages} 页 · 每页 ${page.page_size} 条`;
-  $("obs-prev-page").disabled = page.page <= 1;
-  $("obs-next-page").disabled = page.page >= page.total_pages;
+  if (observationsRequestInFlight) return;
+  observationsRequestInFlight = true;
+  try {
+    const response = await fetch(`/api/observations?${observationQuery()}`);
+    const page = await response.json();
+    observationsPage = page.page;
+    observationsTotalPages = page.total_pages;
+    renderObservations(page.observations || []);
+    applyObservationFilterOptions(page.filter_options);
+    $("observations-page-info").textContent = `共 ${page.total} 条`;
+    $("obs-page-status").textContent = `第 ${page.page} / ${page.total_pages} 页 · 每页 ${page.page_size} 条`;
+    $("obs-prev-page").disabled = page.page <= 1;
+    $("obs-next-page").disabled = page.page >= page.total_pages;
+  } catch (_error) {
+    return;
+  } finally {
+    observationsRequestInFlight = false;
+  }
 }
 
 async function loadObservationSummary() {
-  const response = await fetch(`/api/observation-summary?${observationSummaryQuery()}`);
-  const summary = await response.json();
-  renderObservationSummary(summary);
+  if (observationSummaryRequestInFlight) return;
+  observationSummaryRequestInFlight = true;
+  try {
+    const response = await fetch(`/api/observation-summary?${observationSummaryQuery()}`);
+    const summary = await response.json();
+    renderObservationSummary(summary);
+  } catch (_error) {
+    return;
+  } finally {
+    observationSummaryRequestInFlight = false;
+  }
 }
 
 async function loadOrderProfile() {
-  const response = await fetch("/api/order-profile");
-  const summary = await response.json();
-  lastOrderProfile = summary;
-  renderOrderProfile(summary);
+  if (orderProfileRequestInFlight) return;
+  orderProfileRequestInFlight = true;
+  try {
+    const response = await fetch("/api/order-profile");
+    const summary = await response.json();
+    lastOrderProfile = summary;
+    renderOrderProfile(summary);
+  } catch (_error) {
+    return;
+  } finally {
+    orderProfileRequestInFlight = false;
+  }
 }
 
 async function loadState() {
@@ -1236,6 +1274,6 @@ loadOrderProfile();
 setInterval(loadState, 3000);
 setInterval(loadPrice, 1000);
 setInterval(loadOrders, 10000);
-setInterval(loadObservations, 10000);
-setInterval(loadObservationSummary, 10000);
-setInterval(loadOrderProfile, 10000);
+setInterval(loadObservations, 60000);
+setInterval(loadObservationSummary, 60000);
+setInterval(loadOrderProfile, 60000);

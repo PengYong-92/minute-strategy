@@ -6348,12 +6348,16 @@ class MonitorState:
         except Exception:  # noqa: BLE001 - 最低延迟模式明确静默丢弃分发异常。
             return
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, include_collections: bool = True) -> dict:
         storage_capacity = self._sample_storage_capacity(int(self._now_ms()))
         shadow_optimizer = self.shadow_optimizer_status()
         with self._lock:
             latest = self.klines[-1] if self.klines else None
-            orders = list(reversed(self.simulator.orders[-100:]))
+            orders = (
+                list(reversed(self.simulator.orders[-100:]))
+                if include_collections
+                else []
+            )
             return {
                 "symbol": self.symbol,
                 "updated_at_ms": self.updated_at_ms,
@@ -6396,7 +6400,14 @@ class MonitorState:
                     profile_period=self.active_daily_profile_selection,
                 ),
                 "orders": [order.to_dict() for order in orders],
-                "observations": [observation.to_dict() for observation in reversed(self.observations[-50:])],
+                "observations": (
+                    [
+                        observation.to_dict()
+                        for observation in reversed(self.observations[-50:])
+                    ]
+                    if include_collections
+                    else []
+                ),
                 "kline_count": len(self.klines),
             }
 
@@ -6409,6 +6420,7 @@ class MonitorState:
         level: str = "",
         segment: str = "",
         result: str = "",
+        dashboard: bool = False,
     ) -> dict:
         if self.storage:
             return self.storage.page_orders(
@@ -6419,6 +6431,7 @@ class MonitorState:
                 level=level,
                 segment=segment,
                 result=result,
+                dashboard=dashboard,
             )
         with self._lock:
             orders = list(self.simulator.orders)
@@ -6448,6 +6461,7 @@ class MonitorState:
         entry_structure_state: str = "",
         entry_structure_bias: str = "",
         active_level_source: str = "",
+        dashboard: bool = False,
     ) -> dict:
         if self.storage:
             page_payload = self.storage.page_observations(
@@ -6465,6 +6479,7 @@ class MonitorState:
                 entry_structure_state=entry_structure_state,
                 entry_structure_bias=entry_structure_bias,
                 active_level_source=active_level_source,
+                dashboard=dashboard,
             )
             return self._normalize_observation_page(
                 page_payload,

@@ -23,6 +23,26 @@ from app.storage import SQLiteMonitorStore
 
 
 class OrdersApiTest(unittest.TestCase):
+    def test_state_api_requests_compact_snapshot_without_order_collections(self):
+        calls = []
+        state = SimpleNamespace(
+            snapshot=lambda **kwargs: (
+                calls.append(kwargs)
+                or {"symbol": "BTCUSDT", "orders": [], "observations": []}
+            )
+        )
+        server = _serve(state)
+        try:
+            payload = _get_json(
+                f"http://127.0.0.1:{server.server_port}/api/state"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(payload["symbol"], "BTCUSDT")
+        self.assertEqual(calls, [{"include_collections": False}])
+
     def test_shadow_optimizer_requires_explicit_enable_and_is_wired_to_market_data(self):
         fake_server = SimpleNamespace(
             serve_forever=lambda: None,
