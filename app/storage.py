@@ -4338,7 +4338,7 @@ class SQLiteMonitorStore:
         for attempt in range(PROFILE_SUMMARY_MAX_CAS_RETRIES):
             if self._profile_summary_stop.is_set():
                 return False
-            revision, samples = self._profile_summary_rebuild_input(key)
+            revision = self.profile_summary_revision(key[0])
             claimed = self._claim_profile_summary_lease(key, revision)
             if claimed is None:
                 return False
@@ -4349,6 +4349,9 @@ class SQLiteMonitorStore:
             try:
                 if self._profile_summary_stop.is_set():
                     return False
+                input_revision, samples = self._profile_summary_rebuild_input(key)
+                if input_revision != revision:
+                    continue
                 summary = self._compute_profile_summary(key, samples)
                 branches = self._compute_profile_guard_settlement_branches(
                     key,

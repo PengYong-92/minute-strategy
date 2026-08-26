@@ -1050,6 +1050,24 @@ class SQLiteMonitorStoreTest(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(store.compute_calls, 1)
 
+    def test_profile_rebuild_checks_capacity_before_loading_snapshot_payloads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteMonitorStore(Path(temp_dir) / "monitor.sqlite3")
+            key = store._profile_summary_key("BTCUSDT", 5000, 15, 2)
+            with (
+                mock.patch.object(store, "profile_summary_revision", return_value=7),
+                mock.patch.object(
+                    store,
+                    "_claim_profile_summary_lease",
+                    return_value=None,
+                ),
+                mock.patch.object(store, "_profile_summary_rebuild_input") as load,
+            ):
+                rebuilt = store._rebuild_profile_summary(key)
+
+            self.assertFalse(rebuilt)
+            load.assert_not_called()
+
     def assert_save_rejects_invalid_runtime_reference(
         self,
         snapshot: RuntimeConfigSnapshot,
