@@ -2516,3 +2516,56 @@ browser.page_horizontal_overflow=false
 ```
 
 合并后的`tests.test_packaging`和`tests.test_server`共50项通过，JavaScript语法和差异检查通过。通过HTTPS下载的三个线上文件与本地提交SHA-256完全一致，订单API和页面渲染均正常。
+
+## 50. 2026-08-26生产停摆、Swap与仪表盘查询放大修复
+
+### 50.1 故障证据与根因
+
+实例物理内存只有约1.6GiB。故障时服务cgroup约1.07GiB并长期超过`MemoryHigh=950M`，`memory.pressure full`约96%，Python线程阻塞在`mem_cgroup_handle_over_high`；2026-08-24内核日志还记录过同一服务约999MiB匿名RSS时被OOM Kill。服务器虽然已有有效的2GiB`/swapfile`，但既未启用也未写入`/etc/fstab`，当时实际Swap为0。
+
+资源不足只是触发条件，持续增长的直接原因是页面查询放大：正式SQLite约3.0GiB、影子SQLite约4.4GiB，而正式订单仅78条、观察约10686条。旧`/api/orders`先恢复全部订单及冻结决策上下文，再在Python中分页；78条订单自身JSON约43KiB，但关联决策输入约30.9MiB。`/api/state`每3秒再次序列化订单和观察集合，订单、观察、画像汇总又每10秒并发刷新；请求慢于刷新周期后会重叠堆积。故障进程中订单接口约34.7秒、观察接口约48秒，主进程和影子进程合计匿名工作集一度超过3GiB并耗尽最初启用的2GiB Swap，最终表现为systemd仍为`active`但HTTP长期无响应。
+
+### 50.2 资源恢复
+
+- 启用原有`/swapfile`并新增2GiB`/swapfile2`，总Swap为4GiB；两项均写入`/etc/fstab`，`vm.swappiness=10`，重启后仍会生效。
+- 配置修改前保留`/etc/fstab.pre-victory-swap-20260826`、`/etc/sysctl.conf.pre-victory-swap-20260826`和`/etc/sysctl.d/99-sysctl.conf.pre-victory-swap-20260826`。
+- 故障恢复时临时把服务运行时限制放宽到`MemoryHigh=1150M/MemoryMax=1400M`以退出严重节流；新版本稳定后已恢复原值`950M/1200M`。
+- 最终Swap使用约122MiB，剩余约3.9GiB；服务和Nginx均为`active`，`NRestarts=0`。
+
+### 50.3 代码修复边界
+
+提交`09a3c63`和`125b894`只修复仪表盘读取、轮询和静态缓存，不修改画像、评分、阈值、方向、开单门禁、订单并发、滚单、结算、Webhook、预热月份或市场数据逻辑：
+
+- `/api/state`不再装载和序列化订单、观察集合，页面继续通过独立分页接口读取；
+- 订单改为SQLite先计数、筛选、排序和分页，只恢复当前页；
+- 页面模式删除不展示的`decision_inputs`、`decision_trace`、质量评分明细和方向脉冲影子等大字段，观察筛选使用物化列，不扫描全部冻结上下文；
+- 正常页面请求默认使用轻量模式，显式`dashboard=0`仍可取得完整分析载荷，数据库内冻结审计数据没有删减；
+- 前端为重请求增加in-flight保护，订单保持10秒刷新，观察、画像汇总和订单画像调整为60秒；
+- 静态HTML/JS/CSS返回`Cache-Control: no-store`。即使用户仍打开发布前旧标签，服务端也会把其不带参数的订单和观察请求强制转为轻量路径，避免旧脚本继续拖垮服务。
+
+完整回归为`python3 -m unittest discover -s tests`共1160项通过；Python编译、Shell语法和`git diff --check`通过。测试额外覆盖只恢复请求页、页面载荷裁剪、观察筛选不扫描上下文、请求防重叠、默认轻量兼容及静态缓存禁用。
+
+### 50.4 发布与生产验收
+
+```text
+commits=09a3c63,125b894
+current=/opt/victory-event-monitor/releases/event-contract-monitor-125b894-20260826-212128
+service=active
+nginx=active
+NRestarts=0
+warmup.status=READY
+warmup.loaded_klines=168480
+warmup.cached_files=28
+warmup.downloaded_files=0
+orders.total=78
+orders.open=0
+swap.total=4.0GiB
+swap.used=122MiB
+vm.swappiness=10
+MemoryHigh=950M
+MemoryMax=1200M
+```
+
+发布未备份、清空、覆盖或迁移订单、观察、决策审计、预热缓存和影子数据。预热约4分半完成，168480根K线全部命中缓存。生产默认轻量接口验收为：价格约0.002秒、状态约0.08秒、订单约2.71秒、观察约2.69秒；静态脚本确认返回`Cache-Control: no-store`，HTTPS首页HTTP 200。
+
+旧页面持续轮询条件下连续取样约2分钟，匿名内存在610至619MiB间收敛，主进程RSS从538MiB回落到529MiB，cgroup总占用约795至804MiB，低于950MiB高水位；`memory.events high/max/oom/oom_kill`均为0，压力采样恢复为0，日志中无新`Traceback`、`database is locked`、冻结冲突、`STORAGE_ERROR`或OOM。4GiB Swap是故障兜底，查询放大修复才是本次停摆的根因修复。
