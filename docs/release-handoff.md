@@ -2593,12 +2593,13 @@ swap.used=126MiB
 vm.swappiness=10
 MemoryHigh=950M
 MemoryMax=1200M
-MemoryCurrent.stable=508260352
-cpu.average.15s=5.13%
+MemoryCurrent.sample_range=466681856..868233216
+MemoryAnon.sample_range=342458368..386469888
+cpu.average.15s=4.20%..5.13%
 ```
 
 最终版本于23:15:41启动，23:20:11完成预热，168480根K线全部命中28个缓存文件。内部状态接口约0.005秒，订单接口约0.003秒；观察接口首次约1.89秒、随后缓存命中约0.002秒。公网HTTPS首页、状态和订单接口均为HTTP 200，TLS验证结果为0，耗时约0.07秒。
 
 发布后连续产生4个新分钟决策，`decision_contexts`从3767增至3771，`signal_audit`从4038增至4042，最新决策输入为47至49KiB且不再重复候选数组；状态更新时间逐分钟推进，`last_error=null`，没有再出现`STORAGE_ERROR`。订单仍为78条且无在途订单，未因本次修复清空或改写。
 
-旧页面持续轮询和每分钟分析同时运行时，15秒CPU平均5.13%，故障前同口径约91%；稳定cgroup占用约485MiB，低于950MiB软上限。`memory.events max/oom/oom_kill`均为0，`memory.pressure avg10`恢复为0。日志无新`Traceback`、`database is locked`、冻结冲突、持久化失败、`STORAGE_ERROR`或OOM。4GiB Swap只作为小内存实例的故障兜底，查询放大、重复计算和数据库容量修复才是本次停摆的根因修复。
+旧页面持续轮询和每分钟分析同时运行时，两次15秒CPU平均4.20%和5.13%，故障前同口径约91%。连续60秒cgroup占用约445至828MiB，其中匿名内存约327至369MiB；高位主要是可回收的SQLite文件页缓存，始终低于950MiB软上限。`memory.events high`在稳定采样期没有增加，`max/oom/oom_kill`均为0，`memory.pressure avg10`恢复为0。日志无新`Traceback`、`database is locked`、冻结冲突、持久化失败、`STORAGE_ERROR`或OOM。4GiB Swap只作为小内存实例的故障兜底，查询放大、重复计算和数据库容量修复才是本次停摆的根因修复。
