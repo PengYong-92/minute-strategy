@@ -126,6 +126,7 @@ def configure_max_page_count(connection: _PragmaConnection) -> int:
 def capacity_from_connection(connection: _PragmaConnection) -> StorageCapacity:
     page_count_row = connection.execute("pragma page_count").fetchone()
     page_size_row = connection.execute("pragma page_size").fetchone()
+    freelist_count_row = connection.execute("pragma freelist_count").fetchone()
     if (
         not page_count_row
         or type(page_count_row[0]) is not int
@@ -133,11 +134,16 @@ def capacity_from_connection(connection: _PragmaConnection) -> StorageCapacity:
         or not page_size_row
         or type(page_size_row[0]) is not int
         or page_size_row[0] <= 0
+        or not freelist_count_row
+        or type(freelist_count_row[0]) is not int
+        or freelist_count_row[0] < 0
+        or freelist_count_row[0] > page_count_row[0]
     ):
         raise StorageCapacityConfigurationError(
-            "SQLite returned invalid page_count or page_size"
+            "SQLite returned invalid page_count, page_size, or freelist_count"
         )
-    return capacity_for_bytes(page_count_row[0] * page_size_row[0])
+    active_pages = page_count_row[0] - freelist_count_row[0]
+    return capacity_for_bytes(active_pages * page_size_row[0])
 
 
 def ensure_write_allowed(

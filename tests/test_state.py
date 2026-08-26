@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 import sqlite3
+import app.strategy as strategy_module
 from copy import deepcopy
 from contextlib import closing, contextmanager
 from dataclasses import replace
@@ -802,6 +803,28 @@ class LegacyFailingDailySelectionStorage(FailingDailySelectionStorage):
 
 
 class MonitorStateTest(unittest.TestCase):
+    def test_closed_kline_reuses_one_expensive_strategy_analysis(self):
+        state = MonitorState(
+            symbol="BTCUSDT",
+            enable_daily_profile_selector=False,
+            enable_rolling_edge_guard=False,
+            enable_observation_profile_promotion=False,
+            result_sequence_guard_config=ResultSequenceGuardConfig(enabled=False),
+        )
+        self.addCleanup(state.close)
+        bars = [
+            kline(index, 100.0 + (0.02 if index % 2 else -0.02), 100.0)
+            for index in range(120)
+        ]
+
+        with patch(
+            "app.strategy._volume_context",
+            wraps=strategy_module._volume_context,
+        ) as volume_context:
+            self.assertTrue(state.update_from_klines(bars))
+
+        self.assertEqual(volume_context.call_count, 1)
+
     def test_decision_trace_names_first_decisive_branch_without_changing_decision(self):
         now = 119_999
 
@@ -1123,6 +1146,20 @@ class MonitorStateTest(unittest.TestCase):
             trend="rising",
             updated_at_ms=now - 1_000,
         )
+        selected_profile = {
+            "key": "10|drop_reclaim|live_profile|LONG|WD-00",
+            "direction": "LONG",
+            "threshold_segment": "WD-00",
+        }
+        state.active_daily_profile_selection = {
+            "version": "DPS-COMPACT-TEST",
+            "status": "READY",
+            "selected_profiles": [selected_profile],
+            "candidates": [
+                {"key": f"candidate-{index}", "sample_size": index + 1}
+                for index in range(50)
+            ],
+        }
         signal = replace(
             selected_profile_signal(now),
             decision_inputs={
@@ -1178,6 +1215,11 @@ class MonitorStateTest(unittest.TestCase):
         self.assertEqual(canonical["indicators"]["macd_line"], 1.0)
         self.assertEqual(canonical["context"]["fear_greed"]["value"], 23)
         self.assertIn("daily_7d_14d", canonical["context"])
+        frozen_selection = canonical["context"]["daily_7d_14d"]["selection"]
+        self.assertNotIn("candidates", frozen_selection)
+        self.assertEqual(frozen_selection["candidate_count"], 50)
+        self.assertEqual(frozen_selection["selected_profiles"], [selected_profile])
+        self.assertEqual(len(frozen_selection["selection_sha256"]), 64)
         self.assertIn("n12_n20", canonical["context"])
         self.assertIn("profile_summary_cache", canonical["context"])
         self.assertIn("storage_capacity", canonical["admission"])

@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from statistics import median
 from typing import Sequence
@@ -51,6 +53,19 @@ FAILED_BREAKOUT_OBSERVATION_SEGMENTS = {
     "failed_high_120m_short_observe": set(),
     "failed_low_120m_long_observe": set(),
 }
+
+_ANALYSIS_RESULT_CACHE: ContextVar[dict[tuple[object, ...], Signal] | None] = (
+    ContextVar("analysis_result_cache", default=None)
+)
+
+
+@contextmanager
+def reuse_analysis_results():
+    token = _ANALYSIS_RESULT_CACHE.set({})
+    try:
+        yield
+    finally:
+        _ANALYSIS_RESULT_CACHE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -204,6 +219,30 @@ def choose_best_candidate(candidates: Sequence[Signal]) -> Signal:
 
 
 def analyze_volume_price(
+    klines: Sequence[Kline],
+    timeframe_minutes: int,
+    fear_greed: FearGreedContext | None = None,
+) -> Signal:
+    cache = _ANALYSIS_RESULT_CACHE.get()
+    if cache is None:
+        return _analyze_volume_price(klines, timeframe_minutes, fear_greed)
+    key = (
+        id(klines),
+        len(klines),
+        klines[0].open_time if klines else None,
+        klines[-1].open_time if klines else None,
+        klines[-1].close_time if klines else None,
+        timeframe_minutes,
+        fear_greed,
+    )
+    cached = cache.get(key)
+    if cached is None:
+        cached = _analyze_volume_price(klines, timeframe_minutes, fear_greed)
+        cache[key] = cached
+    return cached
+
+
+def _analyze_volume_price(
     klines: Sequence[Kline],
     timeframe_minutes: int,
     fear_greed: FearGreedContext | None = None,

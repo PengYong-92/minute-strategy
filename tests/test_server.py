@@ -107,6 +107,30 @@ class OrdersApiTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_order_cache_is_reused_until_order_revision_changes(self):
+        calls = []
+        revision = [1]
+        state = SimpleNamespace(
+            symbol="BTCUSDT",
+            order_page_revision=lambda: tuple(revision),
+            page_orders=lambda **kwargs: (
+                calls.append(kwargs) or {"orders": [], "total": revision[0]}
+            ),
+        )
+        server = _serve(state)
+        url = f"http://127.0.0.1:{server.server_port}/api/orders"
+        try:
+            self.assertEqual(_get_json(url)["total"], 1)
+            self.assertEqual(_get_json(url)["total"], 1)
+            revision[0] = 2
+            self.assertEqual(_get_json(url)["total"], 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(server_module.ORDER_RESPONSE_CACHE_SECONDS, 60.0)
+
     def test_static_assets_disable_browser_caching(self):
         state = SimpleNamespace()
         server = _serve(state)

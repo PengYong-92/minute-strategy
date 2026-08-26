@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import threading
@@ -99,6 +100,7 @@ from app.strategy import (
     analyze_volume_price,
     choose_trade_signal,
     max_trade_edge_for,
+    reuse_analysis_results,
 )
 from app.source_fingerprint import python_source_fingerprint
 from app.wave_state import WaveSnapshot, advance_wave, analyze_wave
@@ -1030,27 +1032,28 @@ class MonitorState:
             wave_state = self._bootstrap_wave_anchor(wave_state, wave_evaluated_at)
         fear_greed = self._fear_greed_context()
         if _shadow_analysis_frame is None:
-            new_signals = [
-                analyze_volume_price(
+            with reuse_analysis_results():
+                new_signals = [
+                    analyze_volume_price(
+                        merged_klines,
+                        timeframe_minutes=minutes,
+                        fear_greed=fear_greed,
+                    )
+                    for minutes in LIVE_TRADE_TIMEFRAMES
+                ]
+                observation_signals = [
+                    signal
+                    for minutes in LIVE_TRADE_TIMEFRAMES
+                    for signal in analyze_observation_signals(
+                        merged_klines,
+                        timeframe_minutes=minutes,
+                        fear_greed=fear_greed,
+                    )
+                ]
+                selected_signal = choose_trade_signal(
                     merged_klines,
-                    timeframe_minutes=minutes,
                     fear_greed=fear_greed,
                 )
-                for minutes in LIVE_TRADE_TIMEFRAMES
-            ]
-            observation_signals = [
-                signal
-                for minutes in LIVE_TRADE_TIMEFRAMES
-                for signal in analyze_observation_signals(
-                    merged_klines,
-                    timeframe_minutes=minutes,
-                    fear_greed=fear_greed,
-                )
-            ]
-            selected_signal = choose_trade_signal(
-                merged_klines,
-                fear_greed=fear_greed,
-            )
         else:
             if int(_shadow_analysis_frame.get("latest_close_time") or -1) != int(
                 latest.close_time
@@ -2414,7 +2417,7 @@ class MonitorState:
                 "daily_7d_14d": {
                     "version": signal.daily_profile_version,
                     "selected": signal.daily_profile_selected,
-                    "selection": deepcopy(self.active_daily_profile_selection),
+                    "selection": self._daily_profile_selection_reference(),
                     "7d": deepcopy(
                         adaptive.get("fast_7d", {"status": "NOT_AVAILABLE"})
                     ),
@@ -2447,6 +2450,31 @@ class MonitorState:
             "signal": self._signal_context_payload(signal),
             "audit_snapshot": deepcopy(audit_context),
         }
+
+    def _daily_profile_selection_reference(self) -> dict | None:
+        selection = self.active_daily_profile_selection
+        if not isinstance(selection, Mapping):
+            return None
+        canonical = json.dumps(
+            selection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        compact = {
+            key: deepcopy(value)
+            for key, value in selection.items()
+            if key != "candidates"
+        }
+        candidates = selection.get("candidates", [])
+        compact["candidate_count"] = (
+            len(candidates) if isinstance(candidates, (list, tuple)) else 0
+        )
+        compact["selection_sha256"] = hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        return compact
 
     def _reuse_committed_decision(
         self,
@@ -2877,7 +2905,7 @@ class MonitorState:
                 "daily_7d_14d": {
                     "version": signal.daily_profile_version,
                     "selected": signal.daily_profile_selected,
-                    "selection": deepcopy(self.active_daily_profile_selection),
+                    "selection": self._daily_profile_selection_reference(),
                     "7d": {"status": "NOT_AVAILABLE"},
                     "14d": {"status": "NOT_AVAILABLE"},
                 },
@@ -6421,6 +6449,23 @@ class MonitorState:
                 ),
                 "kline_count": len(self.klines),
             }
+
+    def order_page_revision(self) -> tuple[int, int, int, int, int]:
+        with self._lock:
+            orders = tuple(self.simulator.orders)
+        return (
+            len(orders),
+            max((int(order.id) for order in orders), default=0),
+            max(
+                (
+                    int(order.settled_at or order.opened_at)
+                    for order in orders
+                ),
+                default=0,
+            ),
+            sum(1 for order in orders if order.status == "OPEN"),
+            sum(int(order.settled_at or 0) for order in orders),
+        )
 
     def page_orders(
         self,

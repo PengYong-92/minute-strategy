@@ -141,6 +141,39 @@ class SQLiteCapacityIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(capacity.status, "NORMAL")
 
+    def test_capacity_counts_reusable_freelist_pages_as_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "monitor.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("pragma page_size = 1024")
+                connection.execute(
+                    "create table business_rows(id integer primary key, payload blob)"
+                )
+                for _ in range(32):
+                    connection.execute(
+                        "insert into business_rows(payload) values (zeroblob(4096))"
+                    )
+                connection.commit()
+                page_size = connection.execute("pragma page_size").fetchone()[0]
+                page_count = connection.execute("pragma page_count").fetchone()[0]
+                connection.execute("delete from business_rows")
+                connection.commit()
+                free_pages = connection.execute("pragma freelist_count").fetchone()[0]
+                self.assertGreater(free_pages, 0)
+
+                with mock.patch(
+                    "app.storage_capacity.MAX_DATABASE_BYTES",
+                    page_count * page_size,
+                ):
+                    capacity = capacity_from_connection(connection)
+
+                self.assertEqual(
+                    capacity.database_bytes,
+                    (page_count - free_pages) * page_size,
+                )
+                self.assertEqual(capacity.status, "NORMAL")
+                self.assertTrue(capacity.core_write_allowed)
+
     def test_store_uses_non_default_page_size_for_cap(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "monitor.sqlite3"

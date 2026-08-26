@@ -421,30 +421,31 @@ class ShadowRuntime:
         fear_greed = deepcopy(normalized[-1].fear_greed)
         from app import state as state_module
 
-        return {
-            "latest_close_time": int(merged[-1].close_time),
-            "new_signals": tuple(
-                state_module.analyze_volume_price(
+        with state_module.reuse_analysis_results():
+            return {
+                "latest_close_time": int(merged[-1].close_time),
+                "new_signals": tuple(
+                    state_module.analyze_volume_price(
+                        merged,
+                        timeframe_minutes=minutes,
+                        fear_greed=fear_greed,
+                    )
+                    for minutes in state_module.LIVE_TRADE_TIMEFRAMES
+                ),
+                "observation_signals": tuple(
+                    signal
+                    for minutes in state_module.LIVE_TRADE_TIMEFRAMES
+                    for signal in state_module.analyze_observation_signals(
+                        merged,
+                        timeframe_minutes=minutes,
+                        fear_greed=fear_greed,
+                    )
+                ),
+                "selected_signal": state_module.choose_trade_signal(
                     merged,
-                    timeframe_minutes=minutes,
                     fear_greed=fear_greed,
-                )
-                for minutes in state_module.LIVE_TRADE_TIMEFRAMES
-            ),
-            "observation_signals": tuple(
-                signal
-                for minutes in state_module.LIVE_TRADE_TIMEFRAMES
-                for signal in state_module.analyze_observation_signals(
-                    merged,
-                    timeframe_minutes=minutes,
-                    fear_greed=fear_greed,
-                )
-            ),
-            "selected_signal": state_module.choose_trade_signal(
-                merged,
-                fear_greed=fear_greed,
-            ),
-        }
+                ),
+            }
 
     def process_batch(self, events, *, analysis_frame=None) -> bool:
         normalized = tuple(events)

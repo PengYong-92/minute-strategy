@@ -29,7 +29,7 @@ STATIC_DIR = ROOT / "static"
 DEFAULT_STAKE_PROGRESSION_BASE_ONLY_SEGMENTS = ""
 DEFAULT_LIVE_SHORT_SEGMENTS = "WD-02,WD-23"
 STATE_RESPONSE_CACHE_SECONDS = 2.0
-ORDER_RESPONSE_CACHE_SECONDS = 10.0
+ORDER_RESPONSE_CACHE_SECONDS = 300.0
 OBSERVATION_RESPONSE_CACHE_SECONDS = 30.0
 SUMMARY_RESPONSE_CACHE_SECONDS = 30.0
 
@@ -163,6 +163,7 @@ def make_handler(state: MonitorState, warmup_loader=None, market_data=None):
                         (
                             "orders",
                             getattr(state, "symbol", ""),
+                            _order_page_revision(state),
                             *tuple(kwargs.items()),
                         ),
                         ORDER_RESPONSE_CACHE_SECONDS,
@@ -311,6 +312,14 @@ def _json_bytes(payload: dict) -> bytes:
 
 def _query_dashboard(query: dict) -> bool:
     return _query_text(query, "dashboard").lower() not in {"0", "false", "no"}
+
+
+def _order_page_revision(state) -> tuple:
+    reader = getattr(state, "order_page_revision", None)
+    if not callable(reader):
+        return ()
+    revision = reader()
+    return tuple(revision) if isinstance(revision, (list, tuple)) else (revision,)
 
 
 def _query_int(query: dict, name: str, default: int) -> int:
