@@ -235,6 +235,7 @@ class Signal:
     profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
+    range_policy_shadow: dict[str, object] = field(default_factory=dict)
     decision_id: str = ""
     context_version: str = ""
     runtime_config_hash: str = ""
@@ -322,6 +323,7 @@ class SimulatedOrder:
     profile_health_evaluated_at: int = 0
     profile_degradation_probe: bool = False
     profile_degradation_triggered_at: int = 0
+    range_policy_shadow: dict[str, object] = field(default_factory=dict)
     decision_id: str = ""
     context_version: str = ""
     runtime_config_hash: str = ""
@@ -392,6 +394,7 @@ class ObservationSignal:
     profile_health_win_rate: float = 0.0
     profile_health_ev: float = 0.0
     profile_health_evaluated_at: int = 0
+    range_policy_shadow: dict[str, object] = field(default_factory=dict)
     decision_id: str = ""
     context_version: str = ""
     runtime_config_hash: str = ""

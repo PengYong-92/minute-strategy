@@ -1202,6 +1202,7 @@ class MonitorStateTest(unittest.TestCase):
                 "context",
                 "admission",
                 "entry_structure",
+                "range_policy",
                 "signal",
                 "audit_snapshot",
             },

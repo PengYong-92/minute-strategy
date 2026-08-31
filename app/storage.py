@@ -325,6 +325,15 @@ def _canonical_model_fields(
     if not all(isinstance(item, Mapping) for item in (identity, signal, score, market)):
         raise ValueError("linked canonical model inputs are malformed")
     entry_structure = _canonical_entry_structure(inputs)
+    range_policy = inputs.get("range_policy", signal.get("range_policy_shadow", {}))
+    if not isinstance(range_policy, Mapping):
+        raise ValueError("linked decision range policy must be an object")
+    signal_range_policy = signal.get("range_policy_shadow")
+    if signal_range_policy is not None:
+        if not isinstance(signal_range_policy, Mapping):
+            raise ValueError("linked signal range policy must be an object")
+        if _plain_entry_structure(range_policy) != _plain_entry_structure(signal_range_policy):
+            raise ValueError("linked decision range policy views do not match")
 
     is_order = "id" in payload
     is_observation = "observation_key" in payload
@@ -379,6 +388,7 @@ def _canonical_model_fields(
                 signal.get("adaptive_profile_state", {})
             ),
             "entry_structure_shadow": deepcopy(entry_structure),
+            "range_policy_shadow": deepcopy(range_policy),
         }
     )
     opened_at = (

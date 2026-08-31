@@ -16,6 +16,7 @@ from app.market_data import MarketDataCoordinator
 from app.profile_degradation_guard import ProfileDegradationGuardConfig
 from app.profile_health_guard import ProfileHealthGuardConfig
 from app.profile_admission import ProfileAdmissionPolicy, baseline_policy
+from app.range_policy import RangePolicyConfig
 from app.result_sequence_guard import ResultSequenceGuardConfig
 from app.shadow_supervisor import ShadowSupervisor
 from app.state import DEFAULT_STRATEGY_BUILD_ID, MonitorState, strategy_source_build_id
@@ -632,6 +633,13 @@ def main() -> None:
         help="关闭外部 webhook 信号推送",
     )
     parser.add_argument(
+        "--range-policy-mode",
+        choices=("SHADOW_ONLY", "LIVE"),
+        type=str.upper,
+        default=os.getenv("RANGE_POLICY_MODE", "SHADOW_ONLY").upper(),
+        help="范围策略模式：SHADOW_ONLY 仅记录，LIVE 按范围规则拦截；默认: SHADOW_ONLY",
+    )
+    parser.add_argument(
         "--no-stake-progression",
         action="store_true",
         default=not _env_bool("STAKE_PROGRESSION", True),
@@ -984,6 +992,7 @@ def main() -> None:
         live_short_segments=_split_csv(args.live_short_segments),
         enable_daily_profile_selector=not args.no_daily_profile_selector,
         profile_admission_policy=profile_admission_policy,
+        range_policy_config=RangePolicyConfig(mode=args.range_policy_mode),
         daily_profile_selector_config=DailyProfileSelectorConfig(
             lookback_days=args.daily_profile_lookback_days,
             stable_lookback_days=args.daily_profile_stable_lookback_days,

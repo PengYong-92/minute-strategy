@@ -185,6 +185,7 @@ class AccountSimulator:
             "wave_guard_reason": signal.wave_guard_reason,
             "profile_degradation_probe": signal.profile_degradation_probe,
             "profile_degradation_triggered_at": signal.profile_degradation_triggered_at,
+            "range_policy_shadow": deepcopy(signal.range_policy_shadow),
             "profile_health_status": signal.profile_health_status,
             "profile_health_sample_size": signal.profile_health_sample_size,
             "profile_health_win_rate": signal.profile_health_win_rate,

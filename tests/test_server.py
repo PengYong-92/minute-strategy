@@ -18,6 +18,7 @@ import app.server as server_module
 from app.history import WarmupReport
 from app.models import Kline, ObservationSignal, Signal, SimulatedOrder
 from app.profile_admission import baseline_policy, candidate_policy
+from app.range_policy import RangePolicyConfig
 from app.server import apply_warmup, make_handler
 from app.state import MonitorState
 from app.storage import SQLiteMonitorStore
@@ -633,6 +634,43 @@ class OrdersApiTest(unittest.TestCase):
 
                 config = monitor_state.call_args.kwargs["time_period_guard_config"]
                 self.assertEqual(config.enabled, expected)
+
+    def test_main_injects_range_policy_mode(self):
+        for environment, cli_args, expected in (
+            ({}, [], "SHADOW_ONLY"),
+            ({"RANGE_POLICY_MODE": "LIVE"}, [], "LIVE"),
+            ({"RANGE_POLICY_MODE": "LIVE"}, ["--range-policy-mode", "SHADOW_ONLY"], "SHADOW_ONLY"),
+        ):
+            with self.subTest(environment=environment, cli_args=cli_args):
+                fake_server = SimpleNamespace(
+                    serve_forever=lambda: None,
+                    server_close=lambda: None,
+                )
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "app.server",
+                            "--no-warmup",
+                            "--no-persistence",
+                            "--no-webhook",
+                            *cli_args,
+                        ],
+                    ),
+                    patch(
+                        "app.server.MonitorState",
+                        return_value=SimpleNamespace(symbol="BTCUSDT"),
+                    ) as monitor_state,
+                    patch("app.server.start_market_data", return_value=SimpleNamespace(stop=lambda: None)),
+                    patch("app.server.ThreadingHTTPServer", return_value=fake_server),
+                ):
+                    server_module.main()
+
+                config = monitor_state.call_args.kwargs["range_policy_config"]
+                self.assertIsInstance(config, RangePolicyConfig)
+                self.assertEqual(config.mode, expected)
 
     def test_main_injects_profile_health_guard_config(self):
         cases = (

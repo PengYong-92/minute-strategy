@@ -2603,3 +2603,33 @@ cpu.average.15s=4.20%..5.13%
 发布后连续产生4个新分钟决策，`decision_contexts`从3767增至3771，`signal_audit`从4038增至4042，最新决策输入为47至49KiB且不再重复候选数组；状态更新时间逐分钟推进，`last_error=null`，没有再出现`STORAGE_ERROR`。订单仍为78条且无在途订单，未因本次修复清空或改写。
 
 旧页面持续轮询和每分钟分析同时运行时，两次15秒CPU平均4.20%和5.13%，故障前同口径约91%。连续60秒cgroup占用约445至828MiB，其中匿名内存约327至369MiB；高位主要是可回收的SQLite文件页缓存，始终低于950MiB软上限。`memory.events high`在稳定采样期没有增加，`max/oom/oom_kill`均为0，`memory.pressure avg10`恢复为0。日志无新`Traceback`、`database is locked`、冻结冲突、持久化失败、`STORAGE_ERROR`或OOM。4GiB Swap只作为小内存实例的故障兜底，查询放大、重复计算和数据库容量修复才是本次停摆的根因修复。
+
+## 51. 2026-08-31 范围状态策略影子与 webhook 发布
+
+### 51.1 实施边界
+
+本次按最小改动实现范围策略影子评估，不改变现有默认开单逻辑。新增 `RANGE_POLICY_MODE`，默认值为 `SHADOW_ONLY`；只有显式设置为 `LIVE` 才会把范围策略作为真实拦截条件。
+
+影子规则如下：
+
+- `RANGE_MID`：LONG 保持允许；SHORT 仅在 `SUPPORT` 结构下标记为允许，其余记录为 `RANGE_MID_SHORT_NO_SUPPORT`。
+- `RANGE_HIGH`：仅 `RESISTANCE_REJECTED` 或 `NO_NEARBY_LEVEL` 标记为允许，其余记录为 `RANGE_HIGH_STRUCTURE_RISK`。
+- 非 `RANGE_MID/RANGE_HIGH` 状态标记为不适用，不改变任何原有判断。
+
+结果会随同一信号写入 `Signal`、`SimulatedOrder`、`ObservationSignal`、决策上下文、决策审计和状态接口。冻结模型恢复时从决策上下文回填，避免新增影子字段造成结算一致性冲突。
+
+### 51.2 启动与 webhook
+
+启动脚本新增中文参数 `--range-policy-mode` 和环境变量 `RANGE_POLICY_MODE`。服务器发布时保持范围策略为 `SHADOW_ONLY`，显式设置 `NO_WEBHOOK=0` 且不传 `--no-webhook`，开启现有 webhook；没有修改 webhook payload、发送顺序或现有开单门禁。
+
+### 51.3 本地验收
+
+```text
+python3 -m unittest discover -s tests
+Ran 1174 tests ... OK
+python3 -m py_compile app/range_policy.py app/models.py app/simulator.py app/state.py app/server.py
+bash -n scripts/run.sh
+git diff --check
+```
+
+发布提交和服务器验收结果在本节发布完成后补录；范围策略是否从影子切换为真实拦截，必须另行记录并单独验证，不随本次 webhook 开启自动切换。

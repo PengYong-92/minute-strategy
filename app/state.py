@@ -72,6 +72,7 @@ from app.profile_admission import (
     select_admitted_candidate,
 )
 from app.quality_score import attach_shadow_quality_score
+from app.range_policy import RangePolicyConfig, evaluate_range_policy
 from app.result_sequence_guard import (
     ResultSequenceGuardConfig,
     ResultSequenceGuardDecision,
@@ -210,6 +211,7 @@ class MonitorState:
         time_period_guard_config: TimePeriodGuardConfig | None = None,
         profile_health_guard_config: ProfileHealthGuardConfig | None = None,
         profile_admission_policy: ProfileAdmissionPolicy | None = None,
+        range_policy_config: RangePolicyConfig | None = None,
         strategy_build_id: str = DEFAULT_STRATEGY_BUILD_ID,
     ):
         self.symbol = symbol.upper()
@@ -238,6 +240,7 @@ class MonitorState:
         self.profile_health_guard_config = (
             profile_health_guard_config or ProfileHealthGuardConfig()
         )
+        self.range_policy_config = range_policy_config or RangePolicyConfig()
         self.stake = stake
         self.win_return = win_return
         self.enable_stake_progression = enable_stake_progression
@@ -1738,6 +1741,14 @@ class MonitorState:
             entry_structure_shadow=payload,
         )
 
+    def _attach_range_policy(self, signal: Signal) -> Signal:
+        return replace(
+            signal,
+            range_policy_shadow=deepcopy(
+                evaluate_range_policy(signal, config=self.range_policy_config)
+            ),
+        )
+
     @staticmethod
     def _latest_order_opened_at_by_direction(orders) -> dict[str, int | None]:
         return {
@@ -1868,6 +1879,7 @@ class MonitorState:
                     "profile_enabled": self.enable_profile_guard,
                     "profile_min_history": self.profile_guard_min_history,
                     "profile_min_group_size": self.profile_guard_min_group_size,
+                    "range_policy": self.range_policy_config.to_dict(),
                 },
                 "profiles": {
                     "daily_selector_enabled": self.enable_daily_profile_selector,
@@ -2330,6 +2342,7 @@ class MonitorState:
         n12_n20.setdefault("n20", {"status": "NOT_AVAILABLE", "sample_size": 0})
 
         structure = deepcopy(signal.entry_structure_shadow)
+        range_policy = deepcopy(signal.range_policy_shadow)
 
         trace_by_stage = {
             str(record["stage"]): record
@@ -2337,6 +2350,7 @@ class MonitorState:
         }
         guard_stages = (
             "WAVE_GUARD",
+            "RANGE_POLICY",
             "DAILY_PROFILE",
             "ADAPTIVE_PROFILE",
             "PROFILE_HEALTH_SHORT_WINDOW",
@@ -2438,6 +2452,7 @@ class MonitorState:
                     "batch_id": signal.wave_batch_id,
                 },
                 "direction_pulse": deepcopy(signal.direction_pulse_shadow),
+                "range_policy": range_policy,
                 "profile_summary_cache": {
                     "source_revision": self.profile_guard_audit.get("source_revision"),
                     "current_revision": self.profile_guard_audit.get("current_revision"),
@@ -2447,6 +2462,7 @@ class MonitorState:
             },
             "admission": admission,
             "entry_structure": structure,
+            "range_policy": range_policy,
             "signal": self._signal_context_payload(signal),
             "audit_snapshot": deepcopy(audit_context),
         }
@@ -2776,6 +2792,9 @@ class MonitorState:
                 if isinstance(canonical_structure, dict)
                 else {}
             ),
+            range_policy_shadow=deepcopy(
+                canonical_inputs.get("range_policy", signal.range_policy_shadow)
+            ),
             decision_inputs=canonical_inputs,
             decision_trace=payload["decision_trace"],
             first_decisive_block=context.first_decisive_block,
@@ -2793,6 +2812,7 @@ class MonitorState:
     ) -> dict[str, object]:
         guard_stages = (
             "WAVE_GUARD",
+            "RANGE_POLICY",
             "DAILY_PROFILE",
             "ADAPTIVE_PROFILE",
             "PROFILE_HEALTH_SHORT_WINDOW",
@@ -3041,6 +3061,7 @@ class MonitorState:
             "ADAPTIVE_PROFILE_PAUSED": "ADAPTIVE_PROFILE",
             "ADAPTIVE_PROFILE_SECOND_BLOCKED": "ADAPTIVE_PROFILE",
             "WAVE_DIRECTION_BLOCKED": "WAVE_GUARD",
+            "RANGE_POLICY_BLOCKED": "RANGE_POLICY",
             "PROFILE_GUARD_BLOCKED": "PROFILE_HEALTH",
             "HOLD_OPEN_ORDER": "CAPACITY",
             "COOLDOWN": "COOLDOWN",
@@ -3142,6 +3163,7 @@ class MonitorState:
             latest,
             candidate_origin,
         )
+        signal = self._attach_range_policy(signal)
         self.selected_signal = signal
         run = self._new_decision_run(
             signal,
@@ -3159,6 +3181,30 @@ class MonitorState:
         self.time_period_guard = time_period_decision.to_dict()
         self.rolling_edge = self._rolling_edge_status(signal, latest)
         should_observe = self._should_record_observation(signal)
+        range_policy = signal.range_policy_shadow
+        if range_policy.get("would_block"):
+            run.trace(
+                "RANGE_POLICY",
+                "BLOCK" if not range_policy.get("allowed", True) else "PASS",
+                str(range_policy.get("reason_code", "RANGE_POLICY")),
+                range_policy,
+            )
+            if not range_policy.get("allowed", True):
+                return self._block_order(
+                    signal,
+                    latest,
+                    "RANGE_POLICY_BLOCKED",
+                    str(range_policy.get("reason", "范围策略拦截")),
+                    should_observe=should_observe,
+                    run=run,
+                )
+        else:
+            run.trace(
+                "RANGE_POLICY",
+                "PASS",
+                str(range_policy.get("reason_code", "RANGE_POLICY_NOT_APPLICABLE")),
+                range_policy,
+            )
         batch_decision = evaluate_wave_batch_guard(
             self.simulator.orders,
             current_time=latest.close_time,
@@ -3924,6 +3970,7 @@ class MonitorState:
                 strategy_build_id=context.strategy_build_id,
                 candidate_origin=context.candidate_origin,
                 entry_structure_shadow=deepcopy(signal.entry_structure_shadow),
+                range_policy_shadow=deepcopy(signal.range_policy_shadow),
                 quality_score_inputs=deepcopy(signal.quality_score_inputs),
                 decision_inputs=context_payload["inputs"],
                 decision_trace=context_payload["decision_trace"],
@@ -4930,6 +4977,7 @@ class MonitorState:
             quality_score_components=dict(signal.quality_score_components),
             quality_score_inputs=dict(signal.quality_score_inputs),
             direction_pulse_shadow=dict(signal.direction_pulse_shadow),
+            range_policy_shadow=deepcopy(signal.range_policy_shadow),
             adaptive_profile_state=deepcopy(signal.adaptive_profile_state),
             entry_structure_shadow=deepcopy(signal.entry_structure_shadow),
             profile_health_status=signal.profile_health_status,
@@ -4966,6 +5014,7 @@ class MonitorState:
                 latest,
                 candidate_origin,
             )
+        signal = self._attach_range_policy(signal)
         if not signal.quality_score_version:
             signal = self._attach_quality_score(
                 signal,
@@ -5007,6 +5056,7 @@ class MonitorState:
             decision_trace=context_payload["decision_trace"],
             first_decisive_block=context.first_decisive_block,
             entry_structure_shadow=deepcopy(enriched_signal.entry_structure_shadow),
+            range_policy_shadow=deepcopy(enriched_signal.range_policy_shadow),
         )
         self.observations.append(observation)
         if self.storage:
@@ -5632,6 +5682,11 @@ class MonitorState:
             "profile_health_guard": dict(self.profile_health_guard),
             "time_period_guard": dict(self.time_period_guard),
             "profile_guard": dict(self.profile_guard_audit),
+            "range_policy": deepcopy(
+                self.selected_signal.range_policy_shadow
+                if self.selected_signal
+                else {}
+            ),
         }
 
     def _observation_signal_audit_context(
@@ -5700,6 +5755,7 @@ class MonitorState:
                 "blocked": False,
                 "hit_keys": [],
             },
+            "range_policy": deepcopy(signal.range_policy_shadow),
         }
 
     def _save_observation(self, observation: ObservationSignal) -> None:
@@ -6011,6 +6067,19 @@ class MonitorState:
             "entry_structure_reason_code": "STRUCTURE_NOT_EVALUATED",
             "candidate_origin": "UNKNOWN",
             "active_level_source": "UNKNOWN",
+        }
+
+    def _range_policy_status(self) -> dict:
+        if self.selected_signal and self.selected_signal.range_policy_shadow:
+            return deepcopy(self.selected_signal.range_policy_shadow)
+        return {
+            "version": self.range_policy_config.version,
+            "mode": self.range_policy_config.mode,
+            "action": "NOT_EVALUATED",
+            "allowed": True,
+            "would_block": False,
+            "reason_code": "RANGE_POLICY_NOT_EVALUATED",
+            "config": self.range_policy_config.to_dict(),
         }
 
     def _trade_score_threshold_status(self) -> dict:
@@ -6421,6 +6490,7 @@ class MonitorState:
                 "storage_capacity": storage_capacity,
                 "shadow_optimizer": shadow_optimizer,
                 "entry_structure_shadow": self._entry_structure_status(),
+                "range_policy": self._range_policy_status(),
                 "stake_progression": self._stake_progression_status(),
                 "order_policy": self._order_policy_status(),
                 "trade_score_threshold": self._trade_score_threshold_status(),
