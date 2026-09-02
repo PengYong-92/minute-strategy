@@ -24,6 +24,68 @@ def write_binance_zip(path: Path, timestamp_ms: int, close: float = 100.0) -> No
 
 
 class HistoryWarmupTest(unittest.TestCase):
+    def test_warmup_falls_back_to_cached_daily_files_when_monthly_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_binance_zip(
+                data_dir / "BTCUSDT-1m-2026-08-01.zip",
+                1_754_006_400_000,
+                close=101.0,
+            )
+            write_binance_zip(
+                data_dir / "BTCUSDT-1m-2026-08-02.zip",
+                1_754_092_800_000,
+                close=102.0,
+            )
+
+            def downloader(url: str, target: Path, timeout: float) -> None:
+                self.assertEqual(target.name, "BTCUSDT-1m-2026-09-01.zip")
+                raise FileNotFoundError("current daily archive is not published yet")
+
+            klines, report = warmup_history(
+                WarmupConfig(
+                    symbol="BTCUSDT",
+                    data_dir=data_dir,
+                    months=1,
+                    include_current_month_daily=True,
+                    today=date(2026, 9, 2),
+                    downloader=downloader,
+                )
+            )
+
+        self.assertEqual([item.close for item in klines], [101.0, 102.0])
+        self.assertEqual(report.status, "READY")
+        self.assertEqual(
+            report.cached_files,
+            ["BTCUSDT-1m-2026-08-01.zip", "BTCUSDT-1m-2026-08-02.zip"],
+        )
+        self.assertEqual(report.missing_files, ["BTCUSDT-1m-2026-09-01.zip"])
+
+    def test_missing_current_month_daily_file_does_not_downgrade_cached_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_binance_zip(data_dir / "BTCUSDT-1m-2026-04.zip", 1_775_174_400_000)
+
+            def downloader(url: str, target: Path, timeout: float) -> None:
+                raise FileNotFoundError("current daily archive is not published yet")
+
+            _, report = warmup_history(
+                WarmupConfig(
+                    symbol="BTCUSDT",
+                    data_dir=data_dir,
+                    months=1,
+                    include_current_month_daily=True,
+                    today=date(2026, 5, 3),
+                    downloader=downloader,
+                )
+            )
+
+        self.assertEqual(report.status, "READY")
+        self.assertEqual(
+            report.missing_files,
+            ["BTCUSDT-1m-2026-05-01.zip", "BTCUSDT-1m-2026-05-02.zip"],
+        )
+
     def test_warmup_downloads_missing_monthly_and_current_daily_files(self):
         calls = []
 

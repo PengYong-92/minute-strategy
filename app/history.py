@@ -47,6 +47,7 @@ class WarmupReport:
 class _WarmupTarget:
     url: str
     path: Path
+    required: bool = True
 
 
 def warmup_history(config: WarmupConfig) -> tuple[list[Kline], WarmupReport]:
@@ -59,6 +60,7 @@ def warmup_history(config: WarmupConfig) -> tuple[list[Kline], WarmupReport]:
     downloaded_files: list[str] = []
     missing_files: list[str] = []
     errors: list[str] = []
+    required_errors = False
 
     targets = _warmup_targets(config, symbol, interval, data_dir)
     downloader = config.downloader or _download_file
@@ -73,6 +75,7 @@ def warmup_history(config: WarmupConfig) -> tuple[list[Kline], WarmupReport]:
         except Exception as exc:  # noqa: BLE001 - 公开历史数据缺失不能中断实盘监控。
             missing_files.append(target.path.name)
             errors.append(f"{target.path.name}: {exc}")
+            required_errors = required_errors or target.required
 
     klines_by_open_time: dict[int, Kline] = {}
     for target in targets:
@@ -83,9 +86,10 @@ def warmup_history(config: WarmupConfig) -> tuple[list[Kline], WarmupReport]:
                 klines_by_open_time[item.open_time] = item
         except Exception as exc:  # noqa: BLE001 - 单个缓存文件损坏不能影响其他缓存。
             errors.append(f"{target.path.name}: {exc}")
+            required_errors = required_errors or target.required
 
     klines = sorted(klines_by_open_time.values(), key=lambda item: item.open_time)
-    status = _status(bool(klines), bool(errors))
+    status = _status(bool(klines), required_errors)
     report = WarmupReport(
         status=status,
         symbol=symbol,
@@ -108,17 +112,45 @@ def _warmup_targets(config: WarmupConfig, symbol: str, interval: str, data_dir: 
     for year, month in _previous_months(anchor, max(config.months, 0)):
         filename = f"{symbol}-{interval}-{year:04d}-{month:02d}.zip"
         url = f"{config.base_url}/monthly/klines/{symbol}/{interval}/{filename}"
-        targets.append(_WarmupTarget(url=url, path=data_dir / filename))
+        monthly_path = data_dir / filename
+        if monthly_path.exists():
+            targets.append(_WarmupTarget(url=url, path=monthly_path))
+            continue
+
+        daily_pattern = f"{symbol}-{interval}-{year:04d}-{month:02d}-*.zip"
+        cached_daily_paths = sorted(data_dir.glob(daily_pattern))
+        if cached_daily_paths:
+            targets.extend(
+                _daily_target(config, symbol, interval, path, required=True)
+                for path in cached_daily_paths
+            )
+            continue
+
+        targets.append(_WarmupTarget(url=url, path=monthly_path))
 
     if config.include_current_month_daily:
         day = anchor.replace(day=1)
         last_complete_day = anchor - timedelta(days=1)
         while day <= last_complete_day:
             filename = f"{symbol}-{interval}-{day:%Y-%m-%d}.zip"
-            url = f"{config.base_url}/daily/klines/{symbol}/{interval}/{filename}"
-            targets.append(_WarmupTarget(url=url, path=data_dir / filename))
+            targets.append(
+                _daily_target(config, symbol, interval, data_dir / filename, required=False)
+            )
             day += timedelta(days=1)
     return targets
+
+
+def _daily_target(
+    config: WarmupConfig,
+    symbol: str,
+    interval: str,
+    path: Path,
+    *,
+    required: bool,
+) -> _WarmupTarget:
+    filename = path.name
+    url = f"{config.base_url}/daily/klines/{symbol}/{interval}/{filename}"
+    return _WarmupTarget(url=url, path=path, required=required)
 
 
 def _previous_months(anchor: date, count: int) -> list[tuple[int, int]]:
