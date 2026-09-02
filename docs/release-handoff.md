@@ -2632,4 +2632,14 @@ bash -n scripts/run.sh
 git diff --check
 ```
 
-发布提交和服务器验收结果在本节发布完成后补录；范围策略是否从影子切换为真实拦截，必须另行记录并单独验证，不随本次 webhook 开启自动切换。
+### 51.4 服务器发布结果
+
+2026-09-02按本节范围发布到生产，未清空、迁移或修改正式模拟订单及SQLite数据。发布提交为`3ab2a9fd3fabc1f5bc00a14937f7124f4c462314`，最小包为`event-contract-monitor-3ab2a9f-20260902-085202.tar.gz`，SHA-256为`cf6d0778d58bd3ebb6dc2ac1b3b58c5114d1f27b02f0dc86727dab4a17f20566`。
+
+发布目录为`/opt/victory-event-monitor/releases/event-contract-monitor-3ab2a9f-20260902-085202`，`current`于`2026-09-02 08:58:55 CST`原子切换，服务启动后`active/running`、`NRestarts=0`、主进程PID`225102`。新增systemd覆盖文件`96-range-policy-shadow-webhook.conf`，实际生效配置为`RANGE_POLICY_MODE=SHADOW_ONLY`和`NO_WEBHOOK=0`；没有启用范围策略真实拦截。
+
+公网`https://victory.easy-tx.com/api/state`返回HTTP 200，状态接口确认`RANGE_POLICY_V1/SHADOW_ONLY`、Webhook为`enabled=true`、`last_error=null`；订单接口确认总订单`229`、在途订单`0`，发布没有改变历史订单。发布后日志未发现`Traceback`、`database is locked`、`STORAGE_ERROR`、冻结结算冲突或OOM。
+
+本次启动预热状态为`PARTIAL`、已加载`87840`根1分钟K线。缺口为`BTCUSDT-1m-2026-08.zip`和`BTCUSDT-1m-2026-09-01.zip`，服务器已有的2026-08-01至2026-08-30日包未被当前预热实现作为跨月月包回退；这是既有数据选择边界，不是范围策略发布引入的错误。该缺口需作为独立预热数据/加载逻辑问题处理，不在本次策略发布中掺改。
+
+范围策略仍保持影子模式，`RANGE_MID`和`RANGE_HIGH`的`would_block`及原因字段只用于后续统计，不改变实际开单数量、方向、金额、并发、冷却、画像或结算逻辑。范围策略不得在没有独立样本验收记录前切换为`LIVE`。
