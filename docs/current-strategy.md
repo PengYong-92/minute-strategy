@@ -1,6 +1,6 @@
 # 当前策略说明
 
-更新时间：2026-08-15
+更新时间：2026-09-02
 代码范围：`app/server.py`、`app/strategy.py`、`app/indicators.py`、`app/state.py`、`app/profile_health_guard.py`、`app/time_period_guard.py`、`app/profile_degradation_guard.py`、`app/wave_state.py`、`app/wave_batch_guard.py`、`app/order_policy.py`、`app/simulator.py`、`app/history.py`、`app/storage.py`、`scripts/run.sh`
 
 ## 1. 策略目标与运行周期

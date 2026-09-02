@@ -2671,3 +2671,29 @@ bash -n scripts/*.sh
 ### 52.3 发布验收记录
 
 本节代码修复完成本地验证后再发布。发布时不清空订单、不修改线上SQLite数据、不修改Nginx和SSL；保留现有`RANGE_POLICY_MODE=SHADOW_ONLY`和Webhook开关配置。发布后的服务状态、预热根数、订单数和日志检查结果追加在本节，不以本地测试代替线上验收。
+
+2026-09-02已完成发布。修复提交为`5f766c3`（`5f766c3`），最小包为`event-contract-monitor-5f766c3-warmup-fix-20260902-093304.tar.gz`，SHA-256为`495852befa8586626f70f9cf4f48ffef1fe80ff28f75fbe5ff5ba4b2653918dd`。远端包哈希一致，Python和Shell编译检查通过后，`current`原子切换为：
+
+```text
+/opt/victory-event-monitor/releases/event-contract-monitor-5f766c3-warmup-fix-20260902-093304
+```
+
+发布验收：
+
+```text
+service=active/running
+NRestarts=0
+warmup.status=READY
+warmup.loaded_klines=132480
+warmup.cached_files=32
+warmup.downloaded_files=1
+warmup.missing_files=[]
+warmup.errors=[]
+orders.total=229
+orders.open=0
+last_error=null
+range_policy=RANGE_POLICY_V1/SHADOW_ONLY
+webhook.enabled=true
+```
+
+修复后预热实际加载了服务器已有的2026-08日包，并成功补齐可用的当前月日包；不再出现`BTCUSDT-1m-2026-08.zip`导致的历史缺口。未清空、迁移或改写模拟订单和SQLite，未修改Nginx、SSL、Webhook payload或任何开单策略。发布后日志未发现`Traceback`、`database is locked`、`STORAGE_ERROR`、结算冲突、OOM或重启循环。
